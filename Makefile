@@ -1,5 +1,5 @@
 CC=gcc
-CFLAGS=-W -Wall -ansi -pedantic
+CFLAGS=-W -Wall -ansi -pedantic -std=c99
 LDFLAGS=
 EXEC=hello
 SRC= $(wildcard *.c)
@@ -22,3 +22,4 @@ clean:
 
 mrproper: clean
 	rm -rf $(EXEC)
+	rm -rf *~ 

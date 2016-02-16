@@ -20,15 +20,15 @@ void vector_add(vector *v, void *e)
 {
 	if (v->size == 0) {
 		v->size = 10;
-		v->item = malloc(sizeof(void*) * v->size);
-		memset(v->item, '\0', sizeof(void) * v->size);
+		v->item = malloc(sizeof(vector) * v->size);
+		memset(v->item, '\0', sizeof(vector) * v->size);
 	}
 
 	/* condition to increase v->item:
 	 last slot exhausted */
 	if (v->size == v->count) {
 		v->size *= 2;
-		v->item = realloc(v->item, sizeof(void*) * v->size);
+		v->item = realloc(v->item, sizeof(vector*) * v->size);
 	}
 
 	v->item[v->count] = e;
@@ -47,7 +47,7 @@ void vector_set(vector *v, int index, void *e)
 void *vector_get(vector *v, int index)
 {
 	if (index >= v->count) {
-		return;
+		return 0;
 	}
 
 	return v->item[index];
@@ -63,7 +63,7 @@ void vector_delete(vector *v, int index)
 
 	v->item[index] = NULL;
 
-	void **newarr = (void**)malloc(sizeof(void*) * v->count * 2);
+	void **newarr = (void**)malloc(sizeof(vector*) * v->count * 2);
 	for (i = 0, j = 0; i < v->count; i++) {
 		if (v->item[i] != NULL) {
 			newarr[j] = v->item[i];

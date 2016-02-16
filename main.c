@@ -2,6 +2,12 @@
 
 int main(int argc, char *argv[])
 {
-	write(1,"Je T'aime Alexandra\n",21);
+	
+	if(argc>0){
+		for(int i=0;argc--;i++){
+			printf("%s",argv[i]);
+		}
+	}
+	printf("Test\n");
 	return (1);
 }
