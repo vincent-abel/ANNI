@@ -3,9 +3,9 @@
 int main(int argc, char *argv[])
 {
 	
-	if(argc>0){
+	if(argc>1){
 		for(int i=0;argc--;i++){
-			printf("%s",argv[i]);
+			printf("%s ",argv[i]);
 		}
 	}
 	printf("Test\n");

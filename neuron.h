@@ -1,7 +1,7 @@
 #ifndef NEURON_H__
 #define NEURON_H__
 
-typedef struct inputs_ {
+typedef struct inputs {
 	double i;
 	double w;
 	struct inputs *prev;
