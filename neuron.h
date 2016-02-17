@@ -13,7 +13,7 @@ typedef struct input {
 typedef struct nxtinput {
 	double w;
 	double *i;
-	struct input *prev;
+	struct nxtinput *prev;
 } nxtinput;
 
 typedef struct neuron {
@@ -32,14 +32,15 @@ typedef struct brain {
     void** neuron_layer;
 } brain;
 
+void input_init(input *,int);
 void input_push(input **, double , double);
 int input_delete(input **);
 int input_size(input *);
 void input_clear(input **);
 void input_show(input *);
 void neuron_output(neuron **);
-double neuron_Tinput(neuron **);
-void nlayer_setInput(nlayer **);
-void nxtinput_push(nxtinput **, double **, double)
+double neuron_Tinput(neuron *);
+void nlayer_setInput(nlayer *);
+void nxtinput_push(nxtinput **, double *, double);
 
 #endif

@@ -4,11 +4,29 @@
 #include "main.h"
 #define RESPONSE 1
 
-void input_push(input **p, double input, double weigh)
+double randfrom(double min, double max) 
+{
+    double range = (max - min); 
+    double div = RAND_MAX / range;
+    return min + (rand() / div);
+}
+
+void input_init(input *input,int size)
+{
+	(*input).i=0;
+	(*input).w=0;
+	(*input).prev=0;
+	while (size--)
+	{
+		input_push(&input,randfrom(0,1),randfrom(-2,2));
+	}
+}
+
+void input_push(input **p, double in, double weigh)
 {
         input *new_input = malloc(sizeof(input));
         if (!new_input) exit(EXIT_FAILURE);     /* in case of allocation failure */
-        new_input->i = input;
+        new_input->i = in;
 		new_input->w = weigh;
         new_input->prev = *p;
         *p = new_input;       /* the pointer is on the last element of the pile. */
@@ -65,15 +83,15 @@ void input_show(input *p)
 
 void neuron_output(neuron **n) // Sigmoid for the time being
 {
-	while (n->prev)
+	while ((*n)->prev)
 	{
-		n->output=( 1 / ( 1 + exp(-neuron_Tinput(*n) / RESPONSE)));
+		(*n)->output=( 1 / ( 1 + exp(-neuron_Tinput(*n) / RESPONSE)));
 	}
 }
 
-double neuron_Tinput(neuron **n)
+double neuron_Tinput(neuron *n)
 {
-	input i=n->input;
+	input *i=(*n->input);
 	n->Tinput=0;
 	
 	while (i->prev)
@@ -84,22 +102,22 @@ double neuron_Tinput(neuron **n)
 }
 /* Don't bother what the ouput is we are just linking the input to the prev output by memory address (optimization RULEZ)
 */
-void nlayer_setInput(nlayer **nlayer)
+void nlayer_setInput(nlayer *nlayer)
 {
 	while (nlayer->prev)
 	{
 		neuron n=nlayer->neuron;
 		neuron np=nlayer->prev;
-		while (n->prev)
+		while (n.prev)
 		{
-			nxtinput i=np->input;
-			while (i->prev)
+			nxtinput i=np.input;
+			while (i.prev)
 			{
-				i->input= &n->output;
-				i=i->prev;
+				i.input= &n.output;
+				i=i.prev;
 			}
-			n=n->prev;
+			n=n.prev;
 		}
-		nlayer=nlayer->prev;
+		nlayer=nlayer.prev;
 	}
 }

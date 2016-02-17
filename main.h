@@ -11,4 +11,5 @@
 #include <string.h>
 #include "vector.h"
 #include "neuron.h"
+#include <math.h>
 #endif

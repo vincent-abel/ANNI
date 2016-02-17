@@ -1,7 +1,7 @@
 CC=gcc
 CFLAGS=-W -Wall -ansi -pedantic -std=c99
 LDFLAGS=
-EXEC=hello
+EXEC=ann
 SRC= $(wildcard *.c)
 OBJ= $(SRC:.c=.o)
 
