@@ -1,24 +1,45 @@
+/*
+**	Neuron Header
+*/
 #ifndef NEURON_H__
 #define NEURON_H__
 
-typedef struct inputs {
+typedef struct input {
 	double i;
 	double w;
-	struct inputs *prev;
+	struct input *prev;
+} input;
 
-} inputs;
+typedef struct nxtinput {
+	double w;
+	double *i;
+	struct input *prev;
+} nxtinput;
 
-typedef struct neuron_ {
-    void** item;
-    int size;
-    int count;
+typedef struct neuron {
+    void** input;
+	double Tinput;
+    double output;
+	struct neuron *prev;
 } neuron;
 
+typedef struct nlayer {
+    void** neuron;
+	struct nlayer *prev;
+} nlayer;
 
-void Push(inputs **, double , double);
-int Delete(inputs **);
-int Size(inputs *);
-void Clear(inputs **);
-void Show(inputs *);
+typedef struct brain {
+    void** neuron_layer;
+} brain;
+
+void input_push(input **, double , double);
+int input_delete(input **);
+int input_size(input *);
+void input_clear(input **);
+void input_show(input *);
+void neuron_output(neuron **);
+double neuron_Tinput(neuron **);
+void nlayer_setInput(nlayer **);
+void nxtinput_push(nxtinput **, double **, double)
 
 #endif
