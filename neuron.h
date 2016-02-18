@@ -24,8 +24,16 @@ typedef struct	neuron {
 	struct	neuron *prev;
 } neuron;
 
+typedef struct  neuron_p {
+	double  Tinput;
+	double  output;
+	double 	bias;
+	nxtinput * input;
+	struct  neuron_p *prev;
+} neuron_p;
+
 typedef struct	nlayer {
-	void**	neuron;
+	void	*neuron;
 	struct	nlayer *prev;
 } nlayer;
 

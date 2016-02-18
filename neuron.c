@@ -41,10 +41,9 @@ void neuron_push(neuron **p)
 
 void neuron_show(neuron *p)
 {
-	printf("KIKOO\n");
 	while(p)
 	{
-		//input_show(p->input);
+		input_show(p->input);
 		printf(" Input : %lf | Bias : %lf| Output Σ : %lf |\n",p->Tinput,p->bias,p->output);
 		p = p->prev;
 	}
@@ -116,29 +115,30 @@ double neuron_Tinput(neuron *n)
 	
 	while (i)
 	{
-		n->Tinput += i->i * i->w;
+		n->Tinput += i->i * i->w + n->bias;
 		i = i->prev;
 	}
 	return n->Tinput;
 }
 /* Don't bother what the ouput is we are just linking the input to the prev output by memory address (optimization RULEZ)
 */
-/*void nlayer_setInput(nlayer *nlayer)
+void nlayer_setInput(nlayer *nlayer)
 {
-	while (nlayer->prev)
+	while (nlayer)
 	{
 		neuron *n=nlayer->neuron;
-		neuron *np=nlayer->prev;
-		while (n->prev)
+		neuron_p *np=(neuron_p *)nlayer->neuron;
+		np=np->prev;
+		while (n)
 		{
 			nxtinput *i=np->input;
 			while (i->prev)
 			{
-				i->input= &n->output;
+				i->i= &n->output;
 				i=i->prev;
 			}
-			n=n.prev;
+			n=n->prev;
 		}
-		nlayer=nlayer.prev;
+		nlayer=nlayer->prev;
 	}
-}*/
+}
