@@ -1,13 +1,13 @@
-CC=gcc
+CC=gcc -g
 CFLAGS=-W -Wall -ansi -pedantic -std=c99
-LDFLAGS=
+LDFLAGS= -lm
 EXEC=ann
 SRC= $(wildcard *.c)
 OBJ= $(SRC:.c=.o)
 
 all: $(EXEC)
 
-hello: $(OBJ)
+ann: $(OBJ)
 	$(CC) -o $@ $^ $(LDFLAGS)
 
 main.o: main.h

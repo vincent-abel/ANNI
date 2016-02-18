@@ -32,7 +32,7 @@ typedef struct brain {
     void** neuron_layer;
 } brain;
 
-void input_init(input *,int);
+void input_init(input **,int);
 void input_push(input **, double , double);
 int input_delete(input **);
 int input_size(input *);

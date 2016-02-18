@@ -11,14 +11,11 @@ double randfrom(double min, double max)
     return min + (rand() / div);
 }
 
-void input_init(input *input,int size)
+void input_init(input **input,int size)
 {
-	(*input).i=0;
-	(*input).w=0;
-	(*input).prev=0;
 	while (size--)
 	{
-		input_push(&input,randfrom(0,1),randfrom(-2,2));
+		input_push(input,randfrom(0,1),randfrom(-2,2));
 	}
 }
 
@@ -74,7 +71,8 @@ void input_clear(input **p)
 
 void input_show(input *p)
 {
-        while(p)
+
+        while(p->prev)
           {
              printf("input : %lf | weigh : %lf |\n",p->i,p->w);
              p = p->prev;
@@ -102,22 +100,22 @@ double neuron_Tinput(neuron *n)
 }
 /* Don't bother what the ouput is we are just linking the input to the prev output by memory address (optimization RULEZ)
 */
-void nlayer_setInput(nlayer *nlayer)
+/*void nlayer_setInput(nlayer *nlayer)
 {
 	while (nlayer->prev)
 	{
-		neuron n=nlayer->neuron;
-		neuron np=nlayer->prev;
-		while (n.prev)
+		neuron *n=nlayer->neuron;
+		neuron *np=nlayer->prev;
+		while (n->prev)
 		{
-			nxtinput i=np.input;
-			while (i.prev)
+			nxtinput *i=np->input;
+			while (i->prev)
 			{
-				i.input= &n.output;
-				i=i.prev;
+				i->input= &n->output;
+				i=i->prev;
 			}
 			n=n.prev;
 		}
 		nlayer=nlayer.prev;
 	}
-}
+}*/
