@@ -12,4 +12,5 @@
 #include "vector.h"
 #include "neuron.h"
 #include <math.h>
+#include <time.h>
 #endif

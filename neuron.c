@@ -2,7 +2,7 @@
 **	Neuron Code
 */
 #include "main.h"
-#define RESPONSE 1
+#define RESPONSE 0.5
 
 double randfrom(double min, double max) 
 {
@@ -27,6 +27,27 @@ void input_push(input **p, double in, double weigh)
 		new_input->w = weigh;
         new_input->prev = *p;
         *p = new_input;       /* the pointer is on the last element of the pile. */
+}
+void neuron_push(neuron **p)
+{
+        neuron *new_input = malloc(sizeof(neuron));
+        if (!new_input) exit(EXIT_FAILURE);     /* in case of allocation failure */
+        new_input->Tinput = 0;
+	new_input->output = 0;
+	new_input->bias	= randfrom(-0.5,0.5);
+        new_input->prev = *p;
+        *p = new_input;       /* the pointer is on the last element of the pile. */
+}
+
+void neuron_show(neuron *p)
+{
+	printf("KIKOO\n");
+	while(p)
+	{
+		//input_show(p->input);
+		printf(" Input : %lf | Bias : %lf| Output Σ : %lf |\n",p->Tinput,p->bias,p->output);
+		p = p->prev;
+	}
 }
 
 void nxtinput_push(nxtinput **p, double *input, double weigh)
@@ -72,29 +93,31 @@ void input_clear(input **p)
 void input_show(input *p)
 {
 
-        while(p->prev)
+        while(p)
           {
              printf("input : %lf | weigh : %lf |\n",p->i,p->w);
              p = p->prev;
           }
 }
 
-void neuron_output(neuron **n) // Sigmoid for the time being
+void neuron_output(neuron *n) // Sigmoid for the time being
 {
-	while ((*n)->prev)
+	while (n)
 	{
-		(*n)->output=( 1 / ( 1 + exp(-neuron_Tinput(*n) / RESPONSE)));
+		n->output=( 1 / ( 1 + exp(-neuron_Tinput(n) / RESPONSE)));
+		n = n->prev;
 	}
 }
 
 double neuron_Tinput(neuron *n)
 {
-	input *i=(*n->input);
+	input *i=n->input;
 	n->Tinput=0;
 	
-	while (i->prev)
+	while (i)
 	{
 		n->Tinput += i->i * i->w;
+		i = i->prev;
 	}
 	return n->Tinput;
 }
