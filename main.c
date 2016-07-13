@@ -8,7 +8,7 @@ int main(int argc, char *argv[])
 	srand(time(NULL));
 	
 	if (argc<=1) {
-		printf("Usage : ./ann numberofinput numberoflayer ");
+		printf("Usage : ./ann numberofinput numberoflayer \n");
 	}
 	else {
 		input *in = 0;	
@@ -26,7 +26,7 @@ int main(int argc, char *argv[])
 //		nlayer_setInput(nlayer *nlayer);
 		neuron_Tinput(ne);
 		neuron_output(ne);
-//		neuron_show(ne);
+		neuron_show(ne);
 	}
 
 	return (1);
