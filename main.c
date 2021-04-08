@@ -45,6 +45,7 @@ int main(int argc, char *argv[])
 
 		}
 
+// Test 3
 //		nlayer_show(nlayer);
 //		neuron_show(ne);
 	}
