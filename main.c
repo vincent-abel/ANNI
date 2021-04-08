@@ -44,7 +44,7 @@ int main(int argc, char *argv[])
 			neuron_show(nlayer->neuron);
 
 		}
-
+// test
 //		nlayer_show(nlayer);
 //		neuron_show(ne);
 	}
