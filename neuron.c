@@ -11,12 +11,13 @@ double randfrom(double min, double max)
     return min + (rand() / div);
 }
 
-void input_init(input **input,int size)
+int input_init(input **input,int size)
 {
 	while (size--)
 	{
 		input_push(input,randfrom(0,1),randfrom(-2,2));
 	}
+	return 1;
 }
 
 void input_push(input **p, double in, double weigh)
@@ -41,8 +42,10 @@ void neuron_push(neuron **p)
 
 void neuron_show(neuron *p)
 {
+	int i=0;
 	while(p)
 	{
+		printf("Neuron %i :\n",i++);
 		input_show(p->input);
 		printf(" Input : %lf | Bias : %lf| Output Σ : %lf |\n",p->Tinput,p->bias,p->output);
 		p = p->prev;
@@ -119,26 +122,4 @@ double neuron_Tinput(neuron *n)
 		i = i->prev;
 	}
 	return n->Tinput;
-}
-/* Don't bother what the ouput is we are just linking the input to the prev output by memory address (optimization RULEZ)
-*/
-void nlayer_setInput(nlayer *nlayer)
-{
-	while (nlayer)
-	{
-		neuron *n=nlayer->neuron;
-		neuron_p *np=(neuron_p *)nlayer->neuron;
-		np=np->prev;
-		while (n)
-		{
-			nxtinput *i=np->input;
-			while (i->prev)
-			{
-				i->i= &n->output;
-				i=i->prev;
-			}
-			n=n->prev;
-		}
-		nlayer=nlayer->prev;
-	}
 }

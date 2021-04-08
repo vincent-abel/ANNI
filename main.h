@@ -9,7 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h> 
 #include <string.h>
-#include "neuron.h"
+#include "layer.h"
 #include <math.h>
 #include <time.h>
 #endif

@@ -32,24 +32,14 @@ typedef struct  neuron_p {
 	struct  neuron_p *prev;
 } neuron_p;
 
-typedef struct	nlayer {
-	void	*neuron;
-	struct	nlayer *prev;
-} nlayer;
-
-typedef	struct	brain {
-	void**	neuron_layer;
-} brain;
-
-void	input_init(input **,int);
+int	input_init(input **,int);
 void	input_push(input **, double , double);
-int	input_delete(input **);
-int	input_size(input *);
+int		input_delete(input **);
+int		input_size(input *);
 void	input_clear(input **);
 void	input_show(input *);
 void	neuron_output(neuron *);
 double	neuron_Tinput(neuron *);
-void	nlayer_setInput(nlayer *);
 void	nxtinput_push(nxtinput **, double *, double);
 void	neuron_push(neuron **);
 void	neuron_show(neuron *);
