@@ -8,7 +8,7 @@ OBJDIR=objects
 
 NET_SRC=net/neuron.c net/layer.c net/dataset.c net/optim.c net/serialize.c
 NUM_SRC=num/vec.c num/mat.c num/tensor.c num/ops.c
-LANG_SRC=lang/tokenize.c lang/vocab.c lang/embed.c lang/posenc.c lang/attn.c
+LANG_SRC=lang/tokenize.c lang/vocab.c lang/embed.c lang/posenc.c lang/attn.c lang/ffn.c
 LIB_SRC=$(NET_SRC) $(NUM_SRC) $(LANG_SRC)
 LIB_OBJ=$(patsubst %.c,$(OBJDIR)/%.o,$(notdir $(LIB_SRC)))
 MAIN_OBJ=$(OBJDIR)/main.o
@@ -31,6 +31,7 @@ $(OBJDIR)/vocab.o: lang/vocab.c
 $(OBJDIR)/embed.o: lang/embed.c
 $(OBJDIR)/posenc.o: lang/posenc.c
 $(OBJDIR)/attn.o: lang/attn.c
+$(OBJDIR)/ffn.o: lang/ffn.c
 $(OBJDIR)/main.o: main.c
 
 all: $(EXEC)

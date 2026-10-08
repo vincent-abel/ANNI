@@ -384,6 +384,7 @@ static void test_tokenize_roundtrip(void)
 
 
 
+
 static void test_attn_mha(void)
 {
 	attn *a;
@@ -414,17 +415,17 @@ static void test_attn_self(void)
 	v = mat_create(2, 4);
 	out = mat_create(2, 4);
 	assert(q && k && v && out);
-	mat_fill(q, 0.0);
-	mat_fill(k, 0.0);
+	mat_fill(q, 0.25);
+	mat_fill(k, 0.25);
 	mat_fill(v, 0.0);
 	for (i = 0; i < 4; i++) {
-		mat_set(q, 0, i, 1.0);
-		mat_set(k, 0, i, 1.0);
 		mat_set(v, 0, i, 2.0);
 		mat_set(v, 1, i, 4.0);
 	}
 	assert(attn_self(out, q, k, v, 0) == 0);
-	assert(fabs(mat_get(out, 0, 0) - 3.0) < 0.5);
+	/* equal Q/K rows => uniform weights => mean of V rows */
+	assert(fabs(mat_get(out, 0, 0) - 3.0) < 1e-9);
+	assert(fabs(mat_get(out, 1, 0) - 3.0) < 1e-9);
 	mat_free(&q); mat_free(&k); mat_free(&v); mat_free(&out);
 }
 
@@ -495,6 +496,29 @@ static void test_vocab_byte(void)
 	assert(v == NULL);
 }
 
+
+
+
+
+
+
+
+static void test_ffn_relu_path(void)
+{
+	ffn *f;
+	mat *x;
+
+	f = ffn_create();
+	assert(f);
+	x = mat_create(2, LM_D_MODEL);
+	assert(x);
+	mat_fill(x, 0.1);
+	assert(ffn_forward(x, f) == 0);
+	ffn_free(&f);
+	mat_free(&x);
+}
+
+
 int main(void)
 {
 	test_mse_known();
@@ -518,6 +542,7 @@ int main(void)
 	test_attn_qkv();
 	test_attn_self();
 	test_attn_mha();
+	test_ffn_relu_path();
 	puts("ok");
 	return 0;
 }

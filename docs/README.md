@@ -40,6 +40,7 @@
 - [Query / Key / Value](query-key-value.md)
 - [Self-attention](self-attention.md)
 - [Multi-head attention](multi-head-attention.md)
+- [Feed-forward layers](feed-forward-layers.md)
 
 ---
 
@@ -158,3 +159,6 @@ Self-attention scores every position against every other with scaled dot product
 
 ### [Multi-head attention](multi-head-attention.md)
 Multi-head attention runs several smaller attentions in parallel subspaces. Heads are concatenated and mixed by Wo. attn_mha projects X, splits heads, attends, and projects back.
+
+### [Feed-forward layers](feed-forward-layers.md)
+The feed-forward block is a position-wise two-layer MLP after attention. This repo expands to d_ff, applies ReLU, then projects back to d_model. Same weights run on every token row independently.

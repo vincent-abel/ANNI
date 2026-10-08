@@ -38,6 +38,7 @@ Current implementation:
 - Query / Key / Value
 - Self-attention
 - Multi-head attention
+- Feed-forward layers
 
 Training and Transformer components are not implemented yet.
 
@@ -82,7 +83,7 @@ Training and Transformer components are not implemented yet.
 - [x] Query / Key / Value
 - [x] Self-attention
 - [x] Multi-head attention
-- [ ] Feed-forward layers
+- [x] Feed-forward layers
 - [ ] Layer normalization
 - [ ] Residual connections
 - [ ] Causal attention

@@ -22,5 +22,6 @@
 #include "embed.h"
 #include "posenc.h"
 #include "attn.h"
+#include "ffn.h"
 
 #endif
