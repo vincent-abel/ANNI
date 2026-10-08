@@ -85,15 +85,24 @@ run-gui: gui
 .PHONY: clean mrproper test gui run-gui all cuda
 
 # Optional CUDA build: replaces gpu_stub.o with gpu_cuda.o (requires nvcc).
+# ANN_CUBLAS=1 (default) links cuBLAS for GEMM; set ANN_CUBLAS=0 for teaching kernels only.
+ANN_CUBLAS ?= 1
+CUDA_NVCC_FLAGS=-O2 -I. -Inum -Ilang
+CUDA_LIBS=-lcudart
+ifeq ($(ANN_CUBLAS),1)
+CUDA_NVCC_FLAGS+=-DANN_CUBLAS
+CUDA_LIBS+=-lcublas
+endif
+
 cuda: $(filter-out $(OBJDIR)/gpu_stub.o,$(OBJ)) $(CUDA_OBJ)
 	@if ! command -v $(NVCC) >/dev/null 2>&1; then \
 		echo "nvcc not found; keeping CPU stub (make / make test still work)"; \
 		exit 1; \
 	fi
-	$(CC) -o $(EXEC) $(filter-out $(OBJDIR)/gpu_stub.o,$^) $(LDFLAGS) -lcudart
+	$(CC) -o $(EXEC) $(filter-out $(OBJDIR)/gpu_stub.o,$^) $(LDFLAGS) $(CUDA_LIBS)
 
 $(CUDA_OBJ): num/gpu_cuda.cu | $(OBJDIR)
-	$(NVCC) -O2 -c num/gpu_cuda.cu -o $@ -I. -Inum -Ilang
+	$(NVCC) $(CUDA_NVCC_FLAGS) -c num/gpu_cuda.cu -o $@
 
 clean:
 	rm -rf $(OBJDIR)

@@ -6,10 +6,43 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef ANN_CUBLAS
+#include <cublas_v2.h>
+#endif
 extern "C" {
 #include "gpu.h"
 #include "mat.h"
 }
+
+#ifdef ANN_CUBLAS
+static cublasHandle_t g_cublas;
+static int g_cublas_ok;
+
+static int cublas_ensure(void)
+{
+	if (g_cublas_ok)
+		return 0;
+	if (cublasCreate(&g_cublas) != CUBLAS_STATUS_SUCCESS)
+		return -1;
+	g_cublas_ok = 1;
+	return 0;
+}
+
+/* Row-major C = A B via column-major cuBLAS identity. */
+static int cublas_gemm_rm(double *dC, const double *dA, const double *dB,
+	int M, int N, int K)
+{
+	const double alpha = 1.0;
+	const double beta = 0.0;
+
+	if (cublas_ensure() != 0)
+		return -1;
+	if (cublasDgemm(g_cublas, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha,
+		dB, N, dA, K, &beta, dC, N) != CUBLAS_STATUS_SUCCESS)
+		return -1;
+	return 0;
+}
+#endif
 
 __global__ static void gemm_kernel(const double *A, const double *B, double *C,
 	int M, int N, int K)
@@ -38,7 +71,11 @@ extern "C" int gpu_available(void)
 
 extern "C" const char *gpu_backend_name(void)
 {
+#ifdef ANN_CUBLAS
+	return "cuda+cublas";
+#else
 	return "cuda";
+#endif
 }
 
 extern "C" void *gpu_malloc(size_t nbytes)
@@ -150,12 +187,23 @@ extern "C" int gpu_mat_mul(mat *c, const mat *a, const mat *b)
 		}
 		ownC = 1;
 	}
-	block = dim3(16, 16);
-	grid = dim3((c->cols + 15) / 16, (c->rows + 15) / 16);
-	gemm_kernel<<<grid, block>>>(dA, dB, dC, a->rows, b->cols, a->cols);
-	err = cudaDeviceSynchronize();
-	if (err != cudaSuccess)
-		goto fail;
+#ifdef ANN_CUBLAS
+	if (cublas_gemm_rm(dC, dA, dB, a->rows, b->cols, a->cols) != 0) {
+#endif
+		block = dim3(16, 16);
+		grid = dim3((c->cols + 15) / 16, (c->rows + 15) / 16);
+		gemm_kernel<<<grid, block>>>(dA, dB, dC, a->rows, b->cols,
+		    a->cols);
+		err = cudaDeviceSynchronize();
+		if (err != cudaSuccess)
+			goto fail;
+#ifdef ANN_CUBLAS
+	} else {
+		err = cudaDeviceSynchronize();
+		if (err != cudaSuccess)
+			goto fail;
+	}
+#endif
 	if (c->data && gpu_memcpy_d2h(c->data, dC, mat_bytes(c)) != 0)
 		goto fail;
 	if (ownA)

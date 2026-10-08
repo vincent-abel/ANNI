@@ -82,6 +82,7 @@
 - [LM head + cross-entropy backward](gpu-head-cross-entropy.md)
 - [Adam step on GPU](gpu-adam.md)
 - [KV-cache generate on GPU](gpu-kv-generate.md)
+- [Optional cuBLAS / cuDNN](cublas-cudnn.md)
 
 ---
 
@@ -305,3 +306,6 @@ lm_adam_step packs flat param/grad/m/v buffers and tries gpu_adam_step. CUDA Ada
 
 ### [KV-cache generate on GPU](gpu-kv-generate.md)
 Decode-step attention tries gpu_kv_attn_decode for QKV, K/V append, scores, and Wo. Softmax of the short score row stays on the host; sampling stays on the host.
+
+### [Optional cuBLAS / cuDNN](cublas-cudnn.md)
+make cuda defaults to ANN_CUBLAS=1 so gpu_mat_mul prefers cublasDgemm then falls back to the teaching kernel. cuDNN is reserved; LN/softmax stay educational.
