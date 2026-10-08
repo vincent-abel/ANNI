@@ -13,5 +13,6 @@
 #include "dataset.h"
 #include "vec.h"
 #include "mat.h"
+#include "tensor.h"
 
 #endif

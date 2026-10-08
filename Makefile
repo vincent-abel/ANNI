@@ -2,7 +2,7 @@ CC=gcc -g
 CFLAGS=-W -Wall -ansi -pedantic -std=c99
 LDFLAGS= -lm
 EXEC=ann
-LIB_SRC=neuron.c layer.c dataset.c vec.c mat.c
+LIB_SRC=neuron.c layer.c dataset.c vec.c mat.c tensor.c
 LIB_OBJ=$(LIB_SRC:.c=.o)
 OBJ=$(LIB_OBJ) main.o
 TEST=tests/test_ann
@@ -12,9 +12,9 @@ all: $(EXEC)
 ann: $(OBJ)
 	$(CC) -o $@ $^ $(LDFLAGS)
 
-main.o: main.h layer.h neuron.h dataset.h vec.h mat.h
+main.o: main.h layer.h neuron.h dataset.h vec.h mat.h tensor.h
 
-$(LIB_OBJ): main.h layer.h neuron.h dataset.h vec.h mat.h
+$(LIB_OBJ): main.h layer.h neuron.h dataset.h vec.h mat.h tensor.h
 
 %.o: %.c
 	$(CC) -o $@ -c $< $(CFLAGS)

@@ -70,6 +70,36 @@ static void test_create_rejects_empty(void)
 	assert(net == NULL);
 }
 
+static void test_tensor_views(void)
+{
+	const int shape1[] = {4};
+	const int shape2[] = {2, 3};
+	tensor *t1;
+	tensor *t2;
+	vec view_v;
+	mat view_m;
+	int idx[] = {1, 2};
+	double *p;
+
+	t1 = tensor_create(shape1, 1);
+	t2 = tensor_create(shape2, 2);
+	assert(t1 && t2);
+	assert(t1->size == 4);
+	assert(t2->size == 6);
+	assert(tensor_as_vec(&view_v, t1) == 0);
+	assert(view_v.n == 4);
+	assert(view_v.data == t1->data);
+	tensor_fill(t2, 0.0);
+	p = tensor_at(t2, idx);
+	assert(p != NULL);
+	*p = 7.5;
+	assert(tensor_as_mat(&view_m, t2) == 0);
+	assert(view_m.rows == 2 && view_m.cols == 3);
+	assert(fabs(mat_get(&view_m, 1, 2) - 7.5) < 1e-9);
+	tensor_free(&t1);
+	tensor_free(&t2);
+}
+
 static void test_mat_mul_known(void)
 {
 	mat *a;
@@ -175,6 +205,7 @@ int main(void)
 	test_create_rejects_empty();
 	test_vec_dot_axpy();
 	test_mat_mul_known();
+	test_tensor_views();
 	test_xor_trains();
 	puts("ok");
 	return 0;

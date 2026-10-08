@@ -24,6 +24,7 @@ Current implementation:
 - Memory management
 - Vectors
 - Matrices
+- Tensors
 
 Training and Transformer components are not implemented yet.
 
@@ -45,7 +46,7 @@ Training and Transformer components are not implemented yet.
 
 - [x] Vectors
 - [x] Matrices
-- [ ] Tensors
+- [x] Tensors
 - [ ] Optimized matrix multiplication
 - [ ] Softmax
 - [ ] Cross-entropy

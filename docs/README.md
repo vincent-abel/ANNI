@@ -7,3 +7,6 @@ A vector is a contiguous list of numbers the engine can scale, add, and combine.
 
 ### [Matrices](matrices.md)
 A matrix is a row-major grid of weights that transforms vectors in one shot. Matrix–vector multiply mixes every input into each output; matrix–matrix multiply chains those transforms. `mat_vec_mul` and `mat_mul` implement those products here.
+
+### [Tensors](tensors.md)
+A tensor is contiguous storage plus a multi-axis shape for batches and higher ranks. Flat indexing maps coordinates into one array; rank-1/2 views expose the same memory as `vec` or `mat` without copying.
