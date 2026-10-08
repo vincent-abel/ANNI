@@ -70,6 +70,29 @@ static void test_create_rejects_empty(void)
 	assert(net == NULL);
 }
 
+static void test_cross_entropy(void)
+{
+	vec *probs;
+	vec *logits;
+	double ce;
+	double sce;
+
+	probs = vec_create(3);
+	logits = vec_create(2);
+	assert(probs && logits);
+	probs->data[0] = 0.1;
+	probs->data[1] = 0.7;
+	probs->data[2] = 0.2;
+	ce = vec_cross_entropy(probs, 1);
+	assert(fabs(ce - (-log(0.7))) < 1e-9);
+	logits->data[0] = 1.0;
+	logits->data[1] = 2.0;
+	sce = vec_softmax_cross_entropy(logits, 1);
+	assert(fabs(sce - (-log(exp(2.0) / (exp(1.0) + exp(2.0))))) < 1e-9);
+	vec_free(&probs);
+	vec_free(&logits);
+}
+
 static void test_softmax(void)
 {
 	vec *in;
@@ -257,6 +280,7 @@ int main(void)
 	test_tensor_views();
 	test_mat_mul_blocked_matches_naive();
 	test_softmax();
+	test_cross_entropy();
 	test_xor_trains();
 	puts("ok");
 	return 0;

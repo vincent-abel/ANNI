@@ -16,3 +16,6 @@ Blocked multiply does the same \(C=AB\) math as the naive loops but in cache-fri
 
 ### [Softmax](softmax.md)
 Softmax turns logits into a probability distribution that sums to one. Subtracting the max logit before `exp` keeps the math stable. `vec_softmax` implements that path on contiguous vectors.
+
+### [Cross-entropy](cross-entropy.md)
+Cross-entropy scores how little probability the model put on the true class. `vec_cross_entropy` uses \(-\log p_y\); `vec_softmax_cross_entropy` does the same from logits with a stable log-sum-exp.
