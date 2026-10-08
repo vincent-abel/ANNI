@@ -57,7 +57,7 @@ Current implementation:
 - Checkpoint and resume
 - LM weight serialization
 
-Trainable toy decoder-only LM in `lang/` (full backprop, Adam, corpus train, checkpoints, `./ann lm train|generate|load|bench`). Persistent forward caches and a bump arena start the Performance work.
+Trainable toy decoder-only LM in `lang/` with Performance work: arenas, GEMM attention, SIMD/OpenMP/AVX paths, int8 head quant, KV-cache generate, optional `make cuda`.
 
 ## Roadmap
 
@@ -131,7 +131,7 @@ Trainable toy decoder-only LM in `lang/` (full backprop, Adam, corpus train, che
 - [x] AVX2 / AVX-512
 - [x] Quantization
 - [x] Optimized inference
-- [ ] GPU support
+- [x] GPU support
 
 ## Target
 

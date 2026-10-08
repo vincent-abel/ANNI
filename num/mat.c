@@ -2,6 +2,7 @@
 **	Matrix Code
 */
 #include "main.h"
+#include "gpu.h"
 
 mat *mat_create(int rows, int cols)
 {
@@ -131,6 +132,8 @@ int mat_mul(mat *c, const mat *a, const mat *b)
 		return -1;
 	if (a->cols != b->rows || c->rows != a->rows || c->cols != b->cols)
 		return -1;
+	if (gpu_available() && gpu_mat_mul(c, a, b) == 0)
+		return 0;
 
 	mat_fill(c, 0.0);
 #ifdef _OPENMP

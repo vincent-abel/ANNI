@@ -12,7 +12,9 @@ EXEC=ann
 OBJDIR=objects
 
 NET_SRC=net/neuron.c net/layer.c net/dataset.c net/optim.c net/serialize.c
-NUM_SRC=num/vec.c num/mat.c num/tensor.c num/ops.c num/arena.c num/simd.c
+NUM_SRC=num/vec.c num/mat.c num/tensor.c num/ops.c num/arena.c num/simd.c num/gpu_stub.c
+NVCC ?= nvcc
+CUDA_OBJ=$(OBJDIR)/gpu_cuda.o
 LANG_SRC=lang/tokenize.c lang/vocab.c lang/embed.c lang/posenc.c lang/attn.c lang/ffn.c lang/layernorm.c lang/resid.c lang/block.c lang/lm.c lang/generate.c lang/gradutil.c lang/lm_adam.c lang/dataset_text.c lang/lm_serialize.c lang/lm_train.c lang/lm_bench.c lang/quant.c lang/kv.c
 LIB_SRC=$(NET_SRC) $(NUM_SRC) $(LANG_SRC)
 LIB_OBJ=$(patsubst %.c,$(OBJDIR)/%.o,$(notdir $(LIB_SRC)))
@@ -33,6 +35,7 @@ $(OBJDIR)/tensor.o: num/tensor.c
 $(OBJDIR)/ops.o: num/ops.c
 $(OBJDIR)/arena.o: num/arena.c
 $(OBJDIR)/simd.o: num/simd.c
+$(OBJDIR)/gpu_stub.o: num/gpu_stub.c
 $(OBJDIR)/tokenize.o: lang/tokenize.c
 $(OBJDIR)/vocab.o: lang/vocab.c
 $(OBJDIR)/embed.o: lang/embed.c
@@ -79,7 +82,18 @@ $(GUI): gui/bridge.c $(LIB_SRC) main.h
 run-gui: gui
 	python3 gui/server.py
 
-.PHONY: clean mrproper test gui run-gui all
+.PHONY: clean mrproper test gui run-gui all cuda
+
+# Optional CUDA build: replaces gpu_stub.o with gpu_cuda.o (requires nvcc).
+cuda: $(filter-out $(OBJDIR)/gpu_stub.o,$(OBJ)) $(CUDA_OBJ)
+	@if ! command -v $(NVCC) >/dev/null 2>&1; then \
+		echo "nvcc not found; keeping CPU stub (make / make test still work)"; \
+		exit 1; \
+	fi
+	$(CC) -o $(EXEC) $(filter-out $(OBJDIR)/gpu_stub.o,$^) $(LDFLAGS) -lcudart
+
+$(CUDA_OBJ): num/gpu_cuda.cu | $(OBJDIR)
+	$(NVCC) -O2 -c num/gpu_cuda.cu -o $@ -I. -Inum -Ilang
 
 clean:
 	rm -rf $(OBJDIR)

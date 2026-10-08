@@ -37,5 +37,6 @@
 #include "simd.h"
 #include "quant.h"
 #include "kv.h"
+#include "gpu.h"
 
 #endif

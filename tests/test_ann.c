@@ -819,6 +819,12 @@ static void test_lm_generate_smoke(void)
 	lm_free(&model);
 }
 
+static void test_gpu_stub(void)
+{
+	assert(gpu_available() == 0);
+	assert(strcmp(gpu_backend_name(), "cpu") == 0);
+}
+
 static void test_lm_generate_kv(void)
 {
 	lm *model;
@@ -995,6 +1001,7 @@ int main(void)
 	test_ann_dot_simd();
 	test_qmat_roundtrip();
 	test_lm_generate_kv();
+	test_gpu_stub();
 	puts("ok");
 	return 0;
 }

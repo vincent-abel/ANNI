@@ -71,6 +71,7 @@
 - [AVX2 / AVX-512](avx2-avx-512.md)
 - [Quantization](quantization.md)
 - [Optimized inference](optimized-inference.md)
+- [GPU support](gpu-support.md)
 
 ---
 
@@ -268,3 +269,6 @@ Int8 qmat stores weights with one scale for cheaper inference GEMVs. lm_quantize
 
 ### [Optimized inference](optimized-inference.md)
 A KV cache stores per-layer Keys and Values so generate attends only the new query. lm_generate_kv walks the prompt once then appends tokens. lm_generate prefers that path with a full-reforward fallback.
+
+### [GPU support](gpu-support.md)
+Default builds link a CPU GPU stub so make test needs no CUDA. make cuda swaps in a naive CUDA mat_mul when nvcc is available. mat_mul falls back to the CPU GEMM on any GPU miss.
