@@ -70,6 +70,35 @@ static void test_create_rejects_empty(void)
 	assert(net == NULL);
 }
 
+static void test_mat_mul_blocked_matches_naive(void)
+{
+	mat *a;
+	mat *b;
+	mat *c_block;
+	mat *c_naive;
+	int i;
+	int n = 37;
+
+	a = mat_create(n, n);
+	b = mat_create(n, n);
+	c_block = mat_create(n, n);
+	c_naive = mat_create(n, n);
+	assert(a && b && c_block && c_naive);
+	srand(3);
+	for (i = 0; i < n * n; i++) {
+		a->data[i] = (double)(rand() % 11) - 5.0;
+		b->data[i] = (double)(rand() % 11) - 5.0;
+	}
+	assert(mat_mul(c_block, a, b) == 0);
+	assert(mat_mul_naive(c_naive, a, b) == 0);
+	for (i = 0; i < n * n; i++)
+		assert(fabs(c_block->data[i] - c_naive->data[i]) < 1e-9);
+	mat_free(&a);
+	mat_free(&b);
+	mat_free(&c_block);
+	mat_free(&c_naive);
+}
+
 static void test_tensor_views(void)
 {
 	const int shape1[] = {4};
@@ -206,6 +235,7 @@ int main(void)
 	test_vec_dot_axpy();
 	test_mat_mul_known();
 	test_tensor_views();
+	test_mat_mul_blocked_matches_naive();
 	test_xor_trains();
 	puts("ok");
 	return 0;

@@ -10,3 +10,6 @@ A matrix is a row-major grid of weights that transforms vectors in one shot. Mat
 
 ### [Tensors](tensors.md)
 A tensor is contiguous storage plus a multi-axis shape for batches and higher ranks. Flat indexing maps coordinates into one array; rank-1/2 views expose the same memory as `vec` or `mat` without copying.
+
+### [Optimized matrix multiplication](optimized-matrix-multiplication.md)
+Blocked multiply does the same \(C=AB\) math as the naive loops but in cache-friendly tiles. `mat_mul` uses 32×32 blocks while `mat_mul_naive` stays as a correctness reference. Only the visit order changes, not the result.

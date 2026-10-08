@@ -98,7 +98,49 @@ int mat_mul_naive(mat *c, const mat *a, const mat *b)
 	return 0;
 }
 
+#define MAT_BLOCK 32
+
 int mat_mul(mat *c, const mat *a, const mat *b)
 {
-	return mat_mul_naive(c, a, b);
+	int i0;
+	int j0;
+	int k0;
+	int i;
+	int j;
+	int k;
+	int i_max;
+	int j_max;
+	int k_max;
+	double sum;
+
+	if (!c || !a || !b || !c->data || !a->data || !b->data)
+		return -1;
+	if (a->cols != b->rows || c->rows != a->rows || c->cols != b->cols)
+		return -1;
+
+	mat_fill(c, 0.0);
+	for (i0 = 0; i0 < a->rows; i0 += MAT_BLOCK) {
+		i_max = i0 + MAT_BLOCK;
+		if (i_max > a->rows)
+			i_max = a->rows;
+		for (k0 = 0; k0 < a->cols; k0 += MAT_BLOCK) {
+			k_max = k0 + MAT_BLOCK;
+			if (k_max > a->cols)
+				k_max = a->cols;
+			for (j0 = 0; j0 < b->cols; j0 += MAT_BLOCK) {
+				j_max = j0 + MAT_BLOCK;
+				if (j_max > b->cols)
+					j_max = b->cols;
+				for (i = i0; i < i_max; i++) {
+					for (k = k0; k < k_max; k++) {
+						sum = a->data[i * a->cols + k];
+						for (j = j0; j < j_max; j++)
+							c->data[i * c->cols + j] +=
+								sum * b->data[k * b->cols + j];
+					}
+				}
+			}
+		}
+	}
+	return 0;
 }

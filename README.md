@@ -25,6 +25,7 @@ Current implementation:
 - Vectors
 - Matrices
 - Tensors
+- Optimized matrix multiplication
 
 Training and Transformer components are not implemented yet.
 
@@ -47,7 +48,7 @@ Training and Transformer components are not implemented yet.
 - [x] Vectors
 - [x] Matrices
 - [x] Tensors
-- [ ] Optimized matrix multiplication
+- [x] Optimized matrix multiplication
 - [ ] Softmax
 - [ ] Cross-entropy
 - [ ] Mini-batches
