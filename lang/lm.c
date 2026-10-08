@@ -127,6 +127,7 @@ lm_cache *lm_cache_create(int n)
 		lm_cache_free(&c);
 		return NULL;
 	}
+	mat_try_pin(c->hidden);
 	return c;
 }
 

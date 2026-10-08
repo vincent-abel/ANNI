@@ -121,6 +121,12 @@ attn_cache *attn_cache_create(int T, int n_heads, int d_head)
 		attn_cache_free(&c);
 		return NULL;
 	}
+	/* Pin activation mats on GPU when available (no-op on CPU stub). */
+	mat_try_pin(c->x_in);
+	mat_try_pin(c->q);
+	mat_try_pin(c->k);
+	mat_try_pin(c->v);
+	mat_try_pin(c->concat);
 	for (h = 0; h < n_heads; h++) {
 		c->attn_w[h] = mat_create(T, T);
 		c->v_h[h] = mat_create(T, d_head);

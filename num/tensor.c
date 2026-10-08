@@ -99,7 +99,9 @@ int tensor_as_mat(mat *view, tensor *t)
 	if (!view || !t || !t->data || t->ndim != 2)
 		return -1;
 	view->data = t->data;
+	view->d_data = NULL;
 	view->rows = t->shape[0];
 	view->cols = t->shape[1];
+	view->on_device = 0;
 	return 0;
 }

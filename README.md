@@ -133,6 +133,21 @@ Trainable toy decoder-only LM in `lang/` with Performance work: arenas, GEMM att
 - [x] Optimized inference
 - [x] GPU support
 
+### GPU training / full device path
+
+Today only forward `mat_mul` can use CUDA. These items move the rest of training and decode onto the GPU where it pays off (skip toy-only CPU glue and things that stay host-side by design).
+
+- [x] Device buffers for activations (keep H/Q/K/V on GPU across layers)
+- [ ] CUDA GEMM backward (`dA` / `dB` for `C = AB` and `C = ABᵀ`)
+- [ ] Attention backward on GPU (score / softmax / `AV` grads)
+- [ ] FFN + LayerNorm backward kernels (or fused epilogues)
+- [ ] LM head + cross-entropy backward on device
+- [ ] Adam step on GPU (flat param / grad / moment buffers)
+- [ ] KV-cache generate on GPU (append K/V, decode-step attention)
+- [ ] Optional cuBLAS / cuDNN (replace naive teaching kernels)
+- [ ] Host↔device sync only at batch boundaries (cut PCIe chatter)
+- [ ] `nvidia-smi` / bench proof that train sustains GPU util (not only `lm bench`)
+
 ## Target
 
 Initial language model target:

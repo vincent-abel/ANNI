@@ -1,17 +1,25 @@
 /*
-**	Optional GPU mat_mul backend (CUDA when ANN_CUDA is defined)
+**	Optional GPU backend (CUDA via make cuda; stub otherwise)
 */
 #ifndef GPU_H__
 #define GPU_H__
 
 #include "mat.h"
+#include <stddef.h>
 
-/* 1 if a GPU backend is linked; 0 for CPU-only builds. */
 int	gpu_available(void);
 const char	*gpu_backend_name(void);
+
+void	*gpu_malloc(size_t nbytes);
+void	gpu_free(void *p);
+int	gpu_memcpy_h2d(void *dst, const void *src, size_t nbytes);
+int	gpu_memcpy_d2h(void *dst, const void *src, size_t nbytes);
+int	gpu_memcpy_d2d(void *dst, const void *src, size_t nbytes);
+int	gpu_memset(void *dst, int value, size_t nbytes);
+
 /*
-** Try GPU mat_mul; returns 0 on success, -1 to fall back to CPU mat_mul.
-** CPU builds always return -1.
+** Try GPU mat_mul; returns 0 on success, -1 to fall back to CPU.
+** Uses mat.d_data when both inputs/outputs are on device.
 */
 int	gpu_mat_mul(mat *c, const mat *a, const mat *b);
 

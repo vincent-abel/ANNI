@@ -18,8 +18,10 @@ mat *mat_create(int rows, int cols)
 		free(m);
 		return NULL;
 	}
+	m->d_data = NULL;
 	m->rows = rows;
 	m->cols = cols;
+	m->on_device = 0;
 	return m;
 }
 
@@ -27,9 +29,78 @@ void mat_free(mat **m)
 {
 	if (!m || !*m)
 		return;
+	mat_device_free(*m);
 	free((*m)->data);
 	free(*m);
 	*m = NULL;
+}
+
+int mat_device_alloc(mat *m)
+{
+	size_t n;
+
+	if (!m || !m->data)
+		return -1;
+	if (m->d_data)
+		return 0;
+	if (!gpu_available())
+		return -1;
+	n = (size_t)m->rows * (size_t)m->cols * sizeof(double);
+	m->d_data = (double *)gpu_malloc(n);
+	return m->d_data ? 0 : -1;
+}
+
+void mat_device_free(mat *m)
+{
+	if (!m || !m->d_data)
+		return;
+	gpu_free(m->d_data);
+	m->d_data = NULL;
+	m->on_device = 0;
+}
+
+int mat_to_device(mat *m)
+{
+	size_t n;
+
+	if (!m || !m->data)
+		return -1;
+	if (mat_device_alloc(m) != 0)
+		return -1;
+	n = (size_t)m->rows * (size_t)m->cols * sizeof(double);
+	if (gpu_memcpy_h2d(m->d_data, m->data, n) != 0)
+		return -1;
+	m->on_device = 1;
+	return 0;
+}
+
+int mat_to_host(mat *m)
+{
+	size_t n;
+
+	if (!m || !m->data || !m->d_data)
+		return -1;
+	n = (size_t)m->rows * (size_t)m->cols * sizeof(double);
+	if (gpu_memcpy_d2h(m->data, m->d_data, n) != 0)
+		return -1;
+	m->on_device = 0;
+	return 0;
+}
+
+int mat_ensure_host(mat *m)
+{
+	if (!m)
+		return -1;
+	if (m->on_device && m->d_data)
+		return mat_to_host(m);
+	return 0;
+}
+
+void mat_try_pin(mat *m)
+{
+	if (!m)
+		return;
+	(void)mat_device_alloc(m);
 }
 
 double mat_get(const mat *m, int row, int col)

@@ -825,6 +825,20 @@ static void test_gpu_stub(void)
 	assert(strcmp(gpu_backend_name(), "cpu") == 0);
 }
 
+static void test_mat_device_pin_cpu(void)
+{
+	mat *m;
+
+	m = mat_create(2, 3);
+	assert(m);
+	assert(m->d_data == NULL);
+	mat_try_pin(m);
+	/* Stub: pin must not allocate. */
+	assert(m->d_data == NULL);
+	assert(mat_device_alloc(m) != 0);
+	mat_free(&m);
+}
+
 static void test_lm_generate_kv(void)
 {
 	lm *model;
@@ -1002,6 +1016,7 @@ int main(void)
 	test_qmat_roundtrip();
 	test_lm_generate_kv();
 	test_gpu_stub();
+	test_mat_device_pin_cpu();
 	puts("ok");
 	return 0;
 }

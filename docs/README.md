@@ -73,6 +73,10 @@
 - [Optimized inference](optimized-inference.md)
 - [GPU support](gpu-support.md)
 
+### GPU training
+
+- [Device buffers for activations](gpu-device-buffers.md)
+
 ---
 
 # How this neural network works
@@ -272,3 +276,8 @@ A KV cache stores per-layer Keys and Values so generate attends only the new que
 
 ### [GPU support](gpu-support.md)
 Default builds link a CPU GPU stub so make test needs no CUDA. make cuda swaps in a naive CUDA mat_mul when nvcc is available. mat_mul falls back to the CPU GEMM on any GPU miss.
+
+# GPU training docs
+
+### [Device buffers for activations](gpu-device-buffers.md)
+Mats may own a CUDA d_data twin with H2D/D2H helpers. Attention and LM caches try to pin H/Q/K/V when a GPU is present. The CPU stub leaves pinning as a no-op.
