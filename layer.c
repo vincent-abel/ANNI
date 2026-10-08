@@ -165,7 +165,34 @@ double network_mse(network *net, const double *target, int n_target)
 	return sum / (double)n_target;
 }
 
-void network_backward(network *net, const double *target, int n_target)
+void network_zero_grads(network *net)
+{
+	nlayer *layer;
+
+	if (!net)
+		return;
+	layer = net->layers;
+	while (layer) {
+		neuron_zero_delta(layer->neuron);
+		neuron_zero_grad(layer->neuron);
+		layer = layer->next;
+	}
+}
+
+void network_scale_grads(network *net, double s)
+{
+	nlayer *layer;
+
+	if (!net)
+		return;
+	layer = net->layers;
+	while (layer) {
+		neuron_scale_grad(layer->neuron, s);
+		layer = layer->next;
+	}
+}
+
+void network_backward_accum(network *net, const double *target, int n_target)
 {
 	nlayer *layer;
 
@@ -187,6 +214,12 @@ void network_backward(network *net, const double *target, int n_target)
 		neuron_backward_hidden(layer->neuron);
 		layer = layer->prev;
 	}
+}
+
+void network_backward(network *net, const double *target, int n_target)
+{
+	network_zero_grads(net);
+	network_backward_accum(net, target, n_target);
 }
 
 network *network_create_sizes(int n_inputs, const int *sizes, int n_layers)
@@ -303,6 +336,39 @@ void network_train(network *net, const double *samples, const double *targets,
 				net->n_inputs);
 			network_forward(net);
 			network_backward(net, targets + s * n_target, n_target);
+			network_update(net, lr);
+		}
+	}
+}
+
+void network_train_mb(network *net, const double *samples, const double *targets,
+	int n_samples, int n_target, int epochs, double lr, int batch_size)
+{
+	int e;
+	int s;
+	int b;
+	int end;
+	int count;
+
+	if (!net || !samples || !targets || n_samples <= 0 || n_target <= 0
+		|| epochs <= 0 || batch_size <= 0)
+		return;
+
+	for (e = 0; e < epochs; e++) {
+		for (s = 0; s < n_samples; s += batch_size) {
+			end = s + batch_size;
+			if (end > n_samples)
+				end = n_samples;
+			count = end - s;
+			network_zero_grads(net);
+			for (b = s; b < end; b++) {
+				network_set_inputs(net, samples + b * net->n_inputs,
+					net->n_inputs);
+				network_forward(net);
+				network_backward_accum(net, targets + b * n_target,
+					n_target);
+			}
+			network_scale_grads(net, 1.0 / (double)count);
 			network_update(net, lr);
 		}
 	}

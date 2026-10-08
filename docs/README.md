@@ -19,3 +19,6 @@ Softmax turns logits into a probability distribution that sums to one. Subtracti
 
 ### [Cross-entropy](cross-entropy.md)
 Cross-entropy scores how little probability the model put on the true class. `vec_cross_entropy` uses \(-\log p_y\); `vec_softmax_cross_entropy` does the same from logits with a stable log-sum-exp.
+
+### [Mini-batches](mini-batches.md)
+Mini-batches average gradients over a few examples before each weight update. That smooths the noisy single-sample steps. `network_train_mb` accumulates, scales by batch size, then updates once.

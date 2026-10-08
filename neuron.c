@@ -213,14 +213,36 @@ static void neuron_backward_accumulate(neuron *n)
 
 void neuron_zero_delta(neuron *n)
 {
+	while (n) {
+		n->delta = 0.0;
+		n = n->prev;
+	}
+}
+
+void neuron_zero_grad(neuron *n)
+{
 	input *in;
 
 	while (n) {
-		n->delta = 0.0;
 		n->dbias = 0.0;
 		in = n->input;
 		while (in) {
 			in->dw = 0.0;
+			in = in->prev;
+		}
+		n = n->prev;
+	}
+}
+
+void neuron_scale_grad(neuron *n, double s)
+{
+	input *in;
+
+	while (n) {
+		n->dbias *= s;
+		in = n->input;
+		while (in) {
+			in->dw *= s;
 			in = in->prev;
 		}
 		n = n->prev;

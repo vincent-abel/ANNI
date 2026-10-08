@@ -28,6 +28,7 @@ Current implementation:
 - Optimized matrix multiplication
 - Softmax
 - Cross-entropy
+- Mini-batches
 
 Training and Transformer components are not implemented yet.
 
@@ -53,7 +54,7 @@ Training and Transformer components are not implemented yet.
 - [x] Optimized matrix multiplication
 - [x] Softmax
 - [x] Cross-entropy
-- [ ] Mini-batches
+- [x] Mini-batches
 - [ ] Adam optimizer
 - [ ] Model serialization
 

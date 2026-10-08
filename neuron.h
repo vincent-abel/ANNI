@@ -34,6 +34,8 @@ int	neuron_connect_values(neuron *, double *, int);
 int	neuron_connect_layer(neuron *, neuron *);
 void	neuron_output(neuron *);
 void	neuron_zero_delta(neuron *);
+void	neuron_zero_grad(neuron *);
+void	neuron_scale_grad(neuron *, double s);
 void	neuron_backward_output(neuron *, const double *, int);
 void	neuron_backward_hidden(neuron *);
 void	neuron_update(neuron *, double lr);

@@ -269,6 +269,35 @@ static void test_xor_trains(void)
 	network_free(&net);
 }
 
+static void test_xor_minibatches(void)
+{
+	network *net;
+	const int sizes[] = {4, 1};
+	double mse;
+	int s;
+	int correct;
+	double out;
+
+	srand(1);
+	net = network_create_sizes(XOR_INPUTS, sizes, 2);
+	network_train_mb(net, xor_inputs, xor_targets,
+		XOR_SAMPLES, XOR_OUTPUTS, 5000, 0.5, 2);
+	mse = network_mse_dataset(net, xor_inputs, xor_targets,
+		XOR_SAMPLES, XOR_OUTPUTS);
+	assert(mse < 0.02);
+
+	correct = 0;
+	for (s = 0; s < XOR_SAMPLES; s++) {
+		network_set_inputs(net, xor_inputs + s * XOR_INPUTS, XOR_INPUTS);
+		network_forward(net);
+		out = net->out->neuron->output;
+		if ((out >= 0.5) == (xor_targets[s] >= 0.5))
+			correct++;
+	}
+	assert(correct == XOR_SAMPLES);
+	network_free(&net);
+}
+
 int main(void)
 {
 	test_mse_known();
@@ -282,6 +311,7 @@ int main(void)
 	test_softmax();
 	test_cross_entropy();
 	test_xor_trains();
+	test_xor_minibatches();
 	puts("ok");
 	return 0;
 }
