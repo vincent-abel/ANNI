@@ -10,5 +10,6 @@
 #include <math.h>
 #include <time.h>
 #include "layer.h"
+#include "dataset.h"
 
 #endif

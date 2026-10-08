@@ -1,5 +1,46 @@
 #include "main.h"
 
+static int run_xor(void)
+{
+	network *net;
+	const int sizes[] = {4, 1};
+	int s;
+	double out;
+	double mse;
+	int correct;
+
+	srand(1);
+	net = network_create_sizes(XOR_INPUTS, sizes, 2);
+	mse = network_mse_dataset(net, xor_inputs, xor_targets,
+		XOR_SAMPLES, XOR_OUTPUTS);
+	printf("XOR MSE before  %10.6f\n", mse);
+
+	network_train(net, xor_inputs, xor_targets,
+		XOR_SAMPLES, XOR_OUTPUTS, 5000, 0.5);
+
+	mse = network_mse_dataset(net, xor_inputs, xor_targets,
+		XOR_SAMPLES, XOR_OUTPUTS);
+	printf("XOR MSE after   %10.6f\n\n", mse);
+
+	correct = 0;
+	for (s = 0; s < XOR_SAMPLES; s++) {
+		network_set_inputs(net, xor_inputs + s * XOR_INPUTS, XOR_INPUTS);
+		network_forward(net);
+		out = net->out->neuron->output;
+		printf("  %.0f xor %.0f -> %.4f  (target %.0f)\n",
+			xor_inputs[s * XOR_INPUTS],
+			xor_inputs[s * XOR_INPUTS + 1],
+			out,
+			xor_targets[s]);
+		if ((out >= 0.5) == (xor_targets[s] >= 0.5))
+			correct++;
+	}
+	printf("\naccuracy  %d / %d\n\n", correct, XOR_SAMPLES);
+	network_show(net);
+	network_free(&net);
+	return correct == XOR_SAMPLES ? 0 : 1;
+}
+
 int main(int argc, char *argv[])
 {
 	network *net;
@@ -13,10 +54,15 @@ int main(int argc, char *argv[])
 	int i;
 
 	setvbuf(stdout, NULL, _IONBF, 0);
+
+	if (argc >= 2 && strcmp(argv[1], "xor") == 0)
+		return run_xor();
+
 	srand((unsigned int)time(NULL));
 
 	if (argc < 4) {
 		printf("Usage: ./ann <inputs> <neurons-per-layer> <layers>\n");
+		printf("       ./ann xor\n");
 		return 1;
 	}
 

@@ -19,6 +19,7 @@ Current implementation:
 - Backpropagation
 - Gradient descent
 - Training loop
+- XOR dataset
 
 Training and Transformer components are not implemented yet.
 
@@ -32,7 +33,7 @@ Training and Transformer components are not implemented yet.
 - [x] Backpropagation
 - [x] Gradient descent
 - [x] Training loop
-- [ ] XOR / basic datasets
+- [x] XOR / basic datasets
 - [ ] Unit tests
 - [ ] Memory management
 

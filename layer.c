@@ -180,12 +180,15 @@ void network_backward(network *net, const double *target, int n_target)
 	}
 }
 
-network *network_create(int n_inputs, int n_neurons, int n_layers)
+network *network_create_sizes(int n_inputs, const int *sizes, int n_layers)
 {
 	network *net;
 	nlayer *tail = NULL;
 	neuron *prev = NULL;
 	int i;
+
+	if (!sizes || n_inputs <= 0 || n_layers <= 0)
+		exit(EXIT_FAILURE);
 
 	net = malloc(sizeof(network));
 	if (!net)
@@ -201,8 +204,12 @@ network *network_create(int n_inputs, int n_neurons, int n_layers)
 		net->inputs[i] = randfrom(0, 1);
 
 	for (i = 0; i < n_layers; i++) {
-		neuron *neurons = layer_neurons_create(
-			n_neurons,
+		neuron *neurons;
+
+		if (sizes[i] <= 0)
+			exit(EXIT_FAILURE);
+		neurons = layer_neurons_create(
+			sizes[i],
 			net->inputs,
 			n_inputs,
 			prev);
@@ -210,6 +217,24 @@ network *network_create(int n_inputs, int n_neurons, int n_layers)
 		prev = neurons;
 	}
 	net->out = tail;
+	return net;
+}
+
+network *network_create(int n_inputs, int n_neurons, int n_layers)
+{
+	int *sizes;
+	network *net;
+	int i;
+
+	if (n_neurons <= 0 || n_layers <= 0)
+		exit(EXIT_FAILURE);
+	sizes = malloc((size_t)n_layers * sizeof(int));
+	if (!sizes)
+		exit(EXIT_FAILURE);
+	for (i = 0; i < n_layers; i++)
+		sizes[i] = n_neurons;
+	net = network_create_sizes(n_inputs, sizes, n_layers);
+	free(sizes);
 	return net;
 }
 
@@ -261,6 +286,24 @@ void network_train(network *net, const double *samples, const double *targets,
 			network_update(net, lr);
 		}
 	}
+}
+
+double network_mse_dataset(network *net, const double *samples,
+	const double *targets, int n_samples, int n_target)
+{
+	double sum;
+	int s;
+
+	if (!net || !samples || !targets || n_samples <= 0 || n_target <= 0)
+		return -1.0;
+
+	sum = 0.0;
+	for (s = 0; s < n_samples; s++) {
+		network_set_inputs(net, samples + s * net->n_inputs, net->n_inputs);
+		network_forward(net);
+		sum += network_mse(net, targets + s * n_target, n_target);
+	}
+	return sum / (double)n_samples;
 }
 
 void network_free(network **net)

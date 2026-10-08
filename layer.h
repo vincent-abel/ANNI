@@ -24,15 +24,18 @@ void	nlayer_append(nlayer **, nlayer **, neuron *);
 void	nlayer_clear(nlayer **);
 void	nlayer_forward(nlayer *);
 network	*network_create(int n_inputs, int n_neurons, int n_layers);
+network	*network_create_sizes(int n_inputs, const int *sizes, int n_layers);
 void	network_forward(network *);
 void	network_show(network *);
 double	network_mse(network *, const double *target, int n_target);
+double	network_mse_dataset(network *, const double *samples,
+		const double *targets, int n_samples, int n_target);
 void	network_backward(network *, const double *target, int n_target);
 void	network_update(network *, double lr);
 void	network_set_inputs(network *, const double *values, int n_values);
 void	network_train(network *, const double *samples, const double *targets,
 		int n_samples, int n_target, int epochs, double lr);
-int		network_output_size(network *);
+int	network_output_size(network *);
 void	network_free(network **);
 
 #endif
