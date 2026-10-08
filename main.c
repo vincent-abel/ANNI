@@ -1,5 +1,40 @@
 #include "main.h"
 
+
+
+
+static int run_lm(int argc, char **argv)
+{
+	lm *model;
+	char out[256];
+	const char *phrase;
+	double loss0;
+	double loss1;
+	int ids[LM_MAX_CTX];
+	int n;
+
+	srand(1);
+	model = lm_create();
+	if (!model)
+		return 1;
+	phrase = (argc >= 3) ? argv[2] : "hello";
+	n = tokenize_encode(phrase, ids, LM_MAX_CTX);
+	if (n < 2) {
+		lm_free(&model);
+		return 1;
+	}
+	loss0 = lm_nll(model, ids, n);
+	loss1 = lm_train_steps(model, phrase, 80, 0.05);
+	printf("LM NLL before %.4f after %.4f\n", loss0, loss1);
+	if (lm_generate(model, phrase, out, (int)sizeof(out), 8, 0.0) < 0) {
+		lm_free(&model);
+		return 1;
+	}
+	printf("LM gen: %s\n", out);
+	lm_free(&model);
+	return 0;
+}
+
 static int run_xor(void)
 {
 	network *net;
@@ -59,12 +94,15 @@ int main(int argc, char *argv[])
 
 	if (argc >= 2 && strcmp(argv[1], "xor") == 0)
 		return run_xor();
+	if (argc >= 2 && strcmp(argv[1], "lm") == 0)
+		return run_lm(argc, argv);
 
 	srand((unsigned int)time(NULL));
 
 	if (argc < 4) {
 		printf("Usage: ./ann <inputs> <neurons-per-layer> <layers>\n");
 		printf("       ./ann xor\n");
+		printf("       ./ann lm [phrase]\n");
 		return 1;
 	}
 

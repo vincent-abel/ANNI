@@ -27,5 +27,6 @@
 #include "resid.h"
 #include "block.h"
 #include "lm.h"
+#include "generate.h"
 
 #endif

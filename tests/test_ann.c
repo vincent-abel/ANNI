@@ -623,6 +623,23 @@ static void test_lm_ntp_loss_drops(void)
 }
 
 
+static void test_lm_generate_smoke(void)
+{
+	lm *model;
+	char out[128];
+	int n;
+
+	srand(3);
+	model = lm_create();
+	assert(model);
+	lm_train_steps(model, "ab", 40, 0.1);
+	n = lm_generate(model, "a", out, (int)sizeof(out), 4, 0.0);
+	assert(n > 0);
+	assert(out[0] != '\0');
+	lm_free(&model);
+}
+
+
 int main(void)
 {
 	test_mse_known();
@@ -652,6 +669,7 @@ int main(void)
 	test_attn_causal();
 	test_transformer_block();
 	test_lm_ntp_loss_drops();
+	test_lm_generate_smoke();
 	puts("ok");
 	return 0;
 }

@@ -46,6 +46,7 @@
 - [Causal attention](causal-attention.md)
 - [Transformer blocks](transformer-blocks.md)
 - [Next-token prediction](next-token-prediction.md)
+- [Text generation](text-generation.md)
 
 ---
 
@@ -182,3 +183,6 @@ A decoder block is pre-norm causal MHA plus residual, then pre-norm FFN plus res
 
 ### [Next-token prediction](next-token-prediction.md)
 Next-token prediction trains the model to score the following id at each position. Softmax cross-entropy on the LM head is the loss. A tiny loop on a fixed phrase updates the head and embeddings until NLL drops.
+
+### [Text generation](text-generation.md)
+Generation samples the next id from the final-position logits and appends it. Greedy uses argmax; temperature>0 samples the softened distribution. ./ann lm trains a phrase then prints a short continuation.

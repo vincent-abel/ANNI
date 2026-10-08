@@ -44,8 +44,9 @@ Current implementation:
 - Causal attention
 - Transformer blocks
 - Next-token prediction
+- Text generation
 
-Training and Transformer components are not implemented yet.
+Toy decoder-only LM in `lang/` (byte vocab, pre-norm blocks, next-token train, `./ann lm`).
 
 ## Roadmap
 
@@ -94,7 +95,7 @@ Training and Transformer components are not implemented yet.
 - [x] Causal attention
 - [x] Transformer blocks
 - [x] Next-token prediction
-- [ ] Text generation
+- [x] Text generation
 
 ### Performance
 
