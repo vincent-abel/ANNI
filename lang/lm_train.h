@@ -10,5 +10,7 @@
 
 double	lm_train_corpus(lm *model, text_dataset *ds, lm_adam *opt,
 		int epochs, int batch_size, double lr, int debug);
+/* Mean NLL over every training window (ds->window bytes), not the long ctx score. */
+double	lm_nll_windows(const lm *model, const text_dataset *ds);
 
 #endif

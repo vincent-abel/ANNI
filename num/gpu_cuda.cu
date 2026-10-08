@@ -427,6 +427,25 @@ fail:
 	return -1;
 }
 
+/* double atomicAdd: native on CC >= 6.0, CAS fallback otherwise. */
+__device__ static double atomicAdd_double(double *address, double val)
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 600)
+	return atomicAdd(address, val);
+#else
+	unsigned long long int *addr_as_ull = (unsigned long long int *)address;
+	unsigned long long int old = *addr_as_ull;
+	unsigned long long int assumed;
+
+	do {
+		assumed = old;
+		old = atomicCAS(addr_as_ull, assumed,
+		    __double_as_longlong(val + __longlong_as_double(assumed)));
+	} while (assumed != old);
+	return __longlong_as_double(old);
+#endif
+}
+
 __global__ static void ln_bwd_kernel(double *dx, const double *dy,
 	const double *gamma, const double *x_hat, const double *inv_std,
 	double *dgamma, double *dbeta, int T, int d)
@@ -445,8 +464,8 @@ __global__ static void ln_bwd_kernel(double *dx, const double *dy,
 	sum_dy = 0.0;
 	sum_dy_xhat = 0.0;
 	for (j = 0; j < d; j++) {
-		atomicAdd(&dbeta[j], dy[t * d + j]);
-		atomicAdd(&dgamma[j], dy[t * d + j] * x_hat[t * d + j]);
+		atomicAdd_double(&dbeta[j], dy[t * d + j]);
+		atomicAdd_double(&dgamma[j], dy[t * d + j] * x_hat[t * d + j]);
 		dxhat = dy[t * d + j] * gamma[j];
 		sum_dy += dxhat;
 		sum_dy_xhat += dxhat * x_hat[t * d + j];

@@ -167,6 +167,7 @@ static int run_lm_train(int argc, char **argv)
 	train_dbg(debug, "running mini-batch corpus training");
 	loss = lm_train_corpus(model, ds, opt, epochs, batch, 0.01, debug);
 	printf("LM train NLL %.4f\n", loss);
+	printf("LM train window NLL %.4f\n", lm_nll_windows(model, ds));
 	total_epochs = prev_epoch + epochs;
 	train_dbg(debug, "saving checkpoint");
 	if (lm_save_checkpoint(model, opt, total_epochs, prev_step, out) != 0) {
