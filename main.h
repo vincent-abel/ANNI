@@ -25,5 +25,6 @@
 #include "ffn.h"
 #include "layernorm.h"
 #include "resid.h"
+#include "block.h"
 
 #endif

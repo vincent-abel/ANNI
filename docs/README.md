@@ -44,6 +44,7 @@
 - [Layer normalization](layer-normalization.md)
 - [Residual connections](residual-connections.md)
 - [Causal attention](causal-attention.md)
+- [Transformer blocks](transformer-blocks.md)
 
 ---
 
@@ -174,3 +175,6 @@ Residuals add the sub-layer output back onto the stream so depth stays trainable
 
 ### [Causal attention](causal-attention.md)
 Causal masking blocks future positions so token t only attends to ≤ t. Scores for j>i are driven to a large negative before softmax. Decoder training and generation share that left-context rule.
+
+### [Transformer blocks](transformer-blocks.md)
+A decoder block is pre-norm causal MHA plus residual, then pre-norm FFN plus residual. Stacking LM_N_BLOCKS repeats that pattern. transformer_forward runs the toy two-block body.

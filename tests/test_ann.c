@@ -585,6 +585,22 @@ static void test_attn_causal(void)
 }
 
 
+static void test_transformer_block(void)
+{
+	transformer *tr;
+	mat *x;
+
+	tr = transformer_create();
+	assert(tr);
+	x = mat_create(4, LM_D_MODEL);
+	assert(x);
+	mat_fill(x, 0.02);
+	assert(transformer_forward(x, tr) == 0);
+	transformer_free(&tr);
+	mat_free(&x);
+}
+
+
 int main(void)
 {
 	test_mse_known();
@@ -612,6 +628,7 @@ int main(void)
 	test_layernorm_zero_mean();
 	test_resid_add();
 	test_attn_causal();
+	test_transformer_block();
 	puts("ok");
 	return 0;
 }
