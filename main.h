@@ -24,5 +24,6 @@
 #include "attn.h"
 #include "ffn.h"
 #include "layernorm.h"
+#include "resid.h"
 
 #endif

@@ -42,6 +42,7 @@
 - [Multi-head attention](multi-head-attention.md)
 - [Feed-forward layers](feed-forward-layers.md)
 - [Layer normalization](layer-normalization.md)
+- [Residual connections](residual-connections.md)
 
 ---
 
@@ -166,3 +167,6 @@ The feed-forward block is a position-wise two-layer MLP after attention. This re
 
 ### [Layer normalization](layer-normalization.md)
 Layer norm recenters and rescales each token vector. Learnable gamma and beta restore scale after the unit Gaussian step. This repo normalizes rows of the T×d sequence matrix in place.
+
+### [Residual connections](residual-connections.md)
+Residuals add the sub-layer output back onto the stream so depth stays trainable. This stack commits to pre-norm: normalize, transform, then add. resid_add and resid_copy are the small helpers blocks use.

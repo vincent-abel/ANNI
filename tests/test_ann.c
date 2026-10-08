@@ -543,6 +543,22 @@ static void test_layernorm_zero_mean(void)
 }
 
 
+static void test_resid_add(void)
+{
+	mat *a;
+	mat *b;
+
+	a = mat_create(2, 2);
+	b = mat_create(2, 2);
+	assert(a && b);
+	mat_fill(a, 1.0);
+	mat_fill(b, 2.0);
+	assert(resid_add(a, b) == 0);
+	assert(fabs(mat_get(a, 0, 0) - 3.0) < 1e-12);
+	mat_free(&a); mat_free(&b);
+}
+
+
 int main(void)
 {
 	test_mse_known();
@@ -568,6 +584,7 @@ int main(void)
 	test_attn_mha();
 	test_ffn_relu_path();
 	test_layernorm_zero_mean();
+	test_resid_add();
 	puts("ok");
 	return 0;
 }
