@@ -34,6 +34,7 @@
 ### Language model
 
 - [Tokenizer](tokenizer.md)
+- [Vocabulary](vocabulary.md)
 
 ---
 
@@ -134,3 +135,6 @@ Short guides for each Language Model piece, from plain intuition up to formal de
 
 ### [Tokenizer](tokenizer.md)
 A tokenizer maps text to integer ids and back. This repo starts with one id per byte (0–255). Encode and decode are linear scans with a fixed 256-wide alphabet.
+
+### [Vocabulary](vocabulary.md)
+A vocabulary names every id the model can emit, including pad/bos/eos/unk. Byte tokens sit after four specials, for size 260. Lookups give strings for logging and generation.

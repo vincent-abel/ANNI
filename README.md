@@ -32,6 +32,7 @@ Current implementation:
 - Adam optimizer
 - Model serialization
 - Tokenizer
+- Vocabulary
 
 Training and Transformer components are not implemented yet.
 
@@ -70,7 +71,7 @@ Training and Transformer components are not implemented yet.
 ### Language Model
 
 - [x] Tokenizer
-- [ ] Vocabulary
+- [x] Vocabulary
 - [ ] Token embeddings
 - [ ] Positional encoding
 - [ ] Query / Key / Value

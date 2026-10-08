@@ -16,11 +16,13 @@ Imagine labeling every byte in a file with its numeric value (ASCII/UTF-8 bytes)
 
 Let text be a byte string \(s = s_0 s_1 \ldots s_{n-1}\) with \(s_i \in \{0,\ldots,255\}\).
 
+With specials reserved at the front of the vocab (\(S=4\)):
+
 \[
-\operatorname{enc}(s)_i = s_i, \qquad
+\operatorname{enc}(s)_i = S + s_i, \qquad
 \operatorname{dec}(z)_i =
 \begin{cases}
-\operatorname{chr}(z_i) & 0 \le z_i < 256 \\
+\operatorname{chr}(z_i - S) & 0 \le z_i - S < 256 \\
 \texttt{?} & \text{otherwise}
 \end{cases}
 \]

@@ -374,10 +374,24 @@ static void test_tokenize_roundtrip(void)
 
 	n = tokenize_encode(text, ids, 16);
 	assert(n == 5);
-	assert(ids[0] == (unsigned char)'H');
-	assert(ids[4] == (unsigned char)'o');
+	assert(ids[0] == VOCAB_SPECIALS + (unsigned char)'H');
+	assert(ids[4] == VOCAB_SPECIALS + (unsigned char)'o');
 	assert(tokenize_decode(ids, n, out, 16) == 5);
 	assert(strcmp(out, text) == 0);
+}
+
+static void test_vocab_byte(void)
+{
+	vocab *v;
+
+	v = vocab_byte_create();
+	assert(v != NULL);
+	assert(vocab_size(v) == LM_BYTE_VOCAB + VOCAB_SPECIALS);
+	assert(strcmp(vocab_token(v, VOCAB_BOS), "<bos>") == 0);
+	assert(vocab_id(v, "<eos>") == VOCAB_EOS);
+	assert(vocab_id(v, "A") == VOCAB_SPECIALS + (unsigned char)'A');
+	vocab_free(&v);
+	assert(v == NULL);
 }
 
 int main(void)
@@ -397,6 +411,7 @@ int main(void)
 	test_xor_adam();
 	test_serialize_roundtrip();
 	test_tokenize_roundtrip();
+	test_vocab_byte();
 	puts("ok");
 	return 0;
 }

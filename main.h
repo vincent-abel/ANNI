@@ -18,5 +18,6 @@
 #include "optim.h"
 #include "serialize.h"
 #include "tokenize.h"
+#include "vocab.h"
 
 #endif
