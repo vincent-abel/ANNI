@@ -168,7 +168,7 @@ Training data will progressively increase:
 
     10 MB → 100 MB → 1 GB → 10 GB+
 
-Wikipedia and other freely available text datasets can be used for experimentation.
+freely available text datasets can be used for experimentation.
 
 ## Architecture
 
