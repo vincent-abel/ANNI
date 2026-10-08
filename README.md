@@ -50,6 +50,7 @@ Current implementation:
 - Adam for LM weights
 - Text dataset loading
 - Mini-batch corpus training
+- Generation from trained checkpoints
 - Held-out loss / perplexity
 - Checkpoint and resume
 - LM weight serialization
@@ -115,7 +116,7 @@ Toy decoder-only LM in `lang/` (byte vocab, pre-norm blocks, next-token train, `
 - [x] LM weight serialization
 - [x] Checkpoint and resume
 - [x] Held-out loss / perplexity
-- [ ] Generation from trained checkpoints
+- [x] Generation from trained checkpoints
 - [ ] Scale toward target size
 - [ ] Train / generate / load CLI
 

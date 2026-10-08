@@ -58,6 +58,7 @@
 - [LM weight serialization](lm-weight-serialization.md)
 - [Checkpoint and resume](checkpoint-and-resume.md)
 - [Held-out loss / perplexity](held-out-loss-perplexity.md)
+- [Generation from trained checkpoints](generation-from-checkpoints.md)
 
 ---
 
@@ -223,3 +224,6 @@ Checkpoints store Adam moments and step counters with the weights. Resume contin
 
 ### [Held-out loss / perplexity](held-out-loss-perplexity.md)
 Held-out NLL scores generalization on unseen windows. Perplexity is exp of that mean NLL and stays at least one. data/toy_val.txt exercises the metric in tests.
+
+### [Generation from trained checkpoints](generation-from-checkpoints.md)
+Loaded checkpoints feed lm_generate without reinitializing random weights. Greedy decode from a trained file is the smoke path. Tests save a checkpoint then generate a short continuation.
