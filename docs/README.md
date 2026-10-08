@@ -84,6 +84,7 @@
 - [KV-cache generate on GPU](gpu-kv-generate.md)
 - [Optional cuBLAS / cuDNN](cublas-cudnn.md)
 - [Host↔device sync at batch boundaries](gpu-batch-sync.md)
+- [nvidia-smi / train util proof](gpu-train-util-proof.md)
 
 ---
 
@@ -313,3 +314,6 @@ make cuda defaults to ANN_CUBLAS=1 so gpu_mat_mul prefers cublasDgemm then falls
 
 ### [Host↔device sync at batch boundaries](gpu-batch-sync.md)
 GPU_SYNC_BATCH skips per-GEMM D2H when outputs are pinned. The train loop syncs at Adam and epoch NLL boundaries instead.
+
+### [nvidia-smi / train util proof](gpu-train-util-proof.md)
+lm train --bench-gpu and lm bench --train time full train steps and print the GPU backend. Use nvidia-smi dmon alongside make cuda builds to confirm util.

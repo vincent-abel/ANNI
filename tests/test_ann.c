@@ -1050,6 +1050,19 @@ int main(void)
 	test_gpu_stub();
 	test_mat_device_pin_cpu();
 	test_gpu_gemm_bwd_stub();
+	{
+		lm *m;
+		lm_adam *o;
+		double ms;
+
+		m = lm_create();
+		o = m ? lm_adam_create(m) : NULL;
+		assert(m && o);
+		ms = lm_bench_train_ms(m, o, 8, 2);
+		assert(ms >= 0.0);
+		lm_adam_free(&o);
+		lm_free(&m);
+	}
 	puts("ok");
 	return 0;
 }

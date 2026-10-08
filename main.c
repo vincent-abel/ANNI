@@ -44,6 +44,41 @@ static void train_dbg(int debug, const char *msg)
 	fprintf(stderr, "[%s] %s\n", buf, msg);
 }
 
+static int run_lm_train_bench_gpu(int argc, char **argv)
+{
+	lm *model;
+	lm_adam *opt;
+	int n;
+	int steps;
+	double ms;
+
+	n = atoi(arg_value(argc, argv, "--tokens", "32"));
+	steps = atoi(arg_value(argc, argv, "--steps", "20"));
+	if (n < 2)
+		n = 32;
+	if (steps <= 0)
+		steps = 20;
+	srand(1);
+	model = lm_create();
+	opt = model ? lm_adam_create(model) : NULL;
+	if (!model || !opt) {
+		lm_free(&model);
+		lm_adam_free(&opt);
+		fprintf(stderr, "lm train --bench-gpu: init failed\n");
+		return 1;
+	}
+	ms = lm_bench_train_ms(model, opt, n, steps);
+	printf("LM train GPU bench backend=%s available=%d tokens=%d steps=%d mean_ms=%.3f\n",
+	    gpu_backend_name(), gpu_available(), n, steps, ms);
+	if (gpu_available())
+		printf("Corroborate util: nvidia-smi dmon -s u -c 10  (while this runs)\n");
+	else
+		printf("No CUDA device in this binary (CPU stub). Rebuild with: make cuda\n");
+	lm_adam_free(&opt);
+	lm_free(&model);
+	return ms < 0.0 ? 1 : 0;
+}
+
 static int run_lm_train(int argc, char **argv)
 {
 	lm *model;
@@ -61,6 +96,9 @@ static int run_lm_train(int argc, char **argv)
 	int prev_step;
 	int total_epochs;
 	char msg[256];
+
+	if (arg_flag(argc, argv, NULL, "--bench-gpu"))
+		return run_lm_train_bench_gpu(argc, argv);
 
 	data = arg_value(argc, argv, "--data", "data/toy.txt");
 	resume = arg_value(argc, argv, "--resume", NULL);
@@ -207,6 +245,7 @@ static int run_lm_load(int argc, char **argv)
 static int run_lm_bench(int argc, char **argv)
 {
 	lm *model;
+	lm_adam *opt;
 	int n;
 	int iters;
 	double ms;
@@ -221,13 +260,31 @@ static int run_lm_bench(int argc, char **argv)
 	model = lm_create();
 	if (!model)
 		return 1;
+	if (arg_flag(argc, argv, NULL, "--train")) {
+		opt = lm_adam_create(model);
+		if (!opt) {
+			lm_free(&model);
+			return 1;
+		}
+		ms = lm_bench_train_ms(model, opt, n, iters);
+		lm_adam_free(&opt);
+		lm_free(&model);
+		if (ms < 0.0) {
+			fprintf(stderr, "lm bench --train: failed\n");
+			return 1;
+		}
+		printf("LM bench train backend=%s available=%d tokens=%d steps=%d mean_ms=%.3f\n",
+		    gpu_backend_name(), gpu_available(), n, iters, ms);
+		return 0;
+	}
 	ms = lm_bench_forward_ms(model, n, iters);
 	lm_free(&model);
 	if (ms < 0.0) {
 		fprintf(stderr, "lm bench: failed\n");
 		return 1;
 	}
-	printf("LM bench tokens=%d iters=%d mean_ms=%.3f\n", n, iters, ms);
+	printf("LM bench tokens=%d iters=%d mean_ms=%.3f backend=%s\n",
+	    n, iters, ms, gpu_backend_name());
 	return 0;
 }
 
@@ -346,9 +403,10 @@ int main(int argc, char *argv[])
 		printf("       ./ann lm [phrase]\n");
 		printf("       ./ann lm train [--data PATH] [--epochs N] [--out PATH]\n");
 		printf("                 [--resume PATH] [-d|--debug]\n");
+		printf("       ./ann lm train --bench-gpu [--tokens N] [--steps N]\n");
 		printf("       ./ann lm generate --model model.bin --prompt hello\n");
 		printf("       ./ann lm load --model model.bin\n");
-		printf("       ./ann lm bench [--tokens N] [--iters N]\n");
+		printf("       ./ann lm bench [--tokens N] [--iters N] [--train]\n");
 		return 1;
 	}
 
