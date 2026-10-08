@@ -55,6 +55,15 @@ void embed_zero_grad(embed *e)
 	mat_zero(e->dtable);
 }
 
+int embed_lookup_row(double *out, const embed *e, int id)
+{
+	if (!out || !e || !e->table || id < 0 || id >= e->table->rows)
+		return -1;
+	memcpy(out, &e->table->data[id * LM_D_MODEL],
+	    (size_t)LM_D_MODEL * sizeof(double));
+	return 0;
+}
+
 int embed_lookup(mat *out, const embed *e, const int *ids, int n)
 {
 	int i;

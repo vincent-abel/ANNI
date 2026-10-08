@@ -36,5 +36,6 @@
 #include "arena.h"
 #include "simd.h"
 #include "quant.h"
+#include "kv.h"
 
 #endif

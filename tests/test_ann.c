@@ -819,6 +819,21 @@ static void test_lm_generate_smoke(void)
 	lm_free(&model);
 }
 
+static void test_lm_generate_kv(void)
+{
+	lm *model;
+	char out[128];
+	int n;
+
+	srand(31);
+	model = lm_create();
+	assert(model);
+	n = lm_generate_kv(model, "hi", out, (int)sizeof(out), 4, 0.0);
+	assert(n > 0);
+	assert(out[0] != '\0');
+	lm_free(&model);
+}
+
 static void test_qmat_roundtrip(void)
 {
 	mat *m;
@@ -979,6 +994,7 @@ int main(void)
 	test_mat_mul_bt_known();
 	test_ann_dot_simd();
 	test_qmat_roundtrip();
+	test_lm_generate_kv();
 	puts("ok");
 	return 0;
 }

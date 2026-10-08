@@ -130,7 +130,7 @@ Trainable toy decoder-only LM in `lang/` (full backprop, Adam, corpus train, che
 - [x] Multithreading
 - [x] AVX2 / AVX-512
 - [x] Quantization
-- [ ] Optimized inference
+- [x] Optimized inference
 - [ ] GPU support
 
 ## Target

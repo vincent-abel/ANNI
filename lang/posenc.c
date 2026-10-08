@@ -6,28 +6,29 @@
 #include "lm_config.h"
 #include "posenc.h"
 
-void posenc_sinusoidal_add(mat *seq)
+void posenc_add_row(double *row, int t)
 {
-	int t;
 	int i;
-	int T;
-	int d;
 	double log_base;
 	double angle;
 
+	if (!row || t < 0)
+		return;
+	log_base = -log(10000.0) / (double)LM_D_MODEL;
+	for (i = 0; 2 * i < LM_D_MODEL; i++) {
+		angle = (double)t * exp((2.0 * (double)i) * log_base);
+		row[2 * i] += sin(angle);
+		if (2 * i + 1 < LM_D_MODEL)
+			row[2 * i + 1] += cos(angle);
+	}
+}
+
+void posenc_sinusoidal_add(mat *seq)
+{
+	int t;
+
 	if (!seq || !seq->data || seq->rows <= 0 || seq->cols <= 0)
 		return;
-	T = seq->rows;
-	d = seq->cols;
-	log_base = -log(10000.0) / (double)d;
-	for (t = 0; t < T; t++) {
-		for (i = 0; 2 * i < d; i++) {
-			angle = (double)t * exp((2.0 * (double)i) * log_base);
-			mat_set(seq, t, 2 * i,
-			    mat_get(seq, t, 2 * i) + sin(angle));
-			if (2 * i + 1 < d)
-				mat_set(seq, t, 2 * i + 1,
-				    mat_get(seq, t, 2 * i + 1) + cos(angle));
-		}
-	}
+	for (t = 0; t < seq->rows; t++)
+		posenc_add_row(&seq->data[t * seq->cols], t);
 }

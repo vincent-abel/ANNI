@@ -17,6 +17,7 @@ embed	*embed_create(int vocab_size);
 void	embed_free(embed **e);
 void	embed_zero_grad(embed *e);
 int	embed_lookup(mat *out, const embed *e, const int *ids, int n);
+int	embed_lookup_row(double *out, const embed *e, int id);
 int	embed_backward(embed *e, const mat *dout, const int *ids, int n);
 
 #endif

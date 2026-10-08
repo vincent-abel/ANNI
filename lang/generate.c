@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "generate.h"
+#include "kv.h"
 #include "ops.h"
 #include "tokenize.h"
 #include "vocab.h"
@@ -72,19 +73,22 @@ static int sample_id(const vec *logits, double temperature)
 int lm_generate(lm *model, const char *prompt, char *out, int out_cap,
 	int max_new, double temperature)
 {
-	int ids[LM_MAX_CTX];
+	/* Prefer KV-cache decode; fall back to full reforward if it fails. */
 	int n;
 	int i;
 	int next;
+	int ids[LM_MAX_CTX];
 	mat *hidden;
 	vec *logits;
 
+	n = lm_generate_kv(model, prompt, out, out_cap, max_new, temperature);
+	if (n >= 0)
+		return n;
 	if (!model || !prompt || !out || out_cap <= 1 || max_new < 0)
 		return -1;
 	n = tokenize_encode(prompt, ids, LM_MAX_CTX);
 	if (n <= 0)
 		return -1;
-
 	hidden = mat_create(LM_MAX_CTX, LM_D_MODEL);
 	logits = vec_create(model->vocab_size);
 	if (!hidden || !logits) {
@@ -92,7 +96,6 @@ int lm_generate(lm *model, const char *prompt, char *out, int out_cap,
 		vec_free(&logits);
 		return -1;
 	}
-
 	for (i = 0; i < max_new && n < LM_MAX_CTX; i++) {
 		hidden->rows = n;
 		if (lm_forward(hidden, model, ids, n) != 0) {
@@ -110,7 +113,6 @@ int lm_generate(lm *model, const char *prompt, char *out, int out_cap,
 			break;
 		ids[n++] = next;
 	}
-
 	if (tokenize_decode(ids, n, out, out_cap) < 0) {
 		mat_free(&hidden);
 		vec_free(&logits);

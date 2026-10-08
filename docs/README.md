@@ -70,6 +70,7 @@
 - [Multithreading](multithreading.md)
 - [AVX2 / AVX-512](avx2-avx-512.md)
 - [Quantization](quantization.md)
+- [Optimized inference](optimized-inference.md)
 
 ---
 
@@ -264,3 +265,6 @@ ann_dot picks AVX-512, AVX2, or scalar at compile time. Pass ARCH=-mavx2 when th
 
 ### [Quantization](quantization.md)
 Int8 qmat stores weights with one scale for cheaper inference GEMVs. lm_quantize_head packs the LM head; lm_logits_at uses it when present. Training remains full precision.
+
+### [Optimized inference](optimized-inference.md)
+A KV cache stores per-layer Keys and Values so generate attends only the new query. lm_generate_kv walks the prompt once then appends tokens. lm_generate prefers that path with a full-reforward fallback.
