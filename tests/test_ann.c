@@ -823,8 +823,20 @@ static void test_ann_dot_simd(void)
 {
 	double a[4] = {1.0, 2.0, 3.0, 4.0};
 	double b[4] = {5.0, 6.0, 7.0, 8.0};
+	double x[16];
+	double y[16];
+	double ref;
+	int i;
 
 	assert(fabs(ann_dot(a, b, 4) - 70.0) < 1e-12);
+	ref = 0.0;
+	for (i = 0; i < 16; i++) {
+		x[i] = (double)(i + 1);
+		y[i] = (double)(16 - i);
+		ref += x[i] * y[i];
+	}
+	assert(fabs(ann_dot(x, y, 16) - ref) < 1e-9);
+	assert(ann_simd_backend() != NULL);
 }
 
 static void test_mat_mul_bt_known(void)

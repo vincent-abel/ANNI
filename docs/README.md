@@ -68,6 +68,7 @@
 - [Cache-friendly data structures](cache-friendly-data-structures.md)
 - [SIMD](simd.md)
 - [Multithreading](multithreading.md)
+- [AVX2 / AVX-512](avx2-avx-512.md)
 
 ---
 
@@ -256,3 +257,6 @@ ann_dot and friends use restrict on contiguous doubles so -O2 can auto-vectorize
 
 ### [Multithreading](multithreading.md)
 OpenMP splits mat_mul tiles and attention heads across cores. Each head keeps private scratch so softmax and writes do not race. OMP_NUM_THREADS controls width.
+
+### [AVX2 / AVX-512](avx2-avx-512.md)
+ann_dot picks AVX-512, AVX2, or scalar at compile time. Pass ARCH=-mavx2 when the CPU supports it. ann_simd_backend reports which path linked.

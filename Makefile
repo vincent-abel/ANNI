@@ -4,7 +4,9 @@ INCLUDES=-I. -Inet -Inum -Ilang
 # OPT=-O2 enables auto-vectorization on contiguous ann_dot / mat_mul loops.
 OPT ?= -O2
 OPENMP ?= -fopenmp
-CFLAGS=-W -Wall -ansi -pedantic -std=c99 $(OPT) $(OPENMP) $(INCLUDES)
+# ARCH may add -mavx2 / -mavx512f when the host supports it.
+ARCH ?=
+CFLAGS=-W -Wall -ansi -pedantic -std=c99 $(OPT) $(OPENMP) $(ARCH) $(INCLUDES)
 LDFLAGS=-lm $(OPENMP)
 EXEC=ann
 OBJDIR=objects
