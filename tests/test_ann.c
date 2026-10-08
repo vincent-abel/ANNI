@@ -624,6 +624,23 @@ static void test_lm_ntp_loss_drops(void)
 
 
 
+
+static void test_text_dataset(void)
+{
+	text_dataset *ds;
+	int ids[LM_MAX_CTX];
+	int n;
+	int nw;
+
+	ds = text_dataset_load("data/toy.txt", 8);
+	assert(ds);
+	nw = text_dataset_n_windows(ds);
+	assert(nw > 0);
+	assert(text_dataset_window(ds, 0, ids, &n) == 0);
+	assert(n == 8);
+	text_dataset_free(&ds);
+}
+
 static void test_lm_backprop_head(void)
 {
 	lm *model;
@@ -715,6 +732,7 @@ int main(void)
 	test_lm_ntp_loss_drops();
 	test_lm_generate_smoke();
 	test_lm_backprop_head();
+	test_text_dataset();
 	puts("ok");
 	return 0;
 }

@@ -28,6 +28,7 @@
 #include "block.h"
 #include "lm.h"
 #include "lm_adam.h"
+#include "dataset_text.h"
 #include "generate.h"
 
 #endif

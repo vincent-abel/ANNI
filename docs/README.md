@@ -53,6 +53,7 @@
 - [Transformer backpropagation](transformer-backpropagation.md)
 - [Train all parameters](train-all-parameters.md)
 - [Adam for LM weights](adam-lm-weights.md)
+- [Text dataset loading](text-dataset-loading.md)
 
 ---
 
@@ -203,3 +204,6 @@ Full-stack SGD replaces the old head-and-embed shortcut. Every attention, FFN, L
 
 ### [Adam for LM weights](adam-lm-weights.md)
 LM Adam registers every param/grad scalar into flat slots. Bias-corrected moments update weights like the MLP optimizer, without touching network*. lm_train_steps uses Adam by default after full backward.
+
+### [Text dataset loading](text-dataset-loading.md)
+Text datasets load a UTF-8 file into byte token ids. Sliding windows of length window feed next-token pairs. data/toy.txt is the shipped fixture for tests.

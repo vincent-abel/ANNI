@@ -48,6 +48,7 @@ Current implementation:
 - Transformer backpropagation
 - Train all parameters
 - Adam for LM weights
+- Text dataset loading
 
 Toy decoder-only LM in `lang/` (byte vocab, pre-norm blocks, next-token train, `./ann lm`).
 
@@ -106,7 +107,7 @@ Toy decoder-only LM in `lang/` (byte vocab, pre-norm blocks, next-token train, `
 - [x] Train all parameters
 - [x] Adam for LM weights
 - [ ] Mini-batch corpus training
-- [ ] Text dataset loading
+- [x] Text dataset loading
 - [ ] LM weight serialization
 - [ ] Checkpoint and resume
 - [ ] Held-out loss / perplexity
