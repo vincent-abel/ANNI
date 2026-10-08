@@ -232,6 +232,37 @@ void network_update(network *net, double lr)
 	}
 }
 
+void network_set_inputs(network *net, const double *values, int n_values)
+{
+	int i;
+
+	if (!net || !values || n_values != net->n_inputs)
+		return;
+	for (i = 0; i < n_values; i++)
+		net->inputs[i] = values[i];
+}
+
+void network_train(network *net, const double *samples, const double *targets,
+	int n_samples, int n_target, int epochs, double lr)
+{
+	int e;
+	int s;
+
+	if (!net || !samples || !targets || n_samples <= 0 || n_target <= 0
+		|| epochs <= 0)
+		return;
+
+	for (e = 0; e < epochs; e++) {
+		for (s = 0; s < n_samples; s++) {
+			network_set_inputs(net, samples + s * net->n_inputs,
+				net->n_inputs);
+			network_forward(net);
+			network_backward(net, targets + s * n_target, n_target);
+			network_update(net, lr);
+		}
+	}
+}
+
 void network_free(network **net)
 {
 	if (!net || !*net)

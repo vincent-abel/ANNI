@@ -29,6 +29,9 @@ void	network_show(network *);
 double	network_mse(network *, const double *target, int n_target);
 void	network_backward(network *, const double *target, int n_target);
 void	network_update(network *, double lr);
+void	network_set_inputs(network *, const double *values, int n_values);
+void	network_train(network *, const double *samples, const double *targets,
+		int n_samples, int n_target, int epochs, double lr);
 int		network_output_size(network *);
 void	network_free(network **);
 

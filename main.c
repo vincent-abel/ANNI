@@ -3,11 +3,14 @@
 int main(int argc, char *argv[])
 {
 	network *net;
+	double *samples;
+	double *targets;
 	double *target;
 	int n_inputs;
 	int n_neurons;
 	int n_layers;
 	int n_out;
+	int i;
 
 	setvbuf(stdout, NULL, _IONBF, 0);
 	srand((unsigned int)time(NULL));
@@ -26,20 +29,27 @@ int main(int argc, char *argv[])
 	}
 
 	net = network_create(n_inputs, n_neurons, n_layers);
+	n_out = network_output_size(net);
+
+	samples = malloc((size_t)n_inputs * sizeof(double));
+	targets = calloc((size_t)n_out, sizeof(double));
+	target = calloc((size_t)n_out, sizeof(double));
+	if (!samples || !targets || !target)
+		exit(EXIT_FAILURE);
+	for (i = 0; i < n_inputs; i++)
+		samples[i] = net->inputs[i];
+
+	network_forward(net);
+	printf("MSE before train  %10.6f\n", network_mse(net, target, n_out));
+	network_train(net, samples, targets, 1, n_out, 50, 0.5);
+	network_set_inputs(net, samples, n_inputs);
 	network_forward(net);
 	network_show(net);
+	printf("MSE after train   %10.6f\n\n", network_mse(net, target, n_out));
 
-	n_out = network_output_size(net);
-	target = calloc((size_t)n_out, sizeof(double));
-	if (!target)
-		exit(EXIT_FAILURE);
-	printf("MSE before  %10.6f\n", network_mse(net, target, n_out));
-	network_backward(net, target, n_out);
-	network_update(net, 0.5);
-	network_forward(net);
-	printf("MSE after   %10.6f\n\n", network_mse(net, target, n_out));
+	free(samples);
+	free(targets);
 	free(target);
-
 	network_free(&net);
 	return 0;
 }
