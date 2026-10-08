@@ -56,6 +56,7 @@
 - [Text dataset loading](text-dataset-loading.md)
 - [Mini-batch corpus training](mini-batch-corpus-training.md)
 - [LM weight serialization](lm-weight-serialization.md)
+- [Checkpoint and resume](checkpoint-and-resume.md)
 
 ---
 
@@ -215,3 +216,6 @@ Corpus training walks sliding windows in batches. Gradients average over the bat
 
 ### [LM weight serialization](lm-weight-serialization.md)
 LMCK binary files store config dims and every weight tensor in a fixed walk order. lm_save and lm_load round-trip a model without the MLP ANN1 format. Matching NLL after reload verifies the bytes.
+
+### [Checkpoint and resume](checkpoint-and-resume.md)
+Checkpoints store Adam moments and step counters with the weights. Resume continues optimization without resetting momentum. lm_save_checkpoint and lm_load_checkpoint implement that path.
