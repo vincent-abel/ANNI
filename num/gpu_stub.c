@@ -123,3 +123,24 @@ int gpu_adam_step(double *param, double *grad, double *m, double *v, int n,
 	(void)t;
 	return -1;
 }
+
+int gpu_kv_attn_decode(double *out, const double *x,
+	const double *wq, const double *wk, const double *wv,
+	const double *wo, double *k_cache, double *v_cache,
+	int len, int max_T, int d_model, int n_heads, int d_head)
+{
+	(void)out;
+	(void)x;
+	(void)wq;
+	(void)wk;
+	(void)wv;
+	(void)wo;
+	(void)k_cache;
+	(void)v_cache;
+	(void)len;
+	(void)max_T;
+	(void)d_model;
+	(void)n_heads;
+	(void)d_head;
+	return -1;
+}

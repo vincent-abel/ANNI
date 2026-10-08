@@ -560,3 +560,204 @@ extern "C" int gpu_mat_mul_backward(mat *da, mat *db, const mat *dc,
 	}
 	return rc;
 }
+
+__global__ static void gemv_kernel(const double *x, const double *W, double *y,
+	int D)
+{
+	int j = blockIdx.x * blockDim.x + threadIdx.x;
+	int i;
+	double sum;
+
+	if (j >= D)
+		return;
+	sum = 0.0;
+	for (i = 0; i < D; i++)
+		sum += x[i] * W[i * D + j];
+	y[j] = sum;
+}
+
+__global__ static void kv_append_kernel(double *k_cache, double *v_cache,
+	const double *k, const double *v, int row, int D)
+{
+	int j = blockIdx.x * blockDim.x + threadIdx.x;
+
+	if (j >= D)
+		return;
+	k_cache[row * D + j] = k[j];
+	v_cache[row * D + j] = v[j];
+}
+
+__global__ static void kv_scores_hd(const double *q, const double *k_cache,
+	double *scores, int len, int d_model, int off, int d, double scale)
+{
+	int j = blockIdx.x * blockDim.x + threadIdx.x;
+	int t;
+	double sum;
+
+	if (j >= len)
+		return;
+	sum = 0.0;
+	for (t = 0; t < d; t++)
+		sum += q[off + t] * k_cache[j * d_model + off + t];
+	scores[j] = sum * scale;
+}
+
+__global__ static void kv_av_hd(const double *scores, const double *v_cache,
+	double *otmp, int len, int d_model, int off, int d)
+{
+	int t = blockIdx.x * blockDim.x + threadIdx.x;
+	int j;
+	double sum;
+
+	if (t >= d)
+		return;
+	sum = 0.0;
+	for (j = 0; j < len; j++)
+		sum += scores[j] * v_cache[j * d_model + off + t];
+	otmp[off + t] = sum;
+}
+
+extern "C" int gpu_kv_attn_decode(double *out, const double *x,
+	const double *wq, const double *wk, const double *wv,
+	const double *wo, double *k_cache, double *v_cache,
+	int len, int max_T, int d_model, int n_heads, int d_head)
+{
+	double *d_x;
+	double *d_wq;
+	double *d_wk;
+	double *d_wv;
+	double *d_wo;
+	double *d_q;
+	double *d_k;
+	double *d_v;
+	double *d_kc;
+	double *d_vc;
+	double *d_otmp;
+	double *d_scores;
+	double *h_scores;
+	double *h_tmp;
+	size_t db;
+	size_t wb;
+	size_t cb;
+	double scale;
+	double mx;
+	double sum;
+	int h;
+	int j;
+	int off;
+	int threads;
+
+	if (!out || !x || !wq || !wk || !wv || !wo || !k_cache || !v_cache)
+		return -1;
+	if (!gpu_available() || len <= 0 || len > max_T || d_model <= 0
+	    || n_heads <= 0 || d_head <= 0 || n_heads * d_head != d_model)
+		return -1;
+	db = (size_t)d_model * sizeof(double);
+	wb = (size_t)d_model * (size_t)d_model * sizeof(double);
+	cb = (size_t)max_T * (size_t)d_model * sizeof(double);
+	scale = 1.0 / sqrt((double)d_head);
+	threads = 256;
+	d_x = d_wq = d_wk = d_wv = d_wo = NULL;
+	d_q = d_k = d_v = d_kc = d_vc = d_otmp = d_scores = NULL;
+	h_scores = h_tmp = NULL;
+	if (!(d_x = (double *)gpu_malloc(db))
+	    || !(d_wq = (double *)gpu_malloc(wb))
+	    || !(d_wk = (double *)gpu_malloc(wb))
+	    || !(d_wv = (double *)gpu_malloc(wb))
+	    || !(d_wo = (double *)gpu_malloc(wb))
+	    || !(d_q = (double *)gpu_malloc(db))
+	    || !(d_k = (double *)gpu_malloc(db))
+	    || !(d_v = (double *)gpu_malloc(db))
+	    || !(d_kc = (double *)gpu_malloc(cb))
+	    || !(d_vc = (double *)gpu_malloc(cb))
+	    || !(d_otmp = (double *)gpu_malloc(db))
+	    || !(d_scores = (double *)gpu_malloc((size_t)len * sizeof(double)))
+	    || !(h_scores = (double *)malloc((size_t)len * sizeof(double)))
+	    || !(h_tmp = (double *)malloc((size_t)len * sizeof(double))))
+		goto fail;
+	if (gpu_memcpy_h2d(d_x, x, db) != 0
+	    || gpu_memcpy_h2d(d_wq, wq, wb) != 0
+	    || gpu_memcpy_h2d(d_wk, wk, wb) != 0
+	    || gpu_memcpy_h2d(d_wv, wv, wb) != 0
+	    || gpu_memcpy_h2d(d_wo, wo, wb) != 0
+	    || gpu_memcpy_h2d(d_kc, k_cache, cb) != 0
+	    || gpu_memcpy_h2d(d_vc, v_cache, cb) != 0)
+		goto fail;
+	gemv_kernel<<<(d_model + threads - 1) / threads, threads>>>(d_x, d_wq,
+	    d_q, d_model);
+	gemv_kernel<<<(d_model + threads - 1) / threads, threads>>>(d_x, d_wk,
+	    d_k, d_model);
+	gemv_kernel<<<(d_model + threads - 1) / threads, threads>>>(d_x, d_wv,
+	    d_v, d_model);
+	kv_append_kernel<<<(d_model + threads - 1) / threads, threads>>>(d_kc,
+	    d_vc, d_k, d_v, len - 1, d_model);
+	if (cudaDeviceSynchronize() != cudaSuccess)
+		goto fail;
+	if (gpu_memset(d_otmp, 0, db) != 0)
+		goto fail;
+	for (h = 0; h < n_heads; h++) {
+		off = h * d_head;
+		kv_scores_hd<<<(len + threads - 1) / threads, threads>>>(d_q,
+		    d_kc, d_scores, len, d_model, off, d_head, scale);
+		if (cudaDeviceSynchronize() != cudaSuccess)
+			goto fail;
+		if (gpu_memcpy_d2h(h_scores, d_scores,
+			(size_t)len * sizeof(double)) != 0)
+			goto fail;
+		mx = h_scores[0];
+		for (j = 1; j < len; j++)
+			if (h_scores[j] > mx)
+				mx = h_scores[j];
+		sum = 0.0;
+		for (j = 0; j < len; j++) {
+			h_tmp[j] = exp(h_scores[j] - mx);
+			sum += h_tmp[j];
+		}
+		for (j = 0; j < len; j++)
+			h_scores[j] = h_tmp[j] / sum;
+		if (gpu_memcpy_h2d(d_scores, h_scores,
+			(size_t)len * sizeof(double)) != 0)
+			goto fail;
+		kv_av_hd<<<(d_head + threads - 1) / threads, threads>>>(d_scores,
+		    d_vc, d_otmp, len, d_model, off, d_head);
+	}
+	gemv_kernel<<<(d_model + threads - 1) / threads, threads>>>(d_otmp, d_wo,
+	    d_q, d_model);
+	if (cudaDeviceSynchronize() != cudaSuccess)
+		goto fail;
+	if (gpu_memcpy_d2h(out, d_q, db) != 0
+	    || gpu_memcpy_d2h(k_cache, d_kc, cb) != 0
+	    || gpu_memcpy_d2h(v_cache, d_vc, cb) != 0)
+		goto fail;
+	gpu_free(d_x);
+	gpu_free(d_wq);
+	gpu_free(d_wk);
+	gpu_free(d_wv);
+	gpu_free(d_wo);
+	gpu_free(d_q);
+	gpu_free(d_k);
+	gpu_free(d_v);
+	gpu_free(d_kc);
+	gpu_free(d_vc);
+	gpu_free(d_otmp);
+	gpu_free(d_scores);
+	free(h_scores);
+	free(h_tmp);
+	return 0;
+fail:
+	gpu_free(d_x);
+	gpu_free(d_wq);
+	gpu_free(d_wk);
+	gpu_free(d_wv);
+	gpu_free(d_wo);
+	gpu_free(d_q);
+	gpu_free(d_k);
+	gpu_free(d_v);
+	gpu_free(d_kc);
+	gpu_free(d_vc);
+	gpu_free(d_otmp);
+	gpu_free(d_scores);
+	free(h_scores);
+	free(h_tmp);
+	return -1;
+}

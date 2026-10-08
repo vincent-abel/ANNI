@@ -8,6 +8,7 @@
 #include "embed.h"
 #include "ffn.h"
 #include "generate.h"
+#include "gpu.h"
 #include "kv.h"
 #include "layernorm.h"
 #include "ops.h"
@@ -101,6 +102,8 @@ lm_kv *lm_kv_create(const lm *model, int max_T)
 			lm_kv_free(&kv);
 			return NULL;
 		}
+		mat_try_pin(kv->k[i]);
+		mat_try_pin(kv->v[i]);
 	}
 	return kv;
 }
@@ -170,6 +173,10 @@ static int attn_decode_row(double *out, const attn *a, const double *xrow,
 
 	if (len <= 0 || len > k_cache->rows)
 		return -1;
+	if (gpu_kv_attn_decode(out, xrow, a->wq->data, a->wk->data, a->wv->data,
+		a->wo->data, k_cache->data, v_cache->data, len, k_cache->rows,
+		LM_D_MODEL, a->n_heads, a->d_head) == 0)
+		return 0;
 	d = a->d_head;
 	scale = 1.0 / sqrt((double)d);
 	q = scratch;

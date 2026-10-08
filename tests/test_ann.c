@@ -844,6 +844,8 @@ static void test_gpu_gemm_bwd_stub(void)
 	assert(gpu_mat_outer_add(da, a, b) != 0);
 	assert(gpu_adam_step(a->data, b->data, c->data, da->data, 4,
 	    0.01, 0.9, 0.999, 1e-8, 1) != 0);
+	assert(gpu_kv_attn_decode(a->data, b->data, c->data, da->data, db->data,
+	    a->data, b->data, c->data, 1, 2, 2, 1, 2) != 0);
 	mat_free(&a);
 	mat_free(&b);
 	mat_free(&c);

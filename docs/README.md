@@ -81,6 +81,7 @@
 - [FFN + LayerNorm backward](gpu-ffn-layernorm-backward.md)
 - [LM head + cross-entropy backward](gpu-head-cross-entropy.md)
 - [Adam step on GPU](gpu-adam.md)
+- [KV-cache generate on GPU](gpu-kv-generate.md)
 
 ---
 
@@ -301,3 +302,6 @@ CE delta updates dw_head via mat_outer_add so CUDA outer_add can run. dhidden ac
 
 ### [Adam step on GPU](gpu-adam.md)
 lm_adam_step packs flat param/grad/m/v buffers and tries gpu_adam_step. CUDA Adam updates moments and weights then zeros grads; stubs keep the host loop.
+
+### [KV-cache generate on GPU](gpu-kv-generate.md)
+Decode-step attention tries gpu_kv_attn_decode for QKV, K/V append, scores, and Wo. Softmax of the short score row stays on the host; sampling stays on the host.

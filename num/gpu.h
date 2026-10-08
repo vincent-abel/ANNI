@@ -37,5 +37,13 @@ int	gpu_layernorm_backward(mat *dx, const mat *dy, const double *gamma,
 */
 int	gpu_adam_step(double *param, double *grad, double *m, double *v, int n,
 		double lr, double beta1, double beta2, double eps, int t);
+/*
+** One decode-step MHA: QKV proj, append K/V at row len-1, attend, Wo.
+** k_cache/v_cache are max_T x d_model (host). Returns 0 on success, -1 = CPU.
+*/
+int	gpu_kv_attn_decode(double *out, const double *x,
+		const double *wq, const double *wk, const double *wv,
+		const double *wo, double *k_cache, double *v_cache,
+		int len, int max_T, int d_model, int n_heads, int d_head);
 
 #endif
