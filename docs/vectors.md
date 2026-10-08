@@ -21,7 +21,7 @@ These are the same primitives used inside layer math and later matrix products.
 
 ## How it shows up in this repo
 
-- [`vec.h`](../vec.h) / [`vec.c`](../vec.c) define `vec` as `{ double *data; int n; }`.
+- [`vec.h`](../num/vec.h) / [`vec.c`](../num/vec.c) define `vec` as `{ double *data; int n; }`.
 - `vec_create` / `vec_free` own the contiguous block; `vec_fill` / `vec_copy` set values.
 - `vec_dot`, `vec_axpy`, `vec_scale`, `vec_add` implement the operations above.
 

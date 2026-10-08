@@ -24,7 +24,7 @@ From logits \(\mathbf{z}\) (stable log-softmax form):
 
 ## How it shows up in this repo
 
-- [`ops.c`](../ops.c): `vec_cross_entropy(probs, class_index)` clamps tiny \(p\) then returns \(-\log p\).
+- [`ops.c`](../num/ops.c): `vec_cross_entropy(probs, class_index)` clamps tiny \(p\) then returns \(-\log p\).
 - `vec_softmax_cross_entropy(logits, class_index)` uses the stable combined formula above.
 - The existing MLP still trains with MSE on XOR; these ops are the Numerical Engine loss for multi-class work ahead.
 

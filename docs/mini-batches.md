@@ -22,7 +22,7 @@ Single-example SGD is the special case \(B = 1\).
 
 ## How it shows up in this repo
 
-- [`layer.c`](../layer.c): `network_train_mb` zeros grads, calls `network_backward_accum` per sample in the chunk, `network_scale_grads(1/B)`, then `network_update`.
+- [`layer.c`](../net/layer.c): `network_train_mb` zeros grads, calls `network_backward_accum` per sample in the chunk, `network_scale_grads(1/B)`, then `network_update`.
 - `neuron_zero_delta` clears only deltas between samples; `neuron_zero_grad` clears `dw`/`dbias` at batch start.
 - XOR can train with `batch_size` 2 or 4 on the four-row table.
 

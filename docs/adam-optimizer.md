@@ -28,7 +28,7 @@ v_t = \beta_2 v_{t-1} + (1-\beta_2)g_t^2
 
 ## How it shows up in this repo
 
-- [`optim.h`](../optim.h) / [`optim.c`](../optim.c): `adam_create` walks the network and builds slots pointing at each bias/weight and its `dbias`/`dw`.
+- [`optim.h`](../net/optim.h) / [`optim.c`](../net/optim.c): `adam_create` walks the network and builds slots pointing at each bias/weight and its `dbias`/`dw`.
 - `adam_step` applies the update and clears grads; `network_train_adam` runs forward/backward/Adam per sample.
 - Tests train XOR with Adam instead of `network_update`.
 

@@ -22,7 +22,7 @@ Rank-1 tensors behave as vectors in \(\mathbb{R}^{d_0}\); rank-2 as matrices in 
 
 ## How it shows up in this repo
 
-- [`tensor.h`](../tensor.h) / [`tensor.c`](../tensor.c) define `tensor` as `{ data, shape, ndim, size }`.
+- [`tensor.h`](../num/tensor.h) / [`tensor.c`](../num/tensor.c) define `tensor` as `{ data, shape, ndim, size }`.
 - `tensor_create` / `tensor_free` / `tensor_fill` manage storage; `tensor_at` returns a pointer to one element.
 - `tensor_as_vec` / `tensor_as_mat` fill a view struct that points at the same `data` (no copy) when `ndim` is 1 or 2.
 

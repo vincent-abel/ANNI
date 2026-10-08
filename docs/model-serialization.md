@@ -14,7 +14,7 @@ No new learning math — only an ordered encoding of parameters \(\theta\) (all 
 
 ## How it shows up in this repo
 
-- [`serialize.h`](../serialize.h) / [`serialize.c`](../serialize.c): `network_save` / `network_load` use a small binary format with magic `ANN1`.
+- [`serialize.h`](../net/serialize.h) / [`serialize.c`](../net/serialize.c): `network_save` / `network_load` use a small binary format with magic `ANN1`.
 - Neuron and input lists are written head→`prev`, matching how the live graph is stored.
 - Tests train XOR briefly, save, load, and compare outputs.
 

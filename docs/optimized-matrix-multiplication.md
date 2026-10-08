@@ -21,7 +21,7 @@ C_{ij} \mathrel{+}= A_{ik} B_{kj}
 
 ## How it shows up in this repo
 
-- [`mat.c`](../mat.c): `mat_mul` zeros \(C\) then runs three outer block loops (`MAT_BLOCK` 32) and inner micro-kernels; `mat_mul_naive` remains for checking.
+- [`mat.c`](../num/mat.c): `mat_mul` zeros \(C\) then runs three outer block loops (`MAT_BLOCK` 32) and inner micro-kernels; `mat_mul_naive` remains for checking.
 - Tests compare blocked vs naive on random small matrices.
 
 ## Tiny example

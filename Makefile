@@ -1,23 +1,43 @@
 CC=gcc -g
-CFLAGS=-W -Wall -ansi -pedantic -std=c99
-LDFLAGS= -lm
+# Include roots: net/ (neural network), num/ (numerical engine).
+# Future Language Model sources belong in lang/ and need -Ilang here.
+INCLUDES=-I. -Inet -Inum
+CFLAGS=-W -Wall -ansi -pedantic -std=c99 $(INCLUDES)
+LDFLAGS=-lm
 EXEC=ann
-LIB_SRC=neuron.c layer.c dataset.c vec.c mat.c tensor.c ops.c optim.c serialize.c
-LIB_OBJ=$(LIB_SRC:.c=.o)
-OBJ=$(LIB_OBJ) main.o
+OBJDIR=objects
+
+NET_SRC=net/neuron.c net/layer.c net/dataset.c net/optim.c net/serialize.c
+NUM_SRC=num/vec.c num/mat.c num/tensor.c num/ops.c
+LIB_SRC=$(NET_SRC) $(NUM_SRC)
+LIB_OBJ=$(patsubst %.c,$(OBJDIR)/%.o,$(notdir $(LIB_SRC)))
+MAIN_OBJ=$(OBJDIR)/main.o
+OBJ=$(LIB_OBJ) $(MAIN_OBJ)
 TEST=tests/test_ann
+GUI=gui/ann-gui
+
+# Map basename.o -> source path
+$(OBJDIR)/neuron.o: net/neuron.c
+$(OBJDIR)/layer.o: net/layer.c
+$(OBJDIR)/dataset.o: net/dataset.c
+$(OBJDIR)/optim.o: net/optim.c
+$(OBJDIR)/serialize.o: net/serialize.c
+$(OBJDIR)/vec.o: num/vec.c
+$(OBJDIR)/mat.o: num/mat.c
+$(OBJDIR)/tensor.o: num/tensor.c
+$(OBJDIR)/ops.o: num/ops.c
+$(OBJDIR)/main.o: main.c
 
 all: $(EXEC)
 
+$(OBJDIR):
+	mkdir -p $(OBJDIR)
+
+$(OBJDIR)/%.o: | $(OBJDIR)
+	$(CC) -o $@ -c $< $(CFLAGS)
+
 ann: $(OBJ)
 	$(CC) -o $@ $^ $(LDFLAGS)
-
-main.o: main.h layer.h neuron.h dataset.h vec.h mat.h tensor.h ops.h optim.h serialize.h
-
-$(LIB_OBJ): main.h layer.h neuron.h dataset.h vec.h mat.h tensor.h ops.h optim.h serialize.h
-
-%.o: %.c
-	$(CC) -o $@ -c $< $(CFLAGS)
 
 $(TEST): tests/test_ann.c $(LIB_OBJ)
 	$(CC) $(CFLAGS) -o $@ tests/test_ann.c $(LIB_OBJ) $(LDFLAGS)
@@ -25,12 +45,21 @@ $(TEST): tests/test_ann.c $(LIB_OBJ)
 test: $(TEST)
 	./$(TEST)
 
-.PHONY: clean mrproper test
+gui: $(GUI)
+
+$(GUI): gui/bridge.c $(LIB_SRC) main.h
+	$(CC) $(CFLAGS) -o $@ gui/bridge.c $(LIB_SRC) $(LDFLAGS)
+
+run-gui: gui
+	python3 gui/server.py
+
+.PHONY: clean mrproper test gui run-gui all
 
 clean:
-	rm -rf *.o
+	rm -rf $(OBJDIR)
 
 mrproper: clean
 	rm -rf $(EXEC)
 	rm -rf $(TEST)
+	rm -rf $(GUI)
 	rm -rf *~

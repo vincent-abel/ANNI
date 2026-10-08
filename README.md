@@ -38,6 +38,12 @@ Training and Transformer components are not implemented yet.
 
 ### Neural Network
 
+- [x] Neurons
+- [x] Layers
+- [x] Inputs and weights
+- [x] Biases
+- [x] Connections
+- [x] Activation functions
 - [x] Stabilize current architecture
 - [x] Forward propagation
 - [x] Loss functions

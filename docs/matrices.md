@@ -28,7 +28,7 @@ Index in memory: `data[i * cols + j]` is \(A_{ij}\).
 
 ## How it shows up in this repo
 
-- [`mat.h`](../mat.h) / [`mat.c`](../mat.c) define `mat` as `{ data, rows, cols }`.
+- [`mat.h`](../num/mat.h) / [`mat.c`](../num/mat.c) define `mat` as `{ data, rows, cols }`.
 - `mat_get` / `mat_set` / `mat_fill` access the grid; `mat_vec_mul` computes \(\mathbf{y} = A\mathbf{x}\).
 - `mat_mul` / `mat_mul_naive` compute \(C = AB\) (same algorithm for now; a later commit blocks/tiles it).
 

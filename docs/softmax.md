@@ -20,7 +20,7 @@ The \(\max\) shift cancels in the ratio but prevents overflow.
 
 ## How it shows up in this repo
 
-- [`ops.h`](../ops.h) / [`ops.c`](../ops.c): `vec_softmax(out, in)` writes probabilities into `out` (same length as `in`).
+- [`ops.h`](../num/ops.h) / [`ops.c`](../num/ops.c): `vec_softmax(out, in)` writes probabilities into `out` (same length as `in`).
 - Used as a building block for cross-entropy and later language-model heads.
 
 ## Tiny example
