@@ -80,6 +80,7 @@
 - [Attention backward on GPU](gpu-attention-backward.md)
 - [FFN + LayerNorm backward](gpu-ffn-layernorm-backward.md)
 - [LM head + cross-entropy backward](gpu-head-cross-entropy.md)
+- [Adam step on GPU](gpu-adam.md)
 
 ---
 
@@ -297,3 +298,6 @@ FFN backward is GEMM-shaped with a ReLU mask. LayerNorm tries a CUDA row kernel 
 
 ### [LM head + cross-entropy backward](gpu-head-cross-entropy.md)
 CE delta updates dw_head via mat_outer_add so CUDA outer_add can run. dhidden accumulates W times delta on the host for the toy vocab.
+
+### [Adam step on GPU](gpu-adam.md)
+lm_adam_step packs flat param/grad/m/v buffers and tries gpu_adam_step. CUDA Adam updates moments and weights then zeros grads; stubs keep the host loop.

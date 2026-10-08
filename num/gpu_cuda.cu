@@ -2,6 +2,7 @@
 **	Optional CUDA backend (build with: make cuda)
 */
 #include <cuda_runtime.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -443,6 +444,79 @@ fail:
 	gpu_free(d_inv);
 	gpu_free(d_dg);
 	gpu_free(d_db);
+	return -1;
+}
+
+__global__ static void adam_kernel(double *param, double *grad, double *m,
+	double *v, int n, double lr, double beta1, double beta2, double eps,
+	double bc1, double bc2)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	double g;
+	double mhat;
+	double vhat;
+
+	if (i >= n)
+		return;
+	g = grad[i];
+	m[i] = beta1 * m[i] + (1.0 - beta1) * g;
+	v[i] = beta2 * v[i] + (1.0 - beta2) * g * g;
+	mhat = m[i] / bc1;
+	vhat = v[i] / bc2;
+	param[i] -= lr * mhat / (sqrt(vhat) + eps);
+	grad[i] = 0.0;
+}
+
+extern "C" int gpu_adam_step(double *param, double *grad, double *m, double *v,
+	int n, double lr, double beta1, double beta2, double eps, int t)
+{
+	double *d_p;
+	double *d_g;
+	double *d_m;
+	double *d_v;
+	size_t nbytes;
+	double bc1;
+	double bc2;
+
+	if (!param || !grad || !m || !v || n <= 0 || lr <= 0.0 || t < 1)
+		return -1;
+	if (!gpu_available())
+		return -1;
+	nbytes = (size_t)n * sizeof(double);
+	d_p = d_g = d_m = d_v = NULL;
+	bc1 = 1.0 - pow(beta1, (double)t);
+	bc2 = 1.0 - pow(beta2, (double)t);
+	if (bc1 <= 0.0 || bc2 <= 0.0)
+		return -1;
+	if (!(d_p = (double *)gpu_malloc(nbytes))
+	    || !(d_g = (double *)gpu_malloc(nbytes))
+	    || !(d_m = (double *)gpu_malloc(nbytes))
+	    || !(d_v = (double *)gpu_malloc(nbytes)))
+		goto fail;
+	if (gpu_memcpy_h2d(d_p, param, nbytes) != 0
+	    || gpu_memcpy_h2d(d_g, grad, nbytes) != 0
+	    || gpu_memcpy_h2d(d_m, m, nbytes) != 0
+	    || gpu_memcpy_h2d(d_v, v, nbytes) != 0)
+		goto fail;
+	adam_kernel<<<(n + 255) / 256, 256>>>(d_p, d_g, d_m, d_v, n, lr, beta1,
+	    beta2, eps, bc1, bc2);
+	if (cudaDeviceSynchronize() != cudaSuccess)
+		goto fail;
+	if (gpu_memcpy_d2h(param, d_p, nbytes) != 0
+	    || gpu_memcpy_d2h(grad, d_g, nbytes) != 0
+	    || gpu_memcpy_d2h(m, d_m, nbytes) != 0
+	    || gpu_memcpy_d2h(v, d_v, nbytes) != 0)
+		goto fail;
+	gpu_free(d_p);
+	gpu_free(d_g);
+	gpu_free(d_m);
+	gpu_free(d_v);
+	return 0;
+fail:
+	gpu_free(d_p);
+	gpu_free(d_g);
+	gpu_free(d_m);
+	gpu_free(d_v);
 	return -1;
 }
 

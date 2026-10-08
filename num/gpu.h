@@ -31,5 +31,11 @@ int	gpu_mat_outer_add(mat *dw, const mat *a, const mat *b);
 int	gpu_layernorm_backward(mat *dx, const mat *dy, const double *gamma,
 		const double *x_hat, const double *inv_std, int T, int d,
 		double *dgamma, double *dbeta);
+/*
+** Flat Adam step on device buffers (param/grad/m/v length n).
+** Updates param/m/v in place; zeros grad. Returns 0 on success, -1 = CPU.
+*/
+int	gpu_adam_step(double *param, double *grad, double *m, double *v, int n,
+		double lr, double beta1, double beta2, double eps, int t);
 
 #endif

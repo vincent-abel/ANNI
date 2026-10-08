@@ -3,6 +3,7 @@
 */
 #include <math.h>
 #include <stdlib.h>
+#include "gpu.h"
 #include "lm_adam.h"
 
 static void add_mat(lm_adam_slot *slots, int *i, mat *w, mat *dw)
@@ -112,6 +113,53 @@ void lm_adam_zero_grad(lm *model)
 	lm_zero_grad(model);
 }
 
+static int adam_step_gpu(lm_adam *opt, double lr)
+{
+	double *param;
+	double *grad;
+	double *m;
+	double *v;
+	int i;
+	int n;
+	size_t nbytes;
+	int rc;
+
+	n = opt->n;
+	nbytes = (size_t)n * sizeof(double);
+	param = malloc(nbytes);
+	grad = malloc(nbytes);
+	m = malloc(nbytes);
+	v = malloc(nbytes);
+	if (!param || !grad || !m || !v) {
+		free(param);
+		free(grad);
+		free(m);
+		free(v);
+		return -1;
+	}
+	for (i = 0; i < n; i++) {
+		param[i] = *opt->slots[i].param;
+		grad[i] = *opt->slots[i].grad;
+		m[i] = opt->slots[i].m;
+		v[i] = opt->slots[i].v;
+	}
+	rc = gpu_adam_step(param, grad, m, v, n, lr, opt->beta1, opt->beta2,
+	    opt->eps, opt->t);
+	if (rc == 0) {
+		for (i = 0; i < n; i++) {
+			*opt->slots[i].param = param[i];
+			*opt->slots[i].grad = 0.0;
+			opt->slots[i].m = m[i];
+			opt->slots[i].v = v[i];
+		}
+	}
+	free(param);
+	free(grad);
+	free(m);
+	free(v);
+	return rc;
+}
+
 void lm_adam_step(lm_adam *opt, double lr)
 {
 	int i;
@@ -124,6 +172,8 @@ void lm_adam_step(lm_adam *opt, double lr)
 	if (!opt || lr <= 0.0)
 		return;
 	opt->t++;
+	if (gpu_available() && adam_step_gpu(opt, lr) == 0)
+		return;
 	bc1 = 1.0 - pow(opt->beta1, (double)opt->t);
 	bc2 = 1.0 - pow(opt->beta2, (double)opt->t);
 	for (i = 0; i < opt->n; i++) {

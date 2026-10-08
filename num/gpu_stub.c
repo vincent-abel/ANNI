@@ -107,3 +107,19 @@ int gpu_layernorm_backward(mat *dx, const mat *dy, const double *gamma,
 	(void)dbeta;
 	return -1;
 }
+
+int gpu_adam_step(double *param, double *grad, double *m, double *v, int n,
+	double lr, double beta1, double beta2, double eps, int t)
+{
+	(void)param;
+	(void)grad;
+	(void)m;
+	(void)v;
+	(void)n;
+	(void)lr;
+	(void)beta1;
+	(void)beta2;
+	(void)eps;
+	(void)t;
+	return -1;
+}
