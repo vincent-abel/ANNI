@@ -299,6 +299,16 @@ double lm_nll(const lm *model, const int *ids, int n)
 	return loss / (double)count;
 }
 
+double lm_perplexity(const lm *model, const int *ids, int n)
+{
+	double nll;
+
+	nll = lm_nll(model, ids, n);
+	if (nll < 0.0)
+		return -1.0;
+	return exp(nll);
+}
+
 double lm_train_steps(lm *model, const char *text, int steps, double lr)
 {
 	int ids[LM_MAX_CTX];

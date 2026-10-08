@@ -37,6 +37,7 @@ int	lm_loss_backward(lm *model, const lm_cache *c, const int *ids, int n,
 		mat *dhidden);
 int	lm_backward(lm *model, const mat *dhidden, const lm_cache *c);
 double	lm_nll(const lm *model, const int *ids, int n);
+double	lm_perplexity(const lm *model, const int *ids, int n);
 double	lm_train_steps(lm *model, const char *text, int steps, double lr);
 
 lm_cache	*lm_cache_create(int n);

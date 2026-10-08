@@ -29,6 +29,8 @@
 #include "lm.h"
 #include "lm_adam.h"
 #include "dataset_text.h"
+#include "lm_serialize.h"
+#include "lm_train.h"
 #include "generate.h"
 
 #endif
