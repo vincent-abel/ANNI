@@ -8,15 +8,22 @@
 
 typedef struct	nlayer {
 	struct	neuron *neuron;
-	struct	nlayer *prev;
+	struct	nlayer *next;
 } nlayer;
 
-typedef	struct	brain {
-	void**	neuron_layer;
-} brain;
+typedef struct	network {
+	double	*inputs;
+	int	n_inputs;
+	nlayer	*layers;
+} network;
 
-void 	nlayer_show(nlayer *nlayer);
-void	nlayer_setInput(nlayer *);
-void nlayer_push(nlayer **p);
+void	nlayer_show(nlayer *);
+void	nlayer_append(nlayer **, nlayer **, neuron *);
+void	nlayer_clear(nlayer **);
+void	nlayer_forward(nlayer *);
+network	*network_create(int n_inputs, int n_neurons, int n_layers);
+void	network_forward(network *);
+void	network_show(network *);
+void	network_free(network **);
 
-#endif 
+#endif

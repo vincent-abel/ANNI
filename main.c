@@ -1,54 +1,31 @@
 #include "main.h"
 
-
-
 int main(int argc, char *argv[])
 {
-	setbuf(stdout, NULL);
-	srand(time(NULL));
-	
-	if (argc<=2) {
-		printf("Usage : ./ann numberofinput numberofneuron numberoflayer \n");
-	}
-	else {
-		input *in = 0;	
-		neuron *ne = 0;
-		nlayer *nlayer = 0;
-		int tmp=atoi(argv[1]);	
-		int ineuron,neuron=atoi(argv[2]);
-		int layer=atoi(argv[3]);
+	network *net;
+	int n_inputs;
+	int n_neurons;
+	int n_layers;
 
-		printf("%i\n",layer);
-		int init=input_init(&in,tmp);
-		while(layer--){
-						printf("Layer : %i\n",layer);
-			ne=0;
+	setvbuf(stdout, NULL, _IONBF, 0);
+	srand((unsigned int)time(NULL));
 
-			ineuron=neuron;
-
-			while (ineuron--){
-
-				neuron_push(&ne);
-				if (init)
-				{
-					ne->input = in;
-					init=0;
-				}
-			}
-
-			nlayer_setInput(nlayer);
-			neuron_Tinput(ne);
-			neuron_output(ne);
-			nlayer_push(&nlayer);
-			nlayer->neuron=ne;
-			neuron_show(nlayer->neuron);
-
-		}
-
-// Test 3
-//		nlayer_show(nlayer);
-//		neuron_show(ne);
+	if (argc < 4) {
+		printf("Usage: ./ann <inputs> <neurons-per-layer> <layers>\n");
+		return 1;
 	}
 
-	return (1);
+	n_inputs = atoi(argv[1]);
+	n_neurons = atoi(argv[2]);
+	n_layers = atoi(argv[3]);
+	if (n_inputs <= 0 || n_neurons <= 0 || n_layers <= 0) {
+		printf("All sizes must be positive integers.\n");
+		return 1;
+	}
+
+	net = network_create(n_inputs, n_neurons, n_layers);
+	network_forward(net);
+	network_show(net);
+	network_free(&net);
+	return 0;
 }

@@ -1,52 +1,170 @@
-/* 
-**  Layer Code 
+/*
+**	Layer Code
 */
 #include "main.h"
 
-void nlayer_push(nlayer **p)
+static neuron *layer_neurons_create(int count, double *values, int n_values, neuron *prev_neurons)
 {
-        nlayer *new_input = malloc(sizeof(nlayer));
-        if (!new_input) exit(EXIT_FAILURE);     /* in case of allocation failure */
-        new_input->neuron = 0;
-        new_input->prev = *p;
-        *p = new_input;       /* the pointer is on the last element of the pile. */
+	neuron *head = NULL;
+
+	while (count--) {
+		neuron_push(&head);
+		if (prev_neurons)
+			neuron_connect_layer(head, prev_neurons);
+		else
+			neuron_connect_values(head, values, n_values);
+	}
+	return head;
 }
 
-/* Don't bother what the ouput is we are just linking the input to the prev output by memory address (optimization RULEZ)
-*/
-void nlayer_setInput(nlayer *nlayer)
+void nlayer_append(nlayer **head, nlayer **tail, neuron *neurons)
 {
-	while (nlayer)
-	{
-		neuron *n=nlayer->neuron;
-		neuron_p *np=(neuron_p *)nlayer->neuron;
-		np=np->prev;
-		while (n)
-		{
-			nxtinput *i=np->input;
-			while (i->prev)
-			{
-				i->i= &n->output;
-				i=i->prev;
-			}
-			n=n->prev;
-		}
-		nlayer=nlayer->prev;
+	nlayer *layer = malloc(sizeof(nlayer));
+
+	if (!layer)
+		exit(EXIT_FAILURE);
+	layer->neuron = neurons;
+	layer->next = NULL;
+	if (!*head)
+		*head = layer;
+	else
+		(*tail)->next = layer;
+	*tail = layer;
+}
+
+void nlayer_clear(nlayer **head)
+{
+	nlayer *tmp;
+
+	while (*head) {
+		neuron_clear(&(*head)->neuron);
+		tmp = (*head)->next;
+		free(*head);
+		*head = tmp;
 	}
 }
 
-void nlayer_show(nlayer *nlayer)
+void nlayer_forward(nlayer *layer)
 {
-	int i=0;
-		
-	while(nlayer)
-	{
+	while (layer) {
+		neuron_output(layer->neuron);
+		layer = layer->next;
+	}
+}
+
+static int count_neurons(neuron *n)
+{
+	int c = 0;
+
+	while (n) {
+		c++;
+		n = n->prev;
+	}
+	return c;
+}
+
+static int count_layers(nlayer *layer)
+{
+	int c = 0;
+
+	while (layer) {
+		c++;
+		layer = layer->next;
+	}
+	return c;
+}
+
+void nlayer_show(nlayer *layer)
+{
+	int i = 0;
+	int n_layers = count_layers(layer);
+
+	while (layer) {
+		const char *role;
+
 		i++;
-		//input_show(p->input);
-		printf("\n///////////////Present Layer %i :\n",i);
-		fflush(stdout);
-        neuron_show(nlayer->neuron);
-        printf("\nEnd of Layer %i /////////////////\n",i);
-		nlayer = nlayer->prev;
+		if (n_layers == 1)
+			role = "input/output";
+		else if (i == 1)
+			role = "input";
+		else if (!layer->next)
+			role = "output";
+		else
+			role = "hidden";
+
+		printf("\nLayer %d / %d  (%s, %d neurons)\n\n",
+			i, n_layers, role, count_neurons(layer->neuron));
+		neuron_show(layer->neuron);
+		layer = layer->next;
 	}
+}
+
+void network_show(network *net)
+{
+	int i;
+	int n_layers;
+	int n_neurons;
+
+	if (!net || !net->layers)
+		return;
+
+	n_layers = count_layers(net->layers);
+	n_neurons = count_neurons(net->layers->neuron);
+
+	puts("");
+	printf("ANN  inputs=%d  neurons=%d  layers=%d\n",
+		net->n_inputs, n_neurons, n_layers);
+	printf("sample");
+	for (i = 0; i < net->n_inputs; i++)
+		printf("  %10.4f", net->inputs[i]);
+	puts("");
+	nlayer_show(net->layers);
+	puts("");
+}
+
+network *network_create(int n_inputs, int n_neurons, int n_layers)
+{
+	network *net;
+	nlayer *tail = NULL;
+	neuron *prev = NULL;
+	int i;
+
+	net = malloc(sizeof(network));
+	if (!net)
+		exit(EXIT_FAILURE);
+	net->n_inputs = n_inputs;
+	net->inputs = malloc((size_t)n_inputs * sizeof(double));
+	if (!net->inputs)
+		exit(EXIT_FAILURE);
+	net->layers = NULL;
+
+	for (i = 0; i < n_inputs; i++)
+		net->inputs[i] = randfrom(0, 1);
+
+	for (i = 0; i < n_layers; i++) {
+		neuron *neurons = layer_neurons_create(
+			n_neurons,
+			net->inputs,
+			n_inputs,
+			prev);
+		nlayer_append(&net->layers, &tail, neurons);
+		prev = neurons;
+	}
+	return net;
+}
+
+void network_forward(network *net)
+{
+	if (net)
+		nlayer_forward(net->layers);
+}
+
+void network_free(network **net)
+{
+	if (!net || !*net)
+		return;
+	nlayer_clear(&(*net)->layers);
+	free((*net)->inputs);
+	free(*net);
+	*net = NULL;
 }

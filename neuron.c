@@ -2,124 +2,181 @@
 **	Neuron Code
 */
 #include "main.h"
+
 #define RESPONSE 0.5
 
-double randfrom(double min, double max) 
+double randfrom(double min, double max)
 {
-    double range = (max - min); 
-    double div = RAND_MAX / range;
-    return min + (rand() / div);
+	double range = (max - min);
+	double div = RAND_MAX / range;
+	return min + (rand() / div);
 }
 
-int input_init(input **input,int size)
+void input_push(input **p, double *in, double weigh)
 {
-	while (size--)
-	{
-		input_push(input,randfrom(0,1),randfrom(-2,2));
-	}
-	return 1;
+	input *new_input = malloc(sizeof(input));
+	if (!new_input)
+		exit(EXIT_FAILURE);
+	new_input->i = in;
+	new_input->w = weigh;
+	new_input->prev = *p;
+	*p = new_input;
 }
 
-void input_push(input **p, double in, double weigh)
-{
-        input *new_input = malloc(sizeof(input));
-        if (!new_input) exit(EXIT_FAILURE);     /* in case of allocation failure */
-        new_input->i = in;
-		new_input->w = weigh;
-        new_input->prev = *p;
-        *p = new_input;       /* the pointer is on the last element of the pile. */
-}
 void neuron_push(neuron **p)
 {
-        neuron *new_input = malloc(sizeof(neuron));
-        if (!new_input) exit(EXIT_FAILURE);     /* in case of allocation failure */
-        new_input->Tinput = 0;
-	new_input->output = 0;
-	new_input->bias	= randfrom(-0.5,0.5);
-        new_input->prev = *p;
-        *p = new_input;       /* the pointer is on the last element of the pile. */
+	neuron *n = malloc(sizeof(neuron));
+	if (!n)
+		exit(EXIT_FAILURE);
+	n->Tinput = 0;
+	n->output = 0;
+	n->bias = randfrom(-0.5, 0.5);
+	n->input = NULL;
+	n->prev = *p;
+	*p = n;
+}
+
+void neuron_clear(neuron **p)
+{
+	neuron *tmp;
+
+	while (*p) {
+		input_clear(&(*p)->input);
+		tmp = (*p)->prev;
+		free(*p);
+		*p = tmp;
+	}
+}
+
+void neuron_connect_values(neuron *n, double *values, int count)
+{
+	int i;
+
+	for (i = 0; i < count; i++)
+		input_push(&n->input, &values[i], randfrom(-2, 2));
+}
+
+void neuron_connect_layer(neuron *n, neuron *src)
+{
+	while (src) {
+		input_push(&n->input, &src->output, randfrom(-2, 2));
+		src = src->prev;
+	}
+}
+
+static void neuron_table_sep(void)
+{
+	puts("+--------+------------+------------+------------+");
+}
+
+static void conn_table_sep(void)
+{
+	puts("+--------+--------+------------+------------+");
+}
+
+static void conn_table_rows(int neuron_i, input *p, int *src)
+{
+	if (!p)
+		return;
+	conn_table_rows(neuron_i, p->prev, src);
+	printf("| %6d | %6d | %10.4f | %10.4f |\n",
+		neuron_i, *src, *(p->i), p->w);
+	(*src)++;
 }
 
 void neuron_show(neuron *p)
 {
-	int i=0;
-	while(p)
-	{
-		printf("Neuron %i :\n",i++);
-		input_show(p->input);
-		printf(" Input : %lf | Bias : %lf| Output Σ : %lf |\n",p->Tinput,p->bias,p->output);
-		p = p->prev;
-	}
-}
+	neuron *n;
+	int i;
 
-void nxtinput_push(nxtinput **p, double *input, double weigh)
-{
-        nxtinput *new_input = malloc(sizeof(nxtinput));
-        if (!new_input) exit(EXIT_FAILURE);     /* in case of allocation failure */
-        new_input->i = input;
-		new_input->w = weigh;
-        new_input->prev = *p;
-        *p = new_input;       /* the pointer is on the last element of the pile. */
+	neuron_table_sep();
+	puts("| Neuron |      Input |       Bias |   Output \xCE\xA3 |");
+	neuron_table_sep();
+	n = p;
+	i = 0;
+	while (n) {
+		printf("| %6d | %10.4f | %10.4f | %10.4f |\n",
+			i++, n->Tinput, n->bias, n->output);
+		n = n->prev;
+	}
+	neuron_table_sep();
+
+	puts("");
+	conn_table_sep();
+	puts("| Neuron |     in |      input |      weigh |");
+	conn_table_sep();
+	n = p;
+	i = 0;
+	while (n) {
+		int src = 0;
+
+		conn_table_rows(i++, n->input, &src);
+		n = n->prev;
+	}
+	conn_table_sep();
 }
 
 int input_delete(input **p)
 {
-        input *tmp;
-        if (!*p) return -1;     /* Return -1 in empty pile */
-        tmp = (*p)->prev;
-        free(*p);
-        *p = tmp; 
-	return 0;      /* the pointer is on the last element of the pile. */
+	input *tmp;
+
+	if (!*p)
+		return -1;
+	tmp = (*p)->prev;
+	free(*p);
+	*p = tmp;
+	return 0;
 }
 
 int input_size(input *p)
 {
-        int n = 0;
-        while (p) {
-              n++;
-              p = p->prev;
-          }
-        return n;
+	int n = 0;
+
+	while (p) {
+		n++;
+		p = p->prev;
+	}
+	return n;
 }
 
 void input_clear(input **p)
 {
-        input *tmp;
-        while (*p) {
-             tmp = (*p)->prev;
-             free(*p);
-             *p = tmp;
-          }
+	input *tmp;
+
+	while (*p) {
+		tmp = (*p)->prev;
+		free(*p);
+		*p = tmp;
+	}
 }
 
 void input_show(input *p)
 {
+	int src = 0;
 
-        while(p)
-          {
-             printf("input : %lf | weigh : %lf |\n",p->i,p->w);
-             p = p->prev;
-          }
-}
-
-void neuron_output(neuron *n) // Sigmoid for the time being
-{
-	while (n)
-	{
-		n->output=( 1 / ( 1 + exp(-neuron_Tinput(n) / RESPONSE)));
-		n = n->prev;
-	}
+	conn_table_sep();
+	puts("| Neuron |     in |      input |      weigh |");
+	conn_table_sep();
+	conn_table_rows(0, p, &src);
+	conn_table_sep();
 }
 
 double neuron_Tinput(neuron *n)
 {
-	input *i=n->input;
-	n->Tinput=0;
-	
-	while (i)
-	{
-		n->Tinput += i->i * i->w + n->bias;
+	input *i = n->input;
+
+	n->Tinput = n->bias;
+	while (i) {
+		n->Tinput += *(i->i) * i->w;
 		i = i->prev;
 	}
 	return n->Tinput;
+}
+
+void neuron_output(neuron *n)
+{
+	while (n) {
+		n->output = 1.0 / (1.0 + exp(-neuron_Tinput(n) / RESPONSE));
+		n = n->prev;
+	}
 }
