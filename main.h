@@ -20,5 +20,6 @@
 #include "tokenize.h"
 #include "vocab.h"
 #include "embed.h"
+#include "posenc.h"
 
 #endif

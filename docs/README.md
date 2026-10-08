@@ -36,6 +36,7 @@
 - [Tokenizer](tokenizer.md)
 - [Vocabulary](vocabulary.md)
 - [Token embeddings](token-embeddings.md)
+- [Positional encoding](positional-encoding.md)
 
 ---
 
@@ -142,3 +143,6 @@ A vocabulary names every id the model can emit, including pad/bos/eos/unk. Byte 
 
 ### [Token embeddings](token-embeddings.md)
 Token embeddings store a learned vector per vocab id in a V×d table. Looking up a sequence of ids stacks those rows into a T×d matrix. That matrix is the model's continuous view of the text.
+
+### [Positional encoding](positional-encoding.md)
+Sinusoidal positional encoding adds a fixed pattern so order matters. Even dimensions get sine, odd get cosine, with wavelengths growing across channels. The values are added onto the token embedding matrix in place.

@@ -380,6 +380,21 @@ static void test_tokenize_roundtrip(void)
 	assert(strcmp(out, text) == 0);
 }
 
+
+static void test_posenc_changes(void)
+{
+	mat *m;
+	double before;
+
+	m = mat_create(2, LM_D_MODEL);
+	assert(m);
+	mat_fill(m, 0.0);
+	posenc_sinusoidal_add(m);
+	before = mat_get(m, 1, 0);
+	assert(fabs(before) > 0.0 || fabs(mat_get(m, 1, 1)) > 0.0);
+	mat_free(&m);
+}
+
 static void test_embed_lookup(void)
 {
 	embed *e;
@@ -431,6 +446,7 @@ int main(void)
 	test_tokenize_roundtrip();
 	test_vocab_byte();
 	test_embed_lookup();
+	test_posenc_changes();
 	puts("ok");
 	return 0;
 }

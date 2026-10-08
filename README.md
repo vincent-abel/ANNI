@@ -34,6 +34,7 @@ Current implementation:
 - Tokenizer
 - Vocabulary
 - Token embeddings
+- Positional encoding
 
 Training and Transformer components are not implemented yet.
 
@@ -74,7 +75,7 @@ Training and Transformer components are not implemented yet.
 - [x] Tokenizer
 - [x] Vocabulary
 - [x] Token embeddings
-- [ ] Positional encoding
+- [x] Positional encoding
 - [ ] Query / Key / Value
 - [ ] Self-attention
 - [ ] Multi-head attention
