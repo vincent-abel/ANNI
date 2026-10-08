@@ -819,6 +819,36 @@ static void test_lm_generate_smoke(void)
 	lm_free(&model);
 }
 
+static void test_qmat_roundtrip(void)
+{
+	mat *m;
+	qmat *q;
+	vec *y;
+	double x[2];
+	double ref0;
+	double ref1;
+
+	m = mat_create(2, 2);
+	assert(m);
+	mat_set(m, 0, 0, 1.0);
+	mat_set(m, 0, 1, -2.0);
+	mat_set(m, 1, 0, 0.5);
+	mat_set(m, 1, 1, 0.25);
+	q = qmat_from_mat(m);
+	y = vec_create(2);
+	assert(q && y);
+	x[0] = 1.0;
+	x[1] = 2.0;
+	ref0 = 1.0 * 1.0 + 2.0 * 0.5;
+	ref1 = 1.0 * -2.0 + 2.0 * 0.25;
+	assert(qmat_gemv_t(y, q, x) == 0);
+	assert(fabs(y->data[0] - ref0) < 0.05);
+	assert(fabs(y->data[1] - ref1) < 0.05);
+	qmat_free(&q);
+	vec_free(&y);
+	mat_free(&m);
+}
+
 static void test_ann_dot_simd(void)
 {
 	double a[4] = {1.0, 2.0, 3.0, 4.0};
@@ -948,6 +978,7 @@ int main(void)
 	test_lm_cache_reuse();
 	test_mat_mul_bt_known();
 	test_ann_dot_simd();
+	test_qmat_roundtrip();
 	puts("ok");
 	return 0;
 }

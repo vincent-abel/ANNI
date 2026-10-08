@@ -7,6 +7,7 @@
 #include "block.h"
 #include "embed.h"
 #include "mat.h"
+#include "quant.h"
 #include "vocab.h"
 
 typedef struct	lm {
@@ -17,6 +18,7 @@ typedef struct	lm {
 	vec		*b_head;
 	mat		*dw_head;
 	vec		*db_head;
+	qmat		*w_head_q;	/* optional int8 head for inference */
 	int		vocab_size;
 } lm;
 
@@ -33,6 +35,7 @@ void	lm_zero_grad(lm *model);
 int	lm_forward(mat *hidden, const lm *model, const int *ids, int n);
 int	lm_forward_cache(lm *model, const int *ids, int n, lm_cache *c);
 int	lm_logits_at(vec *logits, const lm *model, const mat *hidden, int t);
+int	lm_quantize_head(lm *model);
 int	lm_loss_backward(lm *model, const lm_cache *c, const int *ids, int n,
 		mat *dhidden);
 int	lm_backward(lm *model, const mat *dhidden, const lm_cache *c);

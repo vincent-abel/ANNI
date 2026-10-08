@@ -69,6 +69,7 @@
 - [SIMD](simd.md)
 - [Multithreading](multithreading.md)
 - [AVX2 / AVX-512](avx2-avx-512.md)
+- [Quantization](quantization.md)
 
 ---
 
@@ -260,3 +261,6 @@ OpenMP splits mat_mul tiles and attention heads across cores. Each head keeps pr
 
 ### [AVX2 / AVX-512](avx2-avx-512.md)
 ann_dot picks AVX-512, AVX2, or scalar at compile time. Pass ARCH=-mavx2 when the CPU supports it. ann_simd_backend reports which path linked.
+
+### [Quantization](quantization.md)
+Int8 qmat stores weights with one scale for cheaper inference GEMVs. lm_quantize_head packs the LM head; lm_logits_at uses it when present. Training remains full precision.

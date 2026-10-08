@@ -35,5 +35,6 @@
 #include "generate.h"
 #include "arena.h"
 #include "simd.h"
+#include "quant.h"
 
 #endif

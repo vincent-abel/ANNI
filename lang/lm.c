@@ -61,6 +61,7 @@ lm *lm_create(void)
 	model->b_head = vec_create(model->vocab_size);
 	model->dw_head = mat_create(LM_D_MODEL, model->vocab_size);
 	model->db_head = vec_create(model->vocab_size);
+	model->w_head_q = NULL;
 	if (!model->embed || !model->tr || !model->w_head || !model->b_head
 	    || !model->dw_head || !model->db_head) {
 		lm_free(&model);
@@ -85,8 +86,18 @@ void lm_free(lm **model)
 	vec_free(&(*model)->b_head);
 	mat_free(&(*model)->dw_head);
 	vec_free(&(*model)->db_head);
+	qmat_free(&(*model)->w_head_q);
 	free(*model);
 	*model = NULL;
+}
+
+int lm_quantize_head(lm *model)
+{
+	if (!model || !model->w_head)
+		return -1;
+	qmat_free(&model->w_head_q);
+	model->w_head_q = qmat_from_mat(model->w_head);
+	return model->w_head_q ? 0 : -1;
 }
 
 void lm_zero_grad(lm *model)
@@ -175,6 +186,7 @@ int lm_logits_at(vec *logits, const lm *model, const mat *hidden, int t)
 	mat hrow;
 	mat lrow;
 	int v;
+	const double *h;
 
 	if (!logits || !model || !hidden || !logits->data || !hidden->data)
 		return -1;
@@ -182,14 +194,20 @@ int lm_logits_at(vec *logits, const lm *model, const mat *hidden, int t)
 		return -1;
 	if (logits->n != model->vocab_size)
 		return -1;
-	hrow.data = &hidden->data[t * hidden->cols];
-	hrow.rows = 1;
-	hrow.cols = LM_D_MODEL;
-	lrow.data = logits->data;
-	lrow.rows = 1;
-	lrow.cols = model->vocab_size;
-	if (mat_mul(&lrow, &hrow, model->w_head) != 0)
-		return -1;
+	h = &hidden->data[t * hidden->cols];
+	if (model->w_head_q) {
+		if (qmat_gemv_t(logits, model->w_head_q, h) != 0)
+			return -1;
+	} else {
+		hrow.data = (double *)h;
+		hrow.rows = 1;
+		hrow.cols = LM_D_MODEL;
+		lrow.data = logits->data;
+		lrow.rows = 1;
+		lrow.cols = model->vocab_size;
+		if (mat_mul(&lrow, &hrow, model->w_head) != 0)
+			return -1;
+	}
 	for (v = 0; v < model->vocab_size; v++)
 		logits->data[v] += model->b_head->data[v];
 	return 0;
