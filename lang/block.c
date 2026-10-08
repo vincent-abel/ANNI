@@ -1,10 +1,17 @@
 /*
-**	Transformer decoder block (pre-norm causal MHA + FFN)
+**	Transformer decoder block (pre-norm causal MHA + FFN) + backward
 */
 #include <stdlib.h>
 #include <string.h>
 #include "block.h"
+#include "gradutil.h"
 #include "resid.h"
+
+static void copy_mat(mat *dst, const mat *src)
+{
+	memcpy(dst->data, src->data,
+	    (size_t)dst->rows * (size_t)dst->cols * sizeof(double));
+}
 
 tblock *tblock_create(void)
 {
@@ -36,48 +43,151 @@ void tblock_free(tblock **b)
 	*b = NULL;
 }
 
+void tblock_zero_grad(tblock *b)
+{
+	if (!b)
+		return;
+	layernorm_zero_grad(b->ln1);
+	attn_zero_grad(b->attn);
+	layernorm_zero_grad(b->ln2);
+	ffn_zero_grad(b->ffn);
+}
+
+block_cache *block_cache_create(int T, const attn *a)
+{
+	block_cache *c;
+
+	if (T <= 0 || !a)
+		return NULL;
+	c = malloc(sizeof(block_cache));
+	if (!c)
+		return NULL;
+	memset(c, 0, sizeof(*c));
+	c->T = T;
+	c->x_in = mat_create(T, LM_D_MODEL);
+	c->ln1_out = mat_create(T, LM_D_MODEL);
+	c->attn_out = mat_create(T, LM_D_MODEL);
+	c->x_mid = mat_create(T, LM_D_MODEL);
+	c->ln2_out = mat_create(T, LM_D_MODEL);
+	c->ffn_out = mat_create(T, LM_D_MODEL);
+	c->ln1c = ln_cache_create(T);
+	c->attnc = attn_cache_create(T, a->n_heads, a->d_head);
+	c->ln2c = ln_cache_create(T);
+	c->ffnc = ffn_cache_create(T);
+	if (!c->x_in || !c->ln1_out || !c->attn_out || !c->x_mid
+	    || !c->ln2_out || !c->ffn_out || !c->ln1c || !c->attnc
+	    || !c->ln2c || !c->ffnc) {
+		block_cache_free(&c);
+		return NULL;
+	}
+	return c;
+}
+
+void block_cache_free(block_cache **c)
+{
+	if (!c || !*c)
+		return;
+	mat_free(&(*c)->x_in);
+	mat_free(&(*c)->ln1_out);
+	mat_free(&(*c)->attn_out);
+	mat_free(&(*c)->x_mid);
+	mat_free(&(*c)->ln2_out);
+	mat_free(&(*c)->ffn_out);
+	ln_cache_free(&(*c)->ln1c);
+	attn_cache_free(&(*c)->attnc);
+	ln_cache_free(&(*c)->ln2c);
+	ffn_cache_free(&(*c)->ffnc);
+	free(*c);
+	*c = NULL;
+}
+
+int tblock_forward_cache(mat *x, tblock *b, block_cache *c)
+{
+	if (!x || !b || !c)
+		return -1;
+	copy_mat(c->x_in, x);
+	copy_mat(c->ln1_out, x);
+	if (layernorm_forward_cache(c->ln1_out, b->ln1, c->ln1c) != 0)
+		return -1;
+	if (attn_mha_forward_cache(c->attn_out, b->attn, c->ln1_out, 1,
+		c->attnc) != 0)
+		return -1;
+	copy_mat(c->x_mid, c->x_in);
+	if (resid_add(c->x_mid, c->attn_out) != 0)
+		return -1;
+	copy_mat(c->ln2_out, c->x_mid);
+	if (layernorm_forward_cache(c->ln2_out, b->ln2, c->ln2c) != 0)
+		return -1;
+	if (ffn_forward_cache(c->ffn_out, c->ln2_out, b->ffn, c->ffnc) != 0)
+		return -1;
+	copy_mat(x, c->x_mid);
+	if (resid_add(x, c->ffn_out) != 0)
+		return -1;
+	return 0;
+}
+
 int tblock_forward(mat *x, tblock *b)
 {
+	block_cache *c;
+	int rc;
+
+	if (!x || !b)
+		return -1;
+	c = block_cache_create(x->rows, b->attn);
+	if (!c)
+		return -1;
+	rc = tblock_forward_cache(x, b, c);
+	block_cache_free(&c);
+	return rc;
+}
+
+int tblock_backward(mat *dx, const mat *dout, tblock *b, const block_cache *c)
+{
+	mat *d_ffn_in;
+	mat *d_mid;
+	mat *d_attn_out;
+	mat *d_ln1_out;
 	mat *tmp;
-	mat *sub;
-	int T;
 
-	if (!x || !b || !x->data)
+	if (!dx || !dout || !b || !c)
 		return -1;
-	if (x->cols != LM_D_MODEL)
-		return -1;
-	T = x->rows;
-	tmp = mat_create(T, LM_D_MODEL);
-	sub = mat_create(T, LM_D_MODEL);
-	if (!tmp || !sub) {
-		mat_free(&tmp);
-		mat_free(&sub);
-		return -1;
-	}
-	if (resid_copy(tmp, x) != 0)
-		goto fail;
-	if (layernorm_forward(tmp, b->ln1) != 0)
-		goto fail;
-	if (attn_mha(sub, b->attn, tmp, 1) != 0)
-		goto fail;
-	if (resid_add(x, sub) != 0)
+
+	d_ffn_in = mat_create(c->T, LM_D_MODEL);
+	d_mid = mat_create(c->T, LM_D_MODEL);
+	d_attn_out = mat_create(c->T, LM_D_MODEL);
+	d_ln1_out = mat_create(c->T, LM_D_MODEL);
+	tmp = mat_create(c->T, LM_D_MODEL);
+	if (!d_ffn_in || !d_mid || !d_attn_out || !d_ln1_out || !tmp)
 		goto fail;
 
-	if (resid_copy(tmp, x) != 0)
+	/* y = x_mid + ffn_out; dy splits to both */
+	copy_mat(d_mid, dout);
+	if (ffn_backward(d_ffn_in, dout, b->ffn, c->ffnc) != 0)
 		goto fail;
-	if (layernorm_forward(tmp, b->ln2) != 0)
+	if (layernorm_backward(tmp, d_ffn_in, b->ln2, c->ln2c) != 0)
 		goto fail;
-	if (ffn_forward(tmp, b->ffn) != 0)
-		goto fail;
-	if (resid_add(x, tmp) != 0)
-		goto fail;
+	mat_axpy(d_mid, 1.0, tmp);
 
+	/* x_mid = x_in + attn_out */
+	copy_mat(dx, d_mid);
+	if (attn_mha_backward(d_attn_out, d_mid, b->attn, c->attnc) != 0)
+		goto fail;
+	if (layernorm_backward(tmp, d_attn_out, b->ln1, c->ln1c) != 0)
+		goto fail;
+	mat_axpy(dx, 1.0, tmp);
+
+	mat_free(&d_ffn_in);
+	mat_free(&d_mid);
+	mat_free(&d_attn_out);
+	mat_free(&d_ln1_out);
 	mat_free(&tmp);
-	mat_free(&sub);
 	return 0;
 fail:
+	mat_free(&d_ffn_in);
+	mat_free(&d_mid);
+	mat_free(&d_attn_out);
+	mat_free(&d_ln1_out);
 	mat_free(&tmp);
-	mat_free(&sub);
 	return -1;
 }
 
@@ -128,15 +238,132 @@ void transformer_free(transformer **t)
 	*t = NULL;
 }
 
-int transformer_forward(mat *x, transformer *t)
+void transformer_zero_grad(transformer *t)
 {
 	int i;
 
-	if (!x || !t || !t->blocks)
+	if (!t || !t->blocks)
+		return;
+	for (i = 0; i < t->n_blocks; i++)
+		tblock_zero_grad(&t->blocks[i]);
+}
+
+transformer_cache *transformer_cache_create(int T, const transformer *t)
+{
+	transformer_cache *c;
+	int i;
+
+	if (T <= 0 || !t)
+		return NULL;
+	c = malloc(sizeof(transformer_cache));
+	if (!c)
+		return NULL;
+	c->T = T;
+	c->n_blocks = t->n_blocks;
+	c->bc = calloc((size_t)t->n_blocks, sizeof(block_cache));
+	if (!c->bc) {
+		free(c);
+		return NULL;
+	}
+	for (i = 0; i < t->n_blocks; i++) {
+		block_cache *bc;
+
+		bc = block_cache_create(T, t->blocks[i].attn);
+		if (!bc) {
+			transformer_cache_free(&c);
+			return NULL;
+		}
+		c->bc[i] = *bc;
+		free(bc);
+	}
+	return c;
+}
+
+void transformer_cache_free(transformer_cache **c)
+{
+	int i;
+	block_cache *bc;
+
+	if (!c || !*c)
+		return;
+	if ((*c)->bc) {
+		for (i = 0; i < (*c)->n_blocks; i++) {
+			bc = &(*c)->bc[i];
+			mat_free(&bc->x_in);
+			mat_free(&bc->ln1_out);
+			mat_free(&bc->attn_out);
+			mat_free(&bc->x_mid);
+			mat_free(&bc->ln2_out);
+			mat_free(&bc->ffn_out);
+			ln_cache_free(&bc->ln1c);
+			attn_cache_free(&bc->attnc);
+			ln_cache_free(&bc->ln2c);
+			ffn_cache_free(&bc->ffnc);
+		}
+		free((*c)->bc);
+	}
+	free(*c);
+	*c = NULL;
+}
+
+int transformer_forward_cache(mat *x, transformer *t, transformer_cache *c)
+{
+	int i;
+
+	if (!x || !t || !c)
 		return -1;
 	for (i = 0; i < t->n_blocks; i++) {
-		if (tblock_forward(x, &t->blocks[i]) != 0)
+		if (tblock_forward_cache(x, &t->blocks[i], &c->bc[i]) != 0)
 			return -1;
 	}
+	return 0;
+}
+
+int transformer_forward(mat *x, transformer *t)
+{
+	transformer_cache *c;
+	int rc;
+
+	if (!x || !t)
+		return -1;
+	c = transformer_cache_create(x->rows, t);
+	if (!c)
+		return -1;
+	rc = transformer_forward_cache(x, t, c);
+	transformer_cache_free(&c);
+	return rc;
+}
+
+int transformer_backward(mat *dx, const mat *dout, transformer *t,
+	const transformer_cache *c)
+{
+	mat *cur;
+	mat *prev;
+	mat *swap;
+	int i;
+
+	if (!dx || !dout || !t || !c)
+		return -1;
+	cur = mat_create(c->T, LM_D_MODEL);
+	prev = mat_create(c->T, LM_D_MODEL);
+	if (!cur || !prev) {
+		mat_free(&cur);
+		mat_free(&prev);
+		return -1;
+	}
+	copy_mat(cur, dout);
+	for (i = t->n_blocks - 1; i >= 0; i--) {
+		if (tblock_backward(prev, cur, &t->blocks[i], &c->bc[i]) != 0) {
+			mat_free(&cur);
+			mat_free(&prev);
+			return -1;
+		}
+		swap = cur;
+		cur = prev;
+		prev = swap;
+	}
+	copy_mat(dx, cur);
+	mat_free(&cur);
+	mat_free(&prev);
 	return 0;
 }

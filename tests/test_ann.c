@@ -623,6 +623,50 @@ static void test_lm_ntp_loss_drops(void)
 }
 
 
+
+static void test_lm_backprop_head(void)
+{
+	lm *model;
+	lm_cache *cache;
+	mat *dhidden;
+	int ids[4];
+	int n;
+	double g_analytic;
+	double g_numeric;
+	double eps;
+	double loss_p;
+	double loss_m;
+	double saved;
+
+	srand(7);
+	model = lm_create();
+	assert(model);
+	n = tokenize_encode("hi", ids, LM_MAX_CTX);
+	assert(n >= 2);
+	cache = lm_cache_create(n);
+	dhidden = mat_create(n, LM_D_MODEL);
+	assert(cache && dhidden);
+	lm_zero_grad(model);
+	assert(lm_forward_cache(model, ids, n, cache) == 0);
+	assert(lm_loss_backward(model, cache, ids, n, dhidden) == 0);
+	assert(lm_backward(model, dhidden, cache) == 0);
+	g_analytic = mat_get(model->dw_head, 0, ids[1]);
+	eps = 1e-5;
+	saved = mat_get(model->w_head, 0, ids[1]);
+	mat_set(model->w_head, 0, ids[1], saved + eps);
+	loss_p = lm_nll(model, ids, n);
+	mat_set(model->w_head, 0, ids[1], saved - eps);
+	loss_m = lm_nll(model, ids, n);
+	mat_set(model->w_head, 0, ids[1], saved);
+	g_numeric = (loss_p - loss_m) / (2.0 * eps);
+	/* mean NLL vs sum of CE: scale by (n-1) for comparable grad */
+	g_numeric *= (double)(n - 1);
+	assert(fabs(g_analytic - g_numeric) < 1e-3 || fabs(g_analytic) < 1e-8);
+	lm_cache_free(&cache);
+	mat_free(&dhidden);
+	lm_free(&model);
+}
+
 static void test_lm_generate_smoke(void)
 {
 	lm *model;
@@ -670,6 +714,7 @@ int main(void)
 	test_transformer_block();
 	test_lm_ntp_loss_drops();
 	test_lm_generate_smoke();
+	test_lm_backprop_head();
 	puts("ok");
 	return 0;
 }

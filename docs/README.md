@@ -48,6 +48,10 @@
 - [Next-token prediction](next-token-prediction.md)
 - [Text generation](text-generation.md)
 
+### Language model training
+
+- [Transformer backpropagation](transformer-backpropagation.md)
+
 ---
 
 # How this neural network works
@@ -186,3 +190,8 @@ Next-token prediction trains the model to score the following id at each positio
 
 ### [Text generation](text-generation.md)
 Generation samples the next id from the final-position logits and appends it. Greedy uses argmax; temperature>0 samples the softened distribution. ./ann lm trains a phrase then prints a short continuation.
+
+# Language Model Training docs
+
+### [Transformer backpropagation](transformer-backpropagation.md)
+Manual backward walks CE through the head, blocks, and embeddings with activation caches. Grad mats sit beside every learnable weight. Finite-difference checks on the head confirm the chain rule plumbing.

@@ -1,8 +1,9 @@
 /*
-**	Layer normalization (per token row)
+**	Layer normalization (per token row) + backward
 */
 #include <math.h>
 #include <stdlib.h>
+#include "gradutil.h"
 #include "layernorm.h"
 
 layernorm *layernorm_create(void)
@@ -14,12 +15,16 @@ layernorm *layernorm_create(void)
 		return NULL;
 	ln->gamma = vec_create(LM_D_MODEL);
 	ln->beta = vec_create(LM_D_MODEL);
-	if (!ln->gamma || !ln->beta) {
+	ln->dgamma = vec_create(LM_D_MODEL);
+	ln->dbeta = vec_create(LM_D_MODEL);
+	if (!ln->gamma || !ln->beta || !ln->dgamma || !ln->dbeta) {
 		layernorm_free(&ln);
 		return NULL;
 	}
 	vec_fill(ln->gamma, 1.0);
 	vec_fill(ln->beta, 0.0);
+	vec_zero(ln->dgamma);
+	vec_zero(ln->dbeta);
 	ln->eps = 1e-5;
 	return ln;
 }
@@ -30,11 +35,67 @@ void layernorm_free(layernorm **ln)
 		return;
 	vec_free(&(*ln)->gamma);
 	vec_free(&(*ln)->beta);
+	vec_free(&(*ln)->dgamma);
+	vec_free(&(*ln)->dbeta);
 	free(*ln);
 	*ln = NULL;
 }
 
+void layernorm_zero_grad(layernorm *ln)
+{
+	if (!ln)
+		return;
+	vec_zero(ln->dgamma);
+	vec_zero(ln->dbeta);
+}
+
+ln_cache *ln_cache_create(int T)
+{
+	ln_cache *c;
+
+	if (T <= 0)
+		return NULL;
+	c = malloc(sizeof(ln_cache));
+	if (!c)
+		return NULL;
+	c->T = T;
+	c->x_hat = mat_create(T, LM_D_MODEL);
+	c->mean = vec_create(T);
+	c->inv_std = vec_create(T);
+	if (!c->x_hat || !c->mean || !c->inv_std) {
+		ln_cache_free(&c);
+		return NULL;
+	}
+	return c;
+}
+
+void ln_cache_free(ln_cache **c)
+{
+	if (!c || !*c)
+		return;
+	mat_free(&(*c)->x_hat);
+	vec_free(&(*c)->mean);
+	vec_free(&(*c)->inv_std);
+	free(*c);
+	*c = NULL;
+}
+
 int layernorm_forward(mat *x, const layernorm *ln)
+{
+	ln_cache *c;
+	int rc;
+
+	if (!x || !ln)
+		return -1;
+	c = ln_cache_create(x->rows);
+	if (!c)
+		return -1;
+	rc = layernorm_forward_cache(x, (layernorm *)ln, c);
+	ln_cache_free(&c);
+	return rc;
+}
+
+int layernorm_forward_cache(mat *x, layernorm *ln, ln_cache *c)
 {
 	int t;
 	int j;
@@ -45,11 +106,9 @@ int layernorm_forward(mat *x, const layernorm *ln)
 	double inv_std;
 	double v;
 
-	if (!x || !ln || !ln->gamma || !ln->beta || !x->data)
+	if (!x || !ln || !c || !x->data)
 		return -1;
-	if (x->cols != LM_D_MODEL)
-		return -1;
-	if (ln->gamma->n != LM_D_MODEL || ln->beta->n != LM_D_MODEL)
+	if (x->cols != LM_D_MODEL || c->T != x->rows)
 		return -1;
 
 	T = x->rows;
@@ -59,6 +118,7 @@ int layernorm_forward(mat *x, const layernorm *ln)
 		for (j = 0; j < d; j++)
 			mean += mat_get(x, t, j);
 		mean /= (double)d;
+		c->mean->data[t] = mean;
 
 		var = 0.0;
 		for (j = 0; j < d; j++) {
@@ -66,12 +126,51 @@ int layernorm_forward(mat *x, const layernorm *ln)
 			var += v * v;
 		}
 		var /= (double)d;
-
 		inv_std = 1.0 / sqrt(var + ln->eps);
+		c->inv_std->data[t] = inv_std;
+
 		for (j = 0; j < d; j++) {
 			v = (mat_get(x, t, j) - mean) * inv_std;
-			v = v * ln->gamma->data[j] + ln->beta->data[j];
-			mat_set(x, t, j, v);
+			mat_set(c->x_hat, t, j, v);
+			mat_set(x, t, j, v * ln->gamma->data[j] + ln->beta->data[j]);
+		}
+	}
+	return 0;
+}
+
+int layernorm_backward(mat *dx, const mat *dy, layernorm *ln, const ln_cache *c)
+{
+	int t;
+	int j;
+	int d;
+	double inv_std;
+	double sum_dy;
+	double sum_dy_xhat;
+	double dxhat;
+	double term;
+
+	if (!dx || !dy || !ln || !c)
+		return -1;
+	if (dx->rows != dy->rows || dx->cols != dy->cols)
+		return -1;
+	d = LM_D_MODEL;
+
+	for (t = 0; t < c->T; t++) {
+		inv_std = c->inv_std->data[t];
+		sum_dy = 0.0;
+		sum_dy_xhat = 0.0;
+		for (j = 0; j < d; j++) {
+			ln->dbeta->data[j] += mat_get(dy, t, j);
+			ln->dgamma->data[j] += mat_get(dy, t, j) * mat_get(c->x_hat, t, j);
+			dxhat = mat_get(dy, t, j) * ln->gamma->data[j];
+			sum_dy += dxhat;
+			sum_dy_xhat += dxhat * mat_get(c->x_hat, t, j);
+		}
+		for (j = 0; j < d; j++) {
+			dxhat = mat_get(dy, t, j) * ln->gamma->data[j];
+			term = (dxhat - (sum_dy + mat_get(c->x_hat, t, j) * sum_dy_xhat) / (double)d)
+			    * inv_std;
+			mat_set(dx, t, j, term);
 		}
 	}
 	return 0;
