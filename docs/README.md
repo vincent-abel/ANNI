@@ -37,6 +37,7 @@
 - [Vocabulary](vocabulary.md)
 - [Token embeddings](token-embeddings.md)
 - [Positional encoding](positional-encoding.md)
+- [Query / Key / Value](query-key-value.md)
 
 ---
 
@@ -146,3 +147,6 @@ Token embeddings store a learned vector per vocab id in a V×d table. Looking up
 
 ### [Positional encoding](positional-encoding.md)
 Sinusoidal positional encoding adds a fixed pattern so order matters. Even dimensions get sine, odd get cosine, with wavelengths growing across channels. The values are added onto the token embedding matrix in place.
+
+### [Query / Key / Value](query-key-value.md)
+Queries, keys, and values are three linear views of the same token matrix. Matching questions to labels decides whose payloads mix. This repo stores Wq/Wk/Wv and projects X into Q, K, and V.

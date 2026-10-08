@@ -21,5 +21,6 @@
 #include "vocab.h"
 #include "embed.h"
 #include "posenc.h"
+#include "attn.h"
 
 #endif

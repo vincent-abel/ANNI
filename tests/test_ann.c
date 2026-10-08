@@ -381,6 +381,28 @@ static void test_tokenize_roundtrip(void)
 }
 
 
+
+static void test_attn_qkv(void)
+{
+	attn *a;
+	mat *x;
+	mat *q;
+	mat *k;
+	mat *v;
+
+	a = attn_create();
+	assert(a);
+	x = mat_create(3, LM_D_MODEL);
+	q = mat_create(3, LM_D_MODEL);
+	k = mat_create(3, LM_D_MODEL);
+	v = mat_create(3, LM_D_MODEL);
+	assert(x && q && k && v);
+	mat_fill(x, 0.1);
+	assert(attn_qkv_project(q, k, v, a, x) == 0);
+	attn_free(&a);
+	mat_free(&x); mat_free(&q); mat_free(&k); mat_free(&v);
+}
+
 static void test_posenc_changes(void)
 {
 	mat *m;
@@ -447,6 +469,7 @@ int main(void)
 	test_vocab_byte();
 	test_embed_lookup();
 	test_posenc_changes();
+	test_attn_qkv();
 	puts("ok");
 	return 0;
 }
