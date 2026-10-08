@@ -28,10 +28,10 @@ typedef struct	attn_cache {
 	mat	*concat;
 	mat	**attn_w;	/* n_heads of T x T softmax weights */
 	mat	**v_h;		/* n_heads of T x d_head */
-	mat	*q_h;		/* reusable head scratch T x d_head */
-	mat	*k_h;
-	mat	*o_h;
-	double	*softmax_tmp;	/* length T; no per-row malloc */
+	mat	**q_h;		/* n_heads of T x d_head scratch (thread-safe) */
+	mat	**k_h;
+	mat	**o_h;
+	double	*softmax_tmp;	/* length n_heads * T */
 	int	T;
 	int	n_heads;
 	int	d_head;

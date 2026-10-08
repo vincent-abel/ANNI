@@ -67,6 +67,7 @@
 - [Contiguous memory](contiguous-memory.md)
 - [Cache-friendly data structures](cache-friendly-data-structures.md)
 - [SIMD](simd.md)
+- [Multithreading](multithreading.md)
 
 ---
 
@@ -252,3 +253,6 @@ Attention scores and outputs use mat_mul_bt and mat_mul on contiguous rows. Embe
 
 ### [SIMD](simd.md)
 ann_dot and friends use restrict on contiguous doubles so -O2 can auto-vectorize. vec_dot and vec_axpy call those kernels. Explicit AVX intrinsics come later.
+
+### [Multithreading](multithreading.md)
+OpenMP splits mat_mul tiles and attention heads across cores. Each head keeps private scratch so softmax and writes do not race. OMP_NUM_THREADS controls width.

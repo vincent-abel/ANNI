@@ -133,6 +133,9 @@ int mat_mul(mat *c, const mat *a, const mat *b)
 		return -1;
 
 	mat_fill(c, 0.0);
+#ifdef _OPENMP
+#pragma omp parallel for private(j0, k0, i, j, k, i_max, j_max, k_max, sum)
+#endif
 	for (i0 = 0; i0 < a->rows; i0 += MAT_BLOCK) {
 		i_max = i0 + MAT_BLOCK;
 		if (i_max > a->rows)

@@ -3,8 +3,9 @@ CC=gcc -g
 INCLUDES=-I. -Inet -Inum -Ilang
 # OPT=-O2 enables auto-vectorization on contiguous ann_dot / mat_mul loops.
 OPT ?= -O2
-CFLAGS=-W -Wall -ansi -pedantic -std=c99 $(OPT) $(INCLUDES)
-LDFLAGS=-lm
+OPENMP ?= -fopenmp
+CFLAGS=-W -Wall -ansi -pedantic -std=c99 $(OPT) $(OPENMP) $(INCLUDES)
+LDFLAGS=-lm $(OPENMP)
 EXEC=ann
 OBJDIR=objects
 

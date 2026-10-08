@@ -109,10 +109,10 @@ attn_cache *attn_cache_create(int T, int n_heads, int d_head)
 	c->k = mat_create(T, LM_D_MODEL);
 	c->v = mat_create(T, LM_D_MODEL);
 	c->concat = mat_create(T, LM_D_MODEL);
-	c->q_h = mat_create(T, d_head);
-	c->k_h = mat_create(T, d_head);
-	c->o_h = mat_create(T, d_head);
-	c->softmax_tmp = calloc((size_t)T, sizeof(double));
+	c->q_h = calloc((size_t)n_heads, sizeof(mat *));
+	c->k_h = calloc((size_t)n_heads, sizeof(mat *));
+	c->o_h = calloc((size_t)n_heads, sizeof(mat *));
+	c->softmax_tmp = calloc((size_t)n_heads * (size_t)T, sizeof(double));
 	c->attn_w = calloc((size_t)n_heads, sizeof(mat *));
 	c->v_h = calloc((size_t)n_heads, sizeof(mat *));
 	if (!c->x_in || !c->q || !c->k || !c->v || !c->concat
@@ -124,7 +124,11 @@ attn_cache *attn_cache_create(int T, int n_heads, int d_head)
 	for (h = 0; h < n_heads; h++) {
 		c->attn_w[h] = mat_create(T, T);
 		c->v_h[h] = mat_create(T, d_head);
-		if (!c->attn_w[h] || !c->v_h[h]) {
+		c->q_h[h] = mat_create(T, d_head);
+		c->k_h[h] = mat_create(T, d_head);
+		c->o_h[h] = mat_create(T, d_head);
+		if (!c->attn_w[h] || !c->v_h[h]
+		    || !c->q_h[h] || !c->k_h[h] || !c->o_h[h]) {
 			attn_cache_free(&c);
 			return NULL;
 		}
@@ -143,9 +147,6 @@ void attn_cache_free(attn_cache **c)
 	mat_free(&(*c)->k);
 	mat_free(&(*c)->v);
 	mat_free(&(*c)->concat);
-	mat_free(&(*c)->q_h);
-	mat_free(&(*c)->k_h);
-	mat_free(&(*c)->o_h);
 	free((*c)->softmax_tmp);
 	if ((*c)->attn_w) {
 		for (h = 0; h < (*c)->n_heads; h++)
@@ -156,6 +157,21 @@ void attn_cache_free(attn_cache **c)
 		for (h = 0; h < (*c)->n_heads; h++)
 			mat_free(&(*c)->v_h[h]);
 		free((*c)->v_h);
+	}
+	if ((*c)->q_h) {
+		for (h = 0; h < (*c)->n_heads; h++)
+			mat_free(&(*c)->q_h[h]);
+		free((*c)->q_h);
+	}
+	if ((*c)->k_h) {
+		for (h = 0; h < (*c)->n_heads; h++)
+			mat_free(&(*c)->k_h[h]);
+		free((*c)->k_h);
+	}
+	if ((*c)->o_h) {
+		for (h = 0; h < (*c)->n_heads; h++)
+			mat_free(&(*c)->o_h[h]);
+		free((*c)->o_h);
 	}
 	free(*c);
 	*c = NULL;
@@ -321,6 +337,7 @@ int attn_mha_forward_cache(mat *out, attn *a, const mat *x, int causal,
 	attn_cache *c)
 {
 	int h;
+	int fail;
 
 	if (!out || !a || !x || !c)
 		return -1;
@@ -331,15 +348,23 @@ int attn_mha_forward_cache(mat *out, attn *a, const mat *x, int causal,
 	if (attn_qkv_project(c->q, c->k, c->v, a, x) != 0)
 		return -1;
 	mat_fill(c->concat, 0.0);
+	fail = 0;
+#ifdef _OPENMP
+#pragma omp parallel for reduction(|:fail)
+#endif
 	for (h = 0; h < a->n_heads; h++) {
-		copy_head(c->q_h, c->q, h, a->d_head);
-		copy_head(c->k_h, c->k, h, a->d_head);
+		copy_head(c->q_h[h], c->q, h, a->d_head);
+		copy_head(c->k_h[h], c->k, h, a->d_head);
 		copy_head(c->v_h[h], c->v, h, a->d_head);
-		if (self_forward_cache(c->o_h, c->q_h, c->k_h, c->v_h[h], causal,
-			c->attn_w[h], c->softmax_tmp) != 0)
-			return -1;
-		write_head(c->concat, c->o_h, h, a->d_head);
+		if (self_forward_cache(c->o_h[h], c->q_h[h], c->k_h[h],
+			c->v_h[h], causal, c->attn_w[h],
+			&c->softmax_tmp[h * c->T]) != 0)
+			fail = 1;
+		else
+			write_head(c->concat, c->o_h[h], h, a->d_head);
 	}
+	if (fail)
+		return -1;
 	if (mat_mul(out, c->concat, a->wo) != 0)
 		return -1;
 	return 0;
