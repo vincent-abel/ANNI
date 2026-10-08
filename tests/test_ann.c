@@ -519,6 +519,30 @@ static void test_ffn_relu_path(void)
 }
 
 
+static void test_layernorm_zero_mean(void)
+{
+	layernorm *ln;
+	mat *x;
+	double mean;
+	int j;
+
+	ln = layernorm_create();
+	assert(ln);
+	x = mat_create(1, LM_D_MODEL);
+	assert(x);
+	for (j = 0; j < LM_D_MODEL; j++)
+		mat_set(x, 0, j, (double)j);
+	assert(layernorm_forward(x, ln) == 0);
+	mean = 0.0;
+	for (j = 0; j < LM_D_MODEL; j++)
+		mean += mat_get(x, 0, j);
+	mean /= (double)LM_D_MODEL;
+	assert(fabs(mean) < 1e-9);
+	layernorm_free(&ln);
+	mat_free(&x);
+}
+
+
 int main(void)
 {
 	test_mse_known();
@@ -543,6 +567,7 @@ int main(void)
 	test_attn_self();
 	test_attn_mha();
 	test_ffn_relu_path();
+	test_layernorm_zero_mean();
 	puts("ok");
 	return 0;
 }

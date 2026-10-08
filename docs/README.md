@@ -41,6 +41,7 @@
 - [Self-attention](self-attention.md)
 - [Multi-head attention](multi-head-attention.md)
 - [Feed-forward layers](feed-forward-layers.md)
+- [Layer normalization](layer-normalization.md)
 
 ---
 
@@ -162,3 +163,6 @@ Multi-head attention runs several smaller attentions in parallel subspaces. Head
 
 ### [Feed-forward layers](feed-forward-layers.md)
 The feed-forward block is a position-wise two-layer MLP after attention. This repo expands to d_ff, applies ReLU, then projects back to d_model. Same weights run on every token row independently.
+
+### [Layer normalization](layer-normalization.md)
+Layer norm recenters and rescales each token vector. Learnable gamma and beta restore scale after the unit Gaussian step. This repo normalizes rows of the T×d sequence matrix in place.

@@ -39,6 +39,7 @@ Current implementation:
 - Self-attention
 - Multi-head attention
 - Feed-forward layers
+- Layer normalization
 
 Training and Transformer components are not implemented yet.
 
@@ -84,7 +85,7 @@ Training and Transformer components are not implemented yet.
 - [x] Self-attention
 - [x] Multi-head attention
 - [x] Feed-forward layers
-- [ ] Layer normalization
+- [x] Layer normalization
 - [ ] Residual connections
 - [ ] Causal attention
 - [ ] Transformer blocks
