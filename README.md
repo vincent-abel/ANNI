@@ -26,6 +26,7 @@ Current implementation:
 - Matrices
 - Tensors
 - Optimized matrix multiplication
+- Softmax
 
 Training and Transformer components are not implemented yet.
 
@@ -49,7 +50,7 @@ Training and Transformer components are not implemented yet.
 - [x] Matrices
 - [x] Tensors
 - [x] Optimized matrix multiplication
-- [ ] Softmax
+- [x] Softmax
 - [ ] Cross-entropy
 - [ ] Mini-batches
 - [ ] Adam optimizer

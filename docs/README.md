@@ -13,3 +13,6 @@ A tensor is contiguous storage plus a multi-axis shape for batches and higher ra
 
 ### [Optimized matrix multiplication](optimized-matrix-multiplication.md)
 Blocked multiply does the same \(C=AB\) math as the naive loops but in cache-friendly tiles. `mat_mul` uses 32×32 blocks while `mat_mul_naive` stays as a correctness reference. Only the visit order changes, not the result.
+
+### [Softmax](softmax.md)
+Softmax turns logits into a probability distribution that sums to one. Subtracting the max logit before `exp` keeps the math stable. `vec_softmax` implements that path on contiguous vectors.

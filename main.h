@@ -14,5 +14,6 @@
 #include "vec.h"
 #include "mat.h"
 #include "tensor.h"
+#include "ops.h"
 
 #endif

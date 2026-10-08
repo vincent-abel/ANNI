@@ -70,6 +70,26 @@ static void test_create_rejects_empty(void)
 	assert(net == NULL);
 }
 
+static void test_softmax(void)
+{
+	vec *in;
+	vec *out;
+	double sum;
+
+	in = vec_create(2);
+	out = vec_create(2);
+	assert(in && out);
+	in->data[0] = 1.0;
+	in->data[1] = 2.0;
+	assert(vec_softmax(out, in) == 0);
+	sum = out->data[0] + out->data[1];
+	assert(fabs(sum - 1.0) < 1e-9);
+	assert(fabs(out->data[0] - exp(1.0) / (exp(1.0) + exp(2.0))) < 1e-9);
+	assert(fabs(out->data[1] - exp(2.0) / (exp(1.0) + exp(2.0))) < 1e-9);
+	vec_free(&in);
+	vec_free(&out);
+}
+
 static void test_mat_mul_blocked_matches_naive(void)
 {
 	mat *a;
@@ -236,6 +256,7 @@ int main(void)
 	test_mat_mul_known();
 	test_tensor_views();
 	test_mat_mul_blocked_matches_naive();
+	test_softmax();
 	test_xor_trains();
 	puts("ok");
 	return 0;
