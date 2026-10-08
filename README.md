@@ -41,6 +41,7 @@ Current implementation:
 - Feed-forward layers
 - Layer normalization
 - Residual connections
+- Causal attention
 
 Training and Transformer components are not implemented yet.
 
@@ -88,7 +89,7 @@ Training and Transformer components are not implemented yet.
 - [x] Feed-forward layers
 - [x] Layer normalization
 - [x] Residual connections
-- [ ] Causal attention
+- [x] Causal attention
 - [ ] Transformer blocks
 - [ ] Next-token prediction
 - [ ] Text generation

@@ -559,6 +559,32 @@ static void test_resid_add(void)
 }
 
 
+static void test_attn_causal(void)
+{
+	mat *q;
+	mat *k;
+	mat *v;
+	mat *out;
+	int i;
+
+	q = mat_create(2, 4);
+	k = mat_create(2, 4);
+	v = mat_create(2, 4);
+	out = mat_create(2, 4);
+	assert(q && k && v && out);
+	mat_fill(q, 0.25);
+	mat_fill(k, 0.25);
+	mat_fill(v, 0.0);
+	for (i = 0; i < 4; i++) {
+		mat_set(v, 0, i, 2.0);
+		mat_set(v, 1, i, 8.0);
+	}
+	assert(attn_self(out, q, k, v, 1) == 0);
+	assert(fabs(mat_get(out, 0, 0) - 2.0) < 1e-9);
+	mat_free(&q); mat_free(&k); mat_free(&v); mat_free(&out);
+}
+
+
 int main(void)
 {
 	test_mse_known();
@@ -585,6 +611,7 @@ int main(void)
 	test_ffn_relu_path();
 	test_layernorm_zero_mean();
 	test_resid_add();
+	test_attn_causal();
 	puts("ok");
 	return 0;
 }

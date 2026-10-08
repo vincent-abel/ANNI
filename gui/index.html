@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ANN — visual trainer</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <div class="brand">
+    <p class="mark">ANN</p>
+    <p class="tag">Visual trainer</p>
+  </div>
+  <p class="blurb">Weights and activations from the C network, redrawn after each run.</p>
+</header>
+<div class="main">
+  <aside class="side">
+    <form id="form" autocomplete="off" novalidate>
+      <div class="fields">
+        <label class="span2">Dataset
+          <select id="dataset">
+            <option value="xor" selected>XOR</option>
+            <option value="custom">Custom sample</option>
+          </select>
+        </label>
+        <label>Inputs
+          <input id="inputs" type="number" min="1" max="784" value="2" disabled>
+        </label>
+        <label>Seed
+          <input id="seed" type="number" min="0" step="1" value="1">
+        </label>
+        <label class="span2">Layer sizes
+          <input id="sizes" type="text" value="4,1" spellcheck="false">
+        </label>
+        <label>Learning rate
+          <input id="lr" type="number" min="0" step="any" value="0.5">
+        </label>
+        <label>Steps
+          <input id="steps" type="number" min="1" max="200000" step="1" value="500">
+        </label>
+        <label class="span2" id="custom-in-label" hidden>Sample inputs
+          <input id="sample-in" type="text" value="0, 1" spellcheck="false">
+        </label>
+        <label class="span2" id="custom-tg-label" hidden>Targets
+          <input id="sample-tg" type="text" value="1" spellcheck="false">
+        </label>
+      </div>
+      <p id="err" class="err" hidden></p>
+      <div class="actions">
+        <button type="submit" class="primary" id="btn-launch">Launch</button>
+        <button type="button" id="btn-step" disabled>Step</button>
+        <button type="button" id="btn-run" disabled>Run 500</button>
+        <button type="button" id="btn-play" disabled>Play</button>
+        <button type="button" id="btn-sample" hidden>Use sample</button>
+      </div>
+      <p id="hint" class="hint"></p>
+    </form>
+    <div class="block">
+      <div class="rowhead">
+        <h2>Samples</h2>
+        <span id="acc"></span>
+      </div>
+      <div id="samples"></div>
+      <p id="fine" class="fine" hidden>The bar is the output. The gold mark is the target.</p>
+    </div>
+    <div class="block">
+      <h2>Selection</h2>
+      <div id="inspect" class="inspect">Click a neuron or a wire.</div>
+    </div>
+    <div class="block">
+      <h2>Session</h2>
+      <div id="log" class="log"></div>
+    </div>
+  </aside>
+  <section class="view">
+    <div class="stage">
+      <canvas id="net"></canvas>
+      <div class="overlay">
+        <div class="metrics">
+          <div><strong id="mse">—</strong><span>mse</span></div>
+          <div><strong id="epoch">0</strong><span>epochs</span></div>
+        </div>
+        <div class="styles">
+          <button type="button" id="style-net" class="on">Network</button>
+          <button type="button" id="style-flow">Flow</button>
+        </div>
+      </div>
+      <div class="legend">
+        <span><i class="swatch pos"></i>positive</span>
+        <span><i class="swatch neg"></i>negative</span>
+        <span><i class="swatch neu"></i>activation</span>
+      </div>
+      <div id="tip" hidden></div>
+    </div>
+    <div class="dock">
+      <div class="panel">
+        <h2>Loss</h2>
+        <canvas id="loss"></canvas>
+      </div>
+      <div class="panel">
+        <h2>Weights <em>blue positive, red negative</em></h2>
+        <div id="heat"></div>
+      </div>
+    </div>
+  </section>
+</div>
+<script src="app.js?v=2"></script>
+</body>
+</html>

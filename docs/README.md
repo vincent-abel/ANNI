@@ -43,6 +43,7 @@
 - [Feed-forward layers](feed-forward-layers.md)
 - [Layer normalization](layer-normalization.md)
 - [Residual connections](residual-connections.md)
+- [Causal attention](causal-attention.md)
 
 ---
 
@@ -170,3 +171,6 @@ Layer norm recenters and rescales each token vector. Learnable gamma and beta re
 
 ### [Residual connections](residual-connections.md)
 Residuals add the sub-layer output back onto the stream so depth stays trainable. This stack commits to pre-norm: normalize, transform, then add. resid_add and resid_copy are the small helpers blocks use.
+
+### [Causal attention](causal-attention.md)
+Causal masking blocks future positions so token t only attends to ≤ t. Scores for j>i are driven to a large negative before softmax. Decoder training and generation share that left-context rule.
