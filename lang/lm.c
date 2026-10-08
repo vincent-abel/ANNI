@@ -22,15 +22,13 @@ static void copy_mat(mat *dst, const mat *src)
 	    (size_t)dst->rows * (size_t)dst->cols * sizeof(double));
 }
 
-static void softmax_inplace(double *x, int n)
+static void softmax_inplace(double *x, int n, double *tmp)
 {
 	vec in;
 	vec out;
-	double *tmp;
 	int i;
 
-	tmp = malloc((size_t)n * sizeof(double));
-	if (!tmp)
+	if (!x || !tmp || n <= 0)
 		return;
 	in.data = x;
 	in.n = n;
@@ -40,7 +38,6 @@ static void softmax_inplace(double *x, int n)
 		for (i = 0; i < n; i++)
 			x[i] = tmp[i];
 	}
-	free(tmp);
 }
 
 lm *lm_create(void)
@@ -141,8 +138,11 @@ int lm_forward_cache(lm *model, const int *ids, int n, lm_cache *c)
 		return -1;
 	for (i = 0; i < n; i++)
 		c->ids[i] = ids[i];
-	transformer_cache_free(&c->trc);
-	c->trc = transformer_cache_create(n, model->tr);
+	/* Reuse persistent transformer cache when sequence length matches. */
+	if (!c->trc || c->trc->T != n) {
+		transformer_cache_free(&c->trc);
+		c->trc = transformer_cache_create(n, model->tr);
+	}
 	if (!c->trc)
 		return -1;
 	if (embed_lookup(c->hidden, model->embed, ids, n) != 0)
@@ -196,6 +196,7 @@ int lm_loss_backward(lm *model, const lm_cache *c, const int *ids, int n,
 {
 	vec *logits;
 	double *delta;
+	double *soft_tmp;
 	int t;
 	int j;
 	int v;
@@ -204,9 +205,11 @@ int lm_loss_backward(lm *model, const lm_cache *c, const int *ids, int n,
 		return -1;
 	logits = vec_create(model->vocab_size);
 	delta = malloc((size_t)model->vocab_size * sizeof(double));
-	if (!logits || !delta) {
+	soft_tmp = malloc((size_t)model->vocab_size * sizeof(double));
+	if (!logits || !delta || !soft_tmp) {
 		vec_free(&logits);
 		free(delta);
+		free(soft_tmp);
 		return -1;
 	}
 	mat_zero(dhidden);
@@ -214,11 +217,12 @@ int lm_loss_backward(lm *model, const lm_cache *c, const int *ids, int n,
 		if (lm_logits_at(logits, model, c->hidden, t) != 0) {
 			vec_free(&logits);
 			free(delta);
+			free(soft_tmp);
 			return -1;
 		}
 		memcpy(delta, logits->data,
 		    (size_t)model->vocab_size * sizeof(double));
-		softmax_inplace(delta, model->vocab_size);
+		softmax_inplace(delta, model->vocab_size, soft_tmp);
 		delta[ids[t + 1]] -= 1.0;
 		for (v = 0; v < model->vocab_size; v++) {
 			model->db_head->data[v] += delta[v];
@@ -234,6 +238,7 @@ int lm_loss_backward(lm *model, const lm_cache *c, const int *ids, int n,
 	}
 	vec_free(&logits);
 	free(delta);
+	free(soft_tmp);
 	return 0;
 }
 

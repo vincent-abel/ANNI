@@ -204,6 +204,33 @@ static int run_lm_load(int argc, char **argv)
 	return 0;
 }
 
+static int run_lm_bench(int argc, char **argv)
+{
+	lm *model;
+	int n;
+	int iters;
+	double ms;
+
+	n = atoi(arg_value(argc, argv, "--tokens", "32"));
+	iters = atoi(arg_value(argc, argv, "--iters", "20"));
+	if (n <= 0)
+		n = 32;
+	if (iters <= 0)
+		iters = 20;
+	srand(1);
+	model = lm_create();
+	if (!model)
+		return 1;
+	ms = lm_bench_forward_ms(model, n, iters);
+	lm_free(&model);
+	if (ms < 0.0) {
+		fprintf(stderr, "lm bench: failed\n");
+		return 1;
+	}
+	printf("LM bench tokens=%d iters=%d mean_ms=%.3f\n", n, iters, ms);
+	return 0;
+}
+
 static int run_lm_demo(int argc, char **argv)
 {
 	lm *model;
@@ -244,6 +271,8 @@ static int run_lm(int argc, char **argv)
 		return run_lm_generate(argc, argv);
 	if (argc >= 3 && arg_eq(argv[2], "load"))
 		return run_lm_load(argc, argv);
+	if (argc >= 3 && arg_eq(argv[2], "bench"))
+		return run_lm_bench(argc, argv);
 	return run_lm_demo(argc, argv);
 }
 
@@ -319,6 +348,7 @@ int main(int argc, char *argv[])
 		printf("                 [--resume PATH] [-d|--debug]\n");
 		printf("       ./ann lm generate --model model.bin --prompt hello\n");
 		printf("       ./ann lm load --model model.bin\n");
+		printf("       ./ann lm bench [--tokens N] [--iters N]\n");
 		return 1;
 	}
 

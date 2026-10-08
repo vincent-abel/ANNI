@@ -62,6 +62,10 @@
 - [Scale toward target size](scale-toward-target-size.md)
 - [Train / generate / load CLI](lm-cli.md)
 
+### Performance
+
+- [Contiguous memory](contiguous-memory.md)
+
 ---
 
 # How this neural network works
@@ -235,3 +239,8 @@ Config bumps d_model to 64, heads to 8, ff to 256, context to 128, and blocks to
 
 ### [Train / generate / load CLI](lm-cli.md)
 The CLI exposes lm train, lm generate, and lm load over model.bin checkpoints. Flags select data, prompt, and output paths. A bare lm [phrase] demo remains for quick smoke runs.
+
+# Performance docs
+
+### [Contiguous memory](contiguous-memory.md)
+A bump arena hands out consecutive scratch bytes without per-object free. LM transformer caches persist across forwards of the same length, and attention keeps head/softmax temps in the cache. ./ann lm bench reports mean forward milliseconds for later speedups.

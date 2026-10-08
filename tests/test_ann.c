@@ -819,6 +819,47 @@ static void test_lm_generate_smoke(void)
 	lm_free(&model);
 }
 
+static void test_arena_bump(void)
+{
+	arena *a;
+	double *p;
+	double *q;
+
+	a = arena_create(1024);
+	assert(a);
+	p = arena_alloc(a, 8 * sizeof(double));
+	q = arena_alloc(a, 4 * sizeof(double));
+	assert(p && q);
+	assert((char *)q > (char *)p);
+	arena_reset(a);
+	assert(a->used == 0);
+	arena_free(&a);
+	assert(a == NULL);
+}
+
+static void test_lm_cache_reuse(void)
+{
+	lm *model;
+	lm_cache *c;
+	transformer_cache *trc0;
+	int ids[8];
+	int i;
+
+	srand(21);
+	model = lm_create();
+	c = lm_cache_create(8);
+	assert(model && c);
+	for (i = 0; i < 8; i++)
+		ids[i] = i + 1;
+	assert(lm_forward_cache(model, ids, 8, c) == 0);
+	trc0 = c->trc;
+	assert(trc0 != NULL);
+	assert(lm_forward_cache(model, ids, 8, c) == 0);
+	assert(c->trc == trc0);
+	lm_cache_free(&c);
+	lm_free(&model);
+}
+
 
 int main(void)
 {
@@ -857,6 +898,8 @@ int main(void)
 	test_lm_checkpoint_resume();
 	test_lm_perplexity();
 	test_lm_generate_from_checkpoint();
+	test_arena_bump();
+	test_lm_cache_reuse();
 	puts("ok");
 	return 0;
 }

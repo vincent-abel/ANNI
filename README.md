@@ -57,7 +57,7 @@ Current implementation:
 - Checkpoint and resume
 - LM weight serialization
 
-Trainable toy decoder-only LM in `lang/` (full backprop, Adam, corpus train, checkpoints, `./ann lm train|generate|load`).
+Trainable toy decoder-only LM in `lang/` (full backprop, Adam, corpus train, checkpoints, `./ann lm train|generate|load|bench`). Persistent forward caches and a bump arena start the Performance work.
 
 ## Roadmap
 
@@ -124,7 +124,7 @@ Trainable toy decoder-only LM in `lang/` (full backprop, Adam, corpus train, che
 
 ### Performance
 
-- [ ] Contiguous memory
+- [x] Contiguous memory
 - [ ] Cache-friendly data structures
 - [ ] SIMD
 - [ ] Multithreading

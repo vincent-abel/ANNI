@@ -31,6 +31,8 @@
 #include "dataset_text.h"
 #include "lm_serialize.h"
 #include "lm_train.h"
+#include "lm_bench.h"
 #include "generate.h"
+#include "arena.h"
 
 #endif

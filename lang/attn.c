@@ -109,9 +109,14 @@ attn_cache *attn_cache_create(int T, int n_heads, int d_head)
 	c->k = mat_create(T, LM_D_MODEL);
 	c->v = mat_create(T, LM_D_MODEL);
 	c->concat = mat_create(T, LM_D_MODEL);
+	c->q_h = mat_create(T, d_head);
+	c->k_h = mat_create(T, d_head);
+	c->o_h = mat_create(T, d_head);
+	c->softmax_tmp = calloc((size_t)T, sizeof(double));
 	c->attn_w = calloc((size_t)n_heads, sizeof(mat *));
 	c->v_h = calloc((size_t)n_heads, sizeof(mat *));
 	if (!c->x_in || !c->q || !c->k || !c->v || !c->concat
+	    || !c->q_h || !c->k_h || !c->o_h || !c->softmax_tmp
 	    || !c->attn_w || !c->v_h) {
 		attn_cache_free(&c);
 		return NULL;
@@ -138,6 +143,10 @@ void attn_cache_free(attn_cache **c)
 	mat_free(&(*c)->k);
 	mat_free(&(*c)->v);
 	mat_free(&(*c)->concat);
+	mat_free(&(*c)->q_h);
+	mat_free(&(*c)->k_h);
+	mat_free(&(*c)->o_h);
+	free((*c)->softmax_tmp);
 	if ((*c)->attn_w) {
 		for (h = 0; h < (*c)->n_heads; h++)
 			mat_free(&(*c)->attn_w[h]);
@@ -165,16 +174,14 @@ int attn_qkv_project(mat *q, mat *k, mat *v, const attn *a, const mat *x)
 	return 0;
 }
 
-static int softmax_row(double *row, int n)
+static int softmax_row(double *row, int n, double *tmp)
 {
 	vec in;
 	vec out;
-	double *tmp;
 	int i;
 	int rc;
 
-	tmp = malloc((size_t)n * sizeof(double));
-	if (!tmp)
+	if (!row || !tmp || n <= 0)
 		return -1;
 	in.data = row;
 	in.n = n;
@@ -185,7 +192,6 @@ static int softmax_row(double *row, int n)
 		for (i = 0; i < n; i++)
 			row[i] = tmp[i];
 	}
-	free(tmp);
 	return rc;
 }
 
@@ -199,6 +205,7 @@ int attn_self(mat *out, const mat *q, const mat *k, const mat *v, int causal)
 	double scale;
 	double sum;
 	mat *scores;
+	double *tmp;
 
 	if (!out || !q || !k || !v || !out->data || !q->data || !k->data || !v->data)
 		return -1;
@@ -210,8 +217,12 @@ int attn_self(mat *out, const mat *q, const mat *k, const mat *v, int causal)
 	d = q->cols;
 	scale = 1.0 / sqrt((double)d);
 	scores = mat_create(T, T);
-	if (!scores)
+	tmp = calloc((size_t)T, sizeof(double));
+	if (!scores || !tmp) {
+		mat_free(&scores);
+		free(tmp);
 		return -1;
+	}
 
 	for (i = 0; i < T; i++) {
 		for (j = 0; j < T; j++) {
@@ -223,8 +234,9 @@ int attn_self(mat *out, const mat *q, const mat *k, const mat *v, int causal)
 				sum = -1e9;
 			mat_set(scores, i, j, sum);
 		}
-		if (softmax_row(&scores->data[i * T], T) != 0) {
+		if (softmax_row(&scores->data[i * T], T, tmp) != 0) {
 			mat_free(&scores);
+			free(tmp);
 			return -1;
 		}
 	}
@@ -239,6 +251,7 @@ int attn_self(mat *out, const mat *q, const mat *k, const mat *v, int causal)
 		}
 	}
 	mat_free(&scores);
+	free(tmp);
 	return 0;
 }
 
@@ -269,7 +282,7 @@ static void write_head(mat *dst, const mat *src, int head, int d_head)
 }
 
 static int self_forward_cache(mat *out, const mat *q, const mat *k, const mat *v,
-	int causal, mat *attn_w)
+	int causal, mat *attn_w, double *softmax_tmp)
 {
 	int T;
 	int d;
@@ -279,6 +292,8 @@ static int self_forward_cache(mat *out, const mat *q, const mat *k, const mat *v
 	double scale;
 	double sum;
 
+	if (!softmax_tmp)
+		return -1;
 	T = q->rows;
 	d = q->cols;
 	scale = 1.0 / sqrt((double)d);
@@ -292,7 +307,7 @@ static int self_forward_cache(mat *out, const mat *q, const mat *k, const mat *v
 				sum = -1e9;
 			mat_set(attn_w, i, j, sum);
 		}
-		if (softmax_row(&attn_w->data[i * T], T) != 0)
+		if (softmax_row(&attn_w->data[i * T], T, softmax_tmp) != 0)
 			return -1;
 	}
 	mat_fill(out, 0.0);
@@ -325,45 +340,26 @@ int attn_mha(mat *out, const attn *a, const mat *x, int causal)
 int attn_mha_forward_cache(mat *out, attn *a, const mat *x, int causal,
 	attn_cache *c)
 {
-	mat *q_h;
-	mat *k_h;
-	mat *o_h;
 	int h;
-	int T;
 
 	if (!out || !a || !x || !c)
 		return -1;
-	T = x->rows;
+	if (c->T != x->rows || !c->q_h || !c->k_h || !c->o_h || !c->softmax_tmp)
+		return -1;
 	c->causal = causal;
 	copy_mat(c->x_in, x);
 	if (attn_qkv_project(c->q, c->k, c->v, a, x) != 0)
 		return -1;
-	q_h = mat_create(T, a->d_head);
-	k_h = mat_create(T, a->d_head);
-	o_h = mat_create(T, a->d_head);
-	if (!q_h || !k_h || !o_h) {
-		mat_free(&q_h);
-		mat_free(&k_h);
-		mat_free(&o_h);
-		return -1;
-	}
 	mat_fill(c->concat, 0.0);
 	for (h = 0; h < a->n_heads; h++) {
-		copy_head(q_h, c->q, h, a->d_head);
-		copy_head(k_h, c->k, h, a->d_head);
+		copy_head(c->q_h, c->q, h, a->d_head);
+		copy_head(c->k_h, c->k, h, a->d_head);
 		copy_head(c->v_h[h], c->v, h, a->d_head);
-		if (self_forward_cache(o_h, q_h, k_h, c->v_h[h], causal,
-			c->attn_w[h]) != 0) {
-			mat_free(&q_h);
-			mat_free(&k_h);
-			mat_free(&o_h);
+		if (self_forward_cache(c->o_h, c->q_h, c->k_h, c->v_h[h], causal,
+			c->attn_w[h], c->softmax_tmp) != 0)
 			return -1;
-		}
-		write_head(c->concat, o_h, h, a->d_head);
+		write_head(c->concat, c->o_h, h, a->d_head);
 	}
-	mat_free(&q_h);
-	mat_free(&k_h);
-	mat_free(&o_h);
 	if (mat_mul(out, c->concat, a->wo) != 0)
 		return -1;
 	return 0;
