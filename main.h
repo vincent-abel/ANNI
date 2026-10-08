@@ -19,5 +19,6 @@
 #include "serialize.h"
 #include "tokenize.h"
 #include "vocab.h"
+#include "embed.h"
 
 #endif

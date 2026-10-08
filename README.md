@@ -33,6 +33,7 @@ Current implementation:
 - Model serialization
 - Tokenizer
 - Vocabulary
+- Token embeddings
 
 Training and Transformer components are not implemented yet.
 
@@ -72,7 +73,7 @@ Training and Transformer components are not implemented yet.
 
 - [x] Tokenizer
 - [x] Vocabulary
-- [ ] Token embeddings
+- [x] Token embeddings
 - [ ] Positional encoding
 - [ ] Query / Key / Value
 - [ ] Self-attention

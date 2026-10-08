@@ -380,6 +380,24 @@ static void test_tokenize_roundtrip(void)
 	assert(strcmp(out, text) == 0);
 }
 
+static void test_embed_lookup(void)
+{
+	embed *e;
+	mat *out;
+	int ids[2];
+
+	e = embed_create(8);
+	assert(e != NULL);
+	out = mat_create(2, LM_D_MODEL);
+	assert(out != NULL);
+	ids[0] = 1;
+	ids[1] = 2;
+	assert(embed_lookup(out, e, ids, 2) == 0);
+	assert(fabs(mat_get(out, 0, 0) - mat_get(e->table, 1, 0)) < 1e-12);
+	embed_free(&e);
+	mat_free(&out);
+}
+
 static void test_vocab_byte(void)
 {
 	vocab *v;
@@ -412,6 +430,7 @@ int main(void)
 	test_serialize_roundtrip();
 	test_tokenize_roundtrip();
 	test_vocab_byte();
+	test_embed_lookup();
 	puts("ok");
 	return 0;
 }

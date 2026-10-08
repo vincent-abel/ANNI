@@ -35,6 +35,7 @@
 
 - [Tokenizer](tokenizer.md)
 - [Vocabulary](vocabulary.md)
+- [Token embeddings](token-embeddings.md)
 
 ---
 
@@ -138,3 +139,6 @@ A tokenizer maps text to integer ids and back. This repo starts with one id per 
 
 ### [Vocabulary](vocabulary.md)
 A vocabulary names every id the model can emit, including pad/bos/eos/unk. Byte tokens sit after four specials, for size 260. Lookups give strings for logging and generation.
+
+### [Token embeddings](token-embeddings.md)
+Token embeddings store a learned vector per vocab id in a V×d table. Looking up a sequence of ids stacks those rows into a T×d matrix. That matrix is the model's continuous view of the text.
