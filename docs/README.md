@@ -66,6 +66,7 @@
 
 - [Contiguous memory](contiguous-memory.md)
 - [Cache-friendly data structures](cache-friendly-data-structures.md)
+- [SIMD](simd.md)
 
 ---
 
@@ -248,3 +249,6 @@ A bump arena hands out consecutive scratch bytes without per-object free. LM tra
 
 ### [Cache-friendly data structures](cache-friendly-data-structures.md)
 Attention scores and outputs use mat_mul_bt and mat_mul on contiguous rows. Embeddings memcpy token rows; logits are a blocked 1xD GEMM against the head. Hot paths drop mat_get/mat_set loops.
+
+### [SIMD](simd.md)
+ann_dot and friends use restrict on contiguous doubles so -O2 can auto-vectorize. vec_dot and vec_axpy call those kernels. Explicit AVX intrinsics come later.

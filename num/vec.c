@@ -2,6 +2,7 @@
 **	Vector Code
 */
 #include "main.h"
+#include "simd.h"
 
 vec *vec_create(int n)
 {
@@ -53,35 +54,23 @@ int vec_copy(vec *dst, const vec *src)
 
 double vec_dot(const vec *a, const vec *b)
 {
-	double sum;
-	int i;
-
 	if (!a || !b || !a->data || !b->data || a->n != b->n)
 		return 0.0;
-	sum = 0.0;
-	for (i = 0; i < a->n; i++)
-		sum += a->data[i] * b->data[i];
-	return sum;
+	return ann_dot(a->data, b->data, a->n);
 }
 
 void vec_axpy(vec *y, double a, const vec *x)
 {
-	int i;
-
 	if (!y || !x || !y->data || !x->data || y->n != x->n)
 		return;
-	for (i = 0; i < y->n; i++)
-		y->data[i] += a * x->data[i];
+	ann_axpy(y->data, a, x->data, y->n);
 }
 
 void vec_scale(vec *v, double s)
 {
-	int i;
-
 	if (!v || !v->data)
 		return;
-	for (i = 0; i < v->n; i++)
-		v->data[i] *= s;
+	ann_scale(v->data, s, v->n);
 }
 
 int vec_add(vec *out, const vec *a, const vec *b)

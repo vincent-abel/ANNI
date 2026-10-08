@@ -1,13 +1,15 @@
 CC=gcc -g
 # Include roots: net/ (neural network), num/ (numerical engine), lang/ (language model).
 INCLUDES=-I. -Inet -Inum -Ilang
-CFLAGS=-W -Wall -ansi -pedantic -std=c99 $(INCLUDES)
+# OPT=-O2 enables auto-vectorization on contiguous ann_dot / mat_mul loops.
+OPT ?= -O2
+CFLAGS=-W -Wall -ansi -pedantic -std=c99 $(OPT) $(INCLUDES)
 LDFLAGS=-lm
 EXEC=ann
 OBJDIR=objects
 
 NET_SRC=net/neuron.c net/layer.c net/dataset.c net/optim.c net/serialize.c
-NUM_SRC=num/vec.c num/mat.c num/tensor.c num/ops.c num/arena.c
+NUM_SRC=num/vec.c num/mat.c num/tensor.c num/ops.c num/arena.c num/simd.c
 LANG_SRC=lang/tokenize.c lang/vocab.c lang/embed.c lang/posenc.c lang/attn.c lang/ffn.c lang/layernorm.c lang/resid.c lang/block.c lang/lm.c lang/generate.c lang/gradutil.c lang/lm_adam.c lang/dataset_text.c lang/lm_serialize.c lang/lm_train.c lang/lm_bench.c
 LIB_SRC=$(NET_SRC) $(NUM_SRC) $(LANG_SRC)
 LIB_OBJ=$(patsubst %.c,$(OBJDIR)/%.o,$(notdir $(LIB_SRC)))
@@ -27,6 +29,7 @@ $(OBJDIR)/mat.o: num/mat.c
 $(OBJDIR)/tensor.o: num/tensor.c
 $(OBJDIR)/ops.o: num/ops.c
 $(OBJDIR)/arena.o: num/arena.c
+$(OBJDIR)/simd.o: num/simd.c
 $(OBJDIR)/tokenize.o: lang/tokenize.c
 $(OBJDIR)/vocab.o: lang/vocab.c
 $(OBJDIR)/embed.o: lang/embed.c

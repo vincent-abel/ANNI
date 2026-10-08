@@ -819,6 +819,14 @@ static void test_lm_generate_smoke(void)
 	lm_free(&model);
 }
 
+static void test_ann_dot_simd(void)
+{
+	double a[4] = {1.0, 2.0, 3.0, 4.0};
+	double b[4] = {5.0, 6.0, 7.0, 8.0};
+
+	assert(fabs(ann_dot(a, b, 4) - 70.0) < 1e-12);
+}
+
 static void test_mat_mul_bt_known(void)
 {
 	mat *a;
@@ -927,6 +935,7 @@ int main(void)
 	test_arena_bump();
 	test_lm_cache_reuse();
 	test_mat_mul_bt_known();
+	test_ann_dot_simd();
 	puts("ok");
 	return 0;
 }

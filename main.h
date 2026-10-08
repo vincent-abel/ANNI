@@ -34,5 +34,6 @@
 #include "lm_bench.h"
 #include "generate.h"
 #include "arena.h"
+#include "simd.h"
 
 #endif
