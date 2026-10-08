@@ -1,3 +1,42 @@
+# Documentation
+
+## Table of contents
+
+### Neural network
+
+- [Neurons](neurons.md)
+- [Layers](layers.md)
+- [Inputs and weights](inputs-and-weights.md)
+- [Biases](biases.md)
+- [Connections](connections.md)
+- [Activation functions](activation-functions.md)
+- [Forward propagation](forward-propagation.md)
+- [MSE loss](mse-loss.md)
+- [Backpropagation](backpropagation.md)
+- [Gradient descent](gradient-descent.md)
+- [Training loop](training-loop.md)
+- [XOR dataset](xor-dataset.md)
+- [Unit tests](unit-tests.md)
+- [Memory management](memory-management.md)
+
+### Numerical engine
+
+- [Vectors](vectors.md)
+- [Matrices](matrices.md)
+- [Tensors](tensors.md)
+- [Optimized matrix multiplication](optimized-matrix-multiplication.md)
+- [Softmax](softmax.md)
+- [Cross-entropy](cross-entropy.md)
+- [Mini-batches](mini-batches.md)
+- [Adam optimizer](adam-optimizer.md)
+- [Model serialization](model-serialization.md)
+
+### Language model
+
+- [Tokenizer](tokenizer.md)
+
+---
+
 # How this neural network works
 
 Short notes on each piece that is already built. Each note explains the idea in ordinary language, then the arithmetic this C program actually runs.
@@ -88,3 +127,10 @@ Adam mixes momentum with per-weight adaptive step sizes from squared-gradient hi
 
 ### [Model serialization](model-serialization.md)
 Serialization writes architecture sizes plus every bias and weight in a fixed walk order. Loading rebuilds the graph and fills the same slots. `network_save` / `network_load` round-trip a trained net through a binary file.
+
+# Language Model docs
+
+Short guides for each Language Model piece, from plain intuition up to formal detail.
+
+### [Tokenizer](tokenizer.md)
+A tokenizer maps text to integer ids and back. This repo starts with one id per byte (0–255). Encode and decode are linear scans with a fixed 256-wide alphabet.

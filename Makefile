@@ -1,7 +1,6 @@
 CC=gcc -g
-# Include roots: net/ (neural network), num/ (numerical engine).
-# Future Language Model sources belong in lang/ and need -Ilang here.
-INCLUDES=-I. -Inet -Inum
+# Include roots: net/ (neural network), num/ (numerical engine), lang/ (language model).
+INCLUDES=-I. -Inet -Inum -Ilang
 CFLAGS=-W -Wall -ansi -pedantic -std=c99 $(INCLUDES)
 LDFLAGS=-lm
 EXEC=ann
@@ -9,7 +8,8 @@ OBJDIR=objects
 
 NET_SRC=net/neuron.c net/layer.c net/dataset.c net/optim.c net/serialize.c
 NUM_SRC=num/vec.c num/mat.c num/tensor.c num/ops.c
-LIB_SRC=$(NET_SRC) $(NUM_SRC)
+LANG_SRC=lang/tokenize.c
+LIB_SRC=$(NET_SRC) $(NUM_SRC) $(LANG_SRC)
 LIB_OBJ=$(patsubst %.c,$(OBJDIR)/%.o,$(notdir $(LIB_SRC)))
 MAIN_OBJ=$(OBJDIR)/main.o
 OBJ=$(LIB_OBJ) $(MAIN_OBJ)
@@ -26,6 +26,7 @@ $(OBJDIR)/vec.o: num/vec.c
 $(OBJDIR)/mat.o: num/mat.c
 $(OBJDIR)/tensor.o: num/tensor.c
 $(OBJDIR)/ops.o: num/ops.c
+$(OBJDIR)/tokenize.o: lang/tokenize.c
 $(OBJDIR)/main.o: main.c
 
 all: $(EXEC)

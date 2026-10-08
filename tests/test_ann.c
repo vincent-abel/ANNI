@@ -365,6 +365,21 @@ static void test_xor_minibatches(void)
 	network_free(&net);
 }
 
+static void test_tokenize_roundtrip(void)
+{
+	const char *text = "Hello";
+	int ids[16];
+	char out[16];
+	int n;
+
+	n = tokenize_encode(text, ids, 16);
+	assert(n == 5);
+	assert(ids[0] == (unsigned char)'H');
+	assert(ids[4] == (unsigned char)'o');
+	assert(tokenize_decode(ids, n, out, 16) == 5);
+	assert(strcmp(out, text) == 0);
+}
+
 int main(void)
 {
 	test_mse_known();
@@ -381,6 +396,7 @@ int main(void)
 	test_xor_minibatches();
 	test_xor_adam();
 	test_serialize_roundtrip();
+	test_tokenize_roundtrip();
 	puts("ok");
 	return 0;
 }

@@ -31,6 +31,7 @@ Current implementation:
 - Mini-batches
 - Adam optimizer
 - Model serialization
+- Tokenizer
 
 Training and Transformer components are not implemented yet.
 
@@ -68,7 +69,7 @@ Training and Transformer components are not implemented yet.
 
 ### Language Model
 
-- [ ] Tokenizer
+- [x] Tokenizer
 - [ ] Vocabulary
 - [ ] Token embeddings
 - [ ] Positional encoding

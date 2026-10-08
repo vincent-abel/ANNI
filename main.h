@@ -17,5 +17,6 @@
 #include "ops.h"
 #include "optim.h"
 #include "serialize.h"
+#include "tokenize.h"
 
 #endif
