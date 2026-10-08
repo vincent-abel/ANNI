@@ -21,6 +21,7 @@ Current implementation:
 - Training loop
 - XOR dataset
 - Unit tests
+- Memory management
 
 Training and Transformer components are not implemented yet.
 
@@ -36,7 +37,7 @@ Training and Transformer components are not implemented yet.
 - [x] Training loop
 - [x] XOR / basic datasets
 - [x] Unit tests
-- [ ] Memory management
+- [x] Memory management
 
 ### Numerical Engine
 

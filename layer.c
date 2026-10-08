@@ -311,7 +311,10 @@ void network_free(network **net)
 	if (!net || !*net)
 		return;
 	nlayer_clear(&(*net)->layers);
+	(*net)->out = NULL;
 	free((*net)->inputs);
+	(*net)->inputs = NULL;
+	(*net)->n_inputs = 0;
 	free(*net);
 	*net = NULL;
 }

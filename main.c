@@ -80,8 +80,13 @@ int main(int argc, char *argv[])
 	samples = malloc((size_t)n_inputs * sizeof(double));
 	targets = calloc((size_t)n_out, sizeof(double));
 	target = calloc((size_t)n_out, sizeof(double));
-	if (!samples || !targets || !target)
+	if (!samples || !targets || !target) {
+		free(samples);
+		free(targets);
+		free(target);
+		network_free(&net);
 		exit(EXIT_FAILURE);
+	}
 	for (i = 0; i < n_inputs; i++)
 		samples[i] = net->inputs[i];
 

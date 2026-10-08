@@ -42,6 +42,21 @@ static void test_forward_shape(void)
 	network_free(&net);
 }
 
+static void test_create_free_cycle(void)
+{
+	network *net;
+	const int sizes[] = {3, 2, 1};
+	int i;
+
+	for (i = 0; i < 20; i++) {
+		srand((unsigned int)i + 1);
+		net = network_create_sizes(2, sizes, 3);
+		network_forward(net);
+		network_free(&net);
+		assert(net == NULL);
+	}
+}
+
 static void test_xor_trains(void)
 {
 	network *net;
@@ -75,6 +90,7 @@ int main(void)
 {
 	test_mse_known();
 	test_forward_shape();
+	test_create_free_cycle();
 	test_xor_trains();
 	puts("ok");
 	return 0;
