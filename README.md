@@ -145,7 +145,7 @@ Today only forward `mat_mul` can use CUDA. These items move the rest of training
 - [x] Adam step on GPU (flat param / grad / moment buffers)
 - [x] KV-cache generate on GPU (append K/V, decode-step attention)
 - [x] Optional cuBLAS / cuDNN (replace naive teaching kernels)
-- [ ] Host↔device sync only at batch boundaries (cut PCIe chatter)
+- [x] Host↔device sync only at batch boundaries (cut PCIe chatter)
 - [ ] `nvidia-smi` / bench proof that train sustains GPU util (not only `lm bench`)
 
 ## Target

@@ -4,8 +4,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
+#include "gpu.h"
 #include "gradutil.h"
 #include "lm_train.h"
+#include "mat.h"
 
 static void scale_grads(lm *model, double scale)
 {
@@ -127,6 +129,8 @@ double lm_train_corpus(lm *model, text_dataset *ds, lm_adam *opt,
 		mat_free(&dhidden);
 		return -1.0;
 	}
+	mat_try_pin(dhidden);
+	mat_try_pin(model->dw_head);
 	total_steps = epochs * nw;
 	done_steps = 0;
 	last = -1.0;
@@ -145,6 +149,8 @@ double lm_train_corpus(lm *model, text_dataset *ds, lm_adam *opt,
 		idx = 0;
 		while (idx < nw) {
 			lm_adam_zero_grad(model);
+			/* Defer GEMM D2H until the optimizer step boundary. */
+			gpu_set_sync_mode(GPU_SYNC_BATCH);
 			b = 0;
 			while (b < batch_size && idx < nw) {
 				if (text_dataset_window(ds, idx, ids, &n) != 0)
@@ -159,14 +165,22 @@ double lm_train_corpus(lm *model, text_dataset *ds, lm_adam *opt,
 				idx++;
 				done_steps++;
 			}
-			if (b <= 0)
+			if (b <= 0) {
+				gpu_set_sync_mode(GPU_SYNC_EAGER);
 				break;
+			}
+			/* Sync grads/activations to host for scale + Adam pack. */
+			mat_ensure_host(dhidden);
+			mat_ensure_host(cache->hidden);
+			mat_ensure_host(model->dw_head);
+			gpu_set_sync_mode(GPU_SYNC_EAGER);
 			scale_grads(model, 1.0 / (double)b);
 			lm_adam_step(opt, lr);
 			if (debug)
 				dbg_progress(ep, epochs, done_steps, total_steps,
 				    last);
 		}
+		/* Epoch boundary: NLL metrics on host weights. */
 		last = lm_nll(model, ds->ids,
 		    ds->n_ids < LM_MAX_CTX ? ds->n_ids : LM_MAX_CTX);
 		if (debug) {
@@ -177,6 +191,7 @@ double lm_train_corpus(lm *model, text_dataset *ds, lm_adam *opt,
 			dbg_stamp(msg);
 		}
 	}
+	gpu_set_sync_mode(GPU_SYNC_EAGER);
 	if (debug)
 		dbg_stamp("train loop finished");
 	lm_cache_free(&cache);

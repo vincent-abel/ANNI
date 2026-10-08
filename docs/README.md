@@ -83,6 +83,7 @@
 - [Adam step on GPU](gpu-adam.md)
 - [KV-cache generate on GPU](gpu-kv-generate.md)
 - [Optional cuBLAS / cuDNN](cublas-cudnn.md)
+- [Host↔device sync at batch boundaries](gpu-batch-sync.md)
 
 ---
 
@@ -309,3 +310,6 @@ Decode-step attention tries gpu_kv_attn_decode for QKV, K/V append, scores, and 
 
 ### [Optional cuBLAS / cuDNN](cublas-cudnn.md)
 make cuda defaults to ANN_CUBLAS=1 so gpu_mat_mul prefers cublasDgemm then falls back to the teaching kernel. cuDNN is reserved; LN/softmax stay educational.
+
+### [Host↔device sync at batch boundaries](gpu-batch-sync.md)
+GPU_SYNC_BATCH skips per-GEMM D2H when outputs are pinned. The train loop syncs at Adam and epoch NLL boundaries instead.

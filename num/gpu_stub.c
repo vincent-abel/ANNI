@@ -4,6 +4,8 @@
 #include <stdlib.h>
 #include "gpu.h"
 
+static int g_sync_mode;
+
 int gpu_available(void)
 {
 	return 0;
@@ -12,6 +14,16 @@ int gpu_available(void)
 const char *gpu_backend_name(void)
 {
 	return "cpu";
+}
+
+void gpu_set_sync_mode(int mode)
+{
+	g_sync_mode = mode;
+}
+
+int gpu_sync_mode(void)
+{
+	return g_sync_mode;
 }
 
 void *gpu_malloc(size_t nbytes)

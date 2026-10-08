@@ -10,6 +10,12 @@
 int	gpu_available(void);
 const char	*gpu_backend_name(void);
 
+/* Eager (default): D2H after each op. Batch: leave results on device when d_data set. */
+#define GPU_SYNC_EAGER	0
+#define GPU_SYNC_BATCH	1
+void	gpu_set_sync_mode(int mode);
+int	gpu_sync_mode(void);
+
 void	*gpu_malloc(size_t nbytes);
 void	gpu_free(void *p);
 int	gpu_memcpy_h2d(void *dst, const void *src, size_t nbytes);

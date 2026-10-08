@@ -823,6 +823,10 @@ static void test_gpu_stub(void)
 {
 	assert(gpu_available() == 0);
 	assert(strcmp(gpu_backend_name(), "cpu") == 0);
+	gpu_set_sync_mode(GPU_SYNC_BATCH);
+	assert(gpu_sync_mode() == GPU_SYNC_BATCH);
+	gpu_set_sync_mode(GPU_SYNC_EAGER);
+	assert(gpu_sync_mode() == GPU_SYNC_EAGER);
 }
 
 static void test_gpu_gemm_bwd_stub(void)

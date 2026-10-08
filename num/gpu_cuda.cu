@@ -14,6 +14,18 @@ extern "C" {
 #include "mat.h"
 }
 
+static int g_sync_mode;
+
+extern "C" void gpu_set_sync_mode(int mode)
+{
+	g_sync_mode = mode;
+}
+
+extern "C" int gpu_sync_mode(void)
+{
+	return g_sync_mode;
+}
+
 #ifdef ANN_CUBLAS
 static cublasHandle_t g_cublas;
 static int g_cublas_ok;
@@ -204,16 +216,21 @@ extern "C" int gpu_mat_mul(mat *c, const mat *a, const mat *b)
 			goto fail;
 	}
 #endif
-	if (c->data && gpu_memcpy_d2h(c->data, dC, mat_bytes(c)) != 0)
-		goto fail;
+	/* Batch mode: keep result on device when c is pinned; skip PCIe D2H. */
+	if (g_sync_mode == GPU_SYNC_BATCH && c->d_data && !ownC) {
+		c->on_device = 1;
+	} else {
+		if (c->data && gpu_memcpy_d2h(c->data, dC, mat_bytes(c)) != 0)
+			goto fail;
+		if (c->d_data && !ownC)
+			c->on_device = 0;
+	}
 	if (ownA)
 		gpu_free(dA);
 	if (ownB)
 		gpu_free(dB);
 	if (ownC)
 		gpu_free(dC);
-	else if (c->d_data)
-		c->on_device = 1;
 	return 0;
 fail:
 	if (ownA)
@@ -319,8 +336,14 @@ extern "C" int gpu_mat_mul_bt(mat *c, const mat *a, const mat *b)
 	gemm_bt_kernel<<<grid, block>>>(dA, dB, dC, a->rows, b->rows, a->cols);
 	if (cudaDeviceSynchronize() != cudaSuccess)
 		goto fail;
-	if (c->data && gpu_memcpy_d2h(c->data, dC, mat_bytes(c)) != 0)
-		goto fail;
+	if (g_sync_mode == GPU_SYNC_BATCH && c->d_data && !ownC) {
+		c->on_device = 1;
+	} else {
+		if (c->data && gpu_memcpy_d2h(c->data, dC, mat_bytes(c)) != 0)
+			goto fail;
+		if (c->d_data && !ownC)
+			c->on_device = 0;
+	}
 	if (ownA)
 		gpu_free(dA);
 	if (ownB)
@@ -379,8 +402,14 @@ extern "C" int gpu_mat_outer_add(mat *dw, const mat *a, const mat *b)
 	outer_add_kernel<<<grid, block>>>(dW, dA, dB, a->rows, a->cols, b->cols);
 	if (cudaDeviceSynchronize() != cudaSuccess)
 		goto fail;
-	if (dw->data && gpu_memcpy_d2h(dw->data, dW, mat_bytes(dw)) != 0)
-		goto fail;
+	if (g_sync_mode == GPU_SYNC_BATCH && dw->d_data && !ownW) {
+		dw->on_device = 1;
+	} else {
+		if (dw->data && gpu_memcpy_d2h(dw->data, dW, mat_bytes(dw)) != 0)
+			goto fail;
+		if (dw->d_data && !ownW)
+			dw->on_device = 0;
+	}
 	if (ownA)
 		gpu_free(dA);
 	if (ownB)
