@@ -3,9 +3,11 @@
 int main(int argc, char *argv[])
 {
 	network *net;
+	double *target;
 	int n_inputs;
 	int n_neurons;
 	int n_layers;
+	int n_out;
 
 	setvbuf(stdout, NULL, _IONBF, 0);
 	srand((unsigned int)time(NULL));
@@ -26,6 +28,14 @@ int main(int argc, char *argv[])
 	net = network_create(n_inputs, n_neurons, n_layers);
 	network_forward(net);
 	network_show(net);
+
+	n_out = network_output_size(net);
+	target = calloc((size_t)n_out, sizeof(double));
+	if (!target)
+		exit(EXIT_FAILURE);
+	printf("MSE (target=0)  %10.6f\n\n", network_mse(net, target, n_out));
+	free(target);
+
 	network_free(&net);
 	return 0;
 }

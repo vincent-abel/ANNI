@@ -15,6 +15,7 @@ Current implementation:
 - Connections
 - Activation functions
 - Forward propagation
+- MSE loss
 
 Training and Transformer components are not implemented yet.
 
@@ -22,9 +23,9 @@ Training and Transformer components are not implemented yet.
 
 ### Neural Network
 
-- [ ] Stabilize current architecture
-- [ ] Forward propagation
-- [ ] Loss functions
+- [x] Stabilize current architecture
+- [x] Forward propagation
+- [x] Loss functions
 - [ ] Backpropagation
 - [ ] Gradient descent
 - [ ] Training loop

@@ -122,6 +122,39 @@ void network_show(network *net)
 	puts("");
 }
 
+int network_output_size(network *net)
+{
+	if (!net || !net->out)
+		return 0;
+	return count_neurons(net->out->neuron);
+}
+
+double network_mse(network *net, const double *target, int n_target)
+{
+	neuron *n;
+	double sum;
+	double d;
+	int i;
+
+	if (!net || !net->out || !target || n_target <= 0)
+		return -1.0;
+
+	n = net->out->neuron;
+	sum = 0.0;
+	i = 0;
+	while (n) {
+		if (i >= n_target)
+			return -1.0;
+		d = n->output - target[i];
+		sum += d * d;
+		i++;
+		n = n->prev;
+	}
+	if (i != n_target)
+		return -1.0;
+	return sum / (double)n_target;
+}
+
 network *network_create(int n_inputs, int n_neurons, int n_layers)
 {
 	network *net;
@@ -137,6 +170,7 @@ network *network_create(int n_inputs, int n_neurons, int n_layers)
 	if (!net->inputs)
 		exit(EXIT_FAILURE);
 	net->layers = NULL;
+	net->out = NULL;
 
 	for (i = 0; i < n_inputs; i++)
 		net->inputs[i] = randfrom(0, 1);
@@ -150,6 +184,7 @@ network *network_create(int n_inputs, int n_neurons, int n_layers)
 		nlayer_append(&net->layers, &tail, neurons);
 		prev = neurons;
 	}
+	net->out = tail;
 	return net;
 }
 
