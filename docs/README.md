@@ -57,6 +57,7 @@
 - [Mini-batch corpus training](mini-batch-corpus-training.md)
 - [LM weight serialization](lm-weight-serialization.md)
 - [Checkpoint and resume](checkpoint-and-resume.md)
+- [Held-out loss / perplexity](held-out-loss-perplexity.md)
 
 ---
 
@@ -219,3 +220,6 @@ LMCK binary files store config dims and every weight tensor in a fixed walk orde
 
 ### [Checkpoint and resume](checkpoint-and-resume.md)
 Checkpoints store Adam moments and step counters with the weights. Resume continues optimization without resetting momentum. lm_save_checkpoint and lm_load_checkpoint implement that path.
+
+### [Held-out loss / perplexity](held-out-loss-perplexity.md)
+Held-out NLL scores generalization on unseen windows. Perplexity is exp of that mean NLL and stays at least one. data/toy_val.txt exercises the metric in tests.
