@@ -220,9 +220,13 @@ int lm_loss_backward(lm *model, const lm_cache *c, const int *ids, int n,
 	vec *logits;
 	double *delta;
 	double *soft_tmp;
+	mat hrow;
+	mat drow;
 	int t;
-	int j;
 	int v;
+	int ii;
+	int jj;
+	double sum;
 
 	if (!model || !c || !ids || !dhidden || n < 2)
 		return -1;
@@ -236,6 +240,14 @@ int lm_loss_backward(lm *model, const lm_cache *c, const int *ids, int n,
 		return -1;
 	}
 	mat_zero(dhidden);
+	hrow.d_data = NULL;
+	hrow.on_device = 0;
+	hrow.rows = 1;
+	hrow.cols = LM_D_MODEL;
+	drow.d_data = NULL;
+	drow.on_device = 0;
+	drow.rows = 1;
+	drow.cols = model->vocab_size;
 	for (t = 0; t < n - 1; t++) {
 		if (lm_logits_at(logits, model, c->hidden, t) != 0) {
 			vec_free(&logits);
@@ -247,16 +259,22 @@ int lm_loss_backward(lm *model, const lm_cache *c, const int *ids, int n,
 		    (size_t)model->vocab_size * sizeof(double));
 		softmax_inplace(delta, model->vocab_size, soft_tmp);
 		delta[ids[t + 1]] -= 1.0;
-		for (v = 0; v < model->vocab_size; v++) {
+		for (v = 0; v < model->vocab_size; v++)
 			model->db_head->data[v] += delta[v];
-			for (j = 0; j < LM_D_MODEL; j++) {
-				mat_set(model->dw_head, j, v,
-				    mat_get(model->dw_head, j, v)
-				    + mat_get(c->hidden, t, j) * delta[v]);
-				mat_set(dhidden, t, j,
-				    mat_get(dhidden, t, j)
-				    + mat_get(model->w_head, j, v) * delta[v]);
-			}
+		hrow.data = &c->hidden->data[t * LM_D_MODEL];
+		drow.data = delta;
+		if (mat_outer_add(model->dw_head, &hrow, &drow) != 0) {
+			vec_free(&logits);
+			free(delta);
+			free(soft_tmp);
+			return -1;
+		}
+		for (jj = 0; jj < LM_D_MODEL; jj++) {
+			sum = 0.0;
+			for (ii = 0; ii < model->vocab_size; ii++)
+				sum += model->w_head->data[jj * model->vocab_size + ii]
+				    * delta[ii];
+			dhidden->data[t * LM_D_MODEL + jj] += sum;
 		}
 	}
 	vec_free(&logits);
