@@ -88,8 +88,11 @@ static int run_lm_train(int argc, char **argv)
 	const char *out;
 	const char *resume;
 	double loss;
+	double lr;
 	int epochs;
 	int batch;
+	int window;
+	int seed;
 	int debug;
 	int nw;
 	int prev_epoch;
@@ -105,11 +108,22 @@ static int run_lm_train(int argc, char **argv)
 	out = arg_value(argc, argv, "--out", resume ? resume : "model.bin");
 	epochs = atoi(arg_value(argc, argv, "--epochs", "3"));
 	batch = atoi(arg_value(argc, argv, "--batch", "4"));
+	lr = atof(arg_value(argc, argv, "--lr", "0.01"));
+	window = atoi(arg_value(argc, argv, "--window", "8"));
+	seed = atoi(arg_value(argc, argv, "--seed", "1"));
 	debug = arg_flag(argc, argv, "-d", "--debug");
 	if (epochs <= 0)
 		epochs = 3;
 	if (batch <= 0)
 		batch = 4;
+	if (lr <= 0.0)
+		lr = 0.01;
+	if (window < 2)
+		window = 8;
+	if (window > LM_MAX_CTX)
+		window = LM_MAX_CTX;
+	if (seed < 0)
+		seed = 1;
 	prev_epoch = 0;
 	prev_step = 0;
 	model = NULL;
@@ -119,13 +133,13 @@ static int run_lm_train(int argc, char **argv)
 	snprintf(msg, sizeof(msg), "will ingest file: %s", data);
 	train_dbg(debug, msg);
 	snprintf(msg, sizeof(msg),
-	    "params: epochs=%d batch=%d lr=0.01 out=%s%s%s",
-	    epochs, batch, out,
+	    "params: epochs=%d batch=%d lr=%.4g window=%d seed=%d out=%s%s%s",
+	    epochs, batch, lr, window, seed, out,
 	    resume ? " resume=" : "",
 	    resume ? resume : "");
 	train_dbg(debug, msg);
 
-	srand(1);
+	srand((unsigned int)seed);
 	if (resume) {
 		snprintf(msg, sizeof(msg), "resuming from checkpoint: %s", resume);
 		train_dbg(debug, msg);
@@ -150,7 +164,7 @@ static int run_lm_train(int argc, char **argv)
 		opt = model ? lm_adam_create(model) : NULL;
 	}
 	train_dbg(debug, "loading dataset / tokenizing");
-	ds = text_dataset_load(data, 8);
+	ds = text_dataset_load(data, window);
 	if (!model || !ds || !opt) {
 		lm_free(&model);
 		text_dataset_free(&ds);
@@ -161,23 +175,24 @@ static int run_lm_train(int argc, char **argv)
 	}
 	nw = text_dataset_n_windows(ds);
 	snprintf(msg, sizeof(msg),
-	    "dataset ready: %d token ids, %d windows (len 8)",
-	    ds->n_ids, nw);
+	    "dataset ready: %d token ids, %d windows (len %d)",
+	    ds->n_ids, nw, window);
 	train_dbg(debug, msg);
 	train_dbg(debug, "running mini-batch corpus training");
-	loss = lm_train_corpus(model, ds, opt, epochs, batch, 0.01, debug);
-	printf("LM train NLL %.4f\n", loss);
-	printf("LM train window NLL %.4f\n", lm_nll_windows(model, ds));
 	total_epochs = prev_epoch + epochs;
-	train_dbg(debug, "saving checkpoint");
-	if (lm_save_checkpoint(model, opt, total_epochs, prev_step, out) != 0) {
-		fprintf(stderr, "lm train: save failed\n");
+	loss = lm_train_corpus(model, ds, opt, epochs, batch, lr, debug,
+	    out, prev_epoch);
+	if (loss < 0.0) {
+		fprintf(stderr, "lm train: failed (train or per-epoch save)\n");
 		lm_free(&model);
 		text_dataset_free(&ds);
 		lm_adam_free(&opt);
 		return 1;
 	}
-	printf("LM saved %s\n", out);
+	printf("LM train NLL %.4f\n", loss);
+	printf("LM train window NLL %.4f\n", lm_nll_windows(model, ds));
+	printf("LM saved %s (after each epoch, last epoch %d)\n",
+	    out, total_epochs);
 	snprintf(msg, sizeof(msg), "lm train finished (wrote %s)", out);
 	train_dbg(debug, msg);
 	lm_free(&model);
@@ -321,6 +336,65 @@ static int run_lm_demo(int argc, char **argv)
 	return 0;
 }
 
+static int run_lm_merge(int argc, char **argv)
+{
+	const char *out;
+	lm *models[32];
+	lm *merged;
+	const char *paths[32];
+	int n;
+	int i;
+	int rc;
+
+	out = arg_value(argc, argv, "--out", "model_merged.bin");
+	n = 0;
+	for (i = 3; i < argc; i++) {
+		if (argv[i][0] == '-') {
+			if (arg_eq(argv[i], "--out") && i + 1 < argc)
+				i++;
+			continue;
+		}
+		if (n >= 32) {
+			fprintf(stderr, "lm merge: too many models (max 32)\n");
+			return 1;
+		}
+		paths[n++] = argv[i];
+	}
+	if (n < 2) {
+		fprintf(stderr,
+		    "Usage: ./ann lm merge --out OUT.bin a.bin b.bin [c.bin ...]\n");
+		return 1;
+	}
+	memset(models, 0, sizeof(models));
+	for (i = 0; i < n; i++) {
+		models[i] = lm_load_any(paths[i]);
+		if (!models[i]) {
+			fprintf(stderr, "lm merge: cannot load %s\n", paths[i]);
+			while (--i >= 0)
+				lm_free(&models[i]);
+			return 1;
+		}
+	}
+	merged = NULL;
+	rc = lm_merge_average(models, n, &merged);
+	for (i = 0; i < n; i++)
+		lm_free(&models[i]);
+	if (rc != 0 || !merged) {
+		fprintf(stderr, "lm merge: average failed\n");
+		lm_free(&merged);
+		return 1;
+	}
+	if (lm_save(merged, out) != 0) {
+		fprintf(stderr, "lm merge: save %s failed\n", out);
+		lm_free(&merged);
+		return 1;
+	}
+	printf("LM merged %d models -> %s (weights only, fresh Adam on next train)\n",
+	    n, out);
+	lm_free(&merged);
+	return 0;
+}
+
 static int run_lm(int argc, char **argv)
 {
 	if (argc >= 3 && arg_eq(argv[2], "train"))
@@ -331,6 +405,8 @@ static int run_lm(int argc, char **argv)
 		return run_lm_load(argc, argv);
 	if (argc >= 3 && arg_eq(argv[2], "bench"))
 		return run_lm_bench(argc, argv);
+	if (argc >= 3 && arg_eq(argv[2], "merge"))
+		return run_lm_merge(argc, argv);
 	return run_lm_demo(argc, argv);
 }
 
@@ -403,8 +479,10 @@ int main(int argc, char *argv[])
 		printf("       ./ann xor\n");
 		printf("       ./ann lm [phrase]\n");
 		printf("       ./ann lm train [--data PATH] [--epochs N] [--out PATH]\n");
-		printf("                 [--resume PATH] [-d|--debug]\n");
+		printf("                 [--resume PATH] [--lr RATE] [--window N]\n");
+		printf("                 [--batch N] [--seed N] [-d|--debug]\n");
 		printf("       ./ann lm train --bench-gpu [--tokens N] [--steps N]\n");
+		printf("       ./ann lm merge --out OUT.bin a.bin b.bin [c.bin ...]\n");
 		printf("       ./ann lm generate --model model.bin --prompt hello\n");
 		printf("       ./ann lm load --model model.bin\n");
 		printf("       ./ann lm bench [--tokens N] [--iters N] [--train]\n");

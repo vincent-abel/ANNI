@@ -15,5 +15,12 @@ int	lm_save_checkpoint(const lm *model, const lm_adam *opt,
 		int epoch, int step, const char *path);
 lm	*lm_load_checkpoint(const char *path, lm_adam **opt_out,
 		int *epoch_out, int *step_out);
+/*
+** Average weights of n models into *out (fresh lm). Same architecture required.
+** Adam state is not merged. Returns 0 on success.
+*/
+int	lm_merge_average(lm *const *models, int n, lm **out);
+/* Weights-only or checkpoint (Adam discarded). */
+lm	*lm_load_any(const char *path);
 
 #endif

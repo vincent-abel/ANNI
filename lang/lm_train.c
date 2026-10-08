@@ -3,9 +3,11 @@
 */
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 #include "gpu.h"
 #include "gradutil.h"
+#include "lm_serialize.h"
 #include "lm_train.h"
 #include "mat.h"
 
@@ -53,12 +55,24 @@ static void scale_grads(lm *model, double scale)
 	}
 }
 
+static int g_progress_open;
+
+static void dbg_progress_close(void)
+{
+	if (!g_progress_open)
+		return;
+	fputc('\n', stderr);
+	fflush(stderr);
+	g_progress_open = 0;
+}
+
 static void dbg_stamp(const char *msg)
 {
 	time_t now;
 	struct tm *tm;
 	char buf[32];
 
+	dbg_progress_close();
 	now = time(NULL);
 	tm = localtime(&now);
 	if (tm)
@@ -77,7 +91,7 @@ static void dbg_fmt_eta(char *out, size_t out_n, double sec)
 	if (!out || out_n == 0)
 		return;
 	if (sec < 0.0 || sec > 86400.0 * 7.0) {
-		snprintf(out, out_n, "--:--:--");
+		snprintf(out, out_n, "--:--");
 		return;
 	}
 	s = (int)(sec + 0.5);
@@ -86,34 +100,53 @@ static void dbg_fmt_eta(char *out, size_t out_n, double sec)
 	m = s / 60;
 	s %= 60;
 	if (h > 0)
-		snprintf(out, out_n, "%d:%02d:%02d", h, m, s);
+		snprintf(out, out_n, "%dh%02dm", h, m);
 	else
 		snprintf(out, out_n, "%02d:%02d", m, s);
 }
 
+/* Single in-place progress line (\\r). Close it before any stamp/log line. */
 static void dbg_progress(int ep, int epochs, int done, int total,
-	double nll, double win_nll, clock_t t0, int tokens_done)
+	int epoch_done, int nw, double nll, double win_nll, clock_t t0,
+	int tokens_done, int force)
 {
 	int width;
 	int filled;
 	int i;
-	double pct;
+	double ep_pct;
 	double elapsed;
 	double eta;
 	double ms_tok;
-	time_t now;
-	struct tm *tm;
-	char buf[32];
 	char eta_buf[16];
+	char bar[16];
+	char line[96];
+	int nline;
+	static clock_t last_print;
+	clock_t nowc;
 
-	width = 28;
+	nowc = clock();
+	if (!force && last_print != (clock_t)0
+	    && (nowc - last_print) < CLOCKS_PER_SEC / 5)
+		return;
+	last_print = nowc;
+
+	width = 12;
+	if (nw <= 0)
+		nw = 1;
 	if (total <= 0)
 		total = 1;
-	pct = 100.0 * (double)done / (double)total;
-	filled = (int)((double)width * (double)done / (double)total + 0.5);
+	if (epoch_done < 0)
+		epoch_done = 0;
+	if (epoch_done > nw)
+		epoch_done = nw;
+	ep_pct = 100.0 * (double)epoch_done / (double)nw;
+	filled = (int)((double)width * (double)epoch_done / (double)nw + 0.5);
 	if (filled > width)
 		filled = width;
-	elapsed = (double)(clock() - t0) / (double)CLOCKS_PER_SEC;
+	for (i = 0; i < width; i++)
+		bar[i] = i < filled ? '#' : '-';
+	bar[width] = '\0';
+	elapsed = (double)(nowc - t0) / (double)CLOCKS_PER_SEC;
 	eta = -1.0;
 	ms_tok = -1.0;
 	if (done > 0 && elapsed > 0.0) {
@@ -122,26 +155,29 @@ static void dbg_progress(int ep, int epochs, int done, int total,
 			ms_tok = 1000.0 * elapsed / (double)tokens_done;
 	}
 	dbg_fmt_eta(eta_buf, sizeof(eta_buf), eta);
-	now = time(NULL);
-	tm = localtime(&now);
-	if (tm)
-		strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", tm);
-	else
-		snprintf(buf, sizeof(buf), "unknown-time");
-	fprintf(stderr, "\r[%s] [", buf);
-	for (i = 0; i < width; i++)
-		fputc(i < filled ? '#' : '-', stderr);
-	fprintf(stderr, "] %5.1f%%  epoch %d/%d  windows %d/%d",
-	    pct, ep + 1, epochs, done, total);
-	if (nll > 0.0)
-		fprintf(stderr, "  NLL %.4f", nll);
-	if (win_nll > 0.0)
-		fprintf(stderr, "  win NLL %.4f", win_nll);
-	if (ms_tok > 0.0)
-		fprintf(stderr, "  %.2f ms/tok", ms_tok);
-	if (eta >= 0.0)
-		fprintf(stderr, "  ETA %s", eta_buf);
+	nline = snprintf(line, sizeof(line),
+	    "ep %d/%d [%s] %4.0f%% %d/%d",
+	    ep + 1, epochs, bar, ep_pct, epoch_done, nw);
+	if (nline < 0)
+		nline = 0;
+	if (nll > 0.0 && (size_t)nline < sizeof(line))
+		nline += snprintf(line + nline, sizeof(line) - (size_t)nline,
+		    " NLL %.3f", nll);
+	if (win_nll > 0.0 && (size_t)nline < sizeof(line))
+		nline += snprintf(line + nline, sizeof(line) - (size_t)nline,
+		    " win %.3f", win_nll);
+	if (ms_tok > 0.0 && (size_t)nline < sizeof(line))
+		nline += snprintf(line + nline, sizeof(line) - (size_t)nline,
+		    " %.2fms/t", ms_tok);
+	if (eta >= 0.0 && (size_t)nline < sizeof(line))
+		snprintf(line + nline, sizeof(line) - (size_t)nline,
+		    " ETA %s", eta_buf);
+	/* Pad/clear leftovers from a longer previous frame. */
+	fprintf(stderr, "\r%-96s", line);
 	fflush(stderr);
+	g_progress_open = 1;
+	if (force)
+		dbg_progress_close();
 }
 
 double lm_nll_windows(const lm *model, const text_dataset *ds)
@@ -167,7 +203,8 @@ double lm_nll_windows(const lm *model, const text_dataset *ds)
 }
 
 double lm_train_corpus(lm *model, text_dataset *ds, lm_adam *opt,
-	int epochs, int batch_size, double lr, int debug)
+	int epochs, int batch_size, double lr, int debug,
+	const char *ckpt_path, int epoch_base)
 {
 	int ep;
 	int nw;
@@ -178,25 +215,36 @@ double lm_train_corpus(lm *model, text_dataset *ds, lm_adam *opt,
 	int total_steps;
 	int done_steps;
 	int tokens_done;
+	int epoch_num;
+	int *order;
+	int tmp;
+	int j;
+	int r;
 	lm_cache *cache;
 	mat *dhidden;
 	double last;
 	double win;
 	clock_t t0;
-	char msg[160];
+	char msg[192];
 
 	if (!model || !ds || !opt || epochs <= 0 || batch_size <= 0 || lr <= 0.0)
 		return -1.0;
+	if (epoch_base < 0)
+		epoch_base = 0;
 	nw = text_dataset_n_windows(ds);
 	if (nw <= 0)
 		return -1.0;
+	order = malloc((size_t)nw * sizeof(int));
 	cache = lm_cache_create(ds->window);
 	dhidden = mat_create(ds->window, LM_D_MODEL);
-	if (!cache || !dhidden) {
+	if (!order || !cache || !dhidden) {
+		free(order);
 		lm_cache_free(&cache);
 		mat_free(&dhidden);
 		return -1.0;
 	}
+	for (j = 0; j < nw; j++)
+		order[j] = j;
 	mat_try_pin(dhidden);
 	mat_try_pin(model->dw_head);
 	total_steps = epochs * nw;
@@ -221,6 +269,13 @@ double lm_train_corpus(lm *model, text_dataset *ds, lm_adam *opt,
 			    ep + 1, epochs);
 			dbg_stamp(msg);
 		}
+		/* Seeded shuffle so parallel --seed runs diverge after resume. */
+		for (j = nw - 1; j > 0; j--) {
+			r = rand() % (j + 1);
+			tmp = order[j];
+			order[j] = order[r];
+			order[r] = tmp;
+		}
 		idx = 0;
 		while (idx < nw) {
 			lm_adam_zero_grad(model);
@@ -228,7 +283,7 @@ double lm_train_corpus(lm *model, text_dataset *ds, lm_adam *opt,
 			gpu_set_sync_mode(GPU_SYNC_BATCH);
 			b = 0;
 			while (b < batch_size && idx < nw) {
-				if (text_dataset_window(ds, idx, ids, &n) != 0)
+				if (text_dataset_window(ds, order[idx], ids, &n) != 0)
 					break;
 				if (lm_forward_cache(model, ids, n, cache) != 0)
 					break;
@@ -254,14 +309,33 @@ double lm_train_corpus(lm *model, text_dataset *ds, lm_adam *opt,
 			lm_adam_step(opt, lr);
 			if (debug)
 				dbg_progress(ep, epochs, done_steps, total_steps,
-				    last, win, t0, tokens_done);
+				    idx, nw, last, win, t0, tokens_done, 0);
 		}
 		/* Epoch boundary: long ctx NLL + mean over train windows. */
 		last = lm_nll(model, ds->ids,
 		    ds->n_ids < LM_MAX_CTX ? ds->n_ids : LM_MAX_CTX);
 		win = lm_nll_windows(model, ds);
+		epoch_num = epoch_base + ep + 1;
+		if (ckpt_path) {
+			if (lm_save_checkpoint(model, opt, epoch_num, 0,
+				ckpt_path) != 0) {
+				if (debug)
+					dbg_stamp("checkpoint save failed");
+				free(order);
+				lm_cache_free(&cache);
+				mat_free(&dhidden);
+				return -1.0;
+			}
+			if (debug) {
+				snprintf(msg, sizeof(msg),
+				    "saved checkpoint %s (epoch %d)",
+				    ckpt_path, epoch_num);
+				dbg_stamp(msg);
+			}
+		}
 		if (debug) {
-			fputc('\n', stderr);
+			dbg_progress(ep, epochs, done_steps, total_steps,
+			    nw, nw, last, win, t0, tokens_done, 1);
 			snprintf(msg, sizeof(msg),
 			    "epoch %d/%d done  NLL %.4f  window NLL %.4f",
 			    ep + 1, epochs, last, win);
@@ -271,6 +345,7 @@ double lm_train_corpus(lm *model, text_dataset *ds, lm_adam *opt,
 	gpu_set_sync_mode(GPU_SYNC_EAGER);
 	if (debug)
 		dbg_stamp("train loop finished");
+	free(order);
 	lm_cache_free(&cache);
 	mat_free(&dhidden);
 	return last;

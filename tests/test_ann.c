@@ -638,7 +638,7 @@ static void test_lm_train_corpus(void)
 	ds = text_dataset_load("data/toy_tiny.txt", 8);
 	opt = lm_adam_create(model);
 	assert(model && ds && opt);
-	loss = lm_train_corpus(model, ds, opt, 1, 2, 0.01, 0);
+	loss = lm_train_corpus(model, ds, opt, 1, 2, 0.01, 0, NULL, 0);
 	assert(loss > 0.0);
 	lm_adam_free(&opt);
 	text_dataset_free(&ds);
@@ -669,6 +669,36 @@ static void test_lm_serialize_roundtrip(void)
 	lm_free(&b);
 }
 
+static void test_lm_merge_average(void)
+{
+	lm *a;
+	lm *b;
+	lm *models[2];
+	lm *m;
+	int i;
+	double sum;
+
+	srand(17);
+	a = lm_create();
+	b = lm_create();
+	assert(a && b);
+	a->w_head->data[0] = 2.0;
+	b->w_head->data[0] = 4.0;
+	models[0] = a;
+	models[1] = b;
+	assert(lm_merge_average(models, 2, &m) == 0);
+	assert(m);
+	assert(fabs(m->w_head->data[0] - 3.0) < 1e-12);
+	sum = 0.0;
+	for (i = 0; i < m->b_head->n; i++)
+		sum += fabs(m->b_head->data[i]
+		    - 0.5 * (a->b_head->data[i] + b->b_head->data[i]));
+	assert(sum < 1e-9);
+	lm_free(&a);
+	lm_free(&b);
+	lm_free(&m);
+}
+
 static void test_lm_checkpoint_resume(void)
 {
 	lm *a;
@@ -686,11 +716,11 @@ static void test_lm_checkpoint_resume(void)
 	ds = text_dataset_load("data/toy_tiny.txt", 8);
 	oa = lm_adam_create(a);
 	assert(a && ds && oa);
-	loss1 = lm_train_corpus(a, ds, oa, 1, 2, 0.01, 0);
+	loss1 = lm_train_corpus(a, ds, oa, 1, 2, 0.01, 0, NULL, 0);
 	assert(lm_save_checkpoint(a, oa, 1, 0, "objects/test_ckpt.bin") == 0);
 	b = lm_load_checkpoint("objects/test_ckpt.bin", &ob, &epoch, &step);
 	assert(b && ob && epoch == 1);
-	loss2 = lm_train_corpus(b, ds, ob, 1, 2, 0.01, 0);
+	loss2 = lm_train_corpus(b, ds, ob, 1, 2, 0.01, 0, NULL, 0);
 	assert(loss2 > 0.0 && loss1 > 0.0);
 	lm_adam_free(&oa);
 	lm_adam_free(&ob);
@@ -732,7 +762,7 @@ static void test_lm_generate_from_checkpoint(void)
 	ds = text_dataset_load("data/toy_tiny.txt", 8);
 	opt = lm_adam_create(model);
 	assert(model && ds && opt);
-	lm_train_corpus(model, ds, opt, 1, 2, 0.01, 0);
+	lm_train_corpus(model, ds, opt, 1, 2, 0.01, 0, NULL, 0);
 	assert(lm_save_checkpoint(model, opt, 1, 0, "objects/gen_ckpt.bin") == 0);
 	loaded = lm_load_checkpoint("objects/gen_ckpt.bin", NULL, NULL, NULL);
 	assert(loaded);
@@ -1038,6 +1068,7 @@ int main(void)
 	test_text_dataset();
 	test_lm_train_corpus();
 	test_lm_serialize_roundtrip();
+	test_lm_merge_average();
 	test_lm_checkpoint_resume();
 	test_lm_perplexity();
 	test_lm_generate_from_checkpoint();
