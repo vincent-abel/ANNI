@@ -22,3 +22,6 @@ Cross-entropy scores how little probability the model put on the true class. `ve
 
 ### [Mini-batches](mini-batches.md)
 Mini-batches average gradients over a few examples before each weight update. That smooths the noisy single-sample steps. `network_train_mb` accumulates, scales by batch size, then updates once.
+
+### [Adam optimizer](adam-optimizer.md)
+Adam mixes momentum with per-weight adaptive step sizes from squared-gradient history. Bias correction warms up early averages. `adam_create` / `adam_step` drive training instead of plain SGD.

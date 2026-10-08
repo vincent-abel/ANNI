@@ -15,5 +15,6 @@
 #include "mat.h"
 #include "tensor.h"
 #include "ops.h"
+#include "optim.h"
 
 #endif

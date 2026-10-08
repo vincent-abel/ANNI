@@ -29,6 +29,7 @@ Current implementation:
 - Softmax
 - Cross-entropy
 - Mini-batches
+- Adam optimizer
 
 Training and Transformer components are not implemented yet.
 
@@ -55,7 +56,7 @@ Training and Transformer components are not implemented yet.
 - [x] Softmax
 - [x] Cross-entropy
 - [x] Mini-batches
-- [ ] Adam optimizer
+- [x] Adam optimizer
 - [ ] Model serialization
 
 ### Language Model

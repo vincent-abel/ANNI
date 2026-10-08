@@ -269,6 +269,39 @@ static void test_xor_trains(void)
 	network_free(&net);
 }
 
+static void test_xor_adam(void)
+{
+	network *net;
+	adam *opt;
+	const int sizes[] = {4, 1};
+	double mse;
+	int s;
+	int correct;
+	double out;
+
+	srand(1);
+	net = network_create_sizes(XOR_INPUTS, sizes, 2);
+	opt = adam_create(net);
+	assert(opt != NULL);
+	network_train_adam(net, opt, xor_inputs, xor_targets,
+		XOR_SAMPLES, XOR_OUTPUTS, 2000, 0.05);
+	mse = network_mse_dataset(net, xor_inputs, xor_targets,
+		XOR_SAMPLES, XOR_OUTPUTS);
+	assert(mse < 0.05);
+
+	correct = 0;
+	for (s = 0; s < XOR_SAMPLES; s++) {
+		network_set_inputs(net, xor_inputs + s * XOR_INPUTS, XOR_INPUTS);
+		network_forward(net);
+		out = net->out->neuron->output;
+		if ((out >= 0.5) == (xor_targets[s] >= 0.5))
+			correct++;
+	}
+	assert(correct == XOR_SAMPLES);
+	adam_free(&opt);
+	network_free(&net);
+}
+
 static void test_xor_minibatches(void)
 {
 	network *net;
@@ -312,6 +345,7 @@ int main(void)
 	test_cross_entropy();
 	test_xor_trains();
 	test_xor_minibatches();
+	test_xor_adam();
 	puts("ok");
 	return 0;
 }
