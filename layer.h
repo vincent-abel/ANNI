@@ -20,7 +20,7 @@ typedef struct	network {
 } network;
 
 void	nlayer_show(nlayer *);
-void	nlayer_append(nlayer **, nlayer **, neuron *);
+int	nlayer_append(nlayer **, nlayer **, neuron *);
 void	nlayer_clear(nlayer **);
 void	nlayer_forward(nlayer *);
 network	*network_create(int n_inputs, int n_neurons, int n_layers);

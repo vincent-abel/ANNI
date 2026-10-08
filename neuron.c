@@ -12,24 +12,25 @@ double randfrom(double min, double max)
 	return min + (rand() / div);
 }
 
-void input_push(input **p, double *in, double weigh, neuron *src)
+int input_push(input **p, double *in, double weigh, neuron *src)
 {
 	input *new_input = malloc(sizeof(input));
 	if (!new_input)
-		exit(EXIT_FAILURE);
+		return -1;
 	new_input->i = in;
 	new_input->w = weigh;
 	new_input->dw = 0.0;
 	new_input->src = src;
 	new_input->prev = *p;
 	*p = new_input;
+	return 0;
 }
 
-void neuron_push(neuron **p)
+neuron *neuron_push(neuron **p)
 {
 	neuron *n = malloc(sizeof(neuron));
 	if (!n)
-		exit(EXIT_FAILURE);
+		return NULL;
 	n->Tinput = 0;
 	n->output = 0;
 	n->bias = randfrom(-0.5, 0.5);
@@ -38,6 +39,7 @@ void neuron_push(neuron **p)
 	n->input = NULL;
 	n->prev = *p;
 	*p = n;
+	return n;
 }
 
 void neuron_clear(neuron **p)
@@ -52,20 +54,25 @@ void neuron_clear(neuron **p)
 	}
 }
 
-void neuron_connect_values(neuron *n, double *values, int count)
+int neuron_connect_values(neuron *n, double *values, int count)
 {
 	int i;
 
-	for (i = 0; i < count; i++)
-		input_push(&n->input, &values[i], randfrom(-2, 2), NULL);
+	for (i = 0; i < count; i++) {
+		if (input_push(&n->input, &values[i], randfrom(-2, 2), NULL) != 0)
+			return -1;
+	}
+	return 0;
 }
 
-void neuron_connect_layer(neuron *n, neuron *src)
+int neuron_connect_layer(neuron *n, neuron *src)
 {
 	while (src) {
-		input_push(&n->input, &src->output, randfrom(-2, 2), src);
+		if (input_push(&n->input, &src->output, randfrom(-2, 2), src) != 0)
+			return -1;
 		src = src->prev;
 	}
+	return 0;
 }
 
 static void neuron_table_sep(void)

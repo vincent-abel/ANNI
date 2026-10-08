@@ -23,15 +23,15 @@ typedef struct	neuron {
 } neuron;
 
 double	randfrom(double min, double max);
-void	input_push(input **, double *, double, neuron *);
+int	input_push(input **, double *, double, neuron *);
 int	input_delete(input **);
 int	input_size(input *);
 void	input_clear(input **);
 void	input_show(input *);
-void	neuron_push(neuron **);
+neuron	*neuron_push(neuron **);
 void	neuron_clear(neuron **);
-void	neuron_connect_values(neuron *, double *, int);
-void	neuron_connect_layer(neuron *, neuron *);
+int	neuron_connect_values(neuron *, double *, int);
+int	neuron_connect_layer(neuron *, neuron *);
 void	neuron_output(neuron *);
 void	neuron_zero_delta(neuron *);
 void	neuron_backward_output(neuron *, const double *, int);

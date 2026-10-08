@@ -11,6 +11,8 @@ static int run_xor(void)
 
 	srand(1);
 	net = network_create_sizes(XOR_INPUTS, sizes, 2);
+	if (!net)
+		exit(EXIT_FAILURE);
 	mse = network_mse_dataset(net, xor_inputs, xor_targets,
 		XOR_SAMPLES, XOR_OUTPUTS);
 	printf("XOR MSE before  %10.6f\n", mse);

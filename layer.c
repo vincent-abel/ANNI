@@ -8,21 +8,29 @@ static neuron *layer_neurons_create(int count, double *values, int n_values, neu
 	neuron *head = NULL;
 
 	while (count--) {
-		neuron_push(&head);
-		if (prev_neurons)
-			neuron_connect_layer(head, prev_neurons);
-		else
-			neuron_connect_values(head, values, n_values);
+		if (!neuron_push(&head)) {
+			neuron_clear(&head);
+			return NULL;
+		}
+		if (prev_neurons) {
+			if (neuron_connect_layer(head, prev_neurons) != 0) {
+				neuron_clear(&head);
+				return NULL;
+			}
+		} else if (neuron_connect_values(head, values, n_values) != 0) {
+			neuron_clear(&head);
+			return NULL;
+		}
 	}
 	return head;
 }
 
-void nlayer_append(nlayer **head, nlayer **tail, neuron *neurons)
+int nlayer_append(nlayer **head, nlayer **tail, neuron *neurons)
 {
 	nlayer *layer = malloc(sizeof(nlayer));
 
 	if (!layer)
-		exit(EXIT_FAILURE);
+		return -1;
 	layer->neuron = neurons;
 	layer->next = NULL;
 	layer->prev = *tail;
@@ -31,6 +39,7 @@ void nlayer_append(nlayer **head, nlayer **tail, neuron *neurons)
 	else
 		(*tail)->next = layer;
 	*tail = layer;
+	return 0;
 }
 
 void nlayer_clear(nlayer **head)
@@ -188,17 +197,20 @@ network *network_create_sizes(int n_inputs, const int *sizes, int n_layers)
 	int i;
 
 	if (!sizes || n_inputs <= 0 || n_layers <= 0)
-		exit(EXIT_FAILURE);
+		return NULL;
 
 	net = malloc(sizeof(network));
 	if (!net)
-		exit(EXIT_FAILURE);
+		return NULL;
 	net->n_inputs = n_inputs;
-	net->inputs = malloc((size_t)n_inputs * sizeof(double));
-	if (!net->inputs)
-		exit(EXIT_FAILURE);
+	net->inputs = NULL;
 	net->layers = NULL;
 	net->out = NULL;
+	net->inputs = malloc((size_t)n_inputs * sizeof(double));
+	if (!net->inputs) {
+		network_free(&net);
+		return NULL;
+	}
 
 	for (i = 0; i < n_inputs; i++)
 		net->inputs[i] = randfrom(0, 1);
@@ -206,14 +218,20 @@ network *network_create_sizes(int n_inputs, const int *sizes, int n_layers)
 	for (i = 0; i < n_layers; i++) {
 		neuron *neurons;
 
-		if (sizes[i] <= 0)
-			exit(EXIT_FAILURE);
+		if (sizes[i] <= 0) {
+			network_free(&net);
+			return NULL;
+		}
 		neurons = layer_neurons_create(
 			sizes[i],
 			net->inputs,
 			n_inputs,
 			prev);
-		nlayer_append(&net->layers, &tail, neurons);
+		if (!neurons || nlayer_append(&net->layers, &tail, neurons) != 0) {
+			neuron_clear(&neurons);
+			network_free(&net);
+			return NULL;
+		}
 		prev = neurons;
 	}
 	net->out = tail;
@@ -226,7 +244,7 @@ network *network_create(int n_inputs, int n_neurons, int n_layers)
 	network *net;
 	int i;
 
-	if (n_neurons <= 0 || n_layers <= 0)
+	if (n_inputs <= 0 || n_neurons <= 0 || n_layers <= 0)
 		exit(EXIT_FAILURE);
 	sizes = malloc((size_t)n_layers * sizeof(int));
 	if (!sizes)
@@ -235,6 +253,8 @@ network *network_create(int n_inputs, int n_neurons, int n_layers)
 		sizes[i] = n_neurons;
 	net = network_create_sizes(n_inputs, sizes, n_layers);
 	free(sizes);
+	if (!net)
+		exit(EXIT_FAILURE);
 	return net;
 }
 

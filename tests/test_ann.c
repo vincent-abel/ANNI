@@ -57,6 +57,19 @@ static void test_create_free_cycle(void)
 	}
 }
 
+static void test_create_rejects_empty(void)
+{
+	const int bad[] = {2, 0};
+	network *net;
+
+	net = network_create_sizes(2, bad, 2);
+	assert(net == NULL);
+	net = network_create_sizes(1, bad, 0);
+	assert(net == NULL);
+	net = network_create_sizes(0, bad, 1);
+	assert(net == NULL);
+}
+
 static void test_xor_trains(void)
 {
 	network *net;
@@ -91,6 +104,7 @@ int main(void)
 	test_mse_known();
 	test_forward_shape();
 	test_create_free_cycle();
+	test_create_rejects_empty();
 	test_xor_trains();
 	puts("ok");
 	return 0;
