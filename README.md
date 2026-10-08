@@ -52,11 +52,12 @@ Current implementation:
 - Mini-batch corpus training
 - Generation from trained checkpoints
 - Scale toward target size
+- Train / generate / load CLI
 - Held-out loss / perplexity
 - Checkpoint and resume
 - LM weight serialization
 
-Toy decoder-only LM in `lang/` (byte vocab, pre-norm blocks, next-token train, `./ann lm`).
+Trainable toy decoder-only LM in `lang/` (full backprop, Adam, corpus train, checkpoints, `./ann lm train|generate|load`).
 
 ## Roadmap
 
@@ -119,7 +120,7 @@ Toy decoder-only LM in `lang/` (byte vocab, pre-norm blocks, next-token train, `
 - [x] Held-out loss / perplexity
 - [x] Generation from trained checkpoints
 - [x] Scale toward target size
-- [ ] Train / generate / load CLI
+- [x] Train / generate / load CLI
 
 ### Performance
 

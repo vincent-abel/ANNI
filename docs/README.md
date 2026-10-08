@@ -60,6 +60,7 @@
 - [Held-out loss / perplexity](held-out-loss-perplexity.md)
 - [Generation from trained checkpoints](generation-from-checkpoints.md)
 - [Scale toward target size](scale-toward-target-size.md)
+- [Train / generate / load CLI](lm-cli.md)
 
 ---
 
@@ -231,3 +232,6 @@ Loaded checkpoints feed lm_generate without reinitializing random weights. Greed
 
 ### [Scale toward target size](scale-toward-target-size.md)
 Config bumps d_model to 64, heads to 8, ff to 256, context to 128, and blocks to 4. Byte vocab stays. README Target 10–50M remains aspirational beyond this toy scale.
+
+### [Train / generate / load CLI](lm-cli.md)
+The CLI exposes lm train, lm generate, and lm load over model.bin checkpoints. Flags select data, prompt, and output paths. A bare lm [phrase] demo remains for quick smoke runs.
