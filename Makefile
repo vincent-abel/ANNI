@@ -8,7 +8,7 @@ OBJDIR=objects
 
 NET_SRC=net/neuron.c net/layer.c net/dataset.c net/optim.c net/serialize.c
 NUM_SRC=num/vec.c num/mat.c num/tensor.c num/ops.c
-LANG_SRC=lang/tokenize.c lang/vocab.c lang/embed.c lang/posenc.c lang/attn.c lang/ffn.c lang/layernorm.c lang/resid.c lang/block.c lang/lm.c lang/generate.c lang/gradutil.c lang/lm_adam.c lang/dataset_text.c
+LANG_SRC=lang/tokenize.c lang/vocab.c lang/embed.c lang/posenc.c lang/attn.c lang/ffn.c lang/layernorm.c lang/resid.c lang/block.c lang/lm.c lang/generate.c lang/gradutil.c lang/lm_adam.c lang/dataset_text.c lang/lm_serialize.c lang/lm_train.c
 LIB_SRC=$(NET_SRC) $(NUM_SRC) $(LANG_SRC)
 LIB_OBJ=$(patsubst %.c,$(OBJDIR)/%.o,$(notdir $(LIB_SRC)))
 MAIN_OBJ=$(OBJDIR)/main.o
@@ -38,7 +38,10 @@ $(OBJDIR)/block.o: lang/block.c
 $(OBJDIR)/lm.o: lang/lm.c
 $(OBJDIR)/generate.o: lang/generate.c
 $(OBJDIR)/gradutil.o: lang/gradutil.c
-$(OBJDIR)/lm_adam.o: lang/lm_adam.c lang/dataset_text.c
+$(OBJDIR)/lm_adam.o: lang/lm_adam.c
+$(OBJDIR)/dataset_text.o: lang/dataset_text.c
+$(OBJDIR)/lm_train.o: lang/lm_train.c
+$(OBJDIR)/lm_serialize.o: lang/lm_serialize.c
 $(OBJDIR)/main.o: main.c
 
 all: $(EXEC)
@@ -47,7 +50,7 @@ $(OBJDIR):
 	mkdir -p $(OBJDIR)
 
 $(OBJDIR)/%.o: | $(OBJDIR)
-	$(CC) -o $@ -c $< $(CFLAGS)
+	$(CC) -o $@ -c $(firstword $(filter %.c,$^)) $(CFLAGS)
 
 ann: $(OBJ)
 	$(CC) -o $@ $^ $(LDFLAGS)

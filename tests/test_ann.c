@@ -625,6 +625,125 @@ static void test_lm_ntp_loss_drops(void)
 
 
 
+
+static void test_lm_train_corpus(void)
+{
+	lm *model;
+	lm_adam *opt;
+	text_dataset *ds;
+	double loss;
+
+	srand(11);
+	model = lm_create();
+	ds = text_dataset_load("data/toy.txt", 8);
+	opt = lm_adam_create(model);
+	assert(model && ds && opt);
+	loss = lm_train_corpus(model, ds, opt, 2, 2, 0.01);
+	assert(loss > 0.0);
+	lm_adam_free(&opt);
+	text_dataset_free(&ds);
+	lm_free(&model);
+}
+
+static void test_lm_serialize_roundtrip(void)
+{
+	lm *a;
+	lm *b;
+	int ids[LM_MAX_CTX];
+	int n;
+	double nll_a;
+	double nll_b;
+
+	srand(12);
+	a = lm_create();
+	assert(a);
+	n = tokenize_encode("hello", ids, LM_MAX_CTX);
+	lm_train_steps(a, "hello", 20, 0.01);
+	nll_a = lm_nll(a, ids, n);
+	assert(lm_save(a, "objects/test_lm.bin") == 0);
+	b = lm_load("objects/test_lm.bin");
+	assert(b);
+	nll_b = lm_nll(b, ids, n);
+	assert(fabs(nll_a - nll_b) < 1e-9);
+	lm_free(&a);
+	lm_free(&b);
+}
+
+static void test_lm_checkpoint_resume(void)
+{
+	lm *a;
+	lm *b;
+	lm_adam *oa;
+	lm_adam *ob;
+	text_dataset *ds;
+	double loss1;
+	double loss2;
+	int epoch;
+	int step;
+
+	srand(13);
+	a = lm_create();
+	ds = text_dataset_load("data/toy.txt", 8);
+	oa = lm_adam_create(a);
+	assert(a && ds && oa);
+	loss1 = lm_train_corpus(a, ds, oa, 1, 2, 0.01);
+	assert(lm_save_checkpoint(a, oa, 1, 0, "objects/test_ckpt.bin") == 0);
+	b = lm_load_checkpoint("objects/test_ckpt.bin", &ob, &epoch, &step);
+	assert(b && ob && epoch == 1);
+	loss2 = lm_train_corpus(b, ds, ob, 1, 2, 0.01);
+	assert(loss2 > 0.0 && loss1 > 0.0);
+	lm_adam_free(&oa);
+	lm_adam_free(&ob);
+	text_dataset_free(&ds);
+	lm_free(&a);
+	lm_free(&b);
+}
+
+static void test_lm_perplexity(void)
+{
+	lm *model;
+	text_dataset *ds;
+	int ids[LM_MAX_CTX];
+	int n;
+	double ppl;
+
+	srand(14);
+	model = lm_create();
+	ds = text_dataset_load("data/toy_val.txt", 4);
+	assert(model && ds);
+	assert(text_dataset_window(ds, 0, ids, &n) == 0);
+	ppl = lm_perplexity(model, ids, n);
+	assert(ppl >= 1.0);
+	lm_free(&model);
+	text_dataset_free(&ds);
+}
+
+static void test_lm_generate_from_checkpoint(void)
+{
+	lm *model;
+	lm_adam *opt;
+	text_dataset *ds;
+	lm *loaded;
+	char out[128];
+	int n;
+
+	srand(15);
+	model = lm_create();
+	ds = text_dataset_load("data/toy.txt", 8);
+	opt = lm_adam_create(model);
+	assert(model && ds && opt);
+	lm_train_corpus(model, ds, opt, 1, 2, 0.01);
+	assert(lm_save_checkpoint(model, opt, 1, 0, "objects/gen_ckpt.bin") == 0);
+	loaded = lm_load_checkpoint("objects/gen_ckpt.bin", NULL, NULL, NULL);
+	assert(loaded);
+	n = lm_generate(loaded, "he", out, (int)sizeof(out), 4, 0.0);
+	assert(n > 0);
+	lm_adam_free(&opt);
+	text_dataset_free(&ds);
+	lm_free(&model);
+	lm_free(&loaded);
+}
+
 static void test_text_dataset(void)
 {
 	text_dataset *ds;
@@ -733,6 +852,11 @@ int main(void)
 	test_lm_generate_smoke();
 	test_lm_backprop_head();
 	test_text_dataset();
+	test_lm_train_corpus();
+	test_lm_serialize_roundtrip();
+	test_lm_checkpoint_resume();
+	test_lm_perplexity();
+	test_lm_generate_from_checkpoint();
 	puts("ok");
 	return 0;
 }

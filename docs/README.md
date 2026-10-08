@@ -54,6 +54,7 @@
 - [Train all parameters](train-all-parameters.md)
 - [Adam for LM weights](adam-lm-weights.md)
 - [Text dataset loading](text-dataset-loading.md)
+- [Mini-batch corpus training](mini-batch-corpus-training.md)
 
 ---
 
@@ -207,3 +208,6 @@ LM Adam registers every param/grad scalar into flat slots. Bias-corrected moment
 
 ### [Text dataset loading](text-dataset-loading.md)
 Text datasets load a UTF-8 file into byte token ids. Sliding windows of length window feed next-token pairs. data/toy.txt is the shipped fixture for tests.
+
+### [Mini-batch corpus training](mini-batch-corpus-training.md)
+Corpus training walks sliding windows in batches. Gradients average over the batch before one Adam step. lm_train_corpus runs epochs over a text_dataset.
