@@ -22,6 +22,7 @@ Current implementation:
 - XOR dataset
 - Unit tests
 - Memory management
+- Vectors
 
 Training and Transformer components are not implemented yet.
 
@@ -41,7 +42,7 @@ Training and Transformer components are not implemented yet.
 
 ### Numerical Engine
 
-- [ ] Vectors
+- [x] Vectors
 - [ ] Matrices
 - [ ] Tensors
 - [ ] Optimized matrix multiplication

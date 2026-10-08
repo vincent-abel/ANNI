@@ -70,6 +70,35 @@ static void test_create_rejects_empty(void)
 	assert(net == NULL);
 }
 
+static void test_vec_dot_axpy(void)
+{
+	vec *a;
+	vec *b;
+	vec *y;
+
+	a = vec_create(3);
+	b = vec_create(3);
+	y = vec_create(3);
+	assert(a && b && y);
+	a->data[0] = 1.0;
+	a->data[1] = 2.0;
+	a->data[2] = 3.0;
+	b->data[0] = 4.0;
+	b->data[1] = 5.0;
+	b->data[2] = 6.0;
+	assert(fabs(vec_dot(a, b) - 32.0) < 1e-9);
+	y->data[0] = 3.0;
+	y->data[1] = 0.0;
+	y->data[2] = 1.0;
+	vec_axpy(y, 2.0, a);
+	assert(fabs(y->data[0] - 5.0) < 1e-9);
+	assert(fabs(y->data[1] - 4.0) < 1e-9);
+	assert(fabs(y->data[2] - 7.0) < 1e-9);
+	vec_free(&a);
+	vec_free(&b);
+	vec_free(&y);
+}
+
 static void test_xor_trains(void)
 {
 	network *net;
@@ -105,6 +134,7 @@ int main(void)
 	test_forward_shape();
 	test_create_free_cycle();
 	test_create_rejects_empty();
+	test_vec_dot_axpy();
 	test_xor_trains();
 	puts("ok");
 	return 0;

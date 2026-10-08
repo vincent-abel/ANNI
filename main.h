@@ -11,5 +11,6 @@
 #include <time.h>
 #include "layer.h"
 #include "dataset.h"
+#include "vec.h"
 
 #endif
