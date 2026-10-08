@@ -3,6 +3,7 @@
 */
 #include <math.h>
 #include <stdlib.h>
+#include "gpu.h"
 #include "gradutil.h"
 #include "layernorm.h"
 
@@ -154,6 +155,9 @@ int layernorm_backward(mat *dx, const mat *dy, layernorm *ln, const ln_cache *c)
 	if (dx->rows != dy->rows || dx->cols != dy->cols)
 		return -1;
 	d = LM_D_MODEL;
+	if (gpu_layernorm_backward(dx, dy, ln->gamma->data, c->x_hat->data,
+		c->inv_std->data, c->T, d, ln->dgamma->data, ln->dbeta->data) == 0)
+		return 0;
 
 	for (t = 0; t < c->T; t++) {
 		inv_std = c->inv_std->data[t];

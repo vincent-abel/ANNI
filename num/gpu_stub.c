@@ -91,3 +91,19 @@ int gpu_mat_outer_add(mat *dw, const mat *a, const mat *b)
 	(void)b;
 	return -1;
 }
+
+int gpu_layernorm_backward(mat *dx, const mat *dy, const double *gamma,
+	const double *x_hat, const double *inv_std, int T, int d,
+	double *dgamma, double *dbeta)
+{
+	(void)dx;
+	(void)dy;
+	(void)gamma;
+	(void)x_hat;
+	(void)inv_std;
+	(void)T;
+	(void)d;
+	(void)dgamma;
+	(void)dbeta;
+	return -1;
+}

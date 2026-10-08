@@ -27,5 +27,9 @@ int	gpu_mat_mul_backward(mat *da, mat *db, const mat *dc,
 		const mat *a, const mat *b);
 int	gpu_mat_mul_bt(mat *c, const mat *a, const mat *b);
 int	gpu_mat_outer_add(mat *dw, const mat *a, const mat *b);
+/* Row LayerNorm backward; 0 = done on device, -1 = use CPU. */
+int	gpu_layernorm_backward(mat *dx, const mat *dy, const double *gamma,
+		const double *x_hat, const double *inv_std, int T, int d,
+		double *dgamma, double *dbeta);
 
 #endif

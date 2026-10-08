@@ -349,6 +349,103 @@ fail:
 	return -1;
 }
 
+__global__ static void ln_bwd_kernel(double *dx, const double *dy,
+	const double *gamma, const double *x_hat, const double *inv_std,
+	double *dgamma, double *dbeta, int T, int d)
+{
+	int t = blockIdx.x * blockDim.x + threadIdx.x;
+	int j;
+	double inv;
+	double sum_dy;
+	double sum_dy_xhat;
+	double dxhat;
+	double term;
+
+	if (t >= T)
+		return;
+	inv = inv_std[t];
+	sum_dy = 0.0;
+	sum_dy_xhat = 0.0;
+	for (j = 0; j < d; j++) {
+		atomicAdd(&dbeta[j], dy[t * d + j]);
+		atomicAdd(&dgamma[j], dy[t * d + j] * x_hat[t * d + j]);
+		dxhat = dy[t * d + j] * gamma[j];
+		sum_dy += dxhat;
+		sum_dy_xhat += dxhat * x_hat[t * d + j];
+	}
+	for (j = 0; j < d; j++) {
+		dxhat = dy[t * d + j] * gamma[j];
+		term = (dxhat - (sum_dy + x_hat[t * d + j] * sum_dy_xhat) / (double)d)
+		    * inv;
+		dx[t * d + j] = term;
+	}
+}
+
+extern "C" int gpu_layernorm_backward(mat *dx, const mat *dy, const double *gamma,
+	const double *x_hat, const double *inv_std, int T, int d,
+	double *dgamma, double *dbeta)
+{
+	double *d_dx;
+	double *d_dy;
+	double *d_gamma;
+	double *d_xhat;
+	double *d_inv;
+	double *d_dg;
+	double *d_db;
+	size_t matb;
+	size_t vb;
+	size_t gb;
+
+	if (!dx || !dy || !gamma || !x_hat || !inv_std || !dgamma || !dbeta)
+		return -1;
+	if (!gpu_available() || T <= 0 || d <= 0)
+		return -1;
+	matb = (size_t)T * (size_t)d * sizeof(double);
+	vb = (size_t)T * sizeof(double);
+	gb = (size_t)d * sizeof(double);
+	d_dx = d_dy = d_gamma = d_xhat = d_inv = d_dg = d_db = NULL;
+	if (!(d_dx = (double *)gpu_malloc(matb))
+	    || !(d_dy = (double *)gpu_malloc(matb))
+	    || !(d_gamma = (double *)gpu_malloc(gb))
+	    || !(d_xhat = (double *)gpu_malloc(matb))
+	    || !(d_inv = (double *)gpu_malloc(vb))
+	    || !(d_dg = (double *)gpu_malloc(gb))
+	    || !(d_db = (double *)gpu_malloc(gb)))
+		goto fail;
+	if (gpu_memcpy_h2d(d_dy, dy->data, matb) != 0
+	    || gpu_memcpy_h2d(d_gamma, gamma, gb) != 0
+	    || gpu_memcpy_h2d(d_xhat, x_hat, matb) != 0
+	    || gpu_memcpy_h2d(d_inv, inv_std, vb) != 0
+	    || gpu_memcpy_h2d(d_dg, dgamma, gb) != 0
+	    || gpu_memcpy_h2d(d_db, dbeta, gb) != 0)
+		goto fail;
+	ln_bwd_kernel<<<(T + 255) / 256, 256>>>(d_dx, d_dy, d_gamma, d_xhat,
+	    d_inv, d_dg, d_db, T, d);
+	if (cudaDeviceSynchronize() != cudaSuccess)
+		goto fail;
+	if (gpu_memcpy_d2h(dx->data, d_dx, matb) != 0
+	    || gpu_memcpy_d2h(dgamma, d_dg, gb) != 0
+	    || gpu_memcpy_d2h(dbeta, d_db, gb) != 0)
+		goto fail;
+	gpu_free(d_dx);
+	gpu_free(d_dy);
+	gpu_free(d_gamma);
+	gpu_free(d_xhat);
+	gpu_free(d_inv);
+	gpu_free(d_dg);
+	gpu_free(d_db);
+	return 0;
+fail:
+	gpu_free(d_dx);
+	gpu_free(d_dy);
+	gpu_free(d_gamma);
+	gpu_free(d_xhat);
+	gpu_free(d_inv);
+	gpu_free(d_dg);
+	gpu_free(d_db);
+	return -1;
+}
+
 extern "C" int gpu_mat_mul_backward(mat *da, mat *db, const mat *dc,
 	const mat *a, const mat *b)
 {

@@ -174,56 +174,75 @@ int ffn_forward(mat *x, const ffn *f)
 	return rc;
 }
 
+static int ffn_transpose(mat *dst, const mat *src)
+{
+	int i;
+	int j;
+
+	if (!dst || !src || dst->rows != src->cols || dst->cols != src->rows)
+		return -1;
+	for (i = 0; i < src->rows; i++)
+		for (j = 0; j < src->cols; j++)
+			dst->data[j * dst->cols + i] = src->data[i * src->cols + j];
+	return 0;
+}
+
 int ffn_backward(mat *dx, const mat *dout, ffn *f, const ffn_cache *c)
 {
 	mat *dh;
+	mat *w2t;
+	mat *w1t;
 	int t;
 	int j;
-	int k;
 	int T;
-	double sum;
 
 	if (!dx || !dout || !f || !c)
 		return -1;
 	T = c->T;
 	dh = mat_create(T, LM_D_FF);
-	if (!dh)
-		return -1;
-
-	if (mat_outer_add(f->dw2, c->hidden, dout) != 0) {
+	w2t = mat_create(LM_D_MODEL, LM_D_FF);
+	w1t = mat_create(LM_D_FF, LM_D_MODEL);
+	if (!dh || !w2t || !w1t) {
 		mat_free(&dh);
+		mat_free(&w2t);
+		mat_free(&w1t);
 		return -1;
 	}
+
+	if (mat_outer_add(f->dw2, c->hidden, dout) != 0)
+		goto fail;
 	for (t = 0; t < T; t++) {
 		for (j = 0; j < LM_D_MODEL; j++)
-			f->db2->data[j] += mat_get(dout, t, j);
+			f->db2->data[j] += dout->data[t * LM_D_MODEL + j];
 	}
+	/* dh = dout * W2^T then ReLU mask (GEMM may use GPU). */
+	if (ffn_transpose(w2t, f->w2) != 0)
+		goto fail;
+	if (mat_mul(dh, dout, w2t) != 0)
+		goto fail;
 	for (t = 0; t < T; t++) {
 		for (j = 0; j < LM_D_FF; j++) {
-			sum = 0.0;
-			for (k = 0; k < LM_D_MODEL; k++)
-				sum += mat_get(dout, t, k) * mat_get(f->w2, j, k);
-			if (mat_get(c->pre_act, t, j) <= 0.0)
-				sum = 0.0;
-			mat_set(dh, t, j, sum);
+			if (c->pre_act->data[t * LM_D_FF + j] <= 0.0)
+				dh->data[t * LM_D_FF + j] = 0.0;
 		}
 	}
-	if (mat_outer_add(f->dw1, c->x_in, dh) != 0) {
-		mat_free(&dh);
-		return -1;
-	}
+	if (mat_outer_add(f->dw1, c->x_in, dh) != 0)
+		goto fail;
 	for (t = 0; t < T; t++) {
 		for (j = 0; j < LM_D_FF; j++)
-			f->db1->data[j] += mat_get(dh, t, j);
+			f->db1->data[j] += dh->data[t * LM_D_FF + j];
 	}
-	for (t = 0; t < T; t++) {
-		for (j = 0; j < LM_D_MODEL; j++) {
-			sum = 0.0;
-			for (k = 0; k < LM_D_FF; k++)
-				sum += mat_get(dh, t, k) * mat_get(f->w1, j, k);
-			mat_set(dx, t, j, sum);
-		}
-	}
+	if (ffn_transpose(w1t, f->w1) != 0)
+		goto fail;
+	if (mat_mul(dx, dh, w1t) != 0)
+		goto fail;
 	mat_free(&dh);
+	mat_free(&w2t);
+	mat_free(&w1t);
 	return 0;
+fail:
+	mat_free(&dh);
+	mat_free(&w2t);
+	mat_free(&w1t);
+	return -1;
 }
