@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "gradutil.h"
+#include "lm_adam.h"
 #include "lm.h"
 #include "ops.h"
 #include "posenc.h"
@@ -298,55 +299,6 @@ double lm_nll(const lm *model, const int *ids, int n)
 	return loss / (double)count;
 }
 
-static void sgd_mat(mat *w, const mat *dw, double lr)
-{
-	int i;
-	int n;
-
-	if (!w || !dw || !w->data || !dw->data)
-		return;
-	n = w->rows * w->cols;
-	for (i = 0; i < n; i++)
-		w->data[i] -= lr * dw->data[i];
-}
-
-static void sgd_vec(vec *w, const vec *dw, double lr)
-{
-	int i;
-
-	if (!w || !dw || !w->data || !dw->data)
-		return;
-	for (i = 0; i < w->n; i++)
-		w->data[i] -= lr * dw->data[i];
-}
-
-static void lm_sgd_step(lm *model, double lr)
-{
-	int i;
-	tblock *b;
-
-	if (!model)
-		return;
-	sgd_mat(model->w_head, model->dw_head, lr);
-	sgd_vec(model->b_head, model->db_head, lr);
-	sgd_mat(model->embed->table, model->embed->dtable, lr);
-	for (i = 0; i < model->tr->n_blocks; i++) {
-		b = &model->tr->blocks[i];
-		sgd_mat(b->attn->wq, b->attn->dwq, lr);
-		sgd_mat(b->attn->wk, b->attn->dwk, lr);
-		sgd_mat(b->attn->wv, b->attn->dwv, lr);
-		sgd_mat(b->attn->wo, b->attn->dwo, lr);
-		sgd_mat(b->ffn->w1, b->ffn->dw1, lr);
-		sgd_vec(b->ffn->b1, b->ffn->db1, lr);
-		sgd_mat(b->ffn->w2, b->ffn->dw2, lr);
-		sgd_vec(b->ffn->b2, b->ffn->db2, lr);
-		sgd_vec(b->ln1->gamma, b->ln1->dgamma, lr);
-		sgd_vec(b->ln1->beta, b->ln1->dbeta, lr);
-		sgd_vec(b->ln2->gamma, b->ln2->dgamma, lr);
-		sgd_vec(b->ln2->beta, b->ln2->dbeta, lr);
-	}
-}
-
 double lm_train_steps(lm *model, const char *text, int steps, double lr)
 {
 	int ids[LM_MAX_CTX];
@@ -370,15 +322,26 @@ double lm_train_steps(lm *model, const char *text, int steps, double lr)
 		return -1.0;
 	}
 
-	for (step = 0; step < steps; step++) {
-		lm_zero_grad(model);
-		if (lm_forward_cache(model, ids, n, cache) != 0)
-			break;
-		if (lm_loss_backward(model, cache, ids, n, dhidden) != 0)
-			break;
-		if (lm_backward(model, dhidden, cache) != 0)
-			break;
-		lm_sgd_step(model, lr);
+	{
+		lm_adam *opt;
+
+		opt = lm_adam_create(model);
+		if (!opt) {
+			lm_cache_free(&cache);
+			mat_free(&dhidden);
+			return -1.0;
+		}
+		for (step = 0; step < steps; step++) {
+			lm_adam_zero_grad(model);
+			if (lm_forward_cache(model, ids, n, cache) != 0)
+				break;
+			if (lm_loss_backward(model, cache, ids, n, dhidden) != 0)
+				break;
+			if (lm_backward(model, dhidden, cache) != 0)
+				break;
+			lm_adam_step(opt, lr);
+		}
+		lm_adam_free(&opt);
 	}
 
 	loss = lm_nll(model, ids, n);

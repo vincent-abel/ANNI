@@ -24,7 +24,7 @@ static int run_lm(int argc, char **argv)
 		return 1;
 	}
 	loss0 = lm_nll(model, ids, n);
-	loss1 = lm_train_steps(model, phrase, 80, 0.05);
+	loss1 = lm_train_steps(model, phrase, 100, 0.01);
 	printf("LM NLL before %.4f after %.4f\n", loss0, loss1);
 	if (lm_generate(model, phrase, out, (int)sizeof(out), 8, 0.0) < 0) {
 		lm_free(&model);

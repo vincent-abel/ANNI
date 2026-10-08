@@ -615,7 +615,7 @@ static void test_lm_ntp_loss_drops(void)
 	n = tokenize_encode("hello", ids, LM_MAX_CTX);
 	assert(n >= 2);
 	before = lm_nll(model, ids, n);
-	after = lm_train_steps(model, "hello", 60, 0.08);
+	after = lm_train_steps(model, "hello", 80, 0.01);
 	assert(before > 0.0);
 	assert(after > 0.0);
 	assert(after < before);
@@ -676,7 +676,7 @@ static void test_lm_generate_smoke(void)
 	srand(3);
 	model = lm_create();
 	assert(model);
-	lm_train_steps(model, "ab", 40, 0.1);
+	lm_train_steps(model, "ab", 60, 0.01);
 	n = lm_generate(model, "a", out, (int)sizeof(out), 4, 0.0);
 	assert(n > 0);
 	assert(out[0] != '\0');

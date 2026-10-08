@@ -52,6 +52,7 @@
 
 - [Transformer backpropagation](transformer-backpropagation.md)
 - [Train all parameters](train-all-parameters.md)
+- [Adam for LM weights](adam-lm-weights.md)
 
 ---
 
@@ -199,3 +200,6 @@ Manual backward walks CE through the head, blocks, and embeddings with activatio
 
 ### [Train all parameters](train-all-parameters.md)
 Full-stack SGD replaces the old head-and-embed shortcut. Every attention, FFN, LayerNorm, embedding, and head weight receives gradients. lm_train_steps now zeros grads, runs cached forward/backward, then steps all params.
+
+### [Adam for LM weights](adam-lm-weights.md)
+LM Adam registers every param/grad scalar into flat slots. Bias-corrected moments update weights like the MLP optimizer, without touching network*. lm_train_steps uses Adam by default after full backward.
