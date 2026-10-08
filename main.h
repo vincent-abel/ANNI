@@ -26,5 +26,6 @@
 #include "layernorm.h"
 #include "resid.h"
 #include "block.h"
+#include "lm.h"
 
 #endif

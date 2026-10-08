@@ -601,6 +601,28 @@ static void test_transformer_block(void)
 }
 
 
+static void test_lm_ntp_loss_drops(void)
+{
+	lm *model;
+	int ids[LM_MAX_CTX];
+	int n;
+	double before;
+	double after;
+
+	srand(2);
+	model = lm_create();
+	assert(model);
+	n = tokenize_encode("hello", ids, LM_MAX_CTX);
+	assert(n >= 2);
+	before = lm_nll(model, ids, n);
+	after = lm_train_steps(model, "hello", 60, 0.08);
+	assert(before > 0.0);
+	assert(after > 0.0);
+	assert(after < before);
+	lm_free(&model);
+}
+
+
 int main(void)
 {
 	test_mse_known();
@@ -629,6 +651,7 @@ int main(void)
 	test_resid_add();
 	test_attn_causal();
 	test_transformer_block();
+	test_lm_ntp_loss_drops();
 	puts("ok");
 	return 0;
 }

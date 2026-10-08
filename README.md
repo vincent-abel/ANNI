@@ -43,6 +43,7 @@ Current implementation:
 - Residual connections
 - Causal attention
 - Transformer blocks
+- Next-token prediction
 
 Training and Transformer components are not implemented yet.
 
@@ -92,7 +93,7 @@ Training and Transformer components are not implemented yet.
 - [x] Residual connections
 - [x] Causal attention
 - [x] Transformer blocks
-- [ ] Next-token prediction
+- [x] Next-token prediction
 - [ ] Text generation
 
 ### Performance
