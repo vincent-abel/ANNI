@@ -30,6 +30,7 @@ Current implementation:
 - Cross-entropy
 - Mini-batches
 - Adam optimizer
+- Model serialization
 
 Training and Transformer components are not implemented yet.
 
@@ -57,7 +58,7 @@ Training and Transformer components are not implemented yet.
 - [x] Cross-entropy
 - [x] Mini-batches
 - [x] Adam optimizer
-- [ ] Model serialization
+- [x] Model serialization
 
 ### Language Model
 

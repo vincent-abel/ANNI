@@ -16,5 +16,6 @@
 #include "tensor.h"
 #include "ops.h"
 #include "optim.h"
+#include "serialize.h"
 
 #endif

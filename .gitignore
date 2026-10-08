@@ -19,6 +19,10 @@
 ann
 tests/test_ann
 
+# serialized models from tests
+*.ann
+tests/*.ann
+
 # I keep these, since I prefer having the reference of the final build
 # *.elf
 # *.hex

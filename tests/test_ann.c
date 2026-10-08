@@ -269,6 +269,40 @@ static void test_xor_trains(void)
 	network_free(&net);
 }
 
+static void test_serialize_roundtrip(void)
+{
+	network *net;
+	network *loaded;
+	const int sizes[] = {4, 1};
+	const char *path = "tests/tmp_xor.ann";
+	double out_a;
+	double out_b;
+	int s;
+
+	srand(1);
+	net = network_create_sizes(XOR_INPUTS, sizes, 2);
+	network_train(net, xor_inputs, xor_targets,
+		XOR_SAMPLES, XOR_OUTPUTS, 2000, 0.5);
+	assert(network_save(net, path) == 0);
+	loaded = network_load(path);
+	assert(loaded != NULL);
+	assert(loaded->n_inputs == net->n_inputs);
+	assert(network_output_size(loaded) == network_output_size(net));
+
+	for (s = 0; s < XOR_SAMPLES; s++) {
+		network_set_inputs(net, xor_inputs + s * XOR_INPUTS, XOR_INPUTS);
+		network_forward(net);
+		out_a = net->out->neuron->output;
+		network_set_inputs(loaded, xor_inputs + s * XOR_INPUTS, XOR_INPUTS);
+		network_forward(loaded);
+		out_b = loaded->out->neuron->output;
+		assert(fabs(out_a - out_b) < 1e-9);
+	}
+	remove(path);
+	network_free(&net);
+	network_free(&loaded);
+}
+
 static void test_xor_adam(void)
 {
 	network *net;
@@ -346,6 +380,7 @@ int main(void)
 	test_xor_trains();
 	test_xor_minibatches();
 	test_xor_adam();
+	test_serialize_roundtrip();
 	puts("ok");
 	return 0;
 }

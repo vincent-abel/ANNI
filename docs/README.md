@@ -25,3 +25,6 @@ Mini-batches average gradients over a few examples before each weight update. Th
 
 ### [Adam optimizer](adam-optimizer.md)
 Adam mixes momentum with per-weight adaptive step sizes from squared-gradient history. Bias correction warms up early averages. `adam_create` / `adam_step` drive training instead of plain SGD.
+
+### [Model serialization](model-serialization.md)
+Serialization writes architecture sizes plus every bias and weight in a fixed walk order. Loading rebuilds the graph and fills the same slots. `network_save` / `network_load` round-trip a trained net through a binary file.
