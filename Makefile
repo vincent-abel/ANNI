@@ -29,7 +29,7 @@ $(OBJDIR)/ops.o: num/ops.c
 $(OBJDIR)/tokenize.o: lang/tokenize.c
 $(OBJDIR)/vocab.o: lang/vocab.c
 $(OBJDIR)/embed.o: lang/embed.c
-$(OBJDIR)/posenc.o: lang/posenc.c lang/attn.c
+$(OBJDIR)/posenc.o: lang/posenc.c
 $(OBJDIR)/attn.o: lang/attn.c
 $(OBJDIR)/main.o: main.c
 

@@ -38,6 +38,7 @@
 - [Token embeddings](token-embeddings.md)
 - [Positional encoding](positional-encoding.md)
 - [Query / Key / Value](query-key-value.md)
+- [Self-attention](self-attention.md)
 
 ---
 
@@ -150,3 +151,6 @@ Sinusoidal positional encoding adds a fixed pattern so order matters. Even dimen
 
 ### [Query / Key / Value](query-key-value.md)
 Queries, keys, and values are three linear views of the same token matrix. Matching questions to labels decides whose payloads mix. This repo stores Wq/Wk/Wv and projects X into Q, K, and V.
+
+### [Self-attention](self-attention.md)
+Self-attention scores every position against every other with scaled dot products of Q and K. Softmax turns those scores into weights that mix the value rows. This repo implements that path in attn_self on T×d matrices.

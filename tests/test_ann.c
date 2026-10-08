@@ -382,6 +382,34 @@ static void test_tokenize_roundtrip(void)
 
 
 
+
+static void test_attn_self(void)
+{
+	mat *q;
+	mat *k;
+	mat *v;
+	mat *out;
+	int i;
+
+	q = mat_create(2, 4);
+	k = mat_create(2, 4);
+	v = mat_create(2, 4);
+	out = mat_create(2, 4);
+	assert(q && k && v && out);
+	mat_fill(q, 0.0);
+	mat_fill(k, 0.0);
+	mat_fill(v, 0.0);
+	for (i = 0; i < 4; i++) {
+		mat_set(q, 0, i, 1.0);
+		mat_set(k, 0, i, 1.0);
+		mat_set(v, 0, i, 2.0);
+		mat_set(v, 1, i, 4.0);
+	}
+	assert(attn_self(out, q, k, v, 0) == 0);
+	assert(fabs(mat_get(out, 0, 0) - 3.0) < 0.5);
+	mat_free(&q); mat_free(&k); mat_free(&v); mat_free(&out);
+}
+
 static void test_attn_qkv(void)
 {
 	attn *a;
@@ -470,6 +498,7 @@ int main(void)
 	test_embed_lookup();
 	test_posenc_changes();
 	test_attn_qkv();
+	test_attn_self();
 	puts("ok");
 	return 0;
 }
