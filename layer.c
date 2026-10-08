@@ -219,6 +219,19 @@ void network_forward(network *net)
 		nlayer_forward(net->layers);
 }
 
+void network_update(network *net, double lr)
+{
+	nlayer *layer;
+
+	if (!net)
+		return;
+	layer = net->layers;
+	while (layer) {
+		neuron_update(layer->neuron, lr);
+		layer = layer->next;
+	}
+}
+
 void network_free(network **net)
 {
 	if (!net || !*net)

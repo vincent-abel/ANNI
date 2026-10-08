@@ -17,6 +17,7 @@ Current implementation:
 - Forward propagation
 - MSE loss
 - Backpropagation
+- Gradient descent
 
 Training and Transformer components are not implemented yet.
 
@@ -28,7 +29,7 @@ Training and Transformer components are not implemented yet.
 - [x] Forward propagation
 - [x] Loss functions
 - [x] Backpropagation
-- [ ] Gradient descent
+- [x] Gradient descent
 - [ ] Training loop
 - [ ] XOR / basic datasets
 - [ ] Unit tests

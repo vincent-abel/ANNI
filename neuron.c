@@ -241,3 +241,21 @@ void neuron_backward_hidden(neuron *n)
 		n = n->prev;
 	}
 }
+
+void neuron_update(neuron *n, double lr)
+{
+	input *in;
+
+	while (n) {
+		n->bias -= lr * n->dbias;
+		n->dbias = 0.0;
+		in = n->input;
+		while (in) {
+			in->w -= lr * in->dw;
+			in->dw = 0.0;
+			in = in->prev;
+		}
+		n->delta = 0.0;
+		n = n->prev;
+	}
+}

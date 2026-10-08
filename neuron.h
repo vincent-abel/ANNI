@@ -36,6 +36,7 @@ void	neuron_output(neuron *);
 void	neuron_zero_delta(neuron *);
 void	neuron_backward_output(neuron *, const double *, int);
 void	neuron_backward_hidden(neuron *);
+void	neuron_update(neuron *, double lr);
 double	neuron_Tinput(neuron *);
 void	neuron_show(neuron *);
 

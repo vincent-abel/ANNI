@@ -33,8 +33,11 @@ int main(int argc, char *argv[])
 	target = calloc((size_t)n_out, sizeof(double));
 	if (!target)
 		exit(EXIT_FAILURE);
-	printf("MSE (target=0)  %10.6f\n\n", network_mse(net, target, n_out));
+	printf("MSE before  %10.6f\n", network_mse(net, target, n_out));
 	network_backward(net, target, n_out);
+	network_update(net, 0.5);
+	network_forward(net);
+	printf("MSE after   %10.6f\n\n", network_mse(net, target, n_out));
 	free(target);
 
 	network_free(&net);
