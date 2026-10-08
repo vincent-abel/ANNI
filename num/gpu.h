@@ -22,5 +22,10 @@ int	gpu_memset(void *dst, int value, size_t nbytes);
 ** Uses mat.d_data when both inputs/outputs are on device.
 */
 int	gpu_mat_mul(mat *c, const mat *a, const mat *b);
+/* dA = dC * B^T, dB = A^T * dC (NULL skips that output). */
+int	gpu_mat_mul_backward(mat *da, mat *db, const mat *dc,
+		const mat *a, const mat *b);
+int	gpu_mat_mul_bt(mat *c, const mat *a, const mat *b);
+int	gpu_mat_outer_add(mat *dw, const mat *a, const mat *b);
 
 #endif

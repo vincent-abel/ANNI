@@ -175,3 +175,217 @@ fail:
 		gpu_free(dC);
 	return -1;
 }
+
+__global__ static void gemm_bt_kernel(const double *A, const double *B, double *C,
+	int M, int N, int K)
+{
+	/* C[m,n] = sum_k A[m,k] * B[n,k] */
+	int row = blockIdx.y * blockDim.y + threadIdx.y;
+	int col = blockIdx.x * blockDim.x + threadIdx.x;
+	int k;
+	double sum;
+
+	if (row >= M || col >= N)
+		return;
+	sum = 0.0;
+	for (k = 0; k < K; k++)
+		sum += A[row * K + k] * B[col * K + k];
+	C[row * N + col] = sum;
+}
+
+__global__ static void outer_add_kernel(double *DW, const double *A, const double *B,
+	int T, int M, int N)
+{
+	/* DW[m,n] += sum_t A[t,m] * B[t,n] */
+	int m = blockIdx.y * blockDim.y + threadIdx.y;
+	int n = blockIdx.x * blockDim.x + threadIdx.x;
+	int t;
+	double sum;
+
+	if (m >= M || n >= N)
+		return;
+	sum = 0.0;
+	for (t = 0; t < T; t++)
+		sum += A[t * M + m] * B[t * N + n];
+	DW[m * N + n] += sum;
+}
+
+static int ensure_dev(const mat *m, double **out, int *owned)
+{
+	*owned = 0;
+	*out = m->d_data;
+	if (*out)
+		return 0;
+	if (!m->data)
+		return -1;
+	*out = (double *)gpu_malloc(mat_bytes(m));
+	if (!*out)
+		return -1;
+	if (gpu_memcpy_h2d(*out, m->data, mat_bytes(m)) != 0) {
+		gpu_free(*out);
+		*out = NULL;
+		return -1;
+	}
+	*owned = 1;
+	return 0;
+}
+
+extern "C" int gpu_mat_mul_bt(mat *c, const mat *a, const mat *b)
+{
+	double *dA;
+	double *dB;
+	double *dC;
+	int ownA;
+	int ownB;
+	int ownC;
+	dim3 block;
+	dim3 grid;
+
+	if (!c || !a || !b || !gpu_available())
+		return -1;
+	if (a->cols != b->cols || c->rows != a->rows || c->cols != b->rows)
+		return -1;
+	if (ensure_dev(a, &dA, &ownA) != 0)
+		return -1;
+	if (ensure_dev(b, &dB, &ownB) != 0) {
+		if (ownA)
+			gpu_free(dA);
+		return -1;
+	}
+	ownC = 0;
+	dC = c->d_data;
+	if (!dC) {
+		dC = (double *)gpu_malloc(mat_bytes(c));
+		if (!dC) {
+			if (ownA)
+				gpu_free(dA);
+			if (ownB)
+				gpu_free(dB);
+			return -1;
+		}
+		ownC = 1;
+	}
+	block = dim3(16, 16);
+	grid = dim3((c->cols + 15) / 16, (c->rows + 15) / 16);
+	gemm_bt_kernel<<<grid, block>>>(dA, dB, dC, a->rows, b->rows, a->cols);
+	if (cudaDeviceSynchronize() != cudaSuccess)
+		goto fail;
+	if (c->data && gpu_memcpy_d2h(c->data, dC, mat_bytes(c)) != 0)
+		goto fail;
+	if (ownA)
+		gpu_free(dA);
+	if (ownB)
+		gpu_free(dB);
+	if (ownC)
+		gpu_free(dC);
+	return 0;
+fail:
+	if (ownA)
+		gpu_free(dA);
+	if (ownB)
+		gpu_free(dB);
+	if (ownC)
+		gpu_free(dC);
+	return -1;
+}
+
+extern "C" int gpu_mat_outer_add(mat *dw, const mat *a, const mat *b)
+{
+	double *dW;
+	double *dA;
+	double *dB;
+	int ownW;
+	int ownA;
+	int ownB;
+	dim3 block;
+	dim3 grid;
+
+	if (!dw || !a || !b || !gpu_available())
+		return -1;
+	if (a->rows != b->rows || dw->rows != a->cols || dw->cols != b->cols)
+		return -1;
+	if (ensure_dev(a, &dA, &ownA) != 0)
+		return -1;
+	if (ensure_dev(b, &dB, &ownB) != 0) {
+		if (ownA)
+			gpu_free(dA);
+		return -1;
+	}
+	ownW = 0;
+	dW = dw->d_data;
+	if (!dW) {
+		dW = (double *)gpu_malloc(mat_bytes(dw));
+		if (!dW || (dw->data && gpu_memcpy_h2d(dW, dw->data, mat_bytes(dw)) != 0)) {
+			gpu_free(dW);
+			if (ownA)
+				gpu_free(dA);
+			if (ownB)
+				gpu_free(dB);
+			return -1;
+		}
+		ownW = 1;
+	}
+	block = dim3(16, 16);
+	grid = dim3((dw->cols + 15) / 16, (dw->rows + 15) / 16);
+	outer_add_kernel<<<grid, block>>>(dW, dA, dB, a->rows, a->cols, b->cols);
+	if (cudaDeviceSynchronize() != cudaSuccess)
+		goto fail;
+	if (dw->data && gpu_memcpy_d2h(dw->data, dW, mat_bytes(dw)) != 0)
+		goto fail;
+	if (ownA)
+		gpu_free(dA);
+	if (ownB)
+		gpu_free(dB);
+	if (ownW)
+		gpu_free(dW);
+	return 0;
+fail:
+	if (ownA)
+		gpu_free(dA);
+	if (ownB)
+		gpu_free(dB);
+	if (ownW)
+		gpu_free(dW);
+	return -1;
+}
+
+extern "C" int gpu_mat_mul_backward(mat *da, mat *db, const mat *dc,
+	const mat *a, const mat *b)
+{
+	/* dA = dC * B^T ; dB = A^T * dC */
+	mat *bt;
+	mat *at;
+	int i;
+	int j;
+	int rc;
+
+	if (!dc || !a || !b || !gpu_available())
+		return -1;
+	rc = 0;
+	if (da) {
+		/* Build B^T on host then gemm */
+		bt = mat_create(b->cols, b->rows);
+		if (!bt)
+			return -1;
+		for (i = 0; i < b->rows; i++)
+			for (j = 0; j < b->cols; j++)
+				bt->data[j * bt->cols + i] = b->data[i * b->cols + j];
+		if (gpu_mat_mul(da, dc, bt) != 0)
+			rc = -1;
+		mat_free(&bt);
+		if (rc != 0)
+			return -1;
+	}
+	if (db) {
+		at = mat_create(a->cols, a->rows);
+		if (!at)
+			return -1;
+		for (i = 0; i < a->rows; i++)
+			for (j = 0; j < a->cols; j++)
+				at->data[j * at->cols + i] = a->data[i * a->cols + j];
+		if (gpu_mat_mul(db, at, dc) != 0)
+			rc = -1;
+		mat_free(&at);
+	}
+	return rc;
+}

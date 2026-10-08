@@ -64,3 +64,30 @@ int gpu_mat_mul(mat *c, const mat *a, const mat *b)
 	(void)b;
 	return -1;
 }
+
+int gpu_mat_mul_backward(mat *da, mat *db, const mat *dc,
+	const mat *a, const mat *b)
+{
+	(void)da;
+	(void)db;
+	(void)dc;
+	(void)a;
+	(void)b;
+	return -1;
+}
+
+int gpu_mat_mul_bt(mat *c, const mat *a, const mat *b)
+{
+	(void)c;
+	(void)a;
+	(void)b;
+	return -1;
+}
+
+int gpu_mat_outer_add(mat *dw, const mat *a, const mat *b)
+{
+	(void)dw;
+	(void)a;
+	(void)b;
+	return -1;
+}

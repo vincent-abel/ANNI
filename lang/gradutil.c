@@ -2,6 +2,7 @@
 **	Small helpers for LM gradient buffers
 */
 #include <string.h>
+#include "gpu.h"
 #include "gradutil.h"
 
 void mat_zero(mat *m)
@@ -44,6 +45,8 @@ int mat_outer_add(mat *dw, const mat *a, const mat *b)
 		return -1;
 	if (a->rows != b->rows || dw->rows != a->cols || dw->cols != b->cols)
 		return -1;
+	if (gpu_mat_outer_add(dw, a, b) == 0)
+		return 0;
 	for (t = 0; t < a->rows; t++) {
 		ar = &a->data[t * a->cols];
 		br = &b->data[t * b->cols];

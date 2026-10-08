@@ -825,6 +825,30 @@ static void test_gpu_stub(void)
 	assert(strcmp(gpu_backend_name(), "cpu") == 0);
 }
 
+static void test_gpu_gemm_bwd_stub(void)
+{
+	mat *a;
+	mat *b;
+	mat *c;
+	mat *da;
+	mat *db;
+
+	a = mat_create(2, 2);
+	b = mat_create(2, 2);
+	c = mat_create(2, 2);
+	da = mat_create(2, 2);
+	db = mat_create(2, 2);
+	assert(a && b && c && da && db);
+	assert(gpu_mat_mul_backward(da, db, c, a, b) != 0);
+	assert(gpu_mat_mul_bt(c, a, b) != 0);
+	assert(gpu_mat_outer_add(da, a, b) != 0);
+	mat_free(&a);
+	mat_free(&b);
+	mat_free(&c);
+	mat_free(&da);
+	mat_free(&db);
+}
+
 static void test_mat_device_pin_cpu(void)
 {
 	mat *m;
@@ -1017,6 +1041,7 @@ int main(void)
 	test_lm_generate_kv();
 	test_gpu_stub();
 	test_mat_device_pin_cpu();
+	test_gpu_gemm_bwd_stub();
 	puts("ok");
 	return 0;
 }

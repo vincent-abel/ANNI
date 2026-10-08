@@ -76,6 +76,7 @@
 ### GPU training
 
 - [Device buffers for activations](gpu-device-buffers.md)
+- [CUDA GEMM backward](cuda-gemm-backward.md)
 
 ---
 
@@ -281,3 +282,6 @@ Default builds link a CPU GPU stub so make test needs no CUDA. make cuda swaps i
 
 ### [Device buffers for activations](gpu-device-buffers.md)
 Mats may own a CUDA d_data twin with H2D/D2H helpers. Attention and LM caches try to pin H/Q/K/V when a GPU is present. The CPU stub leaves pinning as a no-op.
+
+### [CUDA GEMM backward](cuda-gemm-backward.md)
+gpu_mat_mul_backward forms dA and dB for C=AB on device. mat_mul_bt and mat_outer_add try GPU kernels then fall back to CPU. Stubs keep make test green without nvcc.

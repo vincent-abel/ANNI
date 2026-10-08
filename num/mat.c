@@ -250,6 +250,8 @@ int mat_mul_bt(mat *c, const mat *a, const mat *b)
 		return -1;
 	if (a->cols != b->cols || c->rows != a->rows || c->cols != b->rows)
 		return -1;
+	if (gpu_mat_mul_bt(c, a, b) == 0)
+		return 0;
 	for (i = 0; i < a->rows; i++) {
 		ar = &a->data[i * a->cols];
 		for (j = 0; j < b->rows; j++) {

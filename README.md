@@ -138,7 +138,7 @@ Trainable toy decoder-only LM in `lang/` with Performance work: arenas, GEMM att
 Today only forward `mat_mul` can use CUDA. These items move the rest of training and decode onto the GPU where it pays off (skip toy-only CPU glue and things that stay host-side by design).
 
 - [x] Device buffers for activations (keep H/Q/K/V on GPU across layers)
-- [ ] CUDA GEMM backward (`dA` / `dB` for `C = AB` and `C = ABᵀ`)
+- [x] CUDA GEMM backward (`dA` / `dB` for `C = AB` and `C = ABᵀ`)
 - [ ] Attention backward on GPU (score / softmax / `AV` grads)
 - [ ] FFN + LayerNorm backward kernels (or fused epilogues)
 - [ ] LM head + cross-entropy backward on device
