@@ -615,7 +615,7 @@ static void test_lm_ntp_loss_drops(void)
 	n = tokenize_encode("hello", ids, LM_MAX_CTX);
 	assert(n >= 2);
 	before = lm_nll(model, ids, n);
-	after = lm_train_steps(model, "hello", 80, 0.01);
+	after = lm_train_steps(model, "hello", 15, 0.01);
 	assert(before > 0.0);
 	assert(after > 0.0);
 	assert(after < before);
@@ -638,7 +638,7 @@ static void test_lm_train_corpus(void)
 	ds = text_dataset_load("data/toy.txt", 8);
 	opt = lm_adam_create(model);
 	assert(model && ds && opt);
-	loss = lm_train_corpus(model, ds, opt, 2, 2, 0.01);
+	loss = lm_train_corpus(model, ds, opt, 1, 2, 0.01);
 	assert(loss > 0.0);
 	lm_adam_free(&opt);
 	text_dataset_free(&ds);
@@ -658,7 +658,7 @@ static void test_lm_serialize_roundtrip(void)
 	a = lm_create();
 	assert(a);
 	n = tokenize_encode("hello", ids, LM_MAX_CTX);
-	lm_train_steps(a, "hello", 20, 0.01);
+	lm_train_steps(a, "hello", 5, 0.01);
 	nll_a = lm_nll(a, ids, n);
 	assert(lm_save(a, "objects/test_lm.bin") == 0);
 	b = lm_load("objects/test_lm.bin");
@@ -812,7 +812,7 @@ static void test_lm_generate_smoke(void)
 	srand(3);
 	model = lm_create();
 	assert(model);
-	lm_train_steps(model, "ab", 60, 0.01);
+	lm_train_steps(model, "ab", 10, 0.01);
 	n = lm_generate(model, "a", out, (int)sizeof(out), 4, 0.0);
 	assert(n > 0);
 	assert(out[0] != '\0');

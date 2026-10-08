@@ -51,6 +51,7 @@ Current implementation:
 - Text dataset loading
 - Mini-batch corpus training
 - Generation from trained checkpoints
+- Scale toward target size
 - Held-out loss / perplexity
 - Checkpoint and resume
 - LM weight serialization
@@ -117,7 +118,7 @@ Toy decoder-only LM in `lang/` (byte vocab, pre-norm blocks, next-token train, `
 - [x] Checkpoint and resume
 - [x] Held-out loss / perplexity
 - [x] Generation from trained checkpoints
-- [ ] Scale toward target size
+- [x] Scale toward target size
 - [ ] Train / generate / load CLI
 
 ### Performance

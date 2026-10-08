@@ -59,6 +59,7 @@
 - [Checkpoint and resume](checkpoint-and-resume.md)
 - [Held-out loss / perplexity](held-out-loss-perplexity.md)
 - [Generation from trained checkpoints](generation-from-checkpoints.md)
+- [Scale toward target size](scale-toward-target-size.md)
 
 ---
 
@@ -227,3 +228,6 @@ Held-out NLL scores generalization on unseen windows. Perplexity is exp of that 
 
 ### [Generation from trained checkpoints](generation-from-checkpoints.md)
 Loaded checkpoints feed lm_generate without reinitializing random weights. Greedy decode from a trained file is the smoke path. Tests save a checkpoint then generate a short continuation.
+
+### [Scale toward target size](scale-toward-target-size.md)
+Config bumps d_model to 64, heads to 8, ff to 256, context to 128, and blocks to 4. Byte vocab stays. README Target 10–50M remains aspirational beyond this toy scale.

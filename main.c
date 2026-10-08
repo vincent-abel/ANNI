@@ -1,9 +1,126 @@
 #include "main.h"
 
+static int arg_eq(const char *a, const char *b)
+{
+	return a && b && strcmp(a, b) == 0;
+}
 
+static const char *arg_value(int argc, char **argv, const char *key, const char *def)
+{
+	int i;
 
+	for (i = 0; i < argc - 1; i++) {
+		if (arg_eq(argv[i], key))
+			return argv[i + 1];
+	}
+	return def;
+}
 
-static int run_lm(int argc, char **argv)
+static int run_lm_train(int argc, char **argv)
+{
+	lm *model;
+	lm_adam *opt;
+	text_dataset *ds;
+	const char *data;
+	const char *out;
+	double loss;
+	int epochs;
+	int batch;
+
+	data = arg_value(argc, argv, "--data", "data/toy.txt");
+	out = arg_value(argc, argv, "--out", "model.bin");
+	epochs = atoi(arg_value(argc, argv, "--epochs", "3"));
+	batch = atoi(arg_value(argc, argv, "--batch", "4"));
+	if (epochs <= 0)
+		epochs = 3;
+	if (batch <= 0)
+		batch = 4;
+
+	srand(1);
+	model = lm_create();
+	ds = text_dataset_load(data, 8);
+	opt = model ? lm_adam_create(model) : NULL;
+	if (!model || !ds || !opt) {
+		lm_free(&model);
+		text_dataset_free(&ds);
+		lm_adam_free(&opt);
+		fprintf(stderr, "lm train: failed to init\n");
+		return 1;
+	}
+	loss = lm_train_corpus(model, ds, opt, epochs, batch, 0.01);
+	printf("LM train NLL %.4f\n", loss);
+	if (lm_save_checkpoint(model, opt, epochs, 0, out) != 0) {
+		fprintf(stderr, "lm train: save failed\n");
+		lm_free(&model);
+		text_dataset_free(&ds);
+		lm_adam_free(&opt);
+		return 1;
+	}
+	printf("LM saved %s\n", out);
+	lm_free(&model);
+	text_dataset_free(&ds);
+	lm_adam_free(&opt);
+	return 0;
+}
+
+static int run_lm_generate(int argc, char **argv)
+{
+	lm *model;
+	char out[512];
+	const char *path;
+	const char *prompt;
+	int nnew;
+
+	path = arg_value(argc, argv, "--model", "model.bin");
+	prompt = arg_value(argc, argv, "--prompt", "hello");
+	nnew = atoi(arg_value(argc, argv, "--tokens", "16"));
+	if (nnew < 0)
+		nnew = 16;
+
+	model = lm_load(path);
+	if (!model) {
+		/* try checkpoint format */
+		model = lm_load_checkpoint(path, NULL, NULL, NULL);
+	}
+	if (!model) {
+		fprintf(stderr, "lm generate: cannot load %s\n", path);
+		return 1;
+	}
+	if (lm_generate(model, prompt, out, (int)sizeof(out), nnew, 0.0) < 0) {
+		lm_free(&model);
+		return 1;
+	}
+	printf("%s\n", out);
+	lm_free(&model);
+	return 0;
+}
+
+static int run_lm_load(int argc, char **argv)
+{
+	lm *model;
+	const char *path;
+	int ids[LM_MAX_CTX];
+	int n;
+	double nll;
+	double ppl;
+
+	path = arg_value(argc, argv, "--model", "model.bin");
+	model = lm_load(path);
+	if (!model)
+		model = lm_load_checkpoint(path, NULL, NULL, NULL);
+	if (!model) {
+		fprintf(stderr, "lm load: cannot load %s\n", path);
+		return 1;
+	}
+	n = tokenize_encode("hello", ids, LM_MAX_CTX);
+	nll = lm_nll(model, ids, n);
+	ppl = lm_perplexity(model, ids, n);
+	printf("LM loaded %s NLL %.4f PPL %.4f\n", path, nll, ppl);
+	lm_free(&model);
+	return 0;
+}
+
+static int run_lm_demo(int argc, char **argv)
 {
 	lm *model;
 	char out[256];
@@ -24,7 +141,7 @@ static int run_lm(int argc, char **argv)
 		return 1;
 	}
 	loss0 = lm_nll(model, ids, n);
-	loss1 = lm_train_steps(model, phrase, 100, 0.01);
+	loss1 = lm_train_steps(model, phrase, 20, 0.01);
 	printf("LM NLL before %.4f after %.4f\n", loss0, loss1);
 	if (lm_generate(model, phrase, out, (int)sizeof(out), 8, 0.0) < 0) {
 		lm_free(&model);
@@ -33,6 +150,17 @@ static int run_lm(int argc, char **argv)
 	printf("LM gen: %s\n", out);
 	lm_free(&model);
 	return 0;
+}
+
+static int run_lm(int argc, char **argv)
+{
+	if (argc >= 3 && arg_eq(argv[2], "train"))
+		return run_lm_train(argc, argv);
+	if (argc >= 3 && arg_eq(argv[2], "generate"))
+		return run_lm_generate(argc, argv);
+	if (argc >= 3 && arg_eq(argv[2], "load"))
+		return run_lm_load(argc, argv);
+	return run_lm_demo(argc, argv);
 }
 
 static int run_xor(void)
@@ -103,6 +231,9 @@ int main(int argc, char *argv[])
 		printf("Usage: ./ann <inputs> <neurons-per-layer> <layers>\n");
 		printf("       ./ann xor\n");
 		printf("       ./ann lm [phrase]\n");
+		printf("       ./ann lm train --data data/toy.txt --out model.bin\n");
+		printf("       ./ann lm generate --model model.bin --prompt hello\n");
+		printf("       ./ann lm load --model model.bin\n");
 		return 1;
 	}
 
