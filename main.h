@@ -12,5 +12,6 @@
 #include "layer.h"
 #include "dataset.h"
 #include "vec.h"
+#include "mat.h"
 
 #endif

@@ -70,6 +70,45 @@ static void test_create_rejects_empty(void)
 	assert(net == NULL);
 }
 
+static void test_mat_mul_known(void)
+{
+	mat *a;
+	mat *b;
+	mat *c;
+	vec *x;
+	vec *y;
+
+	a = mat_create(2, 2);
+	b = mat_create(2, 2);
+	c = mat_create(2, 2);
+	x = vec_create(2);
+	y = vec_create(2);
+	assert(a && b && c && x && y);
+	mat_set(a, 0, 0, 1.0);
+	mat_set(a, 0, 1, 2.0);
+	mat_set(a, 1, 0, 3.0);
+	mat_set(a, 1, 1, 4.0);
+	x->data[0] = 1.0;
+	x->data[1] = 0.0;
+	assert(mat_vec_mul(y, a, x) == 0);
+	assert(fabs(y->data[0] - 1.0) < 1e-9);
+	assert(fabs(y->data[1] - 3.0) < 1e-9);
+	mat_set(b, 0, 0, 0.0);
+	mat_set(b, 0, 1, 1.0);
+	mat_set(b, 1, 0, 1.0);
+	mat_set(b, 1, 1, 0.0);
+	assert(mat_mul(c, a, b) == 0);
+	assert(fabs(mat_get(c, 0, 0) - 2.0) < 1e-9);
+	assert(fabs(mat_get(c, 0, 1) - 1.0) < 1e-9);
+	assert(fabs(mat_get(c, 1, 0) - 4.0) < 1e-9);
+	assert(fabs(mat_get(c, 1, 1) - 3.0) < 1e-9);
+	mat_free(&a);
+	mat_free(&b);
+	mat_free(&c);
+	vec_free(&x);
+	vec_free(&y);
+}
+
 static void test_vec_dot_axpy(void)
 {
 	vec *a;
@@ -135,6 +174,7 @@ int main(void)
 	test_create_free_cycle();
 	test_create_rejects_empty();
 	test_vec_dot_axpy();
+	test_mat_mul_known();
 	test_xor_trains();
 	puts("ok");
 	return 0;

@@ -23,6 +23,7 @@ Current implementation:
 - Unit tests
 - Memory management
 - Vectors
+- Matrices
 
 Training and Transformer components are not implemented yet.
 
@@ -43,7 +44,7 @@ Training and Transformer components are not implemented yet.
 ### Numerical Engine
 
 - [x] Vectors
-- [ ] Matrices
+- [x] Matrices
 - [ ] Tensors
 - [ ] Optimized matrix multiplication
 - [ ] Softmax
