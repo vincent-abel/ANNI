@@ -388,6 +388,19 @@ static void softmax_bwd_row(const double *y, const double *dy, double *dx, int n
 		dx[i] = y[i] * (dy[i] - sum);
 }
 
+static int mat_transpose_copy(mat *dst, const mat *src)
+{
+	int i;
+	int j;
+
+	if (!dst || !src || dst->rows != src->cols || dst->cols != src->rows)
+		return -1;
+	for (i = 0; i < src->rows; i++)
+		for (j = 0; j < src->cols; j++)
+			dst->data[j * dst->cols + i] = src->data[i * src->cols + j];
+	return 0;
+}
+
 int attn_mha_backward(mat *dx, const mat *dout, attn *a, const attn_cache *c)
 {
 	mat *dconcat;
@@ -399,15 +412,16 @@ int attn_mha_backward(mat *dx, const mat *dout, attn *a, const attn_cache *c)
 	mat *dv_h;
 	mat *do_h;
 	mat *dscores;
+	mat *wot;
+	mat *tmp;
+	mat *k_h;
+	mat *q_h;
 	double *drow;
 	int h;
 	int T;
 	int i;
 	int j;
-	int t;
-	int off;
 	double scale;
-	double sum;
 
 	if (!dx || !dout || !a || !c)
 		return -1;
@@ -422,89 +436,50 @@ int attn_mha_backward(mat *dx, const mat *dout, attn *a, const attn_cache *c)
 	dv_h = mat_create(T, a->d_head);
 	do_h = mat_create(T, a->d_head);
 	dscores = mat_create(T, T);
+	wot = mat_create(LM_D_MODEL, LM_D_MODEL);
+	tmp = mat_create(T, LM_D_MODEL);
+	k_h = mat_create(T, a->d_head);
+	q_h = mat_create(T, a->d_head);
 	drow = malloc((size_t)T * sizeof(double));
 	if (!dconcat || !dq || !dk || !dv || !dq_h || !dk_h || !dv_h || !do_h
-	    || !dscores || !drow) {
-		mat_free(&dconcat);
-		mat_free(&dq);
-		mat_free(&dk);
-		mat_free(&dv);
-		mat_free(&dq_h);
-		mat_free(&dk_h);
-		mat_free(&dv_h);
-		mat_free(&do_h);
-		mat_free(&dscores);
-		free(drow);
-		return -1;
-	}
+	    || !dscores || !wot || !tmp || !k_h || !q_h || !drow)
+		goto fail;
 
-	/* dWo += concat^T dout; dconcat = dout @ Wo^T */
+	/* Weight grads via outer_add (GPU when available). */
 	if (mat_outer_add(a->dwo, c->concat, dout) != 0)
 		goto fail;
-	for (i = 0; i < T; i++) {
-		for (j = 0; j < LM_D_MODEL; j++) {
-			sum = 0.0;
-			for (t = 0; t < LM_D_MODEL; t++)
-				sum += mat_get(dout, i, t) * mat_get(a->wo, j, t);
-			mat_set(dconcat, i, j, sum);
-		}
-	}
+	/* dconcat = dout * Wo^T  (GEMM / GPU). */
+	if (mat_transpose_copy(wot, a->wo) != 0)
+		goto fail;
+	if (mat_mul(dconcat, dout, wot) != 0)
+		goto fail;
 
 	mat_zero(dq);
 	mat_zero(dk);
 	mat_zero(dv);
 	for (h = 0; h < a->n_heads; h++) {
-		off = h * a->d_head;
+		copy_head(do_h, dconcat, h, a->d_head);
+		copy_head(k_h, c->k, h, a->d_head);
+		copy_head(q_h, c->q, h, a->d_head);
+		/* dV = A^T do ; dA_scores = do V^T  (GEMM). */
+		if (mat_mul_at(dv_h, c->attn_w[h], do_h) != 0)
+			goto fail;
+		if (mat_mul_bt(dscores, do_h, c->v_h[h]) != 0)
+			goto fail;
 		for (i = 0; i < T; i++) {
-			for (j = 0; j < a->d_head; j++)
-				mat_set(do_h, i, j, mat_get(dconcat, i, off + j));
-		}
-		/* dV = A^T do; dA = do V^T */
-		mat_zero(dv_h);
-		for (i = 0; i < T; i++) {
-			for (t = 0; t < a->d_head; t++) {
-				sum = 0.0;
-				for (j = 0; j < T; j++)
-					sum += mat_get(c->attn_w[h], j, i)
-					    * mat_get(do_h, j, t);
-				mat_set(dv_h, i, t, sum);
-			}
-		}
-		mat_zero(dscores);
-		for (i = 0; i < T; i++) {
-			for (j = 0; j < T; j++) {
-				sum = 0.0;
-				for (t = 0; t < a->d_head; t++)
-					sum += mat_get(do_h, i, t)
-					    * mat_get(c->v_h[h], j, t);
-				mat_set(dscores, i, j, sum);
-			}
 			softmax_bwd_row(&c->attn_w[h]->data[i * T],
 			    &dscores->data[i * T], drow, T);
 			for (j = 0; j < T; j++) {
 				if (c->causal && j > i)
 					drow[j] = 0.0;
-				mat_set(dscores, i, j, drow[j] * scale);
+				dscores->data[i * T + j] = drow[j] * scale;
 			}
 		}
-		/* dQ = dS K; dK = dS^T Q */
-		copy_head(dq_h, c->q, h, a->d_head);
-		copy_head(dk_h, c->k, h, a->d_head);
-		/* reuse dq_h/dk_h as outputs */
-		for (i = 0; i < T; i++) {
-			for (t = 0; t < a->d_head; t++) {
-				sum = 0.0;
-				for (j = 0; j < T; j++)
-					sum += mat_get(dscores, i, j)
-					    * mat_get(c->k, j, off + t);
-				mat_set(dq_h, i, t, sum);
-				sum = 0.0;
-				for (j = 0; j < T; j++)
-					sum += mat_get(dscores, j, i)
-					    * mat_get(c->q, j, off + t);
-				mat_set(dk_h, i, t, sum);
-			}
-		}
+		/* dQ = dS K ; dK = dS^T Q */
+		if (mat_mul(dq_h, dscores, k_h) != 0)
+			goto fail;
+		if (mat_mul_at(dk_h, dscores, q_h) != 0)
+			goto fail;
 		write_head(dq, dq_h, h, a->d_head);
 		write_head(dk, dk_h, h, a->d_head);
 		write_head(dv, dv_h, h, a->d_head);
@@ -518,18 +493,20 @@ int attn_mha_backward(mat *dx, const mat *dout, attn *a, const attn_cache *c)
 		goto fail;
 
 	/* dx = dq Wq^T + dk Wk^T + dv Wv^T */
-	mat_zero(dx);
-	for (i = 0; i < T; i++) {
-		for (j = 0; j < LM_D_MODEL; j++) {
-			sum = 0.0;
-			for (t = 0; t < LM_D_MODEL; t++) {
-				sum += mat_get(dq, i, t) * mat_get(a->wq, j, t);
-				sum += mat_get(dk, i, t) * mat_get(a->wk, j, t);
-				sum += mat_get(dv, i, t) * mat_get(a->wv, j, t);
-			}
-			mat_set(dx, i, j, sum);
-		}
-	}
+	if (mat_transpose_copy(wot, a->wq) != 0)
+		goto fail;
+	if (mat_mul(dx, dq, wot) != 0)
+		goto fail;
+	if (mat_transpose_copy(wot, a->wk) != 0)
+		goto fail;
+	if (mat_mul(tmp, dk, wot) != 0)
+		goto fail;
+	mat_axpy(dx, 1.0, tmp);
+	if (mat_transpose_copy(wot, a->wv) != 0)
+		goto fail;
+	if (mat_mul(tmp, dv, wot) != 0)
+		goto fail;
+	mat_axpy(dx, 1.0, tmp);
 
 	mat_free(&dconcat);
 	mat_free(&dq);
@@ -540,6 +517,10 @@ int attn_mha_backward(mat *dx, const mat *dout, attn *a, const attn_cache *c)
 	mat_free(&dv_h);
 	mat_free(&do_h);
 	mat_free(&dscores);
+	mat_free(&wot);
+	mat_free(&tmp);
+	mat_free(&k_h);
+	mat_free(&q_h);
 	free(drow);
 	return 0;
 fail:
@@ -552,6 +533,10 @@ fail:
 	mat_free(&dv_h);
 	mat_free(&do_h);
 	mat_free(&dscores);
+	mat_free(&wot);
+	mat_free(&tmp);
+	mat_free(&k_h);
+	mat_free(&q_h);
 	free(drow);
 	return -1;
 }

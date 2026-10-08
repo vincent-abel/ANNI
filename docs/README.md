@@ -77,6 +77,7 @@
 
 - [Device buffers for activations](gpu-device-buffers.md)
 - [CUDA GEMM backward](cuda-gemm-backward.md)
+- [Attention backward on GPU](gpu-attention-backward.md)
 
 ---
 
@@ -285,3 +286,6 @@ Mats may own a CUDA d_data twin with H2D/D2H helpers. Attention and LM caches tr
 
 ### [CUDA GEMM backward](cuda-gemm-backward.md)
 gpu_mat_mul_backward forms dA and dB for C=AB on device. mat_mul_bt and mat_outer_add try GPU kernels then fall back to CPU. Stubs keep make test green without nvcc.
+
+### [Attention backward on GPU](gpu-attention-backward.md)
+MHA backward uses mat_mul, mat_mul_bt, mat_mul_at, and outer_add so CUDA GEMMs apply. Softmax Jacobian rows stay on the host.

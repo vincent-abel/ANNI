@@ -139,7 +139,7 @@ Today only forward `mat_mul` can use CUDA. These items move the rest of training
 
 - [x] Device buffers for activations (keep H/Q/K/V on GPU across layers)
 - [x] CUDA GEMM backward (`dA` / `dB` for `C = AB` and `C = ABᵀ`)
-- [ ] Attention backward on GPU (score / softmax / `AV` grads)
+- [x] Attention backward on GPU (score / softmax / `AV` grads)
 - [ ] FFN + LayerNorm backward kernels (or fused epilogues)
 - [ ] LM head + cross-entropy backward on device
 - [ ] Adam step on GPU (flat param / grad / moment buffers)
