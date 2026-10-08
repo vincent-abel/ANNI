@@ -65,6 +65,7 @@
 ### Performance
 
 - [Contiguous memory](contiguous-memory.md)
+- [Cache-friendly data structures](cache-friendly-data-structures.md)
 
 ---
 
@@ -244,3 +245,6 @@ The CLI exposes lm train, lm generate, and lm load over model.bin checkpoints. F
 
 ### [Contiguous memory](contiguous-memory.md)
 A bump arena hands out consecutive scratch bytes without per-object free. LM transformer caches persist across forwards of the same length, and attention keeps head/softmax temps in the cache. ./ann lm bench reports mean forward milliseconds for later speedups.
+
+### [Cache-friendly data structures](cache-friendly-data-structures.md)
+Attention scores and outputs use mat_mul_bt and mat_mul on contiguous rows. Embeddings memcpy token rows; logits are a blocked 1xD GEMM against the head. Hot paths drop mat_get/mat_set loops.

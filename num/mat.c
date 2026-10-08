@@ -45,6 +45,20 @@ void mat_set(mat *m, int row, int col, double value)
 	m->data[row * m->cols + col] = value;
 }
 
+double *mat_row(mat *m, int row)
+{
+	if (!m || !m->data || row < 0 || row >= m->rows)
+		return NULL;
+	return &m->data[row * m->cols];
+}
+
+const double *mat_row_const(const mat *m, int row)
+{
+	if (!m || !m->data || row < 0 || row >= m->rows)
+		return NULL;
+	return &m->data[row * m->cols];
+}
+
 void mat_fill(mat *m, double value)
 {
 	int i;
@@ -140,6 +154,33 @@ int mat_mul(mat *c, const mat *a, const mat *b)
 					}
 				}
 			}
+		}
+	}
+	return 0;
+}
+
+/* c = a * b^T ; a (m x k), b (n x k) -> c (m x n) */
+int mat_mul_bt(mat *c, const mat *a, const mat *b)
+{
+	int i;
+	int j;
+	int t;
+	double sum;
+	const double *ar;
+	const double *br;
+
+	if (!c || !a || !b || !c->data || !a->data || !b->data)
+		return -1;
+	if (a->cols != b->cols || c->rows != a->rows || c->cols != b->rows)
+		return -1;
+	for (i = 0; i < a->rows; i++) {
+		ar = &a->data[i * a->cols];
+		for (j = 0; j < b->rows; j++) {
+			br = &b->data[j * b->cols];
+			sum = 0.0;
+			for (t = 0; t < a->cols; t++)
+				sum += ar[t] * br[t];
+			c->data[i * c->cols + j] = sum;
 		}
 	}
 	return 0;

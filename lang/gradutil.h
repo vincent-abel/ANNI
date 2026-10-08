@@ -12,6 +12,6 @@ void	vec_zero(vec *v);
 void	mat_axpy(mat *y, double a, const mat *x);
 int	mat_outer_add(mat *dw, const mat *a, const mat *b);
 int	mat_mul_at(mat *c, const mat *a, const mat *b);
-int	mat_mul_bt(mat *c, const mat *a, const mat *b);
+/* mat_mul_bt lives in mat.h */
 
 #endif

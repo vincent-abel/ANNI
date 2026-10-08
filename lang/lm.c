@@ -172,22 +172,26 @@ int lm_forward(mat *hidden, const lm *model, const int *ids, int n)
 
 int lm_logits_at(vec *logits, const lm *model, const mat *hidden, int t)
 {
-	int j;
+	mat hrow;
+	mat lrow;
 	int v;
-	double sum;
 
-	if (!logits || !model || !hidden || !logits->data)
+	if (!logits || !model || !hidden || !logits->data || !hidden->data)
 		return -1;
 	if (t < 0 || t >= hidden->rows)
 		return -1;
 	if (logits->n != model->vocab_size)
 		return -1;
-	for (v = 0; v < model->vocab_size; v++) {
-		sum = model->b_head->data[v];
-		for (j = 0; j < LM_D_MODEL; j++)
-			sum += mat_get(hidden, t, j) * mat_get(model->w_head, j, v);
-		logits->data[v] = sum;
-	}
+	hrow.data = &hidden->data[t * hidden->cols];
+	hrow.rows = 1;
+	hrow.cols = LM_D_MODEL;
+	lrow.data = logits->data;
+	lrow.rows = 1;
+	lrow.cols = model->vocab_size;
+	if (mat_mul(&lrow, &hrow, model->w_head) != 0)
+		return -1;
+	for (v = 0; v < model->vocab_size; v++)
+		logits->data[v] += model->b_head->data[v];
 	return 0;
 }
 

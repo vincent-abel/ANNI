@@ -819,6 +819,32 @@ static void test_lm_generate_smoke(void)
 	lm_free(&model);
 }
 
+static void test_mat_mul_bt_known(void)
+{
+	mat *a;
+	mat *b;
+	mat *c;
+
+	a = mat_create(2, 3);
+	b = mat_create(2, 3);
+	c = mat_create(2, 2);
+	assert(a && b && c);
+	/* a rows: [1,0,0] and [0,1,0]; b same -> I_2 */
+	mat_set(a, 0, 0, 1.0);
+	mat_set(a, 1, 1, 1.0);
+	mat_set(b, 0, 0, 1.0);
+	mat_set(b, 1, 1, 1.0);
+	assert(mat_mul_bt(c, a, b) == 0);
+	assert(fabs(mat_get(c, 0, 0) - 1.0) < 1e-12);
+	assert(fabs(mat_get(c, 0, 1) - 0.0) < 1e-12);
+	assert(fabs(mat_get(c, 1, 0) - 0.0) < 1e-12);
+	assert(fabs(mat_get(c, 1, 1) - 1.0) < 1e-12);
+	assert(mat_row(c, 0) == c->data);
+	mat_free(&a);
+	mat_free(&b);
+	mat_free(&c);
+}
+
 static void test_arena_bump(void)
 {
 	arena *a;
@@ -900,6 +926,7 @@ int main(void)
 	test_lm_generate_from_checkpoint();
 	test_arena_bump();
 	test_lm_cache_reuse();
+	test_mat_mul_bt_known();
 	puts("ok");
 	return 0;
 }

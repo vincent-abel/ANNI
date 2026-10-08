@@ -2,6 +2,7 @@
 **	Token embedding table + backward
 */
 #include <stdlib.h>
+#include <string.h>
 #include "embed.h"
 #include "gradutil.h"
 
@@ -57,7 +58,6 @@ void embed_zero_grad(embed *e)
 int embed_lookup(mat *out, const embed *e, const int *ids, int n)
 {
 	int i;
-	int j;
 	int id;
 
 	if (!out || !e || !e->table || !ids || n <= 0)
@@ -68,8 +68,9 @@ int embed_lookup(mat *out, const embed *e, const int *ids, int n)
 		id = ids[i];
 		if (id < 0 || id >= e->table->rows)
 			return -1;
-		for (j = 0; j < LM_D_MODEL; j++)
-			mat_set(out, i, j, mat_get(e->table, id, j));
+		memcpy(&out->data[i * LM_D_MODEL],
+		    &e->table->data[id * LM_D_MODEL],
+		    (size_t)LM_D_MODEL * sizeof(double));
 	}
 	return 0;
 }
@@ -79,6 +80,7 @@ int embed_backward(embed *e, const mat *dout, const int *ids, int n)
 	int i;
 	int j;
 	int id;
+	double *row;
 
 	if (!e || !dout || !ids || n <= 0)
 		return -1;
@@ -88,9 +90,9 @@ int embed_backward(embed *e, const mat *dout, const int *ids, int n)
 		id = ids[i];
 		if (id < 0 || id >= e->dtable->rows)
 			return -1;
+		row = &e->dtable->data[id * LM_D_MODEL];
 		for (j = 0; j < LM_D_MODEL; j++)
-			mat_set(e->dtable, id, j,
-			    mat_get(e->dtable, id, j) + mat_get(dout, i, j));
+			row[j] += dout->data[i * LM_D_MODEL + j];
 	}
 	return 0;
 }

@@ -37,22 +37,26 @@ int mat_outer_add(mat *dw, const mat *a, const mat *b)
 	int i;
 	int j;
 	double s;
+	const double *ar;
+	const double *br;
 
-	if (!dw || !a || !b)
+	if (!dw || !a || !b || !dw->data || !a->data || !b->data)
 		return -1;
 	if (a->rows != b->rows || dw->rows != a->cols || dw->cols != b->cols)
 		return -1;
 	for (t = 0; t < a->rows; t++) {
+		ar = &a->data[t * a->cols];
+		br = &b->data[t * b->cols];
 		for (i = 0; i < a->cols; i++) {
-			s = mat_get(a, t, i);
+			s = ar[i];
 			for (j = 0; j < b->cols; j++)
-				mat_set(dw, i, j, mat_get(dw, i, j) + s * mat_get(b, t, j));
+				dw->data[i * dw->cols + j] += s * br[j];
 		}
 	}
 	return 0;
 }
 
-/* c = a^T * b ; a (m x k), b (m x n) -> c (k x n)  OR use rows of a as columns */
+/* c = a^T * b ; a (m x k), b (m x n) -> c (k x n) */
 int mat_mul_at(mat *c, const mat *a, const mat *b)
 {
 	int i;
@@ -60,7 +64,7 @@ int mat_mul_at(mat *c, const mat *a, const mat *b)
 	int t;
 	double sum;
 
-	if (!c || !a || !b)
+	if (!c || !a || !b || !c->data || !a->data || !b->data)
 		return -1;
 	if (a->rows != b->rows || c->rows != a->cols || c->cols != b->cols)
 		return -1;
@@ -68,31 +72,8 @@ int mat_mul_at(mat *c, const mat *a, const mat *b)
 		for (j = 0; j < b->cols; j++) {
 			sum = 0.0;
 			for (t = 0; t < a->rows; t++)
-				sum += mat_get(a, t, i) * mat_get(b, t, j);
-			mat_set(c, i, j, sum);
-		}
-	}
-	return 0;
-}
-
-/* c = a * b^T ; a (m x k), b (n x k) -> c (m x n) */
-int mat_mul_bt(mat *c, const mat *a, const mat *b)
-{
-	int i;
-	int j;
-	int t;
-	double sum;
-
-	if (!c || !a || !b)
-		return -1;
-	if (a->cols != b->cols || c->rows != a->rows || c->cols != b->rows)
-		return -1;
-	for (i = 0; i < a->rows; i++) {
-		for (j = 0; j < b->rows; j++) {
-			sum = 0.0;
-			for (t = 0; t < a->cols; t++)
-				sum += mat_get(a, i, t) * mat_get(b, j, t);
-			mat_set(c, i, j, sum);
+				sum += a->data[t * a->cols + i] * b->data[t * b->cols + j];
+			c->data[i * c->cols + j] = sum;
 		}
 	}
 	return 0;

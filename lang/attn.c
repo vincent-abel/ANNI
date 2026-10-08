@@ -198,12 +198,9 @@ static int softmax_row(double *row, int n, double *tmp)
 int attn_self(mat *out, const mat *q, const mat *k, const mat *v, int causal)
 {
 	int T;
-	int d;
 	int i;
 	int j;
-	int t;
 	double scale;
-	double sum;
 	mat *scores;
 	double *tmp;
 
@@ -214,8 +211,7 @@ int attn_self(mat *out, const mat *q, const mat *k, const mat *v, int causal)
 	if (out->rows != q->rows || out->cols != v->cols)
 		return -1;
 	T = q->rows;
-	d = q->cols;
-	scale = 1.0 / sqrt((double)d);
+	scale = 1.0 / sqrt((double)q->cols);
 	scores = mat_create(T, T);
 	tmp = calloc((size_t)T, sizeof(double));
 	if (!scores || !tmp) {
@@ -223,16 +219,16 @@ int attn_self(mat *out, const mat *q, const mat *k, const mat *v, int causal)
 		free(tmp);
 		return -1;
 	}
-
+	if (mat_mul_bt(scores, q, k) != 0) {
+		mat_free(&scores);
+		free(tmp);
+		return -1;
+	}
 	for (i = 0; i < T; i++) {
 		for (j = 0; j < T; j++) {
-			sum = 0.0;
-			for (t = 0; t < d; t++)
-				sum += mat_get(q, i, t) * mat_get(k, j, t);
-			sum *= scale;
+			scores->data[i * T + j] *= scale;
 			if (causal && j > i)
-				sum = -1e9;
-			mat_set(scores, i, j, sum);
+				scores->data[i * T + j] = -1e9;
 		}
 		if (softmax_row(&scores->data[i * T], T, tmp) != 0) {
 			mat_free(&scores);
@@ -240,15 +236,10 @@ int attn_self(mat *out, const mat *q, const mat *k, const mat *v, int causal)
 			return -1;
 		}
 	}
-
-	mat_fill(out, 0.0);
-	for (i = 0; i < T; i++) {
-		for (t = 0; t < d; t++) {
-			sum = 0.0;
-			for (j = 0; j < T; j++)
-				sum += mat_get(scores, i, j) * mat_get(v, j, t);
-			mat_set(out, i, t, sum);
-		}
+	if (mat_mul(out, scores, v) != 0) {
+		mat_free(&scores);
+		free(tmp);
+		return -1;
 	}
 	mat_free(&scores);
 	free(tmp);
@@ -258,27 +249,25 @@ int attn_self(mat *out, const mat *q, const mat *k, const mat *v, int causal)
 static void copy_head(mat *dst, const mat *src, int head, int d_head)
 {
 	int t;
-	int j;
 	int off;
 
 	off = head * d_head;
-	for (t = 0; t < src->rows; t++) {
-		for (j = 0; j < d_head; j++)
-			mat_set(dst, t, j, mat_get(src, t, off + j));
-	}
+	for (t = 0; t < src->rows; t++)
+		memcpy(&dst->data[t * dst->cols],
+		    &src->data[t * src->cols + off],
+		    (size_t)d_head * sizeof(double));
 }
 
 static void write_head(mat *dst, const mat *src, int head, int d_head)
 {
 	int t;
-	int j;
 	int off;
 
 	off = head * d_head;
-	for (t = 0; t < src->rows; t++) {
-		for (j = 0; j < d_head; j++)
-			mat_set(dst, t, off + j, mat_get(src, t, j));
-	}
+	for (t = 0; t < src->rows; t++)
+		memcpy(&dst->data[t * dst->cols + off],
+		    &src->data[t * src->cols],
+		    (size_t)d_head * sizeof(double));
 }
 
 static int self_forward_cache(mat *out, const mat *q, const mat *k, const mat *v,
@@ -288,37 +277,28 @@ static int self_forward_cache(mat *out, const mat *q, const mat *k, const mat *v
 	int d;
 	int i;
 	int j;
-	int t;
 	double scale;
-	double sum;
+	double *row;
 
-	if (!softmax_tmp)
+	if (!softmax_tmp || !out || !q || !k || !v || !attn_w)
 		return -1;
 	T = q->rows;
 	d = q->cols;
 	scale = 1.0 / sqrt((double)d);
+	if (mat_mul_bt(attn_w, q, k) != 0)
+		return -1;
 	for (i = 0; i < T; i++) {
+		row = &attn_w->data[i * T];
 		for (j = 0; j < T; j++) {
-			sum = 0.0;
-			for (t = 0; t < d; t++)
-				sum += mat_get(q, i, t) * mat_get(k, j, t);
-			sum *= scale;
+			row[j] *= scale;
 			if (causal && j > i)
-				sum = -1e9;
-			mat_set(attn_w, i, j, sum);
+				row[j] = -1e9;
 		}
-		if (softmax_row(&attn_w->data[i * T], T, softmax_tmp) != 0)
+		if (softmax_row(row, T, softmax_tmp) != 0)
 			return -1;
 	}
-	mat_fill(out, 0.0);
-	for (i = 0; i < T; i++) {
-		for (t = 0; t < d; t++) {
-			sum = 0.0;
-			for (j = 0; j < T; j++)
-				sum += mat_get(attn_w, i, j) * mat_get(v, j, t);
-			mat_set(out, i, t, sum);
-		}
-	}
+	if (mat_mul(out, attn_w, v) != 0)
+		return -1;
 	return 0;
 }
 

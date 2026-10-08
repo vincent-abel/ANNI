@@ -125,7 +125,7 @@ Trainable toy decoder-only LM in `lang/` (full backprop, Adam, corpus train, che
 ### Performance
 
 - [x] Contiguous memory
-- [ ] Cache-friendly data structures
+- [x] Cache-friendly data structures
 - [ ] SIMD
 - [ ] Multithreading
 - [ ] AVX2 / AVX-512
