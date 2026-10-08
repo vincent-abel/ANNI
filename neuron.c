@@ -12,13 +12,15 @@ double randfrom(double min, double max)
 	return min + (rand() / div);
 }
 
-void input_push(input **p, double *in, double weigh)
+void input_push(input **p, double *in, double weigh, neuron *src)
 {
 	input *new_input = malloc(sizeof(input));
 	if (!new_input)
 		exit(EXIT_FAILURE);
 	new_input->i = in;
 	new_input->w = weigh;
+	new_input->dw = 0.0;
+	new_input->src = src;
 	new_input->prev = *p;
 	*p = new_input;
 }
@@ -31,6 +33,8 @@ void neuron_push(neuron **p)
 	n->Tinput = 0;
 	n->output = 0;
 	n->bias = randfrom(-0.5, 0.5);
+	n->delta = 0.0;
+	n->dbias = 0.0;
 	n->input = NULL;
 	n->prev = *p;
 	*p = n;
@@ -53,13 +57,13 @@ void neuron_connect_values(neuron *n, double *values, int count)
 	int i;
 
 	for (i = 0; i < count; i++)
-		input_push(&n->input, &values[i], randfrom(-2, 2));
+		input_push(&n->input, &values[i], randfrom(-2, 2), NULL);
 }
 
 void neuron_connect_layer(neuron *n, neuron *src)
 {
 	while (src) {
-		input_push(&n->input, &src->output, randfrom(-2, 2));
+		input_push(&n->input, &src->output, randfrom(-2, 2), src);
 		src = src->prev;
 	}
 }
@@ -177,6 +181,63 @@ void neuron_output(neuron *n)
 {
 	while (n) {
 		n->output = 1.0 / (1.0 + exp(-neuron_Tinput(n) / RESPONSE));
+		n = n->prev;
+	}
+}
+
+static double sigmoid_prime(double output)
+{
+	return output * (1.0 - output);
+}
+
+static void neuron_backward_accumulate(neuron *n)
+{
+	input *in;
+
+	n->dbias += n->delta;
+	in = n->input;
+	while (in) {
+		in->dw += n->delta * *(in->i);
+		if (in->src)
+			in->src->delta += n->delta * in->w;
+		in = in->prev;
+	}
+}
+
+void neuron_zero_delta(neuron *n)
+{
+	input *in;
+
+	while (n) {
+		n->delta = 0.0;
+		n->dbias = 0.0;
+		in = n->input;
+		while (in) {
+			in->dw = 0.0;
+			in = in->prev;
+		}
+		n = n->prev;
+	}
+}
+
+void neuron_backward_output(neuron *n, const double *target, int n_target)
+{
+	int i;
+
+	i = 0;
+	while (n && i < n_target) {
+		n->delta = (n->output - target[i]) * sigmoid_prime(n->output);
+		neuron_backward_accumulate(n);
+		i++;
+		n = n->prev;
+	}
+}
+
+void neuron_backward_hidden(neuron *n)
+{
+	while (n) {
+		n->delta *= sigmoid_prime(n->output);
+		neuron_backward_accumulate(n);
 		n = n->prev;
 	}
 }

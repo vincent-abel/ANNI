@@ -16,6 +16,7 @@ Current implementation:
 - Activation functions
 - Forward propagation
 - MSE loss
+- Backpropagation
 
 Training and Transformer components are not implemented yet.
 
@@ -26,7 +27,7 @@ Training and Transformer components are not implemented yet.
 - [x] Stabilize current architecture
 - [x] Forward propagation
 - [x] Loss functions
-- [ ] Backpropagation
+- [x] Backpropagation
 - [ ] Gradient descent
 - [ ] Training loop
 - [ ] XOR / basic datasets

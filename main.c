@@ -34,6 +34,7 @@ int main(int argc, char *argv[])
 	if (!target)
 		exit(EXIT_FAILURE);
 	printf("MSE (target=0)  %10.6f\n\n", network_mse(net, target, n_out));
+	network_backward(net, target, n_out);
 	free(target);
 
 	network_free(&net);

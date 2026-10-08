@@ -25,6 +25,7 @@ void nlayer_append(nlayer **head, nlayer **tail, neuron *neurons)
 		exit(EXIT_FAILURE);
 	layer->neuron = neurons;
 	layer->next = NULL;
+	layer->prev = *tail;
 	if (!*head)
 		*head = layer;
 	else
@@ -153,6 +154,30 @@ double network_mse(network *net, const double *target, int n_target)
 	if (i != n_target)
 		return -1.0;
 	return sum / (double)n_target;
+}
+
+void network_backward(network *net, const double *target, int n_target)
+{
+	nlayer *layer;
+
+	if (!net || !net->out || !target || n_target <= 0)
+		return;
+	if (count_neurons(net->out->neuron) != n_target)
+		return;
+
+	layer = net->layers;
+	while (layer) {
+		neuron_zero_delta(layer->neuron);
+		layer = layer->next;
+	}
+
+	layer = net->out;
+	neuron_backward_output(layer->neuron, target, n_target);
+	layer = layer->prev;
+	while (layer) {
+		neuron_backward_hidden(layer->neuron);
+		layer = layer->prev;
+	}
 }
 
 network *network_create(int n_inputs, int n_neurons, int n_layers)
