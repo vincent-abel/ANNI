@@ -10,7 +10,7 @@ Researchers and students need one entry point to **train on a file**, **save wei
 
 ## How it works for a human (intuition, analogy)
 
-Like `git` subcommands (`git commit`, `git push`), **`ann lm`** groups language-model actions under one noun so flags stay predictable and help text stays scoped.
+Like `git` subcommands (`git commit`, `git push`), **`ann lm`** groups language-model actions under one noun so flags stay predictable and help text stays scoped. Pass **`-d` / `--debug`** on `lm train` for timestamps, ingest path, epoch notes, and a stderr progress bar.
 
 ## Formal view (definitions, formulas, shapes, algorithms)
 
@@ -28,8 +28,8 @@ Like `git` subcommands (`git commit`, `git push`), **`ann lm`** groups language-
 **Target syntax.**
 
 ```text
-ann lm train   [--corpus PATH] [--epochs N] [--batch B] [--lr ETA]
-               [--checkpoint PATH] [--resume PATH] [--out PATH]
+ann lm train   [--data PATH] [--epochs N] [--batch B] [--out PATH]
+               [--resume PATH] [-d|--debug]
 
 ann lm generate [--checkpoint PATH] --prompt TEXT [--max N] [--temp TAU]
 
@@ -37,6 +37,8 @@ ann lm load     --checkpoint PATH [--prompt TEXT]  /* inspect NLL optional */
 
 ann lm eval     --checkpoint PATH --corpus PATH   /* perplexity */
 ```
+
+**`--resume PATH`.** Loads weights + Adam from a prior `lm_save_checkpoint` file and runs `--epochs` more passes. `--out` defaults to the resume path when omitted (overwrite in place). Weights-only files get a warm restart (fresh Adam).
 
 **Dispatch (planned `main.c` structure).**
 
@@ -53,12 +55,13 @@ if argc >= 2 && strcmp(argv[1], "lm") == 0:
 **`run_lm_train` algorithm.**
 
 ```text
-model = resume ? lm_load_adam(ckpt) : lm_create()
-opt = lm_adam_create(model)
-ds = text_dataset_load(corpus default "data/toy.txt")
-loop epochs: lm_train_corpus(model, opt, ds, 1, batch, lr)
-lm_save_adam(model, opt, out_path)
-print lm_perplexity_corpus on holdout if configured
+if --resume PATH:
+  model, opt, prev_epoch = lm_load_checkpoint(PATH)   /* or lm_load + fresh Adam */
+else:
+  model = lm_create(); opt = lm_adam_create(model); prev_epoch = 0
+ds = text_dataset_load(--data default "data/toy.txt")
+loss = lm_train_corpus(model, ds, opt, epochs, batch, lr, debug)
+lm_save_checkpoint(model, opt, prev_epoch + epochs, step, --out)
 ```
 
 **Flags defaults (proposed).**
@@ -100,10 +103,10 @@ print lm_perplexity_corpus on holdout if configured
 # Phrase demo (today)
 ./ann lm "hello world"
 
-# Planned corpus train + generate
-./ann lm train --corpus data/toy.txt --epochs 20 --batch 8 --out /tmp/toy.bin
-./ann lm eval --checkpoint /tmp/toy.bin --corpus data/toy_holdout.txt
-./ann lm generate --checkpoint /tmp/toy.bin --prompt "Once " --max 40 --temp 0.9
+# Corpus train, continue, generate
+./ann lm train --data data/toy.txt --epochs 3 --batch 8 --out /tmp/toy.bin
+./ann lm train --resume /tmp/toy.bin --epochs 5 -d
+./ann lm generate --model /tmp/toy.bin --prompt "Once " --tokens 40
 ```
 
 Expected stdout: epoch losses, final train/holdout PPL, then a generated string appended to prompt.

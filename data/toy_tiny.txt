@@ -1,0 +1,16 @@
+Add visual trainer for weights and stepped epochs
+
+ADD bridge.c
+Read create/train/sample/values/state and reply with one JSON snapshot. cmd_create calls network_create_sizes for xor or one custom sample; cmd_train repeats set/forward/backward/update and loss_add; emit_state prints activations, biases, weights, and mse.
+
+ADD server.py
+Serve the page and hold one ann-gui child. command_for maps /api/create, /api/train, /api/sample, /api/values, and /api/state onto that line protocol.
+
+ADD index.html
+Lay out dataset, layer sizes, learning rate, seed, and steps with Launch/Step/Run/Play. Place the network canvas, loss canvas, weight strip, and sample rows.
+
+ADD style.css
+Style the network view black, blue for positive weights and red for negative, and body.flow as the light tile view.
+
+ADD app.js
+drawNet maps activation to brightness and weight sign to color; drawLoss and renderHeat show the trace and every matrix. doLaunch/doTrain/playLoop step the bridge, and a click lists one neuron's bias and weights.

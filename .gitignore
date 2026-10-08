@@ -10,6 +10,7 @@
 # make and build files
 *.lst
 *.o
+*.bin
 objects/
 *.eep
 *.lss

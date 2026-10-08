@@ -1,7 +1,9 @@
 /*
 **	Mini-batch corpus training for the LM
 */
+#include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
 #include "gradutil.h"
 #include "lm_train.h"
 
@@ -49,8 +51,56 @@ static void scale_grads(lm *model, double scale)
 	}
 }
 
+static void dbg_stamp(const char *msg)
+{
+	time_t now;
+	struct tm *tm;
+	char buf[32];
+
+	now = time(NULL);
+	tm = localtime(&now);
+	if (tm)
+		strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", tm);
+	else
+		snprintf(buf, sizeof(buf), "unknown-time");
+	fprintf(stderr, "[%s] %s\n", buf, msg);
+}
+
+static void dbg_progress(int ep, int epochs, int done, int total, double nll)
+{
+	int width;
+	int filled;
+	int i;
+	double pct;
+	time_t now;
+	struct tm *tm;
+	char buf[32];
+
+	width = 28;
+	if (total <= 0)
+		total = 1;
+	pct = 100.0 * (double)done / (double)total;
+	filled = (int)((double)width * (double)done / (double)total + 0.5);
+	if (filled > width)
+		filled = width;
+	now = time(NULL);
+	tm = localtime(&now);
+	if (tm)
+		strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", tm);
+	else
+		snprintf(buf, sizeof(buf), "unknown-time");
+	fprintf(stderr, "\r[%s] [", buf);
+	for (i = 0; i < width; i++)
+		fputc(i < filled ? '#' : '-', stderr);
+	fprintf(stderr, "] %5.1f%%  epoch %d/%d  windows %d/%d",
+	    pct, ep + 1, epochs, done, total);
+	if (nll > 0.0)
+		fprintf(stderr, "  NLL %.4f", nll);
+	fflush(stderr);
+}
+
 double lm_train_corpus(lm *model, text_dataset *ds, lm_adam *opt,
-	int epochs, int batch_size, double lr)
+	int epochs, int batch_size, double lr, int debug)
 {
 	int ep;
 	int nw;
@@ -58,9 +108,12 @@ double lm_train_corpus(lm *model, text_dataset *ds, lm_adam *opt,
 	int b;
 	int n;
 	int ids[LM_MAX_CTX];
+	int total_steps;
+	int done_steps;
 	lm_cache *cache;
 	mat *dhidden;
 	double last;
+	char msg[128];
 
 	if (!model || !ds || !opt || epochs <= 0 || batch_size <= 0 || lr <= 0.0)
 		return -1.0;
@@ -74,8 +127,21 @@ double lm_train_corpus(lm *model, text_dataset *ds, lm_adam *opt,
 		mat_free(&dhidden);
 		return -1.0;
 	}
+	total_steps = epochs * nw;
+	done_steps = 0;
 	last = -1.0;
+	if (debug) {
+		snprintf(msg, sizeof(msg),
+		    "train loop: %d epochs, %d windows/epoch, batch %d, lr %.4g",
+		    epochs, nw, batch_size, lr);
+		dbg_stamp(msg);
+	}
 	for (ep = 0; ep < epochs; ep++) {
+		if (debug) {
+			snprintf(msg, sizeof(msg), "epoch %d/%d starting",
+			    ep + 1, epochs);
+			dbg_stamp(msg);
+		}
 		idx = 0;
 		while (idx < nw) {
 			lm_adam_zero_grad(model);
@@ -91,14 +157,28 @@ double lm_train_corpus(lm *model, text_dataset *ds, lm_adam *opt,
 					break;
 				b++;
 				idx++;
+				done_steps++;
 			}
 			if (b <= 0)
 				break;
 			scale_grads(model, 1.0 / (double)b);
 			lm_adam_step(opt, lr);
+			if (debug)
+				dbg_progress(ep, epochs, done_steps, total_steps,
+				    last);
 		}
-		last = lm_nll(model, ds->ids, ds->n_ids < LM_MAX_CTX ? ds->n_ids : LM_MAX_CTX);
+		last = lm_nll(model, ds->ids,
+		    ds->n_ids < LM_MAX_CTX ? ds->n_ids : LM_MAX_CTX);
+		if (debug) {
+			fputc('\n', stderr);
+			snprintf(msg, sizeof(msg),
+			    "epoch %d/%d done  mean NLL %.4f",
+			    ep + 1, epochs, last);
+			dbg_stamp(msg);
+		}
 	}
+	if (debug)
+		dbg_stamp("train loop finished");
 	lm_cache_free(&cache);
 	mat_free(&dhidden);
 	return last;

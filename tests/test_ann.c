@@ -635,10 +635,10 @@ static void test_lm_train_corpus(void)
 
 	srand(11);
 	model = lm_create();
-	ds = text_dataset_load("data/toy.txt", 8);
+	ds = text_dataset_load("data/toy_tiny.txt", 8);
 	opt = lm_adam_create(model);
 	assert(model && ds && opt);
-	loss = lm_train_corpus(model, ds, opt, 1, 2, 0.01);
+	loss = lm_train_corpus(model, ds, opt, 1, 2, 0.01, 0);
 	assert(loss > 0.0);
 	lm_adam_free(&opt);
 	text_dataset_free(&ds);
@@ -683,14 +683,14 @@ static void test_lm_checkpoint_resume(void)
 
 	srand(13);
 	a = lm_create();
-	ds = text_dataset_load("data/toy.txt", 8);
+	ds = text_dataset_load("data/toy_tiny.txt", 8);
 	oa = lm_adam_create(a);
 	assert(a && ds && oa);
-	loss1 = lm_train_corpus(a, ds, oa, 1, 2, 0.01);
+	loss1 = lm_train_corpus(a, ds, oa, 1, 2, 0.01, 0);
 	assert(lm_save_checkpoint(a, oa, 1, 0, "objects/test_ckpt.bin") == 0);
 	b = lm_load_checkpoint("objects/test_ckpt.bin", &ob, &epoch, &step);
 	assert(b && ob && epoch == 1);
-	loss2 = lm_train_corpus(b, ds, ob, 1, 2, 0.01);
+	loss2 = lm_train_corpus(b, ds, ob, 1, 2, 0.01, 0);
 	assert(loss2 > 0.0 && loss1 > 0.0);
 	lm_adam_free(&oa);
 	lm_adam_free(&ob);
@@ -729,10 +729,10 @@ static void test_lm_generate_from_checkpoint(void)
 
 	srand(15);
 	model = lm_create();
-	ds = text_dataset_load("data/toy.txt", 8);
+	ds = text_dataset_load("data/toy_tiny.txt", 8);
 	opt = lm_adam_create(model);
 	assert(model && ds && opt);
-	lm_train_corpus(model, ds, opt, 1, 2, 0.01);
+	lm_train_corpus(model, ds, opt, 1, 2, 0.01, 0);
 	assert(lm_save_checkpoint(model, opt, 1, 0, "objects/gen_ckpt.bin") == 0);
 	loaded = lm_load_checkpoint("objects/gen_ckpt.bin", NULL, NULL, NULL);
 	assert(loaded);
@@ -751,7 +751,7 @@ static void test_text_dataset(void)
 	int n;
 	int nw;
 
-	ds = text_dataset_load("data/toy.txt", 8);
+	ds = text_dataset_load("data/toy_tiny.txt", 8);
 	assert(ds);
 	nw = text_dataset_n_windows(ds);
 	assert(nw > 0);

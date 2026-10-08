@@ -16,6 +16,34 @@ static const char *arg_value(int argc, char **argv, const char *key, const char 
 	return def;
 }
 
+static int arg_flag(int argc, char **argv, const char *short_key, const char *long_key)
+{
+	int i;
+
+	for (i = 0; i < argc; i++) {
+		if (arg_eq(argv[i], short_key) || arg_eq(argv[i], long_key))
+			return 1;
+	}
+	return 0;
+}
+
+static void train_dbg(int debug, const char *msg)
+{
+	time_t now;
+	struct tm *tm;
+	char buf[32];
+
+	if (!debug)
+		return;
+	now = time(NULL);
+	tm = localtime(&now);
+	if (tm)
+		strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", tm);
+	else
+		snprintf(buf, sizeof(buf), "unknown-time");
+	fprintf(stderr, "[%s] %s\n", buf, msg);
+}
+
 static int run_lm_train(int argc, char **argv)
 {
 	lm *model;
@@ -23,33 +51,87 @@ static int run_lm_train(int argc, char **argv)
 	text_dataset *ds;
 	const char *data;
 	const char *out;
+	const char *resume;
 	double loss;
 	int epochs;
 	int batch;
+	int debug;
+	int nw;
+	int prev_epoch;
+	int prev_step;
+	int total_epochs;
+	char msg[256];
 
 	data = arg_value(argc, argv, "--data", "data/toy.txt");
-	out = arg_value(argc, argv, "--out", "model.bin");
+	resume = arg_value(argc, argv, "--resume", NULL);
+	out = arg_value(argc, argv, "--out", resume ? resume : "model.bin");
 	epochs = atoi(arg_value(argc, argv, "--epochs", "3"));
 	batch = atoi(arg_value(argc, argv, "--batch", "4"));
+	debug = arg_flag(argc, argv, "-d", "--debug");
 	if (epochs <= 0)
 		epochs = 3;
 	if (batch <= 0)
 		batch = 4;
+	prev_epoch = 0;
+	prev_step = 0;
+	model = NULL;
+	opt = NULL;
+
+	train_dbg(debug, "lm train starting");
+	snprintf(msg, sizeof(msg), "will ingest file: %s", data);
+	train_dbg(debug, msg);
+	snprintf(msg, sizeof(msg),
+	    "params: epochs=%d batch=%d lr=0.01 out=%s%s%s",
+	    epochs, batch, out,
+	    resume ? " resume=" : "",
+	    resume ? resume : "");
+	train_dbg(debug, msg);
 
 	srand(1);
-	model = lm_create();
+	if (resume) {
+		snprintf(msg, sizeof(msg), "resuming from checkpoint: %s", resume);
+		train_dbg(debug, msg);
+		model = lm_load_checkpoint(resume, &opt, &prev_epoch, &prev_step);
+		if (!model) {
+			/* weights-only file: warm restart with fresh Adam */
+			model = lm_load(resume);
+			if (model) {
+				opt = lm_adam_create(model);
+				train_dbg(debug,
+				    "warm restart (no Adam state in file)");
+			}
+		} else {
+			snprintf(msg, sizeof(msg),
+			    "loaded checkpoint epoch=%d step=%d adam_t=%d",
+			    prev_epoch, prev_step, opt ? opt->t : -1);
+			train_dbg(debug, msg);
+		}
+	} else {
+		train_dbg(debug, "creating model and Adam optimizer");
+		model = lm_create();
+		opt = model ? lm_adam_create(model) : NULL;
+	}
+	train_dbg(debug, "loading dataset / tokenizing");
 	ds = text_dataset_load(data, 8);
-	opt = model ? lm_adam_create(model) : NULL;
 	if (!model || !ds || !opt) {
 		lm_free(&model);
 		text_dataset_free(&ds);
 		lm_adam_free(&opt);
-		fprintf(stderr, "lm train: failed to init\n");
+		fprintf(stderr, "lm train: failed to init%s\n",
+		    resume ? " (bad --resume path?)" : "");
 		return 1;
 	}
-	loss = lm_train_corpus(model, ds, opt, epochs, batch, 0.01);
+	nw = text_dataset_n_windows(ds);
+	snprintf(msg, sizeof(msg),
+	    "dataset ready: %d token ids, %d windows (len 8)",
+	    ds->n_ids, nw);
+	train_dbg(debug, msg);
+	train_dbg(debug, "running mini-batch corpus training");
+	loss = lm_train_corpus(model, ds, opt, epochs, batch, 0.01, debug);
 	printf("LM train NLL %.4f\n", loss);
-	if (lm_save_checkpoint(model, opt, epochs, 0, out) != 0) {
+	total_epochs = prev_epoch + epochs;
+	train_dbg(debug, "saving checkpoint");
+	if (lm_save_checkpoint(model, opt, total_epochs, prev_step, out) != 0) {
 		fprintf(stderr, "lm train: save failed\n");
 		lm_free(&model);
 		text_dataset_free(&ds);
@@ -57,6 +139,8 @@ static int run_lm_train(int argc, char **argv)
 		return 1;
 	}
 	printf("LM saved %s\n", out);
+	snprintf(msg, sizeof(msg), "lm train finished (wrote %s)", out);
+	train_dbg(debug, msg);
 	lm_free(&model);
 	text_dataset_free(&ds);
 	lm_adam_free(&opt);
@@ -231,7 +315,8 @@ int main(int argc, char *argv[])
 		printf("Usage: ./ann <inputs> <neurons-per-layer> <layers>\n");
 		printf("       ./ann xor\n");
 		printf("       ./ann lm [phrase]\n");
-		printf("       ./ann lm train --data data/toy.txt --out model.bin\n");
+		printf("       ./ann lm train [--data PATH] [--epochs N] [--out PATH]\n");
+		printf("                 [--resume PATH] [-d|--debug]\n");
 		printf("       ./ann lm generate --model model.bin --prompt hello\n");
 		printf("       ./ann lm load --model model.bin\n");
 		return 1;

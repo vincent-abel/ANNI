@@ -9,6 +9,6 @@
 #include "lm_adam.h"
 
 double	lm_train_corpus(lm *model, text_dataset *ds, lm_adam *opt,
-		int epochs, int batch_size, double lr);
+		int epochs, int batch_size, double lr, int debug);
 
 #endif

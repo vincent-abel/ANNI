@@ -63,7 +63,7 @@ Resetting `t=0` while keeping large `m,v` **mis-scales** updates.
 ## How it shows up in this repo
 
 - Net precedent: no optimizer in ANN1 saves—LM training **adds** optimizer persistence first-class.
-- Planned CLI: `./ann lm train --corpus ... --checkpoint out.bin --resume out.bin` ([lm-cli.md](lm-cli.md)).
+- CLI: `./ann lm train --data data/toy.txt --resume model.bin --epochs 5` ([lm-cli.md](lm-cli.md)).
 - Functions: `lm_save_adam`, `lm_load_adam` ([lm-weight-serialization.md](lm-weight-serialization.md)).
 
 ## Worked example
@@ -73,5 +73,5 @@ Train 2 epochs on toy.txt, save at end of epoch 1 with `cursor=500`, `t=1250`. K
 ## What next
 
 - Extend binary format v2 with Adam payload.
-- Add `--resume` flag parsing and metadata sidecar.
+- Optional: store dataset cursor in checkpoint metadata for mid-epoch resume.
 - Integration test: train N steps, save, load, train M steps vs train N+M continuous.
