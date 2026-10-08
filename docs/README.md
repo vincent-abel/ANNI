@@ -39,6 +39,7 @@
 - [Positional encoding](positional-encoding.md)
 - [Query / Key / Value](query-key-value.md)
 - [Self-attention](self-attention.md)
+- [Multi-head attention](multi-head-attention.md)
 
 ---
 
@@ -154,3 +155,6 @@ Queries, keys, and values are three linear views of the same token matrix. Match
 
 ### [Self-attention](self-attention.md)
 Self-attention scores every position against every other with scaled dot products of Q and K. Softmax turns those scores into weights that mix the value rows. This repo implements that path in attn_self on T×d matrices.
+
+### [Multi-head attention](multi-head-attention.md)
+Multi-head attention runs several smaller attentions in parallel subspaces. Heads are concatenated and mixed by Wo. attn_mha projects X, splits heads, attends, and projects back.

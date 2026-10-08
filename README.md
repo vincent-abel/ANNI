@@ -37,6 +37,7 @@ Current implementation:
 - Positional encoding
 - Query / Key / Value
 - Self-attention
+- Multi-head attention
 
 Training and Transformer components are not implemented yet.
 
@@ -80,7 +81,7 @@ Training and Transformer components are not implemented yet.
 - [x] Positional encoding
 - [x] Query / Key / Value
 - [x] Self-attention
-- [ ] Multi-head attention
+- [x] Multi-head attention
 - [ ] Feed-forward layers
 - [ ] Layer normalization
 - [ ] Residual connections

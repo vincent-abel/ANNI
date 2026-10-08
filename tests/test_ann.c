@@ -383,6 +383,24 @@ static void test_tokenize_roundtrip(void)
 
 
 
+
+static void test_attn_mha(void)
+{
+	attn *a;
+	mat *x;
+	mat *out;
+
+	a = attn_create();
+	assert(a);
+	x = mat_create(3, LM_D_MODEL);
+	out = mat_create(3, LM_D_MODEL);
+	assert(x && out);
+	mat_fill(x, 0.05);
+	assert(attn_mha(out, a, x, 0) == 0);
+	attn_free(&a);
+	mat_free(&x); mat_free(&out);
+}
+
 static void test_attn_self(void)
 {
 	mat *q;
@@ -499,6 +517,7 @@ int main(void)
 	test_posenc_changes();
 	test_attn_qkv();
 	test_attn_self();
+	test_attn_mha();
 	puts("ok");
 	return 0;
 }
