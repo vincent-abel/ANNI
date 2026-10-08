@@ -298,19 +298,63 @@ double lm_nll(const lm *model, const int *ids, int n)
 	return loss / (double)count;
 }
 
+static void sgd_mat(mat *w, const mat *dw, double lr)
+{
+	int i;
+	int n;
+
+	if (!w || !dw || !w->data || !dw->data)
+		return;
+	n = w->rows * w->cols;
+	for (i = 0; i < n; i++)
+		w->data[i] -= lr * dw->data[i];
+}
+
+static void sgd_vec(vec *w, const vec *dw, double lr)
+{
+	int i;
+
+	if (!w || !dw || !w->data || !dw->data)
+		return;
+	for (i = 0; i < w->n; i++)
+		w->data[i] -= lr * dw->data[i];
+}
+
+static void lm_sgd_step(lm *model, double lr)
+{
+	int i;
+	tblock *b;
+
+	if (!model)
+		return;
+	sgd_mat(model->w_head, model->dw_head, lr);
+	sgd_vec(model->b_head, model->db_head, lr);
+	sgd_mat(model->embed->table, model->embed->dtable, lr);
+	for (i = 0; i < model->tr->n_blocks; i++) {
+		b = &model->tr->blocks[i];
+		sgd_mat(b->attn->wq, b->attn->dwq, lr);
+		sgd_mat(b->attn->wk, b->attn->dwk, lr);
+		sgd_mat(b->attn->wv, b->attn->dwv, lr);
+		sgd_mat(b->attn->wo, b->attn->dwo, lr);
+		sgd_mat(b->ffn->w1, b->ffn->dw1, lr);
+		sgd_vec(b->ffn->b1, b->ffn->db1, lr);
+		sgd_mat(b->ffn->w2, b->ffn->dw2, lr);
+		sgd_vec(b->ffn->b2, b->ffn->db2, lr);
+		sgd_vec(b->ln1->gamma, b->ln1->dgamma, lr);
+		sgd_vec(b->ln1->beta, b->ln1->dbeta, lr);
+		sgd_vec(b->ln2->gamma, b->ln2->dgamma, lr);
+		sgd_vec(b->ln2->beta, b->ln2->dbeta, lr);
+	}
+}
+
 double lm_train_steps(lm *model, const char *text, int steps, double lr)
 {
 	int ids[LM_MAX_CTX];
 	int n;
 	int step;
-	int t;
-	int j;
-	int v;
-	mat *hidden;
-	vec *logits;
-	double *delta;
+	lm_cache *cache;
+	mat *dhidden;
 	double loss;
-	double dh[LM_D_MODEL];
 
 	if (!model || !text || steps <= 0 || lr <= 0.0)
 		return -1.0;
@@ -318,47 +362,27 @@ double lm_train_steps(lm *model, const char *text, int steps, double lr)
 	if (n < 2)
 		return -1.0;
 
-	hidden = mat_create(n, LM_D_MODEL);
-	logits = vec_create(model->vocab_size);
-	delta = malloc((size_t)model->vocab_size * sizeof(double));
-	if (!hidden || !logits || !delta) {
-		mat_free(&hidden);
-		vec_free(&logits);
-		free(delta);
+	cache = lm_cache_create(n);
+	dhidden = mat_create(n, LM_D_MODEL);
+	if (!cache || !dhidden) {
+		lm_cache_free(&cache);
+		mat_free(&dhidden);
 		return -1.0;
 	}
 
 	for (step = 0; step < steps; step++) {
-		if (lm_forward(hidden, model, ids, n) != 0)
+		lm_zero_grad(model);
+		if (lm_forward_cache(model, ids, n, cache) != 0)
 			break;
-		for (t = 0; t < n - 1; t++) {
-			if (lm_logits_at(logits, model, hidden, t) != 0)
-				break;
-			memcpy(delta, logits->data,
-			    (size_t)model->vocab_size * sizeof(double));
-			softmax_inplace(delta, model->vocab_size);
-			delta[ids[t + 1]] -= 1.0;
-			for (j = 0; j < LM_D_MODEL; j++)
-				dh[j] = 0.0;
-			for (v = 0; v < model->vocab_size; v++) {
-				model->b_head->data[v] -= lr * delta[v];
-				for (j = 0; j < LM_D_MODEL; j++) {
-					dh[j] += mat_get(model->w_head, j, v) * delta[v];
-					mat_set(model->w_head, j, v,
-					    mat_get(model->w_head, j, v)
-					    - lr * mat_get(hidden, t, j) * delta[v]);
-				}
-			}
-			for (j = 0; j < LM_D_MODEL; j++)
-				mat_set(model->embed->table, ids[t], j,
-				    mat_get(model->embed->table, ids[t], j)
-				    - lr * dh[j]);
-		}
+		if (lm_loss_backward(model, cache, ids, n, dhidden) != 0)
+			break;
+		if (lm_backward(model, dhidden, cache) != 0)
+			break;
+		lm_sgd_step(model, lr);
 	}
 
 	loss = lm_nll(model, ids, n);
-	mat_free(&hidden);
-	vec_free(&logits);
-	free(delta);
+	lm_cache_free(&cache);
+	mat_free(&dhidden);
 	return loss;
 }

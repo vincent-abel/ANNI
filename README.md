@@ -46,6 +46,7 @@ Current implementation:
 - Next-token prediction
 - Text generation
 - Transformer backpropagation
+- Train all parameters
 
 Toy decoder-only LM in `lang/` (byte vocab, pre-norm blocks, next-token train, `./ann lm`).
 
@@ -101,7 +102,7 @@ Toy decoder-only LM in `lang/` (byte vocab, pre-norm blocks, next-token train, `
 ### Language Model Training
 
 - [x] Full backpropagation through the Transformer
-- [ ] Train all parameters
+- [x] Train all parameters
 - [ ] Adam for LM weights
 - [ ] Mini-batch corpus training
 - [ ] Text dataset loading

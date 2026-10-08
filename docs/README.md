@@ -51,6 +51,7 @@
 ### Language model training
 
 - [Transformer backpropagation](transformer-backpropagation.md)
+- [Train all parameters](train-all-parameters.md)
 
 ---
 
@@ -195,3 +196,6 @@ Generation samples the next id from the final-position logits and appends it. Gr
 
 ### [Transformer backpropagation](transformer-backpropagation.md)
 Manual backward walks CE through the head, blocks, and embeddings with activation caches. Grad mats sit beside every learnable weight. Finite-difference checks on the head confirm the chain rule plumbing.
+
+### [Train all parameters](train-all-parameters.md)
+Full-stack SGD replaces the old head-and-embed shortcut. Every attention, FFN, LayerNorm, embedding, and head weight receives gradients. lm_train_steps now zeros grads, runs cached forward/backward, then steps all params.
