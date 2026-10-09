@@ -4,12 +4,22 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/time.h>
 #include <time.h>
 #include "gpu.h"
 #include "gradutil.h"
 #include "lm_serialize.h"
 #include "lm_train.h"
 #include "mat.h"
+
+/* Wall time — clock() freezes while waiting on CUDA. */
+static double wall_sec(void)
+{
+	struct timeval tv;
+
+	gettimeofday(&tv, NULL);
+	return (double)tv.tv_sec + 1e-6 * (double)tv.tv_usec;
+}
 
 static void scale_grads(lm *model, double scale)
 {
@@ -107,7 +117,7 @@ static void dbg_fmt_eta(char *out, size_t out_n, double sec)
 
 /* Single in-place progress line (\\r). Close it before any stamp/log line. */
 static void dbg_progress(int ep, int epochs, int done, int total,
-	int epoch_done, int nw, double nll, double win_nll, clock_t t0,
+	int epoch_done, int nw, double nll, double win_nll, double t0,
 	int tokens_done, int force)
 {
 	int width;
@@ -117,18 +127,17 @@ static void dbg_progress(int ep, int epochs, int done, int total,
 	double elapsed;
 	double eta;
 	double ms_tok;
+	double now;
 	char eta_buf[16];
 	char bar[16];
 	char line[96];
 	int nline;
-	static clock_t last_print;
-	clock_t nowc;
+	static double last_print;
 
-	nowc = clock();
-	if (!force && last_print != (clock_t)0
-	    && (nowc - last_print) < CLOCKS_PER_SEC / 5)
+	now = wall_sec();
+	if (!force && last_print > 0.0 && (now - last_print) < 0.25)
 		return;
-	last_print = nowc;
+	last_print = now;
 
 	width = 12;
 	if (nw <= 0)
@@ -146,7 +155,7 @@ static void dbg_progress(int ep, int epochs, int done, int total,
 	for (i = 0; i < width; i++)
 		bar[i] = i < filled ? '#' : '-';
 	bar[width] = '\0';
-	elapsed = (double)(nowc - t0) / (double)CLOCKS_PER_SEC;
+	elapsed = now - t0;
 	eta = -1.0;
 	ms_tok = -1.0;
 	if (done > 0 && elapsed > 0.0) {
@@ -224,7 +233,7 @@ double lm_train_corpus(lm *model, text_dataset *ds, lm_adam *opt,
 	mat *dhidden;
 	double last;
 	double win;
-	clock_t t0;
+	double t0;
 	char msg[192];
 
 	if (!model || !ds || !opt || epochs <= 0 || batch_size <= 0 || lr <= 0.0)
@@ -253,7 +262,7 @@ double lm_train_corpus(lm *model, text_dataset *ds, lm_adam *opt,
 	last = lm_nll(model, ds->ids,
 	    ds->n_ids < LM_MAX_CTX ? ds->n_ids : LM_MAX_CTX);
 	win = lm_nll_windows(model, ds);
-	t0 = clock();
+	t0 = wall_sec();
 	if (debug) {
 		snprintf(msg, sizeof(msg),
 		    "train loop: %d epochs, %d windows/epoch, batch %d, lr %.4g",
