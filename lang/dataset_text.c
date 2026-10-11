@@ -9,6 +9,11 @@
 
 text_dataset *text_dataset_load(const char *path, int window)
 {
+	return text_dataset_load_tok(path, window, NULL);
+}
+
+text_dataset *text_dataset_load_tok(const char *path, int window, const bpe *tok)
+{
 	FILE *fp;
 	long sz;
 	char *buf;
@@ -49,13 +54,18 @@ text_dataset *text_dataset_load(const char *path, int window)
 		return NULL;
 	}
 	ds->window = window;
+	ds->starts = NULL;
+	ds->n_starts = 0;
 	ds->ids = malloc((size_t)sz * sizeof(int));
 	if (!ds->ids) {
 		free(buf);
 		free(ds);
 		return NULL;
 	}
-	n = tokenize_encode(buf, ds->ids, (int)sz);
+	if (tok)
+		n = bpe_encode_n(tok, buf, (size_t)sz, ds->ids, (int)sz);
+	else
+		n = tokenize_encode(buf, ds->ids, (int)sz);
 	free(buf);
 	if (n < 2) {
 		text_dataset_free(&ds);
@@ -70,12 +80,15 @@ void text_dataset_free(text_dataset **ds)
 	if (!ds || !*ds)
 		return;
 	free((*ds)->ids);
+	free((*ds)->starts);
 	free(*ds);
 	*ds = NULL;
 }
 
 int text_dataset_n_windows(const text_dataset *ds)
 {
+	if (ds && ds->starts)
+		return ds->n_starts;
 	if (!ds || ds->n_ids < ds->window)
 		return 0;
 	return ds->n_ids - ds->window + 1;
@@ -89,6 +102,8 @@ int text_dataset_window(const text_dataset *ds, int index, int *ids_out, int *n_
 		return -1;
 	if (index >= text_dataset_n_windows(ds))
 		return -1;
+	if (ds->starts)
+		index = ds->starts[index];
 	for (i = 0; i < ds->window; i++)
 		ids_out[i] = ds->ids[index + i];
 	*n_out = ds->window;

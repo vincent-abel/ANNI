@@ -1,8 +1,10 @@
 /*
-**	SIMD-friendly kernels (auto-vectorization helpers; no intrinsics yet)
+**	SIMD-friendly kernels (auto-vectorization helpers + optional intrinsics)
 */
 #ifndef SIMD_H__
 #define SIMD_H__
+
+#include "real.h"
 
 #ifdef __GNUC__
 #define ANN_RESTRICT __restrict__
@@ -10,10 +12,11 @@
 #define ANN_RESTRICT
 #endif
 
-double	ann_dot(const double *ANN_RESTRICT a, const double *ANN_RESTRICT b, int n);
-void	ann_axpy(double *ANN_RESTRICT y, double alpha,
-		const double *ANN_RESTRICT x, int n);
-void	ann_scale(double *ANN_RESTRICT v, double s, int n);
+ann_real	ann_dot(const ann_real *ANN_RESTRICT a,
+		const ann_real *ANN_RESTRICT b, int n);
+void	ann_axpy(ann_real *ANN_RESTRICT y, ann_real alpha,
+		const ann_real *ANN_RESTRICT x, int n);
+void	ann_scale(ann_real *ANN_RESTRICT v, ann_real s, int n);
 const char	*ann_simd_backend(void);
 
 #endif

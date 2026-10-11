@@ -84,11 +84,11 @@ static void test_cross_entropy(void)
 	probs->data[1] = 0.7;
 	probs->data[2] = 0.2;
 	ce = vec_cross_entropy(probs, 1);
-	assert(fabs(ce - (-log(0.7))) < 1e-9);
+	assert(fabs(ce - (-log(0.7))) < 1e-4);
 	logits->data[0] = 1.0;
 	logits->data[1] = 2.0;
 	sce = vec_softmax_cross_entropy(logits, 1);
-	assert(fabs(sce - (-log(exp(2.0) / (exp(1.0) + exp(2.0))))) < 1e-9);
+	assert(fabs(sce - (-log(exp(2.0) / (exp(1.0) + exp(2.0))))) < 1e-4);
 	vec_free(&probs);
 	vec_free(&logits);
 }
@@ -106,9 +106,9 @@ static void test_softmax(void)
 	in->data[1] = 2.0;
 	assert(vec_softmax(out, in) == 0);
 	sum = out->data[0] + out->data[1];
-	assert(fabs(sum - 1.0) < 1e-9);
-	assert(fabs(out->data[0] - exp(1.0) / (exp(1.0) + exp(2.0))) < 1e-9);
-	assert(fabs(out->data[1] - exp(2.0) / (exp(1.0) + exp(2.0))) < 1e-9);
+	assert(fabs(sum - 1.0) < 1e-4);
+	assert(fabs(out->data[0] - exp(1.0) / (exp(1.0) + exp(2.0))) < 1e-4);
+	assert(fabs(out->data[1] - exp(2.0) / (exp(1.0) + exp(2.0))) < 1e-4);
 	vec_free(&in);
 	vec_free(&out);
 }
@@ -135,7 +135,7 @@ static void test_mat_mul_blocked_matches_naive(void)
 	assert(mat_mul(c_block, a, b) == 0);
 	assert(mat_mul_naive(c_naive, a, b) == 0);
 	for (i = 0; i < n * n; i++)
-		assert(fabs(c_block->data[i] - c_naive->data[i]) < 1e-9);
+		assert(fabs(c_block->data[i] - c_naive->data[i]) < 1e-4);
 	mat_free(&a);
 	mat_free(&b);
 	mat_free(&c_block);
@@ -151,7 +151,7 @@ static void test_tensor_views(void)
 	vec view_v;
 	mat view_m;
 	int idx[] = {1, 2};
-	double *p;
+	ann_real *p;
 
 	t1 = tensor_create(shape1, 1);
 	t2 = tensor_create(shape2, 2);
@@ -167,7 +167,7 @@ static void test_tensor_views(void)
 	*p = 7.5;
 	assert(tensor_as_mat(&view_m, t2) == 0);
 	assert(view_m.rows == 2 && view_m.cols == 3);
-	assert(fabs(mat_get(&view_m, 1, 2) - 7.5) < 1e-9);
+	assert(fabs(mat_get(&view_m, 1, 2) - 7.5) < 1e-4);
 	tensor_free(&t1);
 	tensor_free(&t2);
 }
@@ -193,17 +193,17 @@ static void test_mat_mul_known(void)
 	x->data[0] = 1.0;
 	x->data[1] = 0.0;
 	assert(mat_vec_mul(y, a, x) == 0);
-	assert(fabs(y->data[0] - 1.0) < 1e-9);
-	assert(fabs(y->data[1] - 3.0) < 1e-9);
+	assert(fabs(y->data[0] - 1.0) < 1e-4);
+	assert(fabs(y->data[1] - 3.0) < 1e-4);
 	mat_set(b, 0, 0, 0.0);
 	mat_set(b, 0, 1, 1.0);
 	mat_set(b, 1, 0, 1.0);
 	mat_set(b, 1, 1, 0.0);
 	assert(mat_mul(c, a, b) == 0);
-	assert(fabs(mat_get(c, 0, 0) - 2.0) < 1e-9);
-	assert(fabs(mat_get(c, 0, 1) - 1.0) < 1e-9);
-	assert(fabs(mat_get(c, 1, 0) - 4.0) < 1e-9);
-	assert(fabs(mat_get(c, 1, 1) - 3.0) < 1e-9);
+	assert(fabs(mat_get(c, 0, 0) - 2.0) < 1e-4);
+	assert(fabs(mat_get(c, 0, 1) - 1.0) < 1e-4);
+	assert(fabs(mat_get(c, 1, 0) - 4.0) < 1e-4);
+	assert(fabs(mat_get(c, 1, 1) - 3.0) < 1e-4);
 	mat_free(&a);
 	mat_free(&b);
 	mat_free(&c);
@@ -227,14 +227,14 @@ static void test_vec_dot_axpy(void)
 	b->data[0] = 4.0;
 	b->data[1] = 5.0;
 	b->data[2] = 6.0;
-	assert(fabs(vec_dot(a, b) - 32.0) < 1e-9);
+	assert(fabs(vec_dot(a, b) - 32.0) < 1e-4);
 	y->data[0] = 3.0;
 	y->data[1] = 0.0;
 	y->data[2] = 1.0;
 	vec_axpy(y, 2.0, a);
-	assert(fabs(y->data[0] - 5.0) < 1e-9);
-	assert(fabs(y->data[1] - 4.0) < 1e-9);
-	assert(fabs(y->data[2] - 7.0) < 1e-9);
+	assert(fabs(y->data[0] - 5.0) < 1e-4);
+	assert(fabs(y->data[1] - 4.0) < 1e-4);
+	assert(fabs(y->data[2] - 7.0) < 1e-4);
 	vec_free(&a);
 	vec_free(&b);
 	vec_free(&y);
@@ -424,8 +424,8 @@ static void test_attn_self(void)
 	}
 	assert(attn_self(out, q, k, v, 0) == 0);
 	/* equal Q/K rows => uniform weights => mean of V rows */
-	assert(fabs(mat_get(out, 0, 0) - 3.0) < 1e-9);
-	assert(fabs(mat_get(out, 1, 0) - 3.0) < 1e-9);
+	assert(fabs(mat_get(out, 0, 0) - 3.0) < 1e-4);
+	assert(fabs(mat_get(out, 1, 0) - 3.0) < 1e-4);
 	mat_free(&q); mat_free(&k); mat_free(&v); mat_free(&out);
 }
 
@@ -477,7 +477,7 @@ static void test_embed_lookup(void)
 	ids[0] = 1;
 	ids[1] = 2;
 	assert(embed_lookup(out, e, ids, 2) == 0);
-	assert(fabs(mat_get(out, 0, 0) - mat_get(e->table, 1, 0)) < 1e-12);
+	assert(fabs(mat_get(out, 0, 0) - mat_get(e->table, 1, 0)) < 1e-4);
 	embed_free(&e);
 	mat_free(&out);
 }
@@ -537,7 +537,7 @@ static void test_layernorm_zero_mean(void)
 	for (j = 0; j < LM_D_MODEL; j++)
 		mean += mat_get(x, 0, j);
 	mean /= (double)LM_D_MODEL;
-	assert(fabs(mean) < 1e-9);
+	assert(fabs(mean) < 1e-4);
 	layernorm_free(&ln);
 	mat_free(&x);
 }
@@ -554,7 +554,7 @@ static void test_resid_add(void)
 	mat_fill(a, 1.0);
 	mat_fill(b, 2.0);
 	assert(resid_add(a, b) == 0);
-	assert(fabs(mat_get(a, 0, 0) - 3.0) < 1e-12);
+	assert(fabs(mat_get(a, 0, 0) - 3.0) < 1e-4);
 	mat_free(&a); mat_free(&b);
 }
 
@@ -580,7 +580,7 @@ static void test_attn_causal(void)
 		mat_set(v, 1, i, 8.0);
 	}
 	assert(attn_self(out, q, k, v, 1) == 0);
-	assert(fabs(mat_get(out, 0, 0) - 2.0) < 1e-9);
+	assert(fabs(mat_get(out, 0, 0) - 2.0) < 1e-4);
 	mat_free(&q); mat_free(&k); mat_free(&v); mat_free(&out);
 }
 
@@ -615,7 +615,7 @@ static void test_lm_ntp_loss_drops(void)
 	n = tokenize_encode("hello", ids, LM_MAX_CTX);
 	assert(n >= 2);
 	before = lm_nll(model, ids, n);
-	after = lm_train_steps(model, "hello", 15, 0.01);
+	after = lm_train_steps(model, "hello", 15, 0.001);
 	assert(before > 0.0);
 	assert(after > 0.0);
 	assert(after < before);
@@ -635,13 +635,115 @@ static void test_lm_train_corpus(void)
 
 	srand(11);
 	model = lm_create();
-	ds = text_dataset_load("data/toy_tiny.txt", 8);
+	ds = text_dataset_load("data/toy_micro.txt", 8);
 	opt = lm_adam_create(model);
 	assert(model && ds && opt);
-	loss = lm_train_corpus(model, ds, opt, 1, 2, 0.01, 0, NULL, 0);
+	/* Micro fixture + no window eval: D=256 full toy_tiny is too slow for CI. */
+	loss = lm_train_corpus(model, ds, opt, 1, 2, 0.01, 0, NULL, 0, 0, 0);
 	assert(loss > 0.0);
 	lm_adam_free(&opt);
 	text_dataset_free(&ds);
+	lm_free(&model);
+}
+
+static double mat_abs_sum(const mat *m)
+{
+	int i;
+	int n;
+	double s;
+
+	mat_ensure_host((mat *)m);
+	n = m->rows * m->cols;
+	s = 0.0;
+	for (i = 0; i < n; i++)
+		s += fabs((double)m->data[i]);
+	return s;
+}
+
+/* Sum |grad| over head, embed, and every block's attention / FFN weights. */
+static double lm_grad_abs_sum(lm *model)
+{
+	double s;
+	int i;
+	tblock *b;
+
+	lm_grads_ensure_host(model);
+	s = mat_abs_sum(model->dw_head) + mat_abs_sum(model->embed->dtable);
+	for (i = 0; i < model->tr->n_blocks; i++) {
+		b = &model->tr->blocks[i];
+		s += mat_abs_sum(b->attn->dwq) + mat_abs_sum(b->attn->dwk)
+		    + mat_abs_sum(b->attn->dwv) + mat_abs_sum(b->attn->dwo)
+		    + mat_abs_sum(b->ffn->dw1) + mat_abs_sum(b->ffn->dw2);
+	}
+	return s;
+}
+
+/* Packed B=3 (fat GEMMs, per-sequence causal attention) == 3 sequential steps. */
+static void test_lm_packed_matches_sequential(void)
+{
+	enum { NB = 3, TT = 8 };
+	lm *model;
+	lm_cache *c1;
+	lm_cache *cp;
+	mat *dh1;
+	mat *dhp;
+	int ids[NB * TT];
+	int b;
+	int t;
+	double seq_norm;
+	double pack_norm;
+	double seq_head;
+	double pack_head;
+
+	srand(21);
+	model = lm_create();
+	assert(model);
+	for (b = 0; b < NB; b++)
+		for (t = 0; t < TT; t++)
+			ids[b * TT + t] = 'a' + (rand() % 20);
+	c1 = lm_cache_create(TT);
+	cp = lm_cache_create_packed(NB, TT);
+	dh1 = mat_create(TT, LM_D_MODEL);
+	dhp = mat_create(NB * TT, LM_D_MODEL);
+	assert(c1 && cp && dh1 && dhp);
+	assert(cp->B == NB && cp->T == TT && cp->n == NB * TT);
+
+	lm_zero_grad(model);
+	for (b = 0; b < NB; b++) {
+		assert(lm_forward_cache(model, &ids[b * TT], TT, c1) == 0);
+		assert(lm_loss_backward(model, c1, &ids[b * TT], TT, dh1) == 0);
+		assert(lm_backward(model, dh1, c1) == 0);
+	}
+	seq_norm = lm_grad_abs_sum(model);
+	seq_head = mat_abs_sum(model->dw_head);
+
+	lm_zero_grad(model);
+	assert(lm_forward_cache_packed(model, ids, NB, TT, cp) == 0);
+	assert(lm_loss_backward_packed(model, cp, ids, NB, TT, dhp) == 0);
+	assert(lm_backward_packed(model, dhp, cp) == 0);
+	pack_norm = lm_grad_abs_sum(model);
+	pack_head = mat_abs_sum(model->dw_head);
+
+	assert(seq_norm > 0.0 && pack_norm > 0.0);
+	assert(fabs(pack_norm - seq_norm) <= 1e-3 * seq_norm);
+	assert(fabs(pack_head - seq_head) <= 1e-3 * seq_head);
+
+	/* Shape mismatch is rejected, not silently misused. */
+	assert(lm_forward_cache_packed(model, ids, NB - 1, TT, cp) != 0);
+	/* B=1 packed cache is the classic cache. */
+	lm_cache_free(&cp);
+	cp = lm_cache_create_packed(1, TT);
+	assert(cp && cp->B == 1 && cp->n == TT);
+	assert(lm_forward_cache_packed(model, ids, 1, TT, cp) == 0);
+
+	assert(lm_batch_auto(64, 256, 0, 0.85, 64, 8) == 8);
+	assert(lm_batch_auto(64, 256, (size_t)1 << 30, 0.85, 64, 8) >= 1);
+	assert(lm_batch_auto(64, 256, (size_t)1 << 34, 0.85, 64, 8) == 64);
+
+	lm_cache_free(&c1);
+	lm_cache_free(&cp);
+	mat_free(&dh1);
+	mat_free(&dhp);
 	lm_free(&model);
 }
 
@@ -664,7 +766,7 @@ static void test_lm_serialize_roundtrip(void)
 	b = lm_load("objects/test_lm.bin");
 	assert(b);
 	nll_b = lm_nll(b, ids, n);
-	assert(fabs(nll_a - nll_b) < 1e-9);
+	assert(fabs(nll_a - nll_b) < 1e-4);
 	lm_free(&a);
 	lm_free(&b);
 }
@@ -688,12 +790,12 @@ static void test_lm_merge_average(void)
 	models[1] = b;
 	assert(lm_merge_average(models, 2, &m) == 0);
 	assert(m);
-	assert(fabs(m->w_head->data[0] - 3.0) < 1e-12);
+	assert(fabs(m->w_head->data[0] - 3.0) < 1e-4);
 	sum = 0.0;
 	for (i = 0; i < m->b_head->n; i++)
 		sum += fabs(m->b_head->data[i]
 		    - 0.5 * (a->b_head->data[i] + b->b_head->data[i]));
-	assert(sum < 1e-9);
+	assert(sum < 1e-4);
 	lm_free(&a);
 	lm_free(&b);
 	lm_free(&m);
@@ -713,14 +815,14 @@ static void test_lm_checkpoint_resume(void)
 
 	srand(13);
 	a = lm_create();
-	ds = text_dataset_load("data/toy_tiny.txt", 8);
+	ds = text_dataset_load("data/toy_micro.txt", 8);
 	oa = lm_adam_create(a);
 	assert(a && ds && oa);
-	loss1 = lm_train_corpus(a, ds, oa, 1, 2, 0.01, 0, NULL, 0);
+	loss1 = lm_train_corpus(a, ds, oa, 1, 2, 0.01, 0, NULL, 0, 0, 0);
 	assert(lm_save_checkpoint(a, oa, 1, 0, "objects/test_ckpt.bin") == 0);
 	b = lm_load_checkpoint("objects/test_ckpt.bin", &ob, &epoch, &step);
 	assert(b && ob && epoch == 1);
-	loss2 = lm_train_corpus(b, ds, ob, 1, 2, 0.01, 0, NULL, 0);
+	loss2 = lm_train_corpus(b, ds, ob, 1, 2, 0.01, 0, NULL, 0, 0, 0);
 	assert(loss2 > 0.0 && loss1 > 0.0);
 	lm_adam_free(&oa);
 	lm_adam_free(&ob);
@@ -759,14 +861,14 @@ static void test_lm_generate_from_checkpoint(void)
 
 	srand(15);
 	model = lm_create();
-	ds = text_dataset_load("data/toy_tiny.txt", 8);
+	ds = text_dataset_load("data/toy_micro.txt", 8);
 	opt = lm_adam_create(model);
 	assert(model && ds && opt);
-	lm_train_corpus(model, ds, opt, 1, 2, 0.01, 0, NULL, 0);
+	lm_train_corpus(model, ds, opt, 1, 2, 0.01, 0, NULL, 0, 0, 0);
 	assert(lm_save_checkpoint(model, opt, 1, 0, "objects/gen_ckpt.bin") == 0);
 	loaded = lm_load_checkpoint("objects/gen_ckpt.bin", NULL, NULL, NULL);
 	assert(loaded);
-	n = lm_generate(loaded, "he", out, (int)sizeof(out), 4, 0.0);
+	n = lm_generate(loaded, "he", out, (int)sizeof(out), 4, 0.0, 0, 1.0);
 	assert(n > 0);
 	lm_adam_free(&opt);
 	text_dataset_free(&ds);
@@ -788,6 +890,208 @@ static void test_text_dataset(void)
 	assert(text_dataset_window(ds, 0, ids, &n) == 0);
 	assert(n == 8);
 	text_dataset_free(&ds);
+}
+
+static const char bpe_sample[] =
+	"the cat sat on the mat. the cat saw the other cat on the mat.\n"
+	"the hat and the bat sat on the mat too. caf\xc3\xa9 au lait!\n";
+
+static void test_bpe_roundtrip(void)
+{
+	bpe *b;
+	bpe *b2;
+	int ids[256];
+	char out[256];
+	int n;
+	int nb;
+	const char *unseen = "a cat on the roof, na\xc3\xafve  \t\n\n x";
+
+	b = bpe_train_text(bpe_sample, strlen(bpe_sample), 300);
+	assert(b);
+	assert(b->vocab_size > BPE_BASE && b->vocab_size <= 300);
+	assert(b->n_merges == b->vocab_size - BPE_BASE);
+	n = bpe_encode(b, bpe_sample, ids, 256);
+	assert(n > 0 && n < (int)strlen(bpe_sample));
+	assert(bpe_decode(b, ids, n, out, sizeof(out)) == (int)strlen(bpe_sample));
+	assert(strcmp(out, bpe_sample) == 0);
+	/* Unseen text still round-trips through the byte fallback. */
+	n = bpe_encode(b, unseen, ids, 256);
+	assert(n > 0);
+	assert(bpe_decode(b, ids, n, out, sizeof(out)) == (int)strlen(unseen));
+	assert(strcmp(out, unseen) == 0);
+	/* Training is deterministic. */
+	b2 = bpe_train_text(bpe_sample, strlen(bpe_sample), 300);
+	assert(b2 && bpe_equal(b, b2));
+	bpe_free(&b2);
+	/* Text vocab file save/load. */
+	assert(bpe_save(b, "objects/test_bpe.vocab") == 0);
+	b2 = bpe_load("objects/test_bpe.vocab");
+	assert(b2 && bpe_equal(b, b2));
+	nb = bpe_encode(b2, bpe_sample, ids, 256);
+	assert(nb > 0);
+	bpe_free(&b2);
+	/* Fewer merges than requested is fine; zero merges == byte ids. */
+	b2 = bpe_train_text("ab", 2, BPE_BASE);
+	assert(b2 && b2->n_merges == 0);
+	assert(bpe_encode(b2, "ab", ids, 8) == 2);
+	assert(ids[0] == VOCAB_SPECIALS + 'a');
+	bpe_free(&b2);
+	bpe_free(&b);
+}
+
+static void test_bpe_lm_checkpoint(void)
+{
+	bpe *tok;
+	lm *a;
+	lm *c;
+	lm *loaded;
+	int ids[32];
+	char out[64];
+	int n;
+
+	srand(5);
+	tok = bpe_train_text(bpe_sample, strlen(bpe_sample), 280);
+	assert(tok);
+	a = lm_create_bpe(tok);
+	assert(a && a->vocab_size == tok->vocab_size && a->bpe == tok);
+	assert(lm_save(a, "objects/test_lm_bpe.bin") == 0);
+	loaded = lm_load("objects/test_lm_bpe.bin");
+	assert(loaded && loaded->bpe && bpe_equal(loaded->bpe, a->bpe));
+	assert(loaded->vocab_size == a->vocab_size);
+	n = lm_encode(loaded, "the cat", ids, 32);
+	assert(n > 0 && n < 7);
+	assert(lm_decode(loaded, ids, n, out, sizeof(out)) == 7);
+	assert(strcmp(out, "the cat") == 0);
+	assert(lm_generate(loaded, "the cat", out, (int)sizeof(out), 2, 0.0, 0,
+	    1.0) >= 0);
+	/* Byte models still use the legacy LMCF layout and byte tokenizer. */
+	c = lm_create();
+	assert(c && c->bpe == NULL);
+	tok = bpe_clone(a->bpe);
+	assert(tok && lm_attach_bpe(c, tok) != 0);	/* size mismatch */
+	bpe_free(&tok);
+	lm_free(&c);
+	lm_free(&a);
+	lm_free(&loaded);
+}
+
+static void write_letter_docs(const char *path, int ndocs, int len)
+{
+	FILE *fp;
+	int d;
+	int i;
+
+	fp = fopen(path, "w");
+	assert(fp);
+	for (d = 0; d < ndocs; d++) {
+		for (i = 0; i < len; i++)
+			fputc('a' + d, fp);
+		fputs("\n\n", fp);
+	}
+	fclose(fp);
+}
+
+/* Bit mask of letters present in a dataset; asserts every window is single-letter. */
+static unsigned int dataset_letters(const text_dataset *ds, int window)
+{
+	unsigned int mask;
+	int ids[LM_MAX_CTX];
+	int n;
+	int i;
+	int k;
+
+	mask = 0;
+	for (i = 0; i < text_dataset_n_windows(ds); i++) {
+		assert(text_dataset_window(ds, i, ids, &n) == 0 && n == window);
+		for (k = 1; k < window; k++)
+			assert(ids[k] == ids[0]);	/* no window crosses documents */
+		mask |= 1u << (ids[0] - VOCAB_SPECIALS - 'a');
+	}
+	return mask;
+}
+
+static unsigned int stream_letters(text_stream *st, long *count)
+{
+	unsigned int mask;
+	int ids[LM_MAX_CTX];
+	int n;
+	int k;
+
+	mask = 0;
+	*count = 0;
+	while (text_stream_next(st, ids, &n) == 1) {
+		(*count)++;
+		for (k = 0; k < n; k++) {
+			if (ids[k] != VOCAB_EOS)
+				mask |= 1u << (ids[k] - VOCAB_SPECIALS - 'a');
+		}
+	}
+	return mask;
+}
+
+static void test_split_and_stream(void)
+{
+	const char *path = "objects/test_docs.txt";
+	text_split sp;
+	text_dataset *tr;
+	text_dataset *va;
+	text_stream *st;
+	text_stream *sv;
+	unsigned int mt;
+	unsigned int mv;
+	long ct;
+	long cv;
+	int mode;
+	int ids[LM_MAX_CTX];
+	int n;
+
+	write_letter_docs(path, 20, 40);
+	for (mode = TEXT_SPLIT_DOC; mode <= TEXT_SPLIT_OFFSET; mode++) {
+		assert(text_split_init(&sp, path, mode, 0.3, 1) == 0);
+		assert(text_dataset_load_split(path, 8, NULL, &sp, &tr, &va) == 0);
+		assert(tr && va);
+		mt = dataset_letters(tr, 8);
+		mv = dataset_letters(va, 8);
+		assert(mt && mv && (mt & mv) == 0);	/* disjoint documents */
+		assert((mt | mv) == (1u << 20) - 1);	/* every document used */
+		/* Streaming sees exactly the same documents on each side. */
+		st = text_stream_open(path, 8, NULL, &sp, TEXT_SIDE_TRAIN, 0, 0, 1);
+		sv = text_stream_open(path, 8, NULL, &sp, TEXT_SIDE_VAL, 0, 0, 1);
+		assert(st && sv);
+		assert(stream_letters(st, &ct) == mt && ct > 0);
+		assert(stream_letters(sv, &cv) == mv && cv > 0);
+		text_stream_free(&st);
+		text_stream_free(&sv);
+		text_dataset_free(&tr);
+		text_dataset_free(&va);
+	}
+	/* Offset split: validation is the tail of the file. */
+	assert(text_split_init(&sp, path, TEXT_SPLIT_OFFSET, 0.25, 1) == 0);
+	assert(text_dataset_load_split(path, 8, NULL, &sp, &tr, &va) == 0);
+	mt = dataset_letters(tr, 8);
+	mv = dataset_letters(va, 8);
+	assert(mt == (1u << 15) - 1 && mv == ((1u << 20) - 1) - ((1u << 15) - 1));
+	text_dataset_free(&tr);
+	text_dataset_free(&va);
+
+	/* Packing: 20 docs * (40 ids + EOS), stride window-1 => 117 windows. */
+	st = text_stream_open(path, 8, NULL, NULL, TEXT_SIDE_ALL, 0, 0, 1);
+	assert(st && text_stream_stride(st) == 7);
+	for (n = 0; text_stream_next(st, ids, &mode) == 1; n++)
+		assert(mode == 8);
+	assert(n == 117 && text_stream_count(st) == 117);
+	assert(text_stream_rewind(st) == 0 && text_stream_last_count(st) == 117);
+	assert(text_stream_next(st, ids, &n) == 1 && ids[0] == VOCAB_SPECIALS + 'a');
+	text_stream_free(&st);
+	/* Shuffle buffer yields the same multiset of windows, different order. */
+	st = text_stream_open(path, 8, NULL, NULL, TEXT_SIDE_ALL, 0, 16, 7);
+	assert(st);
+	stream_letters(st, &ct);
+	assert(ct == 117);
+	assert(text_stream_rewind(st) == 0);
+	stream_letters(st, &ct);
+	assert(ct == 117);
+	text_stream_free(&st);
 }
 
 static void test_lm_backprop_head(void)
@@ -817,7 +1121,7 @@ static void test_lm_backprop_head(void)
 	assert(lm_loss_backward(model, cache, ids, n, dhidden) == 0);
 	assert(lm_backward(model, dhidden, cache) == 0);
 	g_analytic = mat_get(model->dw_head, 0, ids[1]);
-	eps = 1e-5;
+	eps = 1e-2;
 	saved = mat_get(model->w_head, 0, ids[1]);
 	mat_set(model->w_head, 0, ids[1], saved + eps);
 	loss_p = lm_nll(model, ids, n);
@@ -827,7 +1131,7 @@ static void test_lm_backprop_head(void)
 	g_numeric = (loss_p - loss_m) / (2.0 * eps);
 	/* mean NLL vs sum of CE: scale by (n-1) for comparable grad */
 	g_numeric *= (double)(n - 1);
-	assert(fabs(g_analytic - g_numeric) < 1e-3 || fabs(g_analytic) < 1e-8);
+	assert(fabs(g_analytic - g_numeric) < 2e-2 || fabs(g_analytic) < 1e-6);
 	lm_cache_free(&cache);
 	mat_free(&dhidden);
 	lm_free(&model);
@@ -843,7 +1147,7 @@ static void test_lm_generate_smoke(void)
 	model = lm_create();
 	assert(model);
 	lm_train_steps(model, "ab", 10, 0.01);
-	n = lm_generate(model, "a", out, (int)sizeof(out), 4, 0.0);
+	n = lm_generate(model, "a", out, (int)sizeof(out), 4, 0.0, 0, 1.0);
 	assert(n > 0);
 	assert(out[0] != '\0');
 	lm_free(&model);
@@ -875,9 +1179,12 @@ static void test_gpu_gemm_bwd_stub(void)
 	assert(a && b && c && da && db);
 	assert(gpu_mat_mul_backward(da, db, c, a, b) != 0);
 	assert(gpu_mat_mul_bt(c, a, b) != 0);
+	assert(gpu_mat_mul_at(c, a, b) != 0);
 	assert(gpu_mat_outer_add(da, a, b) != 0);
 	assert(gpu_adam_step(a->data, b->data, c->data, da->data, 4,
-	    0.01, 0.9, 0.999, 1e-8, 1) != 0);
+	    0.01, 0.9, 0.999, 1e-8, 1, 1.0) != 0);
+	assert(gpu_adam_step_dev(a->data, b->data, c->data, da->data, 4,
+	    0.01, 0.9, 0.999, 1e-8, 1, 1.0) != 0);
 	assert(gpu_kv_attn_decode(a->data, b->data, c->data, da->data, db->data,
 	    a->data, b->data, c->data, 1, 2, 2, 1, 2) != 0);
 	mat_free(&a);
@@ -910,7 +1217,7 @@ static void test_lm_generate_kv(void)
 	srand(31);
 	model = lm_create();
 	assert(model);
-	n = lm_generate_kv(model, "hi", out, (int)sizeof(out), 4, 0.0);
+	n = lm_generate_kv(model, "hi", out, (int)sizeof(out), 4, 0.0, 0, 1.0);
 	assert(n > 0);
 	assert(out[0] != '\0');
 	lm_free(&model);
@@ -921,7 +1228,7 @@ static void test_qmat_roundtrip(void)
 	mat *m;
 	qmat *q;
 	vec *y;
-	double x[2];
+	ann_real x[2];
 	double ref0;
 	double ref1;
 
@@ -948,21 +1255,21 @@ static void test_qmat_roundtrip(void)
 
 static void test_ann_dot_simd(void)
 {
-	double a[4] = {1.0, 2.0, 3.0, 4.0};
-	double b[4] = {5.0, 6.0, 7.0, 8.0};
-	double x[16];
-	double y[16];
+	ann_real a[4] = {1.0, 2.0, 3.0, 4.0};
+	ann_real b[4] = {5.0, 6.0, 7.0, 8.0};
+	ann_real x[16];
+	ann_real y[16];
 	double ref;
 	int i;
 
-	assert(fabs(ann_dot(a, b, 4) - 70.0) < 1e-12);
+	assert(fabs(ann_dot(a, b, 4) - 70.0) < 1e-4);
 	ref = 0.0;
 	for (i = 0; i < 16; i++) {
 		x[i] = (double)(i + 1);
 		y[i] = (double)(16 - i);
 		ref += x[i] * y[i];
 	}
-	assert(fabs(ann_dot(x, y, 16) - ref) < 1e-9);
+	assert(fabs(ann_dot(x, y, 16) - ref) < 1e-4);
 	assert(ann_simd_backend() != NULL);
 }
 
@@ -982,10 +1289,10 @@ static void test_mat_mul_bt_known(void)
 	mat_set(b, 0, 0, 1.0);
 	mat_set(b, 1, 1, 1.0);
 	assert(mat_mul_bt(c, a, b) == 0);
-	assert(fabs(mat_get(c, 0, 0) - 1.0) < 1e-12);
-	assert(fabs(mat_get(c, 0, 1) - 0.0) < 1e-12);
-	assert(fabs(mat_get(c, 1, 0) - 0.0) < 1e-12);
-	assert(fabs(mat_get(c, 1, 1) - 1.0) < 1e-12);
+	assert(fabs(mat_get(c, 0, 0) - 1.0) < 1e-4);
+	assert(fabs(mat_get(c, 0, 1) - 0.0) < 1e-4);
+	assert(fabs(mat_get(c, 1, 0) - 0.0) < 1e-4);
+	assert(fabs(mat_get(c, 1, 1) - 1.0) < 1e-4);
 	assert(mat_row(c, 0) == c->data);
 	mat_free(&a);
 	mat_free(&b);
@@ -995,13 +1302,13 @@ static void test_mat_mul_bt_known(void)
 static void test_arena_bump(void)
 {
 	arena *a;
-	double *p;
-	double *q;
+	ann_real *p;
+	ann_real *q;
 
 	a = arena_create(1024);
 	assert(a);
-	p = arena_alloc(a, 8 * sizeof(double));
-	q = arena_alloc(a, 4 * sizeof(double));
+	p = arena_alloc(a, 8 * sizeof(ann_real));
+	q = arena_alloc(a, 4 * sizeof(ann_real));
 	assert(p && q);
 	assert((char *)q > (char *)p);
 	arena_reset(a);
@@ -1033,6 +1340,23 @@ static void test_lm_cache_reuse(void)
 	lm_free(&model);
 }
 
+
+static void test_lm_rejects_double_magic(void)
+{
+	FILE *fp;
+	int magic;
+	lm *m;
+
+	magic = (int)LM_MAGIC_F64;
+	fp = fopen("objects/test_lmck.bin", "wb");
+	assert(fp);
+	assert(fwrite(&magic, sizeof(int), 1, fp) == 1);
+	fclose(fp);
+	assert(LM_MAGIC == 0x46434D4CUL);
+	assert((int)sizeof(ann_real) == 4);
+	m = lm_load("objects/test_lmck.bin");
+	assert(m == NULL);
+}
 
 int main(void)
 {
@@ -1066,10 +1390,15 @@ int main(void)
 	test_lm_generate_smoke();
 	test_lm_backprop_head();
 	test_text_dataset();
+	test_bpe_roundtrip();
+	test_bpe_lm_checkpoint();
+	test_split_and_stream();
 	test_lm_train_corpus();
+	test_lm_packed_matches_sequential();
 	test_lm_serialize_roundtrip();
 	test_lm_merge_average();
 	test_lm_checkpoint_resume();
+	test_lm_rejects_double_magic();
 	test_lm_perplexity();
 	test_lm_generate_from_checkpoint();
 	test_arena_bump();

@@ -7,7 +7,9 @@
 #include "lm.h"
 #include "lm_adam.h"
 
-#define LM_MAGIC	0x4B434D4CUL	/* LMCK */
+#define LM_MAGIC	0x46434D4CUL	/* LMCF: float (ann_real) checkpoints */
+#define LM_MAGIC_F64	0x4B434D4CUL	/* LMCK: legacy double (rejected) */
+#define LM_MAGIC_BPE	0x56434D4CUL	/* LMCV: float + embedded BPE merge table */
 
 int	lm_save(const lm *model, const char *path);
 lm	*lm_load(const char *path);

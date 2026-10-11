@@ -13,7 +13,7 @@ vec *vec_create(int n)
 	v = malloc(sizeof(vec));
 	if (!v)
 		return NULL;
-	v->data = calloc((size_t)n, sizeof(double));
+	v->data = calloc((size_t)n, sizeof(ann_real));
 	if (!v->data) {
 		free(v);
 		return NULL;
@@ -31,7 +31,7 @@ void vec_free(vec **v)
 	*v = NULL;
 }
 
-void vec_fill(vec *v, double value)
+void vec_fill(vec *v, ann_real value)
 {
 	int i;
 
@@ -52,21 +52,21 @@ int vec_copy(vec *dst, const vec *src)
 	return 0;
 }
 
-double vec_dot(const vec *a, const vec *b)
+ann_real vec_dot(const vec *a, const vec *b)
 {
 	if (!a || !b || !a->data || !b->data || a->n != b->n)
-		return 0.0;
+		return 0.0f;
 	return ann_dot(a->data, b->data, a->n);
 }
 
-void vec_axpy(vec *y, double a, const vec *x)
+void vec_axpy(vec *y, ann_real a, const vec *x)
 {
 	if (!y || !x || !y->data || !x->data || y->n != x->n)
 		return;
 	ann_axpy(y->data, a, x->data, y->n);
 }
 
-void vec_scale(vec *v, double s)
+void vec_scale(vec *v, ann_real s)
 {
 	if (!v || !v->data)
 		return;

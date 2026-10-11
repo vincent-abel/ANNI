@@ -54,7 +54,7 @@ void qmat_free(qmat **q)
 	*q = NULL;
 }
 
-int qmat_gemv_t(vec *y, const qmat *q, const double *x)
+int qmat_gemv_t(vec *y, const qmat *q, const ann_real *x)
 {
 	int i;
 	int j;

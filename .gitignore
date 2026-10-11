@@ -19,6 +19,7 @@ objects/
 
 #   Executable
 ann
+autotrain
 tests/test_ann
 gui/ann-gui
 gui/__pycache__/
@@ -30,3 +31,6 @@ tests/*.ann
 # I keep these, since I prefer having the reference of the final build
 # *.elf
 # *.hex
+
+# real corpora fetched by scripts/fetch_wiki.sh (CC BY-SA, never vendored)
+data/wiki_*

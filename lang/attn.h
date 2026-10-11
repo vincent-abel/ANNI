@@ -31,7 +31,7 @@ typedef struct	attn_cache {
 	mat	**q_h;		/* n_heads of T x d_head scratch (thread-safe) */
 	mat	**k_h;
 	mat	**o_h;
-	double	*softmax_tmp;	/* length n_heads * T */
+	ann_real	*softmax_tmp;	/* length n_heads * T */
 	int	T;
 	int	n_heads;
 	int	d_head;
@@ -50,5 +50,42 @@ int	attn_mha_backward(mat *dx, const mat *dout, attn *a, const attn_cache *c);
 
 attn_cache	*attn_cache_create(int T, int n_heads, int d_head);
 void		attn_cache_free(attn_cache **c);
+
+/*
+** Token-parallel packed attention. x is (B*T) x D: QKV / Wo projections are
+** fat GEMMs over all B*T rows, but scores/softmax/AV stay causal within each
+** length-T sequence (B caches of T x T per head, never (B*T)^2). seq[b] only
+** carries attn_w / head scratch (x_in/q/k/v/concat are NULL). On a GPU build
+** the same per-sequence weights live in w_all and one fused kernel launch
+** (gpu_attn_causal_fwd/bwd, M1) covers all (b, h); seq[] is then only built
+** as the fallback when the fused path is unavailable.
+*/
+typedef struct	attn_pcache {
+	mat		*x_in;		/* (B*T) x D */
+	mat		*q;
+	mat		*k;
+	mat		*v;
+	mat		*concat;
+	attn_cache	**seq;		/* B per-sequence score caches (host path) */
+	mat		*w_all;		/* (B*H*T) x T weights, fused GPU path */
+	mat		*dq;		/* backward scratch, lazily created */
+	mat		*dk;
+	mat		*dv;
+	mat		*dconcat;
+	mat		*dtmp;
+	int		fused;		/* last forward used gpu_attn_causal_fwd */
+	int		B;
+	int		T;		/* per-sequence length */
+	int		n;		/* B*T */
+	int		n_heads;
+	int		d_head;
+} attn_pcache;
+
+attn_pcache	*attn_pcache_create(int B, int T, int n_heads, int d_head);
+void		attn_pcache_free(attn_pcache **c);
+int		attn_mha_forward_packed(mat *out, attn *a, const mat *x,
+			attn_pcache *c);
+int		attn_mha_backward_packed(mat *dx, const mat *dout, attn *a,
+			const attn_pcache *c);
 
 #endif

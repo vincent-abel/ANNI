@@ -8,7 +8,7 @@
 #include "mat.h"
 
 typedef struct	tensor {
-	double	*data;
+	ann_real	*data;
 	int	*shape;
 	int	ndim;
 	int	size;
@@ -16,8 +16,8 @@ typedef struct	tensor {
 
 tensor	*tensor_create(const int *shape, int ndim);
 void	tensor_free(tensor **t);
-void	tensor_fill(tensor *t, double value);
-double	*tensor_at(tensor *t, const int *idx);
+void	tensor_fill(tensor *t, ann_real value);
+ann_real	*tensor_at(tensor *t, const int *idx);
 int	tensor_as_vec(vec *view, tensor *t);
 int	tensor_as_mat(mat *view, tensor *t);
 

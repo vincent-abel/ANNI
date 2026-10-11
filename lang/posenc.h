@@ -8,6 +8,6 @@
 #include "lm_config.h"
 
 void	posenc_sinusoidal_add(mat *seq);
-void	posenc_add_row(double *row, int t);
+void	posenc_add_row(ann_real *row, int t);
 
 #endif

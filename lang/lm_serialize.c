@@ -16,14 +16,14 @@ static int read_i32(FILE *fp, int *v)
 	return fread(v, sizeof(int), 1, fp) == 1 ? 0 : -1;
 }
 
-static int write_f64(FILE *fp, double v)
+static int write_real(FILE *fp, ann_real v)
 {
-	return fwrite(&v, sizeof(double), 1, fp) == 1 ? 0 : -1;
+	return fwrite(&v, sizeof(ann_real), 1, fp) == 1 ? 0 : -1;
 }
 
-static int read_f64(FILE *fp, double *v)
+static int read_real(FILE *fp, ann_real *v)
 {
-	return fread(v, sizeof(double), 1, fp) == 1 ? 0 : -1;
+	return fread(v, sizeof(ann_real), 1, fp) == 1 ? 0 : -1;
 }
 
 static int write_mat(FILE *fp, const mat *m)
@@ -34,8 +34,9 @@ static int write_mat(FILE *fp, const mat *m)
 		return -1;
 	if (write_i32(fp, m->rows) != 0 || write_i32(fp, m->cols) != 0)
 		return -1;
+	(void)mat_pull_host((mat *)m);	/* A1: weights may live on the device */
 	n = m->rows * m->cols;
-	return fwrite(m->data, sizeof(double), (size_t)n, fp) == (size_t)n ? 0 : -1;
+	return fwrite(m->data, sizeof(ann_real), (size_t)n, fp) == (size_t)n ? 0 : -1;
 }
 
 static int read_mat_into(FILE *fp, mat *m)
@@ -49,7 +50,8 @@ static int read_mat_into(FILE *fp, mat *m)
 	if (!m || rows != m->rows || cols != m->cols)
 		return -1;
 	n = rows * cols;
-	return fread(m->data, sizeof(double), (size_t)n, fp) == (size_t)n ? 0 : -1;
+	mat_host_dirty(m);	/* host write: any device twin is stale */
+	return fread(m->data, sizeof(ann_real), (size_t)n, fp) == (size_t)n ? 0 : -1;
 }
 
 static int write_vec(FILE *fp, const vec *v)
@@ -58,7 +60,7 @@ static int write_vec(FILE *fp, const vec *v)
 		return -1;
 	if (write_i32(fp, v->n) != 0)
 		return -1;
-	return fwrite(v->data, sizeof(double), (size_t)v->n, fp) == (size_t)v->n ? 0 : -1;
+	return fwrite(v->data, sizeof(ann_real), (size_t)v->n, fp) == (size_t)v->n ? 0 : -1;
 }
 
 static int read_vec_into(FILE *fp, vec *v)
@@ -67,7 +69,7 @@ static int read_vec_into(FILE *fp, vec *v)
 
 	if (read_i32(fp, &n) != 0 || !v || n != v->n)
 		return -1;
-	return fread(v->data, sizeof(double), (size_t)n, fp) == (size_t)n ? 0 : -1;
+	return fread(v->data, sizeof(ann_real), (size_t)n, fp) == (size_t)n ? 0 : -1;
 }
 
 static int write_block(FILE *fp, const tblock *b)
@@ -102,11 +104,14 @@ static int write_weights(FILE *fp, const lm *model)
 {
 	int i;
 
-	if (write_i32(fp, LM_MAGIC) != 0)
+	if (write_i32(fp, model->bpe ? (int)LM_MAGIC_BPE : (int)LM_MAGIC) != 0
+	    || write_i32(fp, (int)sizeof(ann_real)) != 0)
 		return -1;
 	if (write_i32(fp, LM_D_MODEL) != 0 || write_i32(fp, LM_N_HEADS) != 0
 	    || write_i32(fp, LM_D_FF) != 0 || write_i32(fp, LM_MAX_CTX) != 0
 	    || write_i32(fp, LM_N_BLOCKS) != 0 || write_i32(fp, model->vocab_size) != 0)
+		return -1;
+	if (model->bpe && bpe_write_fp(fp, model->bpe) != 0)
 		return -1;
 	if (write_mat(fp, model->embed->table) != 0)
 		return -1;
@@ -119,7 +124,11 @@ static int write_weights(FILE *fp, const lm *model)
 	return 0;
 }
 
-static int read_weights(FILE *fp, lm *model)
+/*
+** Read header (+ embedded BPE table for LMCV), build a fresh model of the
+** right vocab size, then read its tensors. LMCF files are byte-vocab models.
+*/
+static lm *read_model(FILE *fp)
 {
 	int magic;
 	int d_model;
@@ -128,27 +137,72 @@ static int read_weights(FILE *fp, lm *model)
 	int max_ctx;
 	int n_blocks;
 	int vsize;
+	int real_size;
 	int i;
+	bpe *tok;
+	lm *model;
 
-	if (read_i32(fp, &magic) != 0 || magic != (int)LM_MAGIC)
-		return -1;
+	if (read_i32(fp, &magic) != 0)
+		return NULL;
+	if (magic == (int)LM_MAGIC_F64) {
+		fprintf(stderr, "lm: incompatible checkpoint: file is a legacy "
+		    "double-precision (LMCK) model; this build uses %d-byte "
+		    "ann_real (LMCF). Retrain or convert the checkpoint.\n",
+		    (int)sizeof(ann_real));
+		return NULL;
+	}
+	if (magic != (int)LM_MAGIC && magic != (int)LM_MAGIC_BPE) {
+		fprintf(stderr, "lm: bad checkpoint magic 0x%08lX (expected LMCF "
+		    "0x%08lX or LMCV 0x%08lX; double-precision LMCK checkpoints "
+		    "are incompatible)\n", (unsigned long)(unsigned int)magic,
+		    (unsigned long)LM_MAGIC, (unsigned long)LM_MAGIC_BPE);
+		return NULL;
+	}
+	if (read_i32(fp, &real_size) != 0 || real_size != (int)sizeof(ann_real)) {
+		fprintf(stderr, "lm: incompatible checkpoint: stored real size "
+		    "%d, this build uses %d\n", real_size, (int)sizeof(ann_real));
+		return NULL;
+	}
 	if (read_i32(fp, &d_model) != 0 || read_i32(fp, &n_heads) != 0
 	    || read_i32(fp, &d_ff) != 0 || read_i32(fp, &max_ctx) != 0
 	    || read_i32(fp, &n_blocks) != 0 || read_i32(fp, &vsize) != 0)
-		return -1;
+		return NULL;
 	if (d_model != LM_D_MODEL || n_heads != LM_N_HEADS || d_ff != LM_D_FF
-	    || max_ctx != LM_MAX_CTX || n_blocks != LM_N_BLOCKS
-	    || vsize != model->vocab_size)
-		return -1;
+	    || max_ctx != LM_MAX_CTX || n_blocks != LM_N_BLOCKS)
+		return NULL;
+	tok = NULL;
+	if (magic == (int)LM_MAGIC_BPE) {
+		tok = bpe_read_fp(fp);
+		if (!tok || tok->vocab_size != vsize) {
+			bpe_free(&tok);
+			return NULL;
+		}
+		model = lm_create_bpe(tok);
+		if (!model) {
+			bpe_free(&tok);
+			return NULL;
+		}
+	} else {
+		model = lm_create();
+		if (!model)
+			return NULL;
+		if (vsize != model->vocab_size) {
+			lm_free(&model);
+			return NULL;
+		}
+	}
 	if (read_mat_into(fp, model->embed->table) != 0)
-		return -1;
+		goto fail;
 	for (i = 0; i < model->tr->n_blocks; i++) {
 		if (read_block(fp, &model->tr->blocks[i]) != 0)
-			return -1;
+			goto fail;
 	}
 	if (read_mat_into(fp, model->w_head) != 0 || read_vec_into(fp, model->b_head) != 0)
-		return -1;
-	return 0;
+		goto fail;
+	return model;
+fail:
+	lm_free(&model);
+	return NULL;
 }
 
 int lm_save(const lm *model, const char *path)
@@ -179,13 +233,8 @@ lm *lm_load(const char *path)
 	fp = fopen(path, "rb");
 	if (!fp)
 		return NULL;
-	model = lm_create();
+	model = read_model(fp);
 	if (!model) {
-		fclose(fp);
-		return NULL;
-	}
-	if (read_weights(fp, model) != 0) {
-		lm_free(&model);
 		fclose(fp);
 		return NULL;
 	}
@@ -216,8 +265,9 @@ int lm_save_checkpoint(const lm *model, const lm_adam *opt, int epoch, int step,
 		fclose(fp);
 		return -1;
 	}
+	lm_adam_sync_host((lm_adam *)opt);
 	for (i = 0; i < opt->n; i++) {
-		if (write_f64(fp, opt->slots[i].m) != 0 || write_f64(fp, opt->slots[i].v) != 0) {
+		if (write_real(fp, opt->slots[i].m) != 0 || write_real(fp, opt->slots[i].v) != 0) {
 			fclose(fp);
 			return -1;
 		}
@@ -235,6 +285,8 @@ static void add_mat(mat *acc, const mat *x)
 		return;
 	if (acc->rows != x->rows || acc->cols != x->cols)
 		return;
+	mat_ensure_host((mat *)x);
+	mat_host_dirty(acc);
 	n = acc->rows * acc->cols;
 	for (i = 0; i < n; i++)
 		acc->data[i] += x->data[i];
@@ -257,6 +309,7 @@ static void scale_mat(mat *m, double s)
 
 	if (!m || !m->data)
 		return;
+	mat_host_dirty(m);
 	n = m->rows * m->cols;
 	for (i = 0; i < n; i++)
 		m->data[i] *= s;
@@ -313,14 +366,16 @@ static void copy_mat(mat *dst, const mat *src)
 	if (dst->rows != src->rows || dst->cols != src->cols)
 		return;
 	n = dst->rows * dst->cols;
-	memcpy(dst->data, src->data, (size_t)n * sizeof(double));
+	mat_ensure_host((mat *)src);
+	memcpy(dst->data, src->data, (size_t)n * sizeof(ann_real));
+	mat_host_dirty(dst);
 }
 
 static void copy_vec(vec *dst, const vec *src)
 {
 	if (!dst || !src || !dst->data || !src->data || dst->n != src->n)
 		return;
-	memcpy(dst->data, src->data, (size_t)src->n * sizeof(double));
+	memcpy(dst->data, src->data, (size_t)src->n * sizeof(ann_real));
 }
 
 static void copy_block(tblock *dst, const tblock *src)
@@ -375,6 +430,7 @@ static void scale_lm_weights(lm *m, double s)
 int lm_merge_average(lm *const *models, int n, lm **out)
 {
 	lm *merged;
+	bpe *tok;
 	int i;
 
 	if (!models || !out || n < 2)
@@ -385,7 +441,19 @@ int lm_merge_average(lm *const *models, int n, lm **out)
 		    || models[i]->vocab_size != models[0]->vocab_size)
 			return -1;
 	}
-	merged = lm_create();
+	for (i = 1; i < n; i++) {
+		if ((models[i]->bpe != NULL) != (models[0]->bpe != NULL)
+		    || (models[0]->bpe && !bpe_equal(models[i]->bpe, models[0]->bpe)))
+			return -1;
+	}
+	if (models[0]->bpe) {
+		tok = bpe_clone(models[0]->bpe);
+		merged = tok ? lm_create_bpe(tok) : NULL;
+		if (!merged)
+			bpe_free(&tok);
+	} else {
+		merged = lm_create();
+	}
 	if (!merged)
 		return -1;
 	copy_lm_weights(merged, models[0]);
@@ -414,13 +482,8 @@ lm *lm_load_checkpoint(const char *path, lm_adam **opt_out, int *epoch_out,
 	fp = fopen(path, "rb");
 	if (!fp)
 		return NULL;
-	model = lm_create();
+	model = read_model(fp);
 	if (!model) {
-		fclose(fp);
-		return NULL;
-	}
-	if (read_weights(fp, model) != 0) {
-		lm_free(&model);
 		fclose(fp);
 		return NULL;
 	}
@@ -444,8 +507,8 @@ lm *lm_load_checkpoint(const char *path, lm_adam **opt_out, int *epoch_out,
 	}
 	opt->t = t;
 	for (i = 0; i < n; i++) {
-		if (read_f64(fp, &opt->slots[i].m) != 0
-		    || read_f64(fp, &opt->slots[i].v) != 0) {
+		if (read_real(fp, &opt->slots[i].m) != 0
+		    || read_real(fp, &opt->slots[i].v) != 0) {
 			lm_adam_free(&opt);
 			lm_free(&model);
 			fclose(fp);
@@ -467,13 +530,8 @@ lm *lm_load_checkpoint(const char *path, lm_adam **opt_out, int *epoch_out,
 lm *lm_load_any(const char *path)
 {
 	lm *model;
-	lm_adam *opt;
 
+	/* lm_load reads the weight section of both weights-only and checkpoints. */
 	model = lm_load(path);
-	if (model)
-		return model;
-	opt = NULL;
-	model = lm_load_checkpoint(path, &opt, NULL, NULL);
-	lm_adam_free(&opt);
 	return model;
 }

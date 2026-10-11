@@ -17,64 +17,6 @@
 #include "tokenize.h"
 #include "vocab.h"
 
-static int sample_id(const vec *logits, double temperature)
-{
-	int i;
-	int best;
-	double best_v;
-	double sum;
-	double u;
-	vec scaled;
-	vec probs;
-	double *buf;
-	double *pbuf;
-
-	if (!logits || !logits->data || logits->n <= 0)
-		return VOCAB_EOS;
-	if (temperature <= 0.0) {
-		best = 0;
-		best_v = logits->data[0];
-		for (i = 1; i < logits->n; i++) {
-			if (logits->data[i] > best_v) {
-				best_v = logits->data[i];
-				best = i;
-			}
-		}
-		return best;
-	}
-	buf = malloc((size_t)logits->n * sizeof(double));
-	pbuf = malloc((size_t)logits->n * sizeof(double));
-	if (!buf || !pbuf) {
-		free(buf);
-		free(pbuf);
-		return VOCAB_EOS;
-	}
-	for (i = 0; i < logits->n; i++)
-		buf[i] = logits->data[i] / temperature;
-	scaled.data = buf;
-	scaled.n = logits->n;
-	probs.data = pbuf;
-	probs.n = logits->n;
-	if (vec_softmax(&probs, &scaled) != 0) {
-		free(buf);
-		free(pbuf);
-		return VOCAB_EOS;
-	}
-	u = (double)rand() / (double)RAND_MAX;
-	sum = 0.0;
-	best = logits->n - 1;
-	for (i = 0; i < logits->n; i++) {
-		sum += pbuf[i];
-		if (u <= sum) {
-			best = i;
-			break;
-		}
-	}
-	free(buf);
-	free(pbuf);
-	return best;
-}
-
 lm_kv *lm_kv_create(const lm *model, int max_T)
 {
 	lm_kv *kv;
@@ -134,7 +76,7 @@ void lm_kv_reset(lm_kv *kv)
 		kv->len = 0;
 }
 
-static int softmax_row(double *row, int n, double *tmp)
+static int softmax_row(ann_real *row, int n, ann_real *tmp)
 {
 	vec in;
 	vec out;
@@ -154,15 +96,15 @@ static int softmax_row(double *row, int n, double *tmp)
 }
 
 /* Attend one query row against K/V cache length len; write D_MODEL out. */
-static int attn_decode_row(double *out, const attn *a, const double *xrow,
-	mat *k_cache, mat *v_cache, int len, double *scratch)
+static int attn_decode_row(ann_real *out, const attn *a, const ann_real *xrow,
+	mat *k_cache, mat *v_cache, int len, ann_real *scratch)
 {
-	double *q;
-	double *k;
-	double *v;
-	double *scores;
-	double *otmp;
-	double *stmp;
+	ann_real *q;
+	ann_real *k;
+	ann_real *v;
+	ann_real *scores;
+	ann_real *otmp;
+	ann_real *stmp;
 	double scale;
 	int h;
 	int j;
@@ -201,10 +143,10 @@ static int attn_decode_row(double *out, const attn *a, const double *xrow,
 		v[j] = sum;
 	}
 	memcpy(&k_cache->data[(len - 1) * LM_D_MODEL], k,
-	    (size_t)LM_D_MODEL * sizeof(double));
+	    (size_t)LM_D_MODEL * sizeof(ann_real));
 	memcpy(&v_cache->data[(len - 1) * LM_D_MODEL], v,
-	    (size_t)LM_D_MODEL * sizeof(double));
-	memset(otmp, 0, (size_t)LM_D_MODEL * sizeof(double));
+	    (size_t)LM_D_MODEL * sizeof(ann_real));
+	memset(otmp, 0, (size_t)LM_D_MODEL * sizeof(ann_real));
 	for (h = 0; h < a->n_heads; h++) {
 		off = h * d;
 		for (j = 0; j < len; j++) {
@@ -233,7 +175,7 @@ static int attn_decode_row(double *out, const attn *a, const double *xrow,
 	return 0;
 }
 
-static int ln_row(double *x, const layernorm *ln)
+static int ln_row(ann_real *x, const layernorm *ln)
 {
 	int j;
 	double mean;
@@ -255,7 +197,7 @@ static int ln_row(double *x, const layernorm *ln)
 	return 0;
 }
 
-static int ffn_row(double *x, const ffn *f, double *hid)
+static int ffn_row(ann_real *x, const ffn *f, ann_real *hid)
 {
 	int j;
 	int k;
@@ -276,13 +218,13 @@ static int ffn_row(double *x, const ffn *f, double *hid)
 	return 0;
 }
 
-static int decode_token(lm *model, lm_kv *kv, int id, int pos, double *x,
-	double *scratch)
+static int decode_token(lm *model, lm_kv *kv, int id, int pos, ann_real *x,
+	ann_real *scratch)
 {
 	tblock *b;
-	double *lnbuf;
-	double *attn_out;
-	double *ffn_hid;
+	ann_real *lnbuf;
+	ann_real *attn_out;
+	ann_real *ffn_hid;
 	int i;
 	int j;
 
@@ -297,16 +239,16 @@ static int decode_token(lm *model, lm_kv *kv, int id, int pos, double *x,
 	kv->len = pos + 1;
 	for (i = 0; i < model->tr->n_blocks; i++) {
 		b = &model->tr->blocks[i];
-		memcpy(lnbuf, x, (size_t)LM_D_MODEL * sizeof(double));
+		memcpy(lnbuf, x, (size_t)LM_D_MODEL * sizeof(ann_real));
 		ln_row(lnbuf, b->ln1);
 		if (attn_decode_row(attn_out, b->attn, lnbuf, kv->k[i], kv->v[i],
 			kv->len, scratch) != 0)
 			return -1;
 		for (j = 0; j < LM_D_MODEL; j++)
 			x[j] += attn_out[j];
-		memcpy(lnbuf, x, (size_t)LM_D_MODEL * sizeof(double));
+		memcpy(lnbuf, x, (size_t)LM_D_MODEL * sizeof(ann_real));
 		ln_row(lnbuf, b->ln2);
-		memcpy(attn_out, lnbuf, (size_t)LM_D_MODEL * sizeof(double));
+		memcpy(attn_out, lnbuf, (size_t)LM_D_MODEL * sizeof(ann_real));
 		ffn_row(attn_out, b->ffn, ffn_hid);
 		for (j = 0; j < LM_D_MODEL; j++)
 			x[j] += attn_out[j];
@@ -315,7 +257,7 @@ static int decode_token(lm *model, lm_kv *kv, int id, int pos, double *x,
 }
 
 int lm_generate_kv(lm *model, const char *prompt, char *out, int out_cap,
-	int max_new, double temperature)
+	int max_new, double temperature, int top_k, double top_p)
 {
 	int ids[LM_MAX_CTX];
 	int n;
@@ -323,20 +265,21 @@ int lm_generate_kv(lm *model, const char *prompt, char *out, int out_cap,
 	int next;
 	lm_kv *kv;
 	vec *logits;
-	double *x;
-	double *scratch;
+	ann_real *x;
+	ann_real *scratch;
 	mat hrow;
 
 	if (!model || !prompt || !out || out_cap <= 1 || max_new < 0)
 		return -1;
-	n = tokenize_encode(prompt, ids, LM_MAX_CTX);
+	n = lm_encode(model, prompt, ids, LM_MAX_CTX);
 	if (n <= 0)
 		return -1;
+	lm_weights_ensure_host(model);	/* decode reads weight ->data directly */
 	kv = lm_kv_create(model, LM_MAX_CTX);
 	logits = vec_create(model->vocab_size);
-	x = calloc((size_t)LM_D_MODEL, sizeof(double));
+	x = calloc((size_t)LM_D_MODEL, sizeof(ann_real));
 	scratch = calloc((size_t)(12 * LM_D_MODEL + LM_D_FF + LM_MAX_CTX * 2),
-	    sizeof(double));
+	    sizeof(ann_real));
 	if (!kv || !logits || !x || !scratch) {
 		lm_kv_free(&kv);
 		vec_free(&logits);
@@ -352,9 +295,11 @@ int lm_generate_kv(lm *model, const char *prompt, char *out, int out_cap,
 		hrow.data = x;
 		hrow.rows = 1;
 		hrow.cols = LM_D_MODEL;
+		hrow.d_data = NULL;
+		hrow.on_device = 0;
 		if (lm_logits_at(logits, model, &hrow, 0) != 0)
 			goto fail;
-		next = sample_id(logits, temperature);
+		next = lm_sample_id(logits, temperature, top_k, top_p);
 		if (next == VOCAB_EOS)
 			break;
 		ids[n] = next;
@@ -362,7 +307,7 @@ int lm_generate_kv(lm *model, const char *prompt, char *out, int out_cap,
 			goto fail;
 		n++;
 	}
-	if (tokenize_decode(ids, n, out, out_cap) < 0)
+	if (lm_decode(model, ids, n, out, out_cap) < 0)
 		goto fail;
 	lm_kv_free(&kv);
 	vec_free(&logits);

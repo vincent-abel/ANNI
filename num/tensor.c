@@ -32,7 +32,7 @@ tensor *tensor_create(const int *shape, int ndim)
 	if (!t)
 		return NULL;
 	t->shape = malloc((size_t)ndim * sizeof(int));
-	t->data = calloc((size_t)size, sizeof(double));
+	t->data = calloc((size_t)size, sizeof(ann_real));
 	if (!t->shape || !t->data) {
 		free(t->shape);
 		free(t->data);
@@ -56,7 +56,7 @@ void tensor_free(tensor **t)
 	*t = NULL;
 }
 
-void tensor_fill(tensor *t, double value)
+void tensor_fill(tensor *t, ann_real value)
 {
 	int i;
 
@@ -66,7 +66,7 @@ void tensor_fill(tensor *t, double value)
 		t->data[i] = value;
 }
 
-double *tensor_at(tensor *t, const int *idx)
+ann_real *tensor_at(tensor *t, const int *idx)
 {
 	int i;
 	int flat;

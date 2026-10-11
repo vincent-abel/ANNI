@@ -18,6 +18,6 @@ typedef struct	qmat {
 qmat	*qmat_from_mat(const mat *m);
 void	qmat_free(qmat **q);
 /* y[j] += scale * sum_i x[i] * q[i, j]  for q shaped (rows=x.n, cols=y.n) */
-int	qmat_gemv_t(vec *y, const qmat *q, const double *x);
+int	qmat_gemv_t(vec *y, const qmat *q, const ann_real *x);
 
 #endif

@@ -6,7 +6,7 @@
 #include "lm_config.h"
 #include "posenc.h"
 
-void posenc_add_row(double *row, int t)
+void posenc_add_row(ann_real *row, int t)
 {
 	int i;
 	double log_base;
