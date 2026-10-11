@@ -238,7 +238,7 @@ Broader throughput and wall-time wins beyond the GPU residency / pack / R-stack.
 - [ ] **E7** cuDNN or hand-fused LN + softmax where beneficial after R1
 - [ ] **E8** Variable-length sequence packing with attention mask (less pad waste → more real tokens/sec)
 - [ ] **E9** Gradient accumulation by **token budget** (`--tokens-per-step`) not only `--grad-accum` step count
-- [ ] **E10** Throughput dashboard: tokens/sec, TFLOP/s estimate, util%, VRAM high-water (`-d` and/or `lm bench --train`)
+- [x] **E10** Throughput dashboard: tokens/sec, TFLOP/s estimate, VRAM used (`-d` / tower); see [docs/throughput-dashboard.md](docs/throughput-dashboard.md)
 - [ ] **E11** Deterministic seed path + repro JSON of CLI flags written next to the checkpoint
 - [ ] **E12** Compile profile docs: `-O3`, LTO, `ARCH=…`; clear `make` (CPU stub) vs `make cuda`
 - [ ] **E13** Inference efficiency: keep KV generate on GPU; batch generate; lean on existing int8 head path

@@ -228,8 +228,12 @@ static void tower_draw(void)
 	} else {
 		snprintf(eta, sizeof(eta), "--:--");
 	}
-	mvprintw(y++, 0, "speed %.2f ms/tok  elapsed %.1fs  ETA %s  %s",
-	    p->ms_tok > 0.0 ? p->ms_tok : 0.0, p->elapsed_sec, eta,
+	mvprintw(y++, 0, "speed %.2f ms/tok  %.0f t/s  ~%.2f TF  VRAM %.0f MB",
+	    p->ms_tok, p->tok_sec > 0.0 ? p->tok_sec : 0.0,
+	    p->tflops_est > 0.0 ? p->tflops_est : 0.0,
+	    p->vram_used_mb > 0.0 ? p->vram_used_mb : 0.0);
+	mvprintw(y++, 0, "elapsed %.1fs  ETA %s  %s",
+	    p->elapsed_sec, eta,
 	    g_tw.ctl.pause ? "PAUSED" : "running");
 
 	fr = tot = 0;

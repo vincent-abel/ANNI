@@ -8,9 +8,33 @@
 #include <time.h>
 #include "gpu.h"
 #include "gradutil.h"
+#include "lm_config.h"
 #include "lm_serialize.h"
 #include "lm_train.h"
 #include "mat.h"
+
+/* E10: tokens/sec, rough TFLOP/s, VRAM used (MB). */
+static void fill_throughput(train_progress *tp, int tokens_done, double elapsed)
+{
+	size_t fr;
+	size_t tot;
+	long params;
+
+	tp->tok_sec = -1.0;
+	tp->tflops_est = -1.0;
+	tp->vram_used_mb = -1.0;
+	if (tokens_done > 0 && elapsed > 0.0) {
+		tp->tok_sec = (double)tokens_done / elapsed;
+		params = (long)LM_N_BLOCKS
+		    * (12L * LM_D_MODEL * LM_D_MODEL
+		    + 2L * LM_D_MODEL * LM_D_FF);
+		tp->tflops_est = 6.0 * (double)params * tp->tok_sec / 1e12;
+	}
+	fr = 0;
+	tot = 0;
+	if (gpu_available() && gpu_mem_info(&fr, &tot) == 0 && tot > 0)
+		tp->vram_used_mb = (double)(tot - fr) / 1048576.0;
+}
 
 static train_progress_fn g_progress_fn;
 static void *g_progress_ud;
@@ -167,8 +191,12 @@ static void dbg_progress(int ep, int epochs, int done, int total,
 	double now;
 	char eta_buf[16];
 	char bar[16];
-	char line[96];
+	char line[160];
 	int nline;
+	double tok_sec;
+	double tflops;
+	size_t fr;
+	size_t tot;
 	static double last_print;
 
 	now = wall_sec();
@@ -195,10 +223,19 @@ static void dbg_progress(int ep, int epochs, int done, int total,
 	elapsed = now - t0;
 	eta = -1.0;
 	ms_tok = -1.0;
+	tok_sec = -1.0;
+	tflops = -1.0;
 	if (done > 0 && elapsed > 0.0) {
 		eta = elapsed * (double)(total - done) / (double)done;
-		if (tokens_done > 0)
+		if (tokens_done > 0) {
 			ms_tok = 1000.0 * elapsed / (double)tokens_done;
+			tok_sec = (double)tokens_done / elapsed;
+			/* Rough decoder train FLOPs ~ 6 * N_params * tokens. */
+			tflops = 6.0 * (double)(LM_N_BLOCKS
+			    * (12L * LM_D_MODEL * LM_D_MODEL
+			    + 2L * LM_D_MODEL * LM_D_FF))
+			    * tok_sec / 1e12;
+		}
 	}
 	dbg_fmt_eta(eta_buf, sizeof(eta_buf), eta);
 	nline = snprintf(line, sizeof(line),
@@ -215,11 +252,23 @@ static void dbg_progress(int ep, int epochs, int done, int total,
 	if (ms_tok > 0.0 && (size_t)nline < sizeof(line))
 		nline += snprintf(line + nline, sizeof(line) - (size_t)nline,
 		    " %.2fms/t", ms_tok);
+	if (tok_sec > 0.0 && (size_t)nline < sizeof(line))
+		nline += snprintf(line + nline, sizeof(line) - (size_t)nline,
+		    " %.0ft/s", tok_sec);
+	if (tflops > 0.0 && (size_t)nline < sizeof(line))
+		nline += snprintf(line + nline, sizeof(line) - (size_t)nline,
+		    " ~%.2fTF", tflops);
+	fr = 0;
+	tot = 0;
+	if (gpu_available() && gpu_mem_info(&fr, &tot) == 0 && tot > 0
+	    && (size_t)nline < sizeof(line))
+		nline += snprintf(line + nline, sizeof(line) - (size_t)nline,
+		    " %.0fMB", (double)(tot - fr) / 1048576.0);
 	if (eta >= 0.0 && (size_t)nline < sizeof(line))
 		snprintf(line + nline, sizeof(line) - (size_t)nline,
 		    " ETA %s", eta_buf);
 	/* Pad/clear leftovers from a longer previous frame. */
-	fprintf(stderr, "\r%-96s", line);
+	fprintf(stderr, "\r%-160s", line);
 	fflush(stderr);
 	g_progress_open = 1;
 	if (force)
@@ -547,6 +596,7 @@ double lm_train_corpus_val(lm *model, text_dataset *ds, lm_adam *opt,
 				tp.ms_tok = (tokens_done > 0 && elapsed > 0.0)
 				    ? 1000.0 * elapsed / (double)tokens_done
 				    : -1.0;
+				fill_throughput(&tp, tokens_done, elapsed);
 				if (train_poll_control(&tp)) {
 					quit = 1;
 					break;
@@ -629,6 +679,7 @@ double lm_train_corpus_val(lm *model, text_dataset *ds, lm_adam *opt,
 				tp.ms_tok = (tokens_done > 0 && elapsed > 0.0)
 				    ? 1000.0 * elapsed / (double)tokens_done
 				    : -1.0;
+				fill_throughput(&tp, tokens_done, elapsed);
 				tp.event = TRAIN_EV_STEP;
 				tp.msg = NULL;
 				if (g_progress_fn)

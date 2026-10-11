@@ -89,6 +89,7 @@
 - [GPU activation residency (R1)](gpu-activation-residency.md)
 - [Huge batch / VRAM fill (R3–R4)](huge-batch-vram.md)
 - [Safe default learning rate (E1)](safe-default-lr.md)
+- [Throughput dashboard (E10)](throughput-dashboard.md)
 
 ### From toy LM → small LLM
 
