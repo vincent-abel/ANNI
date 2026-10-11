@@ -16,6 +16,10 @@ extern "C" {
 }
 
 static int g_sync_mode;
+static cudaStream_t g_copy_stream;
+static cudaGraph_t g_graph;
+static cudaGraphExec_t g_graph_exec;
+static int g_graph_ok;
 
 extern "C" void gpu_set_sync_mode(int mode)
 {
@@ -37,6 +41,12 @@ static int cublas_ensure(void)
 		return 0;
 	if (cublasCreate(&g_cublas) != CUBLAS_STATUS_SUCCESS)
 		return -1;
+	/* R10: TF32 tensor cores on Ampere+ when the cuBLAS header knows it. */
+#ifdef CUBLAS_TF32_TENSOR_OP_MATH
+	(void)cublasSetMathMode(g_cublas, CUBLAS_TF32_TENSOR_OP_MATH);
+#elif defined(CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION)
+	(void)cublasSetMathMode(g_cublas, CUBLAS_DEFAULT_MATH);
+#endif
 	g_cublas_ok = 1;
 	return 0;
 }
@@ -1951,7 +1961,15 @@ extern "C" int gpu_embed_lookup(mat *out, const mat *table, const int *ids, int 
 	d_ids = (int *)gpu_malloc(ib);
 	if (!d_ids)
 		return -1;
-	if (gpu_memcpy_h2d(d_ids, ids, ib) != 0) {
+	/* R8: async H2D on copy stream when available. */
+	if (g_copy_stream) {
+		if (cudaMemcpyAsync(d_ids, ids, ib, cudaMemcpyHostToDevice,
+		    g_copy_stream) != cudaSuccess
+		    || cudaStreamSynchronize(g_copy_stream) != cudaSuccess) {
+			gpu_free(d_ids);
+			return -1;
+		}
+	} else if (gpu_memcpy_h2d(d_ids, ids, ib) != 0) {
 		gpu_free(d_ids);
 		return -1;
 	}
@@ -2019,4 +2037,69 @@ extern "C" void gpu_host_free(void *p)
 {
 	if (p)
 		cudaFreeHost(p);
+}
+
+extern "C" void *gpu_copy_stream(void)
+{
+	if (!gpu_available())
+		return NULL;
+	if (!g_copy_stream
+	    && cudaStreamCreateWithFlags(&g_copy_stream, cudaStreamNonBlocking)
+	    != cudaSuccess)
+		return NULL;
+	return (void *)g_copy_stream;
+}
+
+extern "C" void gpu_stream_sync_copy(void)
+{
+	if (g_copy_stream)
+		(void)cudaStreamSynchronize(g_copy_stream);
+}
+
+extern "C" int gpu_graph_begin(void)
+{
+	if (!gpu_available())
+		return -1;
+	gpu_graph_destroy();
+	if (cudaStreamBeginCapture(0, cudaStreamCaptureModeGlobal) != cudaSuccess)
+		return -1;
+	return 0;
+}
+
+extern "C" int gpu_graph_end(void)
+{
+	if (!gpu_available())
+		return -1;
+	if (cudaStreamEndCapture(0, &g_graph) != cudaSuccess)
+		return -1;
+	if (cudaGraphInstantiate(&g_graph_exec, g_graph, NULL, NULL, 0)
+	    != cudaSuccess) {
+		cudaGraphDestroy(g_graph);
+		g_graph = NULL;
+		return -1;
+	}
+	g_graph_ok = 1;
+	return 0;
+}
+
+extern "C" int gpu_graph_replay(void)
+{
+	if (!g_graph_ok || !g_graph_exec)
+		return -1;
+	if (cudaGraphLaunch(g_graph_exec, 0) != cudaSuccess)
+		return -1;
+	return launch_done();
+}
+
+extern "C" void gpu_graph_destroy(void)
+{
+	if (g_graph_exec) {
+		cudaGraphExecDestroy(g_graph_exec);
+		g_graph_exec = NULL;
+	}
+	if (g_graph) {
+		cudaGraphDestroy(g_graph);
+		g_graph = NULL;
+	}
+	g_graph_ok = 0;
 }

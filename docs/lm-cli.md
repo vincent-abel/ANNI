@@ -28,7 +28,8 @@ Like `git` subcommands (`git commit`, `git push`), **`ann lm`** groups language-
 **Target syntax.**
 
 ```text
-ann lm train   [--data PATH] [--epochs N] [--batch B] [--out PATH]
+ann lm train   [--data PATH] [--epochs N] [--batch B|auto] [--grad-accum K]
+               [--vram-frac F] [--out PATH]
                [--resume PATH] [-d|--debug]
 
 ann lm generate [--checkpoint PATH] --prompt TEXT [--max N] [--temp TAU]

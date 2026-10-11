@@ -355,3 +355,31 @@ void gpu_host_free(void *p)
 {
 	(void)p;
 }
+
+void *gpu_copy_stream(void)
+{
+	return NULL;
+}
+
+void gpu_stream_sync_copy(void)
+{
+}
+
+int gpu_graph_begin(void)
+{
+	return -1;
+}
+
+int gpu_graph_end(void)
+{
+	return -1;
+}
+
+int gpu_graph_replay(void)
+{
+	return -1;
+}
+
+void gpu_graph_destroy(void)
+{
+}

@@ -27,6 +27,10 @@ void	lm_train_set_grad_clip(double max_norm);	/* 0 = off */
 void	lm_train_set_weight_decay(double wd);		/* AdamW-style; 0 = off */
 /* E9: if >0, derive grad_accum from B*T so each Adam ≈ this many tokens. */
 void	lm_train_set_tokens_per_step(int n);
+/* E15: stop after `patience` evals without val improvement (0 = off). */
+void	lm_train_set_early_stop(int patience);
+/* E16: abort if train/val NLL rises by more than delta vs best, or non-finite. */
+void	lm_train_set_diverge_delta(double delta);
 
 /*
 ** ckpt_path NULL = no mid-train saves. Otherwise overwrite that path after each

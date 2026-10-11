@@ -75,6 +75,15 @@ return lm_perplexity(model, ds_eval) or train NLL
 - Planned: `lang/lm_train.c` — `lm_train_corpus`, `lm_scale_grads`.
 - Entry: `./ann lm train --corpus data/toy.txt --batch 4` ([lm-cli.md](lm-cli.md)).
 
+## Token-parallel packing (`--batch B`)
+
+`--batch B` packs **B windows of T tokens into one forward/backward**: embed, LN, QKV/Wo, FFN and the LM head are single `(B·T)×D` GEMMs, while attention is causal **within each sequence only** (B score caches of `T×T`, never `(B·T)²`). The CE head gathers hidden rows `0..T-2` of every sequence into one `B·(T-1)×D` matrix (position `t` of sequence `b` predicts `ids[b*T+t+1]`).
+
+- API: `lm_cache_create_packed(B, T)`, `lm_forward_cache_packed`, `lm_loss_backward_packed`, `lm_backward_packed` (`lang/lm.h`). `B == 1` is the classic single-window path.
+- `--grad-accum K`: K packed microbatches are summed before one Adam step (scale `1/(B·K)`); activations do not grow with K.
+- `--batch auto` (with `--vram-frac F`, default 0.85): largest B (cap 64, and windows per epoch) whose `lm_packed_bytes` estimate fits `F × cudaMemGetInfo free`; CPU builds fall back to 8. `-d` prints free/total VRAM, B, T and the estimate. A failed allocation halves B.
+- GPU builds run attention for all `(b, h)` in one fused kernel launch (`gpu_attn_causal_fwd/bwd`); CPU builds loop per sequence/head under OpenMP.
+
 ## Worked example
 
 **batch_size=2**, two windows from `"abcd"` with max_len=4, stride=1.

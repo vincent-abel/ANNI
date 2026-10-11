@@ -98,6 +98,12 @@
 - [Microbatch prefetch (E3)](microbatch-prefetch.md)
 - [Streaming dataloader (E14 mmap)](streaming-dataloader.md)
 - [Repro JSON sidecar (E11)](repro-json-sidecar.md)
+- [CUDA Graphs train (R12)](cuda-graphs-train.md)
+- [CUDA streams overlap (R8/E6)](cuda-streams-overlap.md)
+- [Fused LN / softmax (E7)](fused-ln-softmax.md)
+- [Early-stop val plateau (E15)](early-stop-val-plateau.md)
+- [Diverge ditch (E16)](diverge-ditch.md)
+- [Mixed precision train (R10)](mixed-precision-train.md)
 
 ### From toy LM → small LLM
 

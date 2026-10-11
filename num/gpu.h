@@ -147,4 +147,18 @@ int	gpu_embed_scatter(mat *dtable, const mat *dout, const int *ids, int n);
 void	*gpu_host_alloc(size_t nbytes);
 void	gpu_host_free(void *p);
 
+/* R8/E6: secondary copy stream (NULL/0 = default). */
+void	*gpu_copy_stream(void);
+void	gpu_stream_sync_copy(void);
+
+/*
+** R12: capture/replay helpers for a fixed microbatch. begin/end wrap the
+** default stream; replay returns -1 if no graph. Capture fails if host ops
+** remain in the region (expected until full residency).
+*/
+int	gpu_graph_begin(void);
+int	gpu_graph_end(void);
+int	gpu_graph_replay(void);
+void	gpu_graph_destroy(void);
+
 #endif

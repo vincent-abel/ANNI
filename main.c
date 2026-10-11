@@ -209,6 +209,10 @@ static int run_lm_train_core(int argc, char **argv, int use_tower)
 		lm_train_set_grad_clip(clip);
 		lm_train_set_weight_decay(wd);
 		lm_train_set_tokens_per_step(tps);
+		lm_train_set_early_stop(atoi(arg_value(argc, argv,
+		    "--early-stop-patience", "0")));
+		lm_train_set_diverge_delta(atof(arg_value(argc, argv,
+		    "--diverge-delta", "0")));
 	}
 	if (lr <= 0.0)
 		lr = 0.001;

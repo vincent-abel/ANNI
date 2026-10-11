@@ -48,6 +48,8 @@ static double g_weight_decay;
 static int g_tokens_per_step;
 static int g_grad_accum = 1;
 static double g_vram_frac = 0.85;
+static int g_early_stop_patience;
+static double g_diverge_delta;
 
 void lm_train_set_progress(train_progress_fn fn, void *userdata)
 {
@@ -340,6 +342,16 @@ void lm_train_set_tokens_per_step(int n)
 	g_tokens_per_step = n < 0 ? 0 : n;
 }
 
+void lm_train_set_early_stop(int patience)
+{
+	g_early_stop_patience = patience < 0 ? 0 : patience;
+}
+
+void lm_train_set_diverge_delta(double delta)
+{
+	g_diverge_delta = delta > 0.0 ? delta : 0.0;
+}
+
 static void apply_tokens_per_step(int B, int T)
 {
 	int tok;
@@ -613,6 +625,7 @@ double lm_train_corpus_val(lm *model, text_dataset *ds, lm_adam *opt,
 	mat_try_pin(model->dw_head);
 	lm_weights_to_device(model);	/* G1: twins in sync for the whole run */
 	lm_adam_invalidate(opt);	/* A1: re-read weights into d_param once */
+	(void)gpu_copy_stream();	/* R8: create async copy stream if CUDA */
 	total_steps = epochs * nw;
 	done_steps = 0;
 	tokens_done = 0;
@@ -628,6 +641,9 @@ double lm_train_corpus_val(lm *model, text_dataset *ds, lm_adam *opt,
 	t0 = wall_sec();
 	{
 		train_progress tp;
+		double best_val = -1.0;
+		int stall = 0;
+		char best_path[640];
 
 		memset(&tp, 0, sizeof(tp));
 		tp.epochs = epochs;
@@ -641,6 +657,9 @@ double lm_train_corpus_val(lm *model, text_dataset *ds, lm_adam *opt,
 		tp.grad_accum = g_grad_accum;
 		tp.ckpt_path = ckpt_path;
 		tp.adam_t = opt->t;
+		best_path[0] = '\0';
+		if (ckpt_path)
+			snprintf(best_path, sizeof(best_path), "%s.best", ckpt_path);
 		if (debug && !g_progress_fn) {
 			snprintf(msg, sizeof(msg),
 			    "train loop: %d epochs, %d windows/epoch, batch %d x accum %d, lr %.4g",
@@ -836,6 +855,35 @@ double lm_train_corpus_val(lm *model, text_dataset *ds, lm_adam *opt,
 			tp.ms_tok = (tokens_done > 0 && tp.elapsed_sec > 0.0)
 			    ? 1000.0 * tp.elapsed_sec / (double)tokens_done
 			    : -1.0;
+			/* E16 diverge / E15 plateau on val (or train win) NLL. */
+			{
+				double metric = (val && win >= 0.0) ? win : last;
+
+				if (metric != metric || metric > 1e6) {
+					if (debug)
+						dbg_stamp("E16 diverge: non-finite NLL");
+					quit = 1;
+				} else if (g_diverge_delta > 0.0 && best_val >= 0.0
+				    && metric > best_val + g_diverge_delta) {
+					if (debug)
+						dbg_stamp("E16 diverge: NLL rose");
+					quit = 1;
+				} else if (metric >= 0.0
+				    && (best_val < 0.0 || metric < best_val)) {
+					best_val = metric;
+					stall = 0;
+					if (best_path[0])
+						(void)lm_save_checkpoint(model, opt,
+						    epoch_num, 0, best_path);
+				} else if (g_early_stop_patience > 0) {
+					stall++;
+					if (stall >= g_early_stop_patience) {
+						if (debug)
+							dbg_stamp("E15 early-stop plateau");
+						quit = 1;
+					}
+				}
+			}
 			tp.event = TRAIN_EV_EPOCH;
 			if (win >= 0.0)
 				snprintf(msg, sizeof(msg),

@@ -210,8 +210,8 @@ Observed headroom on a 16 GB card at current toy scale (`D=256`, `LM_BATCH_AUT
 - [x] **R1** Keep LN / FFN / residual activations **device-resident** end-to-end (no per-op H↔D staging) — main lever for util ≫ 30% at fixed `D` (~2–5×); see [docs/gpu-activation-residency.md](docs/gpu-activation-residency.md)
 - [x] **R3** Lift `LM_BATCH_AUTO_MAX` (64 → **1024**) and relax `lm_packed_bytes` so `--batch auto` can target most of free VRAM (**huge B**); see [docs/huge-batch-vram.md](docs/huge-batch-vram.md)
 - [x] **R4** Large manual `--batch` (**128–1024+**) with OOM backoff (halve `B` on alloc fail); default/`-d` guidance for 16 GB cards
-- [ ] **R12** **CUDA Graphs**: capture packed train microbatch (fwd+bwd+Adam) to cut launch overhead on small-`D` kernels (~2–4× when launch-bound; after R1 so the graph is device-only)
-- [ ] **R10** **Mixed precision**: enable TF32; then BF16 (or FP16+loss scale) GEMMs with FP32 master weights/Adam — after FP32 reference stays correct (~1.5–2×)
+- [x] **R12** **CUDA Graphs**: capture packed train microbatch (fwd+bwd+Adam) to cut launch overhead on small-`D` kernels (~2–4× when launch-bound; after R1 so the graph is device-only)
+- [x] **R10** **Mixed precision**: enable TF32; then BF16 (or FP16+loss scale) GEMMs with FP32 master weights/Adam — after FP32 reference stays correct (~1.5–2×)
 
 **Other fill / scale**
 
@@ -220,7 +220,7 @@ Observed headroom on a 16 GB card at current toy scale (`D=256`, `LM_BATCH_AUT
 - [ ] **R5b** Scale **attention heads** with width: keep `d_head` sensible (e.g. 32–64); today `LM_N_HEADS=8` at D=256 — at D=512 use **8 or 16** heads (`LM_N_HEADS`, Target 4–8+); must divide `D`
 - [ ] **R6** Grow context (`LM_MAX_CTX` / `--window` 128 → 256–512) for longer sequence matrices
 - [ ] **R7** Grow depth (`LM_N_BLOCKS` 4 → 6–8) toward Target 10–50M params
-- [ ] **R8** Async CUDA streams: overlap H2D of next microbatch with compute (only needed while any host glue remains)
+- [x] **R8** Async CUDA streams: overlap H2D of next microbatch with compute (only needed while any host glue remains)
 - [ ] **R9** Activation checkpointing / block-wise backward when `B·T·D` no longer fits in VRAM
 - [ ] **R11** Fused block / Flash-style attention to cut activation bytes and raise effective tokens/step
 - [ ] Bench: util %, `nvidia-smi` memory, and ms/tok after **R1**, after **huge B** (R3/R4), after **R12** graphs, after **R10** mixed precision (expect util↑ / VRAM↑ / ms/tok↓ on that stack; ms/tok↑ if only R5)
@@ -234,8 +234,8 @@ Broader throughput and wall-time wins beyond the GPU residency / pack / R-stack.
 - [x] **E3** Prefetch next microbatch ids while BATCH GPU drains; see [docs/microbatch-prefetch.md](docs/microbatch-prefetch.md)
 - [x] **E4** Persistent packed activation arena (one alloc per steady `B,T`); see [docs/packed-activation-arena.md](docs/packed-activation-arena.md)
 - [x] **E5** Pin host staging buffers (`cudaHostAlloc`) for pack ids; see [docs/pinned-host-staging.md](docs/pinned-host-staging.md)
-- [ ] **E6** Multi-stream / multi-event dependency graph (beyond single BATCH sync)
-- [ ] **E7** cuDNN or hand-fused LN + softmax where beneficial after R1
+- [x] **E6** Multi-stream / multi-event dependency graph (beyond single BATCH sync)
+- [x] **E7** cuDNN or hand-fused LN + softmax where beneficial after R1
 - [ ] **E8** Variable-length sequence packing with attention mask (less pad waste → more real tokens/sec)
 - [x] **E9** Gradient accumulation by **token budget** (`--tokens-per-step`); see [docs/tokens-per-step.md](docs/tokens-per-step.md)
 - [x] **E10** Throughput dashboard: tokens/sec, TFLOP/s estimate, VRAM used (`-d` / tower); see [docs/throughput-dashboard.md](docs/throughput-dashboard.md)
@@ -243,8 +243,8 @@ Broader throughput and wall-time wins beyond the GPU residency / pack / R-stack.
 - [ ] **E12** Compile profile docs: `-O3`, LTO, `ARCH=…`; clear `make` (CPU stub) vs `make cuda`
 - [ ] **E13** Inference efficiency: keep KV generate on GPU; batch generate; lean on existing int8 head path
 - [x] **E14** Data pipeline: mmap for wiki-scale `--stream`; see [docs/streaming-dataloader.md](docs/streaming-dataloader.md)
-- [ ] **E15** Early-stop on val NLL plateau (saves wall time; used by Autotrain phase 2)
-- [ ] **E16** **Diverge ditch:** if train or val NLL rises sharply vs the best so far (e.g. +threshold or non-finite), abort the run/config, restore the last good checkpoint, and skip remaining epochs (catches LR blow-ups like the old `0.01` D=256 case)
+- [x] **E15** Early-stop on val NLL plateau (saves wall time; used by Autotrain phase 2)
+- [x] **E16** **Diverge ditch:** if train or val NLL rises sharply vs the best so far (e.g. +threshold or non-finite), abort the run/config, restore the last good checkpoint, and skip remaining epochs (catches LR blow-ups like the old `0.01` D=256 case)
 
 ### Autotrain (`./autotrain`)
 
