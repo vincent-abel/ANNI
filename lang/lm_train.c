@@ -305,7 +305,8 @@ typedef struct	pack_slot {
 typedef struct	pack_ctx {
 	int		Bmax;
 	int		T;
-	int		*ids;		/* Bmax * T */
+	int		*ids;		/* Bmax * T (E4 steady arena) */
+	int		ids_pinned;	/* E5: cudaHostAlloc */
 	pack_slot	slot[2];	/* [0] = Bmax, [1] = tail */
 } pack_ctx;
 
@@ -320,8 +321,14 @@ static void pack_ctx_free(pack_ctx *p)
 {
 	if (!p)
 		return;
-	free(p->ids);
+	if (p->ids) {
+		if (p->ids_pinned)
+			gpu_host_free(p->ids);
+		else
+			free(p->ids);
+	}
 	p->ids = NULL;
+	p->ids_pinned = 0;
 	pack_slot_free(&p->slot[0]);
 	pack_slot_free(&p->slot[1]);
 }
@@ -344,10 +351,17 @@ static int pack_slot_get(pack_slot *s, int B, int T)
 
 static int pack_ctx_init_once(pack_ctx *p, int Bmax, int T)
 {
+	size_t nbytes;
+
 	memset(p, 0, sizeof(*p));
 	p->Bmax = Bmax;
 	p->T = T;
-	p->ids = malloc((size_t)Bmax * (size_t)T * sizeof(int));
+	nbytes = (size_t)Bmax * (size_t)T * sizeof(int);
+	p->ids = (int *)gpu_host_alloc(nbytes);
+	if (p->ids)
+		p->ids_pinned = 1;
+	else
+		p->ids = malloc(nbytes);
 	if (!p->ids || pack_slot_get(&p->slot[0], Bmax, T) != 0) {
 		pack_ctx_free(p);
 		return -1;
