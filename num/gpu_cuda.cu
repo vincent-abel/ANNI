@@ -1900,3 +1900,123 @@ extern "C" int gpu_mat_axpy(mat *y, double a, const mat *x)
 	y->on_device = MAT_DEV_DEVICE;
 	return 0;
 }
+
+__global__ static void embed_lookup_kernel(ann_real *out, const ann_real *table,
+	const int *ids, int n, int d)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	int t;
+	int j;
+	int id;
+
+	if (i >= n * d)
+		return;
+	t = i / d;
+	j = i % d;
+	id = ids[t];
+	out[i] = table[id * d + j];
+}
+
+__global__ static void embed_scatter_kernel(ann_real *dtable, const ann_real *dout,
+	const int *ids, int n, int d)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	int t;
+	int j;
+	int id;
+
+	if (i >= n * d)
+		return;
+	t = i / d;
+	j = i % d;
+	id = ids[t];
+	atomicAdd(&dtable[id * d + j], dout[i]);
+}
+
+extern "C" int gpu_embed_lookup(mat *out, const mat *table, const int *ids, int n)
+{
+	int *d_ids;
+	int d;
+	int nd;
+	size_t ib;
+
+	if (!out || !table || !ids || n <= 0 || !gpu_available())
+		return -1;
+	if (out->rows != n || out->cols != table->cols)
+		return -1;
+	d = table->cols;
+	if (mat_ensure_dev_auth((mat *)table) != 0 || mat_device_alloc(out) != 0)
+		return -1;
+	ib = (size_t)n * sizeof(int);
+	d_ids = (int *)gpu_malloc(ib);
+	if (!d_ids)
+		return -1;
+	if (gpu_memcpy_h2d(d_ids, ids, ib) != 0) {
+		gpu_free(d_ids);
+		return -1;
+	}
+	nd = n * d;
+	embed_lookup_kernel<<<(nd + 255) / 256, 256>>>(out->d_data, table->d_data,
+	    d_ids, n, d);
+	gpu_free(d_ids);
+	if (launch_done() != 0)
+		return -1;
+	out->on_device = MAT_DEV_DEVICE;
+	return 0;
+}
+
+extern "C" int gpu_embed_scatter(mat *dtable, const mat *dout, const int *ids,
+	int n)
+{
+	int *d_ids;
+	int d;
+	int nd;
+	size_t ib;
+
+	if (!dtable || !dout || !ids || n <= 0 || !gpu_available())
+		return -1;
+	if (dout->rows != n || dout->cols != dtable->cols)
+		return -1;
+	d = dtable->cols;
+	if (mat_ensure_dev_auth((mat *)dout) != 0 || mat_device_alloc(dtable) != 0)
+		return -1;
+	if (dtable->on_device == MAT_DEV_HOST) {
+		if (gpu_memcpy_h2d(dtable->d_data, dtable->data,
+		    mat_nbytes(dtable)) != 0)
+			return -1;
+		dtable->on_device = MAT_DEV_SYNCED;
+	}
+	ib = (size_t)n * sizeof(int);
+	d_ids = (int *)gpu_malloc(ib);
+	if (!d_ids)
+		return -1;
+	if (gpu_memcpy_h2d(d_ids, ids, ib) != 0) {
+		gpu_free(d_ids);
+		return -1;
+	}
+	nd = n * d;
+	embed_scatter_kernel<<<(nd + 255) / 256, 256>>>(dtable->d_data,
+	    dout->d_data, d_ids, n, d);
+	gpu_free(d_ids);
+	if (launch_done() != 0)
+		return -1;
+	dtable->on_device = MAT_DEV_DEVICE;
+	return 0;
+}
+
+extern "C" void *gpu_host_alloc(size_t nbytes)
+{
+	void *p;
+
+	if (nbytes == 0 || !gpu_available())
+		return NULL;
+	if (cudaHostAlloc(&p, nbytes, cudaHostAllocDefault) != cudaSuccess)
+		return NULL;
+	return p;
+}
+
+extern "C" void gpu_host_free(void *p)
+{
+	if (p)
+		cudaFreeHost(p);
+}

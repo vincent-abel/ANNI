@@ -569,6 +569,8 @@ int lm_forward_cache_packed(lm *model, const int *ids, int B, int T,
 	/* Embed all B*T ids once, then add positions restarting per sequence. */
 	if (embed_lookup(c->hidden, model->embed, ids, n) != 0)
 		return -1;
+	/* Posenc still host; pull after R2 GPU gather, then dirty for stack. */
+	(void)mat_ensure_host(c->hidden);
 	for (b = 0; b < B; b++)
 		for (t = 0; t < T; t++)
 			posenc_add_row(&c->hidden->data[(size_t)(b * T + t)

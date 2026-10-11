@@ -90,6 +90,9 @@
 - [Huge batch / VRAM fill (R3–R4)](huge-batch-vram.md)
 - [Safe default learning rate (E1)](safe-default-lr.md)
 - [Throughput dashboard (E10)](throughput-dashboard.md)
+- [GPU embed lookup (R2)](gpu-embed-lookup.md)
+- [Packed activation arena (E4)](packed-activation-arena.md)
+- [Pinned host staging (E5)](pinned-host-staging.md)
 
 ### From toy LM → small LLM
 

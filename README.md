@@ -215,7 +215,7 @@ Observed headroom on a 16 GB card at current toy scale (`D=256`, `LM_BATCH_AUT
 
 **Other fill / scale**
 
-- [ ] **R2** GPU embed lookup + embed grad scatter (table already pinned; still host today)
+- [x] **R2** GPU embed lookup + embed grad scatter; see [docs/gpu-embed-lookup.md](docs/gpu-embed-lookup.md)
 - [ ] **R5** Grow **D** (`LM_D_MODEL` 256 → 512 → 1024); set `LM_D_FF ≈ 4×D` — fattens every GEMM; **breaks old checkpoints** (retrain)
 - [ ] **R5b** Scale **attention heads** with width: keep `d_head` sensible (e.g. 32–64); today `LM_N_HEADS=8` at D=256 — at D=512 use **8 or 16** heads (`LM_N_HEADS`, Target 4–8+); must divide `D`
 - [ ] **R6** Grow context (`LM_MAX_CTX` / `--window` 128 → 256–512) for longer sequence matrices
@@ -232,8 +232,8 @@ Broader throughput and wall-time wins beyond the GPU residency / pack / R-stack.
 - [x] **E1** Default `--lr` safe for FP32 D≥256 (`0.001`); see [docs/safe-default-lr.md](docs/safe-default-lr.md)
 - [ ] **E2** LR warmup + cosine/linear decay CLI; optional grad clip / weight decay
 - [ ] **E3** Prefetch next microbatch (CPU tokenize/pack while GPU trains current step)
-- [ ] **E4** Persistent packed activation arena (one alloc per steady `B,T`; no realloc each step)
-- [ ] **E5** Pin host staging buffers (`cudaHostAlloc`) wherever H↔D remains after R1
+- [x] **E4** Persistent packed activation arena (one alloc per steady `B,T`); see [docs/packed-activation-arena.md](docs/packed-activation-arena.md)
+- [x] **E5** Pin host staging buffers (`cudaHostAlloc`) for pack ids; see [docs/pinned-host-staging.md](docs/pinned-host-staging.md)
 - [ ] **E6** Multi-stream / multi-event dependency graph (beyond single BATCH sync)
 - [ ] **E7** cuDNN or hand-fused LN + softmax where beneficial after R1
 - [ ] **E8** Variable-length sequence packing with attention mask (less pad waste → more real tokens/sec)

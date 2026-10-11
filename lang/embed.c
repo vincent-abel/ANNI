@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "embed.h"
+#include "gpu.h"
 #include "gradutil.h"
 
 static double embed_rand_weight(void)
@@ -35,6 +36,8 @@ embed *embed_create(int vocab_size)
 	for (i = 0; i < n; i++)
 		e->table->data[i] = embed_rand_weight();
 	embed_zero_grad(e);
+	mat_try_pin(e->table);
+	mat_try_pin(e->dtable);
 	return e;
 }
 
@@ -52,15 +55,16 @@ void embed_zero_grad(embed *e)
 {
 	if (!e)
 		return;
-	mat_zero(e->dtable);
+	mat_zero_dev(e->dtable);
 }
 
-int embed_lookup_row(double *out, const embed *e, int id)
+int embed_lookup_row(ann_real *out, const embed *e, int id)
 {
 	if (!out || !e || !e->table || id < 0 || id >= e->table->rows)
 		return -1;
+	(void)mat_ensure_host((mat *)e->table);
 	memcpy(out, &e->table->data[id * LM_D_MODEL],
-	    (size_t)LM_D_MODEL * sizeof(double));
+	    (size_t)LM_D_MODEL * sizeof(ann_real));
 	return 0;
 }
 
@@ -73,14 +77,19 @@ int embed_lookup(mat *out, const embed *e, const int *ids, int n)
 		return -1;
 	if (out->rows != n || out->cols != LM_D_MODEL)
 		return -1;
+	mat_try_pin(out);
+	if (gpu_embed_lookup(out, e->table, ids, n) == 0)
+		return 0;
+	(void)mat_ensure_host((mat *)e->table);
 	for (i = 0; i < n; i++) {
 		id = ids[i];
 		if (id < 0 || id >= e->table->rows)
 			return -1;
 		memcpy(&out->data[i * LM_D_MODEL],
 		    &e->table->data[id * LM_D_MODEL],
-		    (size_t)LM_D_MODEL * sizeof(double));
+		    (size_t)LM_D_MODEL * sizeof(ann_real));
 	}
+	mat_host_dirty(out);
 	return 0;
 }
 
@@ -89,12 +98,16 @@ int embed_backward(embed *e, const mat *dout, const int *ids, int n)
 	int i;
 	int j;
 	int id;
-	double *row;
+	ann_real *row;
 
 	if (!e || !dout || !ids || n <= 0)
 		return -1;
 	if (dout->rows != n || dout->cols != LM_D_MODEL)
 		return -1;
+	if (gpu_embed_scatter(e->dtable, dout, ids, n) == 0)
+		return 0;
+	(void)mat_ensure_host((mat *)dout);
+	(void)mat_ensure_host(e->dtable);
 	for (i = 0; i < n; i++) {
 		id = ids[i];
 		if (id < 0 || id >= e->dtable->rows)
@@ -103,5 +116,6 @@ int embed_backward(embed *e, const mat *dout, const int *ids, int n)
 		for (j = 0; j < LM_D_MODEL; j++)
 			row[j] += dout->data[i * LM_D_MODEL + j];
 	}
+	mat_host_dirty(e->dtable);
 	return 0;
 }

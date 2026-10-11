@@ -136,4 +136,15 @@ int	gpu_mat_add(mat *dst, const mat *src);
 /* y += a * x (elementwise). */
 int	gpu_mat_axpy(mat *y, double a, const mat *x);
 
+/*
+** R2: embed gather / grad scatter. table is vocab x D (pinned). ids length n
+** on host (uploaded). out / dout are n x D mats.
+*/
+int	gpu_embed_lookup(mat *out, const mat *table, const int *ids, int n);
+int	gpu_embed_scatter(mat *dtable, const mat *dout, const int *ids, int n);
+
+/* E5: page-locked host alloc for staging; NULL on stub/failure. */
+void	*gpu_host_alloc(size_t nbytes);
+void	gpu_host_free(void *p);
+
 #endif

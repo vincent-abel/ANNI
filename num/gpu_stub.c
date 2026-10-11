@@ -326,3 +326,32 @@ int gpu_mat_axpy(mat *y, double a, const mat *x)
 	(void)x;
 	return -1;
 }
+
+int gpu_embed_lookup(mat *out, const mat *table, const int *ids, int n)
+{
+	(void)out;
+	(void)table;
+	(void)ids;
+	(void)n;
+	return -1;
+}
+
+int gpu_embed_scatter(mat *dtable, const mat *dout, const int *ids, int n)
+{
+	(void)dtable;
+	(void)dout;
+	(void)ids;
+	(void)n;
+	return -1;
+}
+
+void *gpu_host_alloc(size_t nbytes)
+{
+	(void)nbytes;
+	return NULL;
+}
+
+void gpu_host_free(void *p)
+{
+	(void)p;
+}
