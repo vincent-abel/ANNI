@@ -619,8 +619,8 @@ static int run_lm_tower(int argc, char **argv)
 		return 0;
 	}
 	fprintf(stderr,
-	    "Usage: ./ann lm tower train [lm train flags…]\n"
-	    "       ./ann lm tower inspect --model PATH [--prompt TEXT]\n"
+	    "Usage: ./anni lm tower train [lm train flags…]\n"
+	    "       ./anni lm tower inspect --model PATH [--prompt TEXT]\n"
 	    "                 [--data PATH] [--eval-windows M] [--window N]\n");
 	return 1;
 }
@@ -702,6 +702,87 @@ static int run_lm_generate(int argc, char **argv)
 	printf("%s\n", out);
 	lm_free(&model);
 	return 0;
+}
+
+static int run_anni_chat_stdin(chat_session *sess, const char *path)
+{
+	char line[1024];
+	char reply[8192];
+
+	printf("AnnI chat (%s) — empty line or Ctrl-D to exit\n", path);
+	for (;;) {
+		printf("User: ");
+		fflush(stdout);
+		if (!fgets(line, (int)sizeof(line), stdin)) {
+			printf("\n");
+			break;
+		}
+		line[strcspn(line, "\r\n")] = '\0';
+		if (line[0] == '\0')
+			break;
+		if (chat_session_turn(sess, line, reply, (int)sizeof(reply))
+		    != 0) {
+			fprintf(stderr, "chat: generate failed\n");
+			return 1;
+		}
+		printf("Assistant: %s\n", reply);
+	}
+	return 0;
+}
+
+/* Top-level ./anni chat and alias ./anni lm chat. */
+static int run_anni_chat(int argc, char **argv)
+{
+	lm *model;
+	const char *path;
+	chat_session sess;
+	chat_ui_cfg ui;
+	int nnew;
+	int top_k;
+	double temperature;
+	double top_p;
+	int rc;
+
+	path = arg_value(argc, argv, "--model", "wiki_bpe.bin");
+	nnew = atoi(arg_value(argc, argv, "--tokens", "64"));
+	temperature = atof(arg_value(argc, argv, "--temperature", "0.8"));
+	top_k = atoi(arg_value(argc, argv, "--top-k", "0"));
+	top_p = atof(arg_value(argc, argv, "--top-p", "0.9"));
+
+	model = lm_load(path);
+	if (!model)
+		model = lm_load_checkpoint(path, NULL, NULL, NULL);
+	if (!model) {
+		fprintf(stderr, "chat: cannot load %s\n", path);
+		return 1;
+	}
+	if (apply_vocab_arg(model, argc, argv, "chat") != 0) {
+		lm_free(&model);
+		return 1;
+	}
+	if (chat_session_init(&sess, model, nnew, temperature, top_k, top_p)
+	    != 0) {
+		lm_free(&model);
+		return 1;
+	}
+
+	rc = 1;
+	if (tower_available()) {
+		memset(&ui, 0, sizeof(ui));
+		ui.model = model;
+		ui.model_path = path;
+		ui.tokens = sess.nnew;
+		ui.temperature = temperature;
+		ui.top_k = top_k;
+		ui.top_p = top_p;
+		chat_session_free(&sess);
+		rc = chat_ui_run(&ui) != 0 ? 1 : 0;
+	} else {
+		rc = run_anni_chat_stdin(&sess, path);
+		chat_session_free(&sess);
+	}
+	lm_free(&model);
+	return rc;
 }
 
 static int run_lm_load(int argc, char **argv)
@@ -886,6 +967,8 @@ static int run_lm(int argc, char **argv)
 		return run_lm_info(argc, argv);
 	if (argc >= 3 && arg_eq(argv[2], "generate"))
 		return run_lm_generate(argc, argv);
+	if (argc >= 3 && arg_eq(argv[2], "chat"))
+		return run_anni_chat(argc, argv);
 	if (argc >= 3 && arg_eq(argv[2], "load"))
 		return run_lm_load(argc, argv);
 	if (argc >= 3 && arg_eq(argv[2], "bench"))
@@ -954,16 +1037,21 @@ int main(int argc, char *argv[])
 
 	if (argc >= 2 && strcmp(argv[1], "xor") == 0)
 		return run_xor();
+	if (argc >= 2 && strcmp(argv[1], "chat") == 0)
+		return run_anni_chat(argc, argv);
 	if (argc >= 2 && strcmp(argv[1], "lm") == 0)
 		return run_lm(argc, argv);
 
 	srand((unsigned int)time(NULL));
 
 	if (argc < 4) {
-		printf("Usage: ./ann <inputs> <neurons-per-layer> <layers>\n");
-		printf("       ./ann xor\n");
-		printf("       ./ann lm [phrase]\n");
-		printf("       ./ann lm train [--data PATH] [--epochs N] [--out PATH]\n");
+		printf("Usage: ./anni <inputs> <neurons-per-layer> <layers>\n");
+		printf("       ./anni xor\n");
+		printf("       ./anni chat --model wiki_bpe.bin\n");
+		printf("                 [--tokens N] [--temperature T] [--top-k K] [--top-p P]\n");
+		printf("                 [--vocab PATH]\n");
+		printf("       ./anni lm [phrase]\n");
+		printf("       ./anni lm train [--data PATH] [--epochs N] [--out PATH]\n");
 		printf("                 [--resume PATH] [--lr RATE] [--window N]\n");
 		printf("                 [--batch N|auto] [--grad-accum K] [--vram-frac F]\n");
 		printf("                 [--seed N] [--eval-every N]\n");
@@ -971,17 +1059,18 @@ int main(int argc, char *argv[])
 		printf("                 [--vocab PATH] [--tokenizer byte|bpe] [--vocab-size N]\n");
 		printf("                 [--bpe-max-bytes N] [--val-frac F] [--split doc|offset]\n");
 		printf("                 [--split-seed N] [--stream] [--shuffle-buf N] [--stride N]\n");
-		printf("       ./ann lm train --bench-gpu [--tokens N] [--steps N]\n");
-		printf("       ./ann lm tower train [same flags as lm train] [--prompt TEXT]\n");
-		printf("       ./ann lm tower inspect --model PATH [--prompt TEXT]\n");
+		printf("       ./anni lm train --bench-gpu [--tokens N] [--steps N]\n");
+		printf("       ./anni lm tower train [same flags as lm train] [--prompt TEXT]\n");
+		printf("       ./anni lm tower inspect --model PATH [--prompt TEXT]\n");
 		printf("                 [--data PATH] [--eval-windows M] [--window N]\n");
-		printf("       ./ann lm info --model PATH [--prompt TEXT] [--data PATH]\n");
-		printf("       ./ann lm merge --out OUT.bin a.bin b.bin [c.bin ...]\n");
-		printf("       ./ann lm generate --model model.bin --prompt hello\n");
+		printf("       ./anni lm info --model PATH [--prompt TEXT] [--data PATH]\n");
+		printf("       ./anni lm merge --out OUT.bin a.bin b.bin [c.bin ...]\n");
+		printf("       ./anni lm generate --model model.bin --prompt hello\n");
 		printf("                 [--tokens N] [--temperature T] [--top-k K] [--top-p P]\n");
 		printf("                 [--vocab PATH]\n");
-		printf("       ./ann lm load --model model.bin [--vocab PATH] [--prompt TEXT]\n");
-		printf("       ./ann lm bench [--tokens N] [--iters N] [--train]\n");
+		printf("       ./anni lm chat --model wiki_bpe.bin   (alias of ./anni chat)\n");
+		printf("       ./anni lm load --model model.bin [--vocab PATH] [--prompt TEXT]\n");
+		printf("       ./anni lm bench [--tokens N] [--iters N] [--train]\n");
 		return 1;
 	}
 

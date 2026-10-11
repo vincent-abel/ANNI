@@ -61,6 +61,7 @@
 - [Generation from trained checkpoints](generation-from-checkpoints.md)
 - [Scale toward target size](scale-toward-target-size.md)
 - [Train / generate / load CLI](lm-cli.md)
+- [Interactive chat (AnnI)](lm-chat.md)
 - [Training control tower](training-control-tower.md)
 
 ### Performance

@@ -2,19 +2,24 @@
 
 ## What it is
 
-An optional **ncurses** full-screen UI for LM training and a companion **inspect** view for any checkpoint. Build enables it when `ncurses.h` is present (`ANN_NCURSES` + `-lncurses` in the Makefile). Without headers, `./ann lm train -d` still works; tower commands tell you to install `libncurses-dev`.
+An optional **ncurses** full-screen UI for AnnI LM training and a companion **inspect** view for any checkpoint. Build enables it when `ncurses.h` is present (`ANN_NCURSES` + `-lncurses` in the Makefile). Without headers, `./anni lm train -d` still works; tower commands tell you to install `libncurses-dev`.
+
+Interactive chat is separate: **`./anni chat`** (messenger UI; see [lm-chat.md](lm-chat.md)) — same visual kinship, not a `tower` subcommand.
 
 ## Commands
 
 ```bash
 # Live train UI (same flags as lm train)
-./ann lm tower train --data data/toy_tiny.txt --epochs 3 --out model.bin --force
+./anni lm tower train --data data/toy_tiny.txt --epochs 3 --out model.bin --force
 
 # Full-screen intel on a checkpoint
-./ann lm tower inspect --model model.bin --prompt "The " [--data PATH]
+./anni lm tower inspect --model model.bin --prompt "The " [--data PATH]
 
 # Plain-text intel (no ncurses; good for scripts)
-./ann lm info --model model.bin --prompt hello [--data PATH] [--eval-windows M]
+./anni lm info --model model.bin --prompt hello [--data PATH] [--eval-windows M]
+
+# Chat (TTY ncurses / stdin fallback)
+./anni chat --model wiki_bpe.bin
 ```
 
 ## Train panes

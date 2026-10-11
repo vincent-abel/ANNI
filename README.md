@@ -1,6 +1,6 @@
-# ANN
+# AnnI
 
-A neural network implemented from scratch in **C**, with the long-term goal of building a small **Transformer-based language model** without machine-learning frameworks.
+**AnnI** (`./anni`) is a neural network implemented from scratch in **C**, with the long-term goal of building a small **Transformer-based language model** without machine-learning frameworks. (`./ann` is a compat symlink to `./anni`.)
 
 ## Status
 
@@ -57,17 +57,17 @@ Current implementation:
 - LM weight serialization
 - Per-epoch checkpoints, `--lr` / `--window` / `--seed`, `lm merge`
 - FP32 (`ann_real`), generate sampling, `--out` resume confirm, BPE + streaming data path
-- (Scale to Target 10–50M params — still open; see Roadmap Capacity)
+- Target-shaped config (~36M @ 16k BPE); quality run Q1–Q5 still open — see **Target quality run**
 
-Trainable decoder-only LM in `lang/`: FP32 mats, byte or BPE tokenizer, CUDA optional, checkpoint/resume, eval knobs, streaming splits, `lm merge`. Still shy of Target capacity (10–50M) — usable for learning and local experiments.
+Trainable decoder-only LM in `lang/`: FP32 mats, byte or BPE tokenizer, CUDA optional, checkpoint/resume, eval knobs, streaming splits, `lm merge`. Config is Target-shaped (`D=512`, 6 blocks, ctx=256 → ~**36M** params at 16k BPE); readable generate / chat gated on **Q1–Q5**.
 
 ### Done vs open (Target)
 
-**Done (plumbing + speed stack):** FP32 / `LMCF`, GPU residency (R1–R4, R2, R8–R12, R10 TF32), packed `--batch` / `--batch auto`, BPE + `LMCV`, wiki stream, Efficiency E1–E16, Autotrain AT1–AT9. Config today: `D=512`, `heads=16`, `FF=2048`, `ctx=256`, `blocks=6` (Target-shaped; retrain old ckpts).
+**Done (plumbing + speed stack):** FP32 / `LMCF`, GPU residency (R1–R4, R2, R8–R12, R10 TF32), packed `--batch` / `--batch auto`, BPE + `LMCV`, wiki stream, Efficiency E1–E16, Autotrain AT1–AT9. Config today: `D=512`, `heads=16`, `FF=2048`, `ctx=256`, `blocks=6` (~36M @ 16k BPE; retrain old d=256 ckpts).
 
-**Open for Target quality:** real ≥100 MB BPE train run to readable generate, eval suite / held-out quality proof (config + Autotrain path land; quality not yet claimed).
+**Open for Target quality:** Q1–Q5 (rebuild → autotrain wiki → honest val metrics → gate → flip Hit Target). Config + Autotrain path land; quality not yet claimed.
 
-**Beyond Target:** ChatGPT-class needs more than a bigger decoder — see **Toward ChatGPT-class (code)** (modern block, scale, data shards, multi-GPU, SFT/DPO, eval, serve). That work starts after Target is honest; do not skip Target for shiny chat UI.
+**Beyond Target:** ChatGPT-class needs more than a bigger decoder — see **Toward ChatGPT-class (code)** (modern block, scale, data shards, multi-GPU, SFT/DPO, eval, serve). Local `./anni chat` (CHAT1/CHAT3) is Stage 1 after Q4; do not skip Target for Stage 3 serve/SFT.
 
 ### Milestone map (code)
 
@@ -140,8 +140,9 @@ Trainable decoder-only LM in `lang/`: FP32 mats, byte or BPE tokenizer, CUDA opt
 - [x] Generation from trained checkpoints
 - [x] Train / generate / load CLI
 - [x] Per-epoch checkpoint saves; `--lr` / `--window` / `--seed`; `lm merge` weight average
-- [x] Subword BPE + stream/splits + packed batch (still below Target param count)
-- [ ] Hit Target size/quality — see **From toy LM → small LLM** + **R5–R7** / **R5b**
+- [x] Subword BPE + stream/splits + packed batch (Target-shaped config landed; quality = Q1–Q5)
+- [ ] Hit Target size/quality — see **Target quality run (Q\*)** (flip after Q4)
+- [x] Interactive chat CLI — see **CHAT1** / **CHAT2** / **CHAT3**
 - [ ] ChatGPT-class code path — see **Toward ChatGPT-class (code)**
 
 ### Performance
@@ -246,14 +247,14 @@ Broader throughput and wall-time wins beyond the GPU residency / pack / R-stack.
 
 ### Autotrain (`./autotrain`)
 
-Opinionated **second binary** (not more flags on `./ann`) so the teaching CLI stays explicit. `./ann lm train …` remains the manual path; `./autotrain` picks Target-oriented defaults and runs an end-to-end job.
+Opinionated **second binary** (not more flags on `./anni`) so the teaching CLI stays explicit. `./anni lm train …` remains the manual path; `./autotrain` picks Target-oriented defaults and runs an end-to-end job.
 
 ```
 ./autotrain → probe GPU/VRAM → ensure data → BPE → pick window/batch/lr/epochs
            → packed train → smoke generate + report
 ```
 
-**Build:** `make autotrain` → `./autotrain` (thin `autotrain.c` linked against the same `lang/` + `num/` libs as `ann`).
+**Build:** `make autotrain` → CUDA `./autotrain` (same as `make cuda-autotrain`). CPU stub only via `make autotrain-cpu`. Runtime refuses to train without a GPU unless `--cpu`.
 
 **Phase 1 — one command (MVP)**
 
@@ -306,7 +307,23 @@ What we have at `f3a44b3` was a **byte-level** educational model (`LM_BYTE_VOCAB
 - [x] One-command Target path — see **Autotrain** (`./autotrain`, AT1–AT9)
 - [ ] After Target: Stage 2 (**C1–C14**) then Stage 3 (**ARCH/TOK/DAT/DIST/ALN/EV/SRV/OPS**)
 
-**Done when:** subword vocab, ≥100 MB train data, ~10M+ params, train window ≈ generate horizon, FP32 (or faster) on GPU, and generate produces readable multi-word text on held-out-style prompts—not just low NLL on `toy_tiny`.
+**Target quality run (Q\*)**
+
+- [x] **Q1** Rebuild: `make clean && make cuda && make cuda-autotrain` after R5–R7 dims; old d=256 ckpts will not load
+- [x] **Q2** Smoke train on `data/wiki_sample.txt` (~1 MB): BPE 16k + stream + val-frac → `wiki_bpe.bin` (use `--batch 64` if `--batch auto` OOMs near ~12 GB; not full `wiki_simple.txt`)
+- [x] **Q3** Honest metrics resume: `ann lm train` with `--tokenizer bpe --vocab wiki_bpe.bin.vocab --data data/wiki_sample.txt --val-frac 0.05 --split doc --window 128 --batch 64 --resume wiki_bpe.bin`
+- [ ] **Q4** Gate: `lm info` shows ~tens of M params + BPE V≈16384; val window NLL ≪ ln(V)≈9.7; in-domain `lm generate` readable English (smoke: 35.7M / V=16384 / val≈8.6 — generate still not readable; needs more data/steps)
+- [ ] **Q5** Mark “Hit Target size/quality” [x] only after Q4 **and** a real ≥100 MB run (`data/wiki_simple.txt`) — smoke on `wiki_sample` does not flip this
+
+**Interactive chat (after Target quality)**
+
+Stage 1 local turn loop on a pretrained checkpoint — not Stage 3 SFT/HTTP.
+
+- [x] **CHAT1** `./anni chat --model wiki_bpe.bin`: User/Assistant history, `lm_generate`, context ≤ `LM_MAX_CTX` (stdin when no TTY)
+- [x] **CHAT2** Docs + README example; exit on empty line / Ctrl-D (stdin) or Esc/q (ncurses)
+- [x] **CHAT3** Ncurses messenger UI on TTY (`libncurses-dev`); same flags as CHAT1; `./anni lm chat` is an alias
+
+**Done when:** subword vocab, ≥100 MB train data, ~10M+ params, train window ≈ generate horizon, FP32 (or faster) on GPU, and generate produces readable multi-word text on held-out-style prompts—not just low NLL on `toy_tiny`. Then `./anni chat` for multi-turn local chat.
 
 ### Capable local LLM (code) — Stage 2
 
@@ -438,7 +455,7 @@ Training loop:
 5. Update parameters
 6. Repeat
 
-Practical CLI knobs already: `--data`, `--epochs`, `--batch N|auto`, `--grad-accum K`, `--vram-frac F`, `--lr`, `--window`, `--seed`, `--resume`, `--out`, `-d`; generate via `lm generate --model … --prompt … --tokens …`. Ncurses tower (needs `libncurses-dev`): `lm tower train`, `lm tower inspect`; plain intel: `lm info --model …` (see [docs/training-control-tower.md](docs/training-control-tower.md)).
+Practical CLI knobs already: `--data`, `--epochs`, `--batch N|auto`, `--grad-accum K`, `--vram-frac F`, `--lr`, `--window`, `--seed`, `--resume`, `--out`, `-d`; generate via `./anni lm generate --model … --prompt … --tokens …`; chat via `./anni chat --model wiki_bpe.bin` (see [docs/lm-chat.md](docs/lm-chat.md)). Ncurses tower (needs `libncurses-dev`): `./anni lm tower train`, `./anni lm tower inspect`; plain intel: `./anni lm info --model …` (see [docs/training-control-tower.md](docs/training-control-tower.md)).
 
 ## Data
 
@@ -469,8 +486,8 @@ Byte LMs need **more raw text** than subword LMs for similar fluency. Prefer doc
 The project is written in C and aims to remain dependency-light.
 
     make          # CPU stub ./ann
-    make cuda     # CUDA ./ann (when nvcc available)
-    make autotrain   # planned: opinionated ./autotrain (see Autotrain section)
+    make cuda     # CUDA ./anni (+ ./ann symlink; when nvcc available)
+    make autotrain   # CUDA ./autotrain (requires nvcc); autotrain-cpu for stub
 
 ## Philosophy
 

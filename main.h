@@ -42,5 +42,7 @@
 #include "kv.h"
 #include "gpu.h"
 #include "tower.h"
+#include "chat_session.h"
+#include "chat_ui.h"
 
 #endif
