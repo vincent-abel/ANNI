@@ -77,5 +77,7 @@ int		text_stream_window(const text_stream *s);
 int		text_stream_stride(const text_stream *s);
 long		text_stream_count(const text_stream *s);	/* this epoch */
 long		text_stream_last_count(const text_stream *s);	/* previous epoch */
+/* Best-known windows/epoch: last_count after epoch 1, else size heuristic. */
+long		text_stream_est_count(const text_stream *s);
 
 #endif

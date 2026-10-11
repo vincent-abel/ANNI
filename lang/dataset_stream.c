@@ -758,6 +758,39 @@ long text_stream_last_count(const text_stream *s)
 	return s ? s->last_count : 0;
 }
 
+long text_stream_est_count(const text_stream *s)
+{
+	long bytes;
+	double tok_per_byte;
+	double tokens;
+	double frac;
+	long n;
+
+	if (!s)
+		return 0;
+	/* After one full epoch, last_count is exact for the same split. */
+	if (s->last_count > 0)
+		return s->last_count;
+	bytes = s->sp.file_size;
+	if (bytes <= 0)
+		return 0;
+	/* Byte ids ≈ 1 token/byte; BPE on English wiki is roughly ~0.25–0.35. */
+	tok_per_byte = s->tok ? 0.30 : 1.0;
+	tokens = (double)bytes * tok_per_byte;
+	frac = 1.0;
+	if (s->side == TEXT_SIDE_TRAIN && s->sp.val_frac > 0.0
+	    && s->sp.val_frac < 1.0)
+		frac = 1.0 - s->sp.val_frac;
+	else if (s->side == TEXT_SIDE_VAL && s->sp.val_frac > 0.0
+	    && s->sp.val_frac < 1.0)
+		frac = s->sp.val_frac;
+	tokens *= frac;
+	if (s->stride <= 0)
+		return 0;
+	n = (long)(tokens / (double)s->stride);
+	return n > 0 ? n : 1;
+}
+
 int text_stream_window(const text_stream *s)
 {
 	return s ? s->window : 0;

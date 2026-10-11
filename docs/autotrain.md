@@ -11,8 +11,9 @@ Reaching the README Target needs many flags (BPE, stream, val split, batch auto,
 ## How it works for a human
 
 ```text
-make autotrain          # or: make cuda-autotrain
+make autotrain          # CUDA binary (default; needs nvcc)
 ./autotrain --out wiki.bin [--data PATH] [--epochs N] [--sweep]
+# make autotrain-cpu && ./autotrain --cpu …   # stub only
 ```
 
 It prints a short plan (data size, B, T, lr, epochs, VRAM), trains with stream + `--batch auto` defaults, writes `OUT.autotrain.json`, then smoke-generates. With `--sweep`, it tries a few learning rates for one epoch each, keeps the best by val metric (E15/E16), then continues.
@@ -37,7 +38,7 @@ Phase 1 (AT1–AT6) maps environment \(\mathcal{E}\) (VRAM free, data path) to a
 
 | Id | Behavior |
 | --- | --- |
-| AT1 | `make autotrain` builds `./autotrain` |
+| AT1 | `make autotrain` builds CUDA `./autotrain` |
 | AT2 | BPE, stream, val-frac, batch auto, lr 0.001 |
 | AT3 | Missing `--data` → fetch wiki or exit offline |
 | AT4 | Vocab beside `--out`; resume when present |

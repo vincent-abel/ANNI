@@ -54,12 +54,12 @@ static void write_plan_json(const char *out, const char *data, int B, int T,
 	printf("wrote %s\n", path);
 }
 
-static int arg_has_sweep(int argc, char **argv)
+static int arg_has(int argc, char **argv, const char *key)
 {
 	int i;
 
 	for (i = 1; i < argc; i++)
-		if (strcmp(argv[i], "--sweep") == 0)
+		if (strcmp(argv[i], key) == 0)
 			return 1;
 	return 0;
 }
@@ -67,7 +67,8 @@ static int arg_has_sweep(int argc, char **argv)
 static void usage(const char *argv0)
 {
 	fprintf(stderr,
-	    "Usage: %s [--out PATH] [--data PATH] [--epochs N] [--sweep] [--help]\n",
+	    "Usage: %s [--out PATH] [--data PATH] [--epochs N] [--sweep] [--cpu] [--help]\n"
+	    "  CUDA train by default (build with: make autotrain). --cpu allows stub.\n",
 	    argv0);
 }
 
@@ -79,6 +80,7 @@ int main(int argc, char **argv)
 	int i;
 	int window;
 	int B;
+	int allow_cpu;
 	double lr;
 	size_t fr;
 	size_t tot;
@@ -92,10 +94,15 @@ int main(int argc, char **argv)
 	char smoke[256];
 	char vocab_path[640];
 
+	/* Line-buffer so plan/BPE lines show before the long train (not after). */
+	setvbuf(stdout, NULL, _IOLBF, 0);
+	setvbuf(stderr, NULL, _IOLBF, 0);
+
 	out = "model_auto.bin";
 	data = NULL;
 	epochs = 1;
 	lr = 0.001;
+	allow_cpu = 0;
 	window = LM_MAX_CTX < 64 ? LM_MAX_CTX : 64;
 	for (i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
@@ -108,9 +115,23 @@ int main(int argc, char **argv)
 			data = argv[++i];
 		else if (strcmp(argv[i], "--epochs") == 0 && i + 1 < argc)
 			epochs = atoi(argv[++i]);
+		else if (strcmp(argv[i], "--cpu") == 0)
+			allow_cpu = 1;
 	}
 	if (epochs < 1)
 		epochs = 1;
+
+	/* Target path is GPU-first; refuse silent CPU stub trains. */
+	if (!gpu_available() && !allow_cpu) {
+		fprintf(stderr,
+		    "autotrain: no CUDA device (backend=%s).\n"
+		    "  Rebuild: make autotrain   # links gpu_cuda\n"
+		    "  Or pass --cpu for a stub run (slow / not Target).\n",
+		    gpu_backend_name());
+		return 1;
+	}
+	if (!gpu_available() && allow_cpu)
+		fprintf(stderr, "autotrain: warning: --cpu stub train\n");
 
 	/* AT3: ensure data */
 	if (!data)
@@ -138,10 +159,11 @@ int main(int argc, char **argv)
 	printf("  data=%s out=%s\n", data, out);
 	printf("  tokenizer=bpe stream=1 val_frac=0.01 batch=auto window=%d lr=%g epochs=%d\n",
 	    window, lr, epochs);
+	printf("  backend=%s available=%d", gpu_backend_name(), gpu_available());
 	if (tot)
-		printf("  VRAM free %.0f / total %.0f MB backend=%s\n",
-		    (double)fr / 1048576.0, (double)tot / 1048576.0,
-		    gpu_backend_name());
+		printf(" VRAM free %.0f / total %.0f MB",
+		    (double)fr / 1048576.0, (double)tot / 1048576.0);
+	printf("\n");
 
 	/* AT4: resume if out exists */
 	model = NULL;
@@ -161,12 +183,15 @@ int main(int argc, char **argv)
 			tok = bpe_load(vocab_path);
 		if (!tok) {
 			printf("training BPE vocab on %s...\n", data);
+			fflush(stdout);
 			tok = bpe_train_from_file(data, 16384, 0);
 			if (!tok) {
 				fprintf(stderr, "autotrain: BPE train failed\n");
 				return 1;
 			}
 			(void)bpe_save(tok, vocab_path);
+			printf("BPE vocab ready → %s\n", vocab_path);
+			fflush(stdout);
 		}
 		model = lm_create_bpe(tok);
 		if (!model) {
@@ -197,8 +222,10 @@ int main(int argc, char **argv)
 	lm_train_set_vram_frac(0.85);
 	lm_train_set_varlen(1);	/* E8: keep short EOF windows */
 	write_plan_json(out, data, B, window, lr, epochs, fr, tot); /* E11/AT5 */
+	printf("training (CUDA packed stream; progress on stderr)…\n");
+	fflush(stdout);
 	/* AT7–AT9: optional short lr sweep; keep best via E15/E16 hooks. */
-	if (arg_has_sweep(argc, argv)) {
+	if (arg_has(argc, argv, "--sweep")) {
 		const double lrs[] = { 3e-4, 1e-3, 3e-3 };
 		double best = 1e300;
 		double cand;

@@ -236,16 +236,21 @@ static void dbg_progress(int ep, int epochs, int done, int total,
 	last_print = now;
 
 	width = 12;
-	if (nw <= 0)
-		nw = 1;
 	if (total <= 0)
 		total = 1;
 	if (epoch_done < 0)
 		epoch_done = 0;
-	if (epoch_done > nw)
-		epoch_done = nw;
-	ep_pct = 100.0 * (double)epoch_done / (double)nw;
-	filled = (int)((double)width * (double)epoch_done / (double)nw + 0.5);
+	/* nw<=0 means unknown stream total — do not fake N/N at 100%. */
+	if (nw > 0) {
+		if (epoch_done > nw)
+			epoch_done = nw;
+		ep_pct = 100.0 * (double)epoch_done / (double)nw;
+		filled = (int)((double)width * (double)epoch_done
+		    / (double)nw + 0.5);
+	} else {
+		ep_pct = -1.0;
+		filled = 0;
+	}
 	if (filled > width)
 		filled = width;
 	for (i = 0; i < width; i++)
@@ -257,7 +262,8 @@ static void dbg_progress(int ep, int epochs, int done, int total,
 	tok_sec = -1.0;
 	tflops = -1.0;
 	if (done > 0 && elapsed > 0.0) {
-		eta = elapsed * (double)(total - done) / (double)done;
+		if (nw > 0 && total >= done)
+			eta = elapsed * (double)(total - done) / (double)done;
 		if (tokens_done > 0) {
 			ms_tok = 1000.0 * elapsed / (double)tokens_done;
 			tok_sec = (double)tokens_done / elapsed;
@@ -269,9 +275,14 @@ static void dbg_progress(int ep, int epochs, int done, int total,
 		}
 	}
 	dbg_fmt_eta(eta_buf, sizeof(eta_buf), eta);
-	nline = snprintf(line, sizeof(line),
-	    "ep %d/%d [%s] %4.0f%% %d/%d",
-	    ep + 1, epochs, bar, ep_pct, epoch_done, nw);
+	if (nw > 0)
+		nline = snprintf(line, sizeof(line),
+		    "ep %d/%d [%s] %4.0f%% %d/%d",
+		    ep + 1, epochs, bar, ep_pct, epoch_done, nw);
+	else
+		nline = snprintf(line, sizeof(line),
+		    "ep %d/%d [%s]    ?%% %d/?",
+		    ep + 1, epochs, bar, epoch_done);
 	if (nline < 0)
 		nline = 0;
 	if (nll > 0.0 && (size_t)nline < sizeof(line))
@@ -551,13 +562,16 @@ static int resolve_batch(int batch_size, int T, int vocab, int max_b,
 	fr = 0;
 	tot = 0;
 	have = gpu_available() && gpu_mem_info(&fr, &tot) == 0;
+	/* max_b<=0 (stream path) means no window cap — use LM_BATCH_AUTO_MAX. */
+	if (max_b <= 0)
+		max_b = LM_BATCH_AUTO_MAX;
 	if (batch_size > 0)
 		B = batch_size;
 	else
 		B = lm_batch_auto(T, vocab, have ? fr : 0, g_vram_frac,
 		    max_b < LM_BATCH_AUTO_MAX ? max_b : LM_BATCH_AUTO_MAX,
 		    8);
-	if (max_b > 0 && B > max_b)
+	if (B > max_b)
 		B = max_b;
 	if (B < 1)
 		B = 1;
@@ -1080,6 +1094,9 @@ double lm_train_stream(lm *model, text_stream *train, lm_adam *opt,
 			if ((ep > 0 || text_stream_count(train) > 0)
 			    && text_stream_rewind(train) != 0)
 				goto fail;
+			/* Prefetch EOF flag must not carry across epochs. */
+			pk.next_bb = 0;
+			pk.next_done = 0;
 			steps = 0;
 			tokens = 0;
 			n0 = 0;
@@ -1089,7 +1106,13 @@ double lm_train_stream(lm *model, text_stream *train, lm_adam *opt,
 
 				tp.epoch = ep;
 				tp.epoch_done = (int)text_stream_count(train);
-				tp.nw = tp.epoch_done > 0 ? tp.epoch_done : 1;
+				{
+					long est = text_stream_est_count(train);
+
+					tp.nw = est > 0 ? (int)est : 0;
+					if (tp.nw > 0 && tp.epoch_done > tp.nw)
+						tp.nw = tp.epoch_done;
+				}
 				tp.done_steps = (int)steps;
 				tp.tokens_done = (int)tokens;
 				tp.nll = last;
@@ -1212,7 +1235,13 @@ double lm_train_stream(lm *model, text_stream *train, lm_adam *opt,
 				el = wall_sec() - t0;
 				tp.epoch = ep;
 				tp.epoch_done = (int)text_stream_count(train);
-				tp.nw = tp.epoch_done > 0 ? tp.epoch_done : 1;
+				{
+					long est = text_stream_est_count(train);
+
+					tp.nw = est > 0 ? (int)est : 0;
+					if (tp.nw > 0 && tp.epoch_done > tp.nw)
+						tp.nw = tp.epoch_done;
+				}
 				tp.done_steps = (int)steps;
 				tp.tokens_done = (int)tokens;
 				tp.lr = step_lr;
@@ -1224,12 +1253,25 @@ double lm_train_stream(lm *model, text_stream *train, lm_adam *opt,
 				tp.msg = NULL;
 				if (g_progress_fn) {
 					emit_progress(&tp);
-				} else if (debug && (steps % 200) == 0) {
-					snprintf(msg, sizeof(msg),
-					    "epoch %d/%d: %ld windows, %.2f ms/token",
-					    ep + 1, epochs, text_stream_count(train),
-					    tp.ms_tok > 0.0 ? tp.ms_tok : 0.0);
-					dbg_stamp(msg);
+				} else if (debug) {
+					/* Live \\r line (throttled); not every-200 stamps. */
+					int win_done = tp.epoch_done;
+					int win_total = tp.nw;
+					int step_total;
+
+					if (win_total > 0)
+						step_total = win_total
+						    / (batch_size > 0
+						    ? batch_size : 1);
+					else
+						step_total = 0;
+					if (step_total < 1 && win_total > 0)
+						step_total = 1;
+					fill_throughput(&tp, (int)tokens, el);
+					dbg_progress(ep, epochs, (int)steps,
+					    step_total > 0 ? step_total
+					    : (int)steps, win_done, win_total,
+					    last, win, t0, (int)tokens, 0);
 				}
 				if (g_train_ctl && g_train_ctl->quit_save) {
 					quit = 1;
@@ -1252,7 +1294,13 @@ double lm_train_stream(lm *model, text_stream *train, lm_adam *opt,
 			tp.tokens_done = (int)tokens;
 			tp.done_steps = (int)steps;
 			tp.epoch_done = (int)text_stream_count(train);
-			tp.nw = tp.epoch_done > 0 ? tp.epoch_done : 1;
+			{
+				long est = text_stream_est_count(train);
+
+				/* Prefer exact count just finished this epoch. */
+				tp.nw = tp.epoch_done > 0 ? tp.epoch_done
+				    : (est > 0 ? (int)est : 0);
+			}
 			tp.lr = train_step_lr(lr, opt->t);
 			tp.adam_t = opt->t;
 			tp.elapsed_sec = wall_sec() - t0;

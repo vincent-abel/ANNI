@@ -19,6 +19,7 @@ objects/
 
 #   Executable
 ann
+anni
 autotrain
 tests/test_ann
 gui/ann-gui
