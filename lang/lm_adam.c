@@ -107,6 +107,8 @@ lm_adam *lm_adam_create(lm *model)
 	opt->beta1 = 0.9;
 	opt->beta2 = 0.999;
 	opt->eps = 1e-8;
+	opt->weight_decay = 0.0;
+	opt->grad_clip = 0.0;
 	i = 0;
 	add_mat(opt, &i, model->w_head, model->dw_head, 0);
 	add_vec(opt, &i, model->b_head, model->db_head);
@@ -357,6 +359,20 @@ void lm_adam_step_scaled(lm_adam *opt, double lr, double grad_scale)
 	}
 	bc1 = 1.0 - pow(opt->beta1, (double)opt->t);
 	bc2 = 1.0 - pow(opt->beta2, (double)opt->t);
+	if (opt->grad_clip > 0.0) {
+		double norm = 0.0;
+		double s;
+
+		for (i = 0; i < opt->n; i++) {
+			g = *opt->slots[i].grad * grad_scale;
+			norm += g * g;
+		}
+		norm = sqrt(norm);
+		if (norm > opt->grad_clip) {
+			s = opt->grad_clip / (norm + 1e-12);
+			grad_scale *= s;
+		}
+	}
 	for (i = 0; i < opt->n; i++) {
 		g = *opt->slots[i].grad * grad_scale;
 		opt->slots[i].m = opt->beta1 * opt->slots[i].m + (1.0 - opt->beta1) * g;
@@ -364,6 +380,9 @@ void lm_adam_step_scaled(lm_adam *opt, double lr, double grad_scale)
 		mhat = opt->slots[i].m / bc1;
 		vhat = opt->slots[i].v / bc2;
 		*opt->slots[i].param -= lr * mhat / (sqrt(vhat) + opt->eps);
+		if (opt->weight_decay > 0.0)
+			*opt->slots[i].param -= lr * opt->weight_decay
+			    * *opt->slots[i].param;
 		*opt->slots[i].grad = 0.0f;
 	}
 	/* Host wrote weights and zeroed grads: device twins are stale. */

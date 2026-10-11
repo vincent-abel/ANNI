@@ -93,6 +93,8 @@
 - [GPU embed lookup (R2)](gpu-embed-lookup.md)
 - [Packed activation arena (E4)](packed-activation-arena.md)
 - [Pinned host staging (E5)](pinned-host-staging.md)
+- [LR schedule, clip, weight decay (E2)](lr-schedule-clip-wd.md)
+- [Tokens per step (E9)](tokens-per-step.md)
 
 ### From toy LM → small LLM
 

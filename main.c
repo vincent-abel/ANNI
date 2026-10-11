@@ -197,6 +197,19 @@ static int run_lm_train_core(int argc, char **argv, int use_tower)
 		vram_frac = 0.85;
 	lm_train_set_grad_accum(grad_accum);
 	lm_train_set_vram_frac(vram_frac);
+	{
+		int warm = atoi(arg_value(argc, argv, "--lr-warmup", "0"));
+		int decay = atoi(arg_value(argc, argv, "--lr-decay-steps", "0"));
+		const char *dk = arg_value(argc, argv, "--lr-decay", "none");
+		double clip = atof(arg_value(argc, argv, "--grad-clip", "0"));
+		double wd = atof(arg_value(argc, argv, "--weight-decay", "0"));
+		int tps = atoi(arg_value(argc, argv, "--tokens-per-step", "0"));
+
+		lm_train_set_lr_schedule(warm, decay, dk);
+		lm_train_set_grad_clip(clip);
+		lm_train_set_weight_decay(wd);
+		lm_train_set_tokens_per_step(tps);
+	}
 	if (lr <= 0.0)
 		lr = 0.001;
 	if (window < 2)

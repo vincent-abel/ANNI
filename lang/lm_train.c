@@ -1,6 +1,7 @@
 /*
 **	Mini-batch corpus training for the LM
 */
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -39,6 +40,14 @@ static void fill_throughput(train_progress *tp, int tokens_done, double elapsed)
 static train_progress_fn g_progress_fn;
 static void *g_progress_ud;
 static train_control *g_train_ctl;
+static int g_warmup_steps;
+static int g_decay_steps;
+static char g_decay_kind[16] = "none";
+static double g_grad_clip;
+static double g_weight_decay;
+static int g_tokens_per_step;
+static int g_grad_accum = 1;
+static double g_vram_frac = 0.85;
 
 void lm_train_set_progress(train_progress_fn fn, void *userdata)
 {
@@ -51,11 +60,29 @@ void lm_train_set_control(train_control *ctl)
 	g_train_ctl = ctl;
 }
 
-static double train_step_lr(double lr)
+static double train_step_lr(double base_lr, int step)
 {
+	double lr;
+	double p;
+	int t;
+
 	if (g_train_ctl && g_train_ctl->lr > 0.0)
 		return g_train_ctl->lr;
-	return lr;
+	lr = base_lr;
+	if (g_warmup_steps > 0 && step < g_warmup_steps)
+		return lr * ((double)step + 1.0) / (double)g_warmup_steps;
+	if (g_decay_steps <= 0 || strcmp(g_decay_kind, "none") == 0)
+		return lr;
+	t = step - g_warmup_steps;
+	if (t < 0)
+		t = 0;
+	if (t > g_decay_steps)
+		t = g_decay_steps;
+	p = (double)t / (double)g_decay_steps;
+	if (strcmp(g_decay_kind, "linear") == 0)
+		return lr * (1.0 - p);
+	/* cosine */
+	return lr * 0.5 * (1.0 + cos(3.14159265358979323846 * p));
 }
 
 static void emit_progress(const train_progress *p)
@@ -86,7 +113,7 @@ static int train_poll_control(train_progress *p)
 	while (g_train_ctl->pause && !g_train_ctl->quit_save) {
 		if (p) {
 			p->event = TRAIN_EV_STEP;
-			p->lr = train_step_lr(p->lr);
+			p->lr = train_step_lr(p->lr, p->adam_t);
 			emit_progress(p);
 		}
 		train_sleep_ms(50);
@@ -278,9 +305,6 @@ static void dbg_progress(int ep, int epochs, int done, int total,
 
 /* ---- Token-parallel packing -------------------------------------------- */
 
-static int g_grad_accum = 1;
-static double g_vram_frac = 0.85;
-
 void lm_train_set_grad_accum(int k)
 {
 	g_grad_accum = k < 1 ? 1 : k;
@@ -289,6 +313,43 @@ void lm_train_set_grad_accum(int k)
 void lm_train_set_vram_frac(double f)
 {
 	g_vram_frac = (f > 0.0 && f <= 1.0) ? f : 0.85;
+}
+
+void lm_train_set_lr_schedule(int warmup_steps, int decay_steps, const char *kind)
+{
+	g_warmup_steps = warmup_steps < 0 ? 0 : warmup_steps;
+	g_decay_steps = decay_steps < 0 ? 0 : decay_steps;
+	if (!kind)
+		kind = "none";
+	strncpy(g_decay_kind, kind, sizeof(g_decay_kind) - 1);
+	g_decay_kind[sizeof(g_decay_kind) - 1] = '\0';
+}
+
+void lm_train_set_grad_clip(double max_norm)
+{
+	g_grad_clip = max_norm > 0.0 ? max_norm : 0.0;
+}
+
+void lm_train_set_weight_decay(double wd)
+{
+	g_weight_decay = wd > 0.0 ? wd : 0.0;
+}
+
+void lm_train_set_tokens_per_step(int n)
+{
+	g_tokens_per_step = n < 0 ? 0 : n;
+}
+
+static void apply_tokens_per_step(int B, int T)
+{
+	int tok;
+
+	if (g_tokens_per_step <= 0 || B <= 0 || T <= 0)
+		return;
+	tok = B * T;
+	g_grad_accum = (g_tokens_per_step + tok - 1) / tok;
+	if (g_grad_accum < 1)
+		g_grad_accum = 1;
 }
 
 /*
@@ -524,6 +585,7 @@ double lm_train_corpus_val(lm *model, text_dataset *ds, lm_adam *opt,
 	/* batch_size <= 0: auto (see resolve_batch). */
 	batch_size = resolve_batch(batch_size, ds->window, model->vocab_size,
 	    nw, debug);
+	apply_tokens_per_step(batch_size, ds->window);
 	order = malloc((size_t)nw * sizeof(int));
 	if (!order || pack_ctx_init(&pk, &batch_size, ds->window, debug) != 0) {
 		free(order);
@@ -603,7 +665,7 @@ double lm_train_corpus_val(lm *model, text_dataset *ds, lm_adam *opt,
 				tp.nll = last;
 				tp.win_nll = win;
 				tp.val_nll = val ? win : -1.0;
-				tp.lr = train_step_lr(lr);
+				tp.lr = train_step_lr(lr, opt->t);
 				tp.adam_t = opt->t;
 				elapsed = wall_sec() - t0;
 				tp.elapsed_sec = elapsed;
@@ -680,7 +742,9 @@ double lm_train_corpus_val(lm *model, text_dataset *ds, lm_adam *opt,
 				** A1: Adam gathers device-authoritative dW D2D and
 				** leaves weights device-authoritative.
 				*/
-				step_lr = train_step_lr(lr);
+				step_lr = train_step_lr(lr, opt->t);
+				opt->weight_decay = g_weight_decay;
+				opt->grad_clip = g_grad_clip;
 				lm_adam_step_scaled(opt, step_lr, 1.0 / (double)b);
 				elapsed = wall_sec() - t0;
 				tp.epoch = ep;
@@ -749,7 +813,7 @@ double lm_train_corpus_val(lm *model, text_dataset *ds, lm_adam *opt,
 			tp.nll = last;
 			tp.win_nll = win;
 			tp.val_nll = val ? win : -1.0;
-			tp.lr = train_step_lr(lr);
+			tp.lr = train_step_lr(lr, opt->t);
 			tp.adam_t = opt->t;
 			tp.elapsed_sec = wall_sec() - t0;
 			tp.ms_tok = (tokens_done > 0 && tp.elapsed_sec > 0.0)
@@ -793,7 +857,7 @@ double lm_train_corpus_val(lm *model, text_dataset *ds, lm_adam *opt,
 		tp.tokens_done = tokens_done;
 		tp.nll = last;
 		tp.win_nll = win;
-		tp.lr = train_step_lr(lr);
+		tp.lr = train_step_lr(lr, opt->t);
 		tp.batch = batch_size;
 		tp.grad_accum = g_grad_accum;
 		tp.ckpt_path = ckpt_path;
@@ -868,6 +932,7 @@ double lm_train_stream(lm *model, text_stream *train, lm_adam *opt,
 	T = text_stream_window(train);
 	/* batch_size <= 0: auto (see resolve_batch). */
 	batch_size = resolve_batch(batch_size, T, model->vocab_size, 0, debug);
+	apply_tokens_per_step(batch_size, T);
 	if (pack_ctx_init(&pk, &batch_size, T, debug) != 0)
 		return -1.0;
 	mat_try_pin(model->dw_head);
@@ -917,7 +982,7 @@ double lm_train_stream(lm *model, text_stream *train, lm_adam *opt,
 				tp.nll = last;
 				tp.win_nll = win;
 				tp.val_nll = val ? win : -1.0;
-				tp.lr = train_step_lr(lr);
+				tp.lr = train_step_lr(lr, opt->t);
 				tp.adam_t = opt->t;
 				el = wall_sec() - t0;
 				tp.elapsed_sec = el;
@@ -970,7 +1035,9 @@ double lm_train_stream(lm *model, text_stream *train, lm_adam *opt,
 					goto fail;
 				if (b <= 0)
 					break;
-				step_lr = train_step_lr(lr);
+				step_lr = train_step_lr(lr, opt->t);
+				opt->weight_decay = g_weight_decay;
+				opt->grad_clip = g_grad_clip;
 				lm_adam_step_scaled(opt, step_lr, 1.0 / (double)b);
 				steps++;
 				el = wall_sec() - t0;
@@ -1017,7 +1084,7 @@ double lm_train_stream(lm *model, text_stream *train, lm_adam *opt,
 			tp.done_steps = (int)steps;
 			tp.epoch_done = (int)text_stream_count(train);
 			tp.nw = tp.epoch_done > 0 ? tp.epoch_done : 1;
-			tp.lr = train_step_lr(lr);
+			tp.lr = train_step_lr(lr, opt->t);
 			tp.adam_t = opt->t;
 			tp.elapsed_sec = wall_sec() - t0;
 			tp.ms_tok = tokens > 0 && tp.elapsed_sec > 0.0

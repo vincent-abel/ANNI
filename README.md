@@ -230,14 +230,14 @@ Observed headroom on a 16 GB card at current toy scale (`D=256`, `LM_BATCH_AUT
 Broader throughput and wall-time wins beyond the GPU residency / pack / R-stack. Cross-links: LR schedule here is **E2** (Capacity bullet points here); activation checkpointing is **R9**; mixed precision is **R10**.
 
 - [x] **E1** Default `--lr` safe for FP32 D≥256 (`0.001`); see [docs/safe-default-lr.md](docs/safe-default-lr.md)
-- [ ] **E2** LR warmup + cosine/linear decay CLI; optional grad clip / weight decay
+- [x] **E2** LR warmup + cosine/linear decay CLI; optional grad clip / weight decay; see [docs/lr-schedule-clip-wd.md](docs/lr-schedule-clip-wd.md)
 - [ ] **E3** Prefetch next microbatch (CPU tokenize/pack while GPU trains current step)
 - [x] **E4** Persistent packed activation arena (one alloc per steady `B,T`); see [docs/packed-activation-arena.md](docs/packed-activation-arena.md)
 - [x] **E5** Pin host staging buffers (`cudaHostAlloc`) for pack ids; see [docs/pinned-host-staging.md](docs/pinned-host-staging.md)
 - [ ] **E6** Multi-stream / multi-event dependency graph (beyond single BATCH sync)
 - [ ] **E7** cuDNN or hand-fused LN + softmax where beneficial after R1
 - [ ] **E8** Variable-length sequence packing with attention mask (less pad waste → more real tokens/sec)
-- [ ] **E9** Gradient accumulation by **token budget** (`--tokens-per-step`) not only `--grad-accum` step count
+- [x] **E9** Gradient accumulation by **token budget** (`--tokens-per-step`); see [docs/tokens-per-step.md](docs/tokens-per-step.md)
 - [x] **E10** Throughput dashboard: tokens/sec, TFLOP/s estimate, VRAM used (`-d` / tower); see [docs/throughput-dashboard.md](docs/throughput-dashboard.md)
 - [ ] **E11** Deterministic seed path + repro JSON of CLI flags written next to the checkpoint
 - [ ] **E12** Compile profile docs: `-O3`, LTO, `ARCH=…`; clear `make` (CPU stub) vs `make cuda`

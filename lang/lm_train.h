@@ -20,6 +20,13 @@
 #define LM_BATCH_AUTO_MAX	1024	/* R3: fill most of free VRAM on 16GB+ cards */
 void	lm_train_set_grad_accum(int k);		/* default 1 */
 void	lm_train_set_vram_frac(double f);	/* default 0.85 */
+/* E2: warmup steps, then cosine|linear|none over decay_steps (0 = flat). */
+void	lm_train_set_lr_schedule(int warmup_steps, int decay_steps,
+		const char *kind);
+void	lm_train_set_grad_clip(double max_norm);	/* 0 = off */
+void	lm_train_set_weight_decay(double wd);		/* AdamW-style; 0 = off */
+/* E9: if >0, derive grad_accum from B*T so each Adam ≈ this many tokens. */
+void	lm_train_set_tokens_per_step(int n);
 
 /*
 ** ckpt_path NULL = no mid-train saves. Otherwise overwrite that path after each
