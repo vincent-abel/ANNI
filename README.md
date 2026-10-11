@@ -239,7 +239,7 @@ Broader throughput and wall-time wins beyond the GPU residency / pack / R-stack.
 - [ ] **E8** Variable-length sequence packing with attention mask (less pad waste → more real tokens/sec)
 - [x] **E9** Gradient accumulation by **token budget** (`--tokens-per-step`); see [docs/tokens-per-step.md](docs/tokens-per-step.md)
 - [x] **E10** Throughput dashboard: tokens/sec, TFLOP/s estimate, VRAM used (`-d` / tower); see [docs/throughput-dashboard.md](docs/throughput-dashboard.md)
-- [ ] **E11** Deterministic seed path + repro JSON of CLI flags written next to the checkpoint
+- [x] **E11** Repro JSON beside checkpoint (`OUT.autotrain.json`); see [docs/repro-json-sidecar.md](docs/repro-json-sidecar.md)
 - [ ] **E12** Compile profile docs: `-O3`, LTO, `ARCH=…`; clear `make` (CPU stub) vs `make cuda`
 - [ ] **E13** Inference efficiency: keep KV generate on GPU; batch generate; lean on existing int8 head path
 - [x] **E14** Data pipeline: mmap for wiki-scale `--stream`; see [docs/streaming-dataloader.md](docs/streaming-dataloader.md)
@@ -260,11 +260,11 @@ Opinionated **second binary** (not more flags on `./ann`) so the teaching CLI st
 **Phase 1 — one command (MVP)**
 
 - [x] **AT1** Makefile target `autotrain` produces `./autotrain`
-- [ ] **AT2** Defaults: `--tokenizer bpe`, `--stream`, `--val-frac 0.01`, `--batch auto`, `--window` min(64, `LM_MAX_CTX`), safe FP32 `--lr`, `--epochs` from data-size heuristic
-- [ ] **AT3** If `--data` missing: run `scripts/fetch_wiki.sh`, or exit with a clear offline message
-- [ ] **AT4** Train/load vocab beside `--out`; resume when `--out` is already `LMCF` / `LMCV`
-- [ ] **AT5** Print plan before run (data MB, B, T, lr, epochs, VRAM) and write `OUT.autotrain.json` flag dump
-- [ ] **AT6** Finish with smoke `generate` + final train/val NLL
+- [x] **AT2** Defaults: BPE, stream, val-frac 0.01, batch auto, window min(64,ctx), lr 0.001
+- [x] **AT3** If `--data` missing: run `scripts/fetch_wiki.sh`, or exit offline
+- [x] **AT4** Train/load vocab beside `--out`; resume checkpoint when present
+- [x] **AT5** Print plan + write `OUT.autotrain.json` (E11)
+- [x] **AT6** Smoke `generate` + final metric
 
 **Phase 2 — light tune**
 

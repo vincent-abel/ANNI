@@ -26,7 +26,7 @@ Phase 1 maps environment \(\mathcal{E}\) (VRAM free, data path) to a config \(c 
 
 ## How it shows up in this repo
 
-- [`autotrain.c`](../autotrain.c), `make autotrain` / `make cuda-autotrain` in the Makefile (**AT1** done: probes GPU/VRAM and prints the plan stub)
+- [`autotrain.c`](../autotrain.c), `make autotrain` / `make cuda-autotrain` — **AT1–AT6 MVP** (BPE stream train, resume, plan JSON, smoke generate)
 - Roadmap checklist: **AT1–AT9** in [`../README.md`](../README.md) under **Autotrain**
 - Reuses train/pack APIs in [`lang/lm_train.h`](../lang/lm_train.h), BPE in [`lang/bpe.h`](../lang/bpe.h), fetch in [`scripts/fetch_wiki.sh`](../scripts/fetch_wiki.sh)
 

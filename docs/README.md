@@ -97,6 +97,7 @@
 - [Tokens per step (E9)](tokens-per-step.md)
 - [Microbatch prefetch (E3)](microbatch-prefetch.md)
 - [Streaming dataloader (E14 mmap)](streaming-dataloader.md)
+- [Repro JSON sidecar (E11)](repro-json-sidecar.md)
 
 ### From toy LM → small LLM
 
