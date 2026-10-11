@@ -88,6 +88,7 @@
 - [nvidia-smi / train util proof](gpu-train-util-proof.md)
 - [GPU activation residency (R1)](gpu-activation-residency.md)
 - [Huge batch / VRAM fill (R3–R4)](huge-batch-vram.md)
+- [Safe default learning rate (E1)](safe-default-lr.md)
 
 ### From toy LM → small LLM
 

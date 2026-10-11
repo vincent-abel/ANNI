@@ -229,7 +229,7 @@ Observed headroom on a 16 GB card at current toy scale (`D=256`, `LM_BATCH_AUT
 
 Broader throughput and wall-time wins beyond the GPU residency / pack / R-stack. Cross-links: LR schedule here is **E2** (Capacity bullet points here); activation checkpointing is **R9**; mixed precision is **R10**.
 
-- [ ] **E1** Default `--lr` safe for FP32 D≥256 (stop teaching-default `0.01` blowing up runs); document schedule-friendly peaks
+- [x] **E1** Default `--lr` safe for FP32 D≥256 (`0.001`); see [docs/safe-default-lr.md](docs/safe-default-lr.md)
 - [ ] **E2** LR warmup + cosine/linear decay CLI; optional grad clip / weight decay
 - [ ] **E3** Prefetch next microbatch (CPU tokenize/pack while GPU trains current step)
 - [ ] **E4** Persistent packed activation arena (one alloc per steady `B,T`; no realloc each step)
