@@ -95,6 +95,8 @@
 - [Pinned host staging (E5)](pinned-host-staging.md)
 - [LR schedule, clip, weight decay (E2)](lr-schedule-clip-wd.md)
 - [Tokens per step (E9)](tokens-per-step.md)
+- [Microbatch prefetch (E3)](microbatch-prefetch.md)
+- [Streaming dataloader (E14 mmap)](streaming-dataloader.md)
 
 ### From toy LM → small LLM
 

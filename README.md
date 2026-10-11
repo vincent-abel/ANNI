@@ -231,7 +231,7 @@ Broader throughput and wall-time wins beyond the GPU residency / pack / R-stack.
 
 - [x] **E1** Default `--lr` safe for FP32 D≥256 (`0.001`); see [docs/safe-default-lr.md](docs/safe-default-lr.md)
 - [x] **E2** LR warmup + cosine/linear decay CLI; optional grad clip / weight decay; see [docs/lr-schedule-clip-wd.md](docs/lr-schedule-clip-wd.md)
-- [ ] **E3** Prefetch next microbatch (CPU tokenize/pack while GPU trains current step)
+- [x] **E3** Prefetch next microbatch ids while BATCH GPU drains; see [docs/microbatch-prefetch.md](docs/microbatch-prefetch.md)
 - [x] **E4** Persistent packed activation arena (one alloc per steady `B,T`); see [docs/packed-activation-arena.md](docs/packed-activation-arena.md)
 - [x] **E5** Pin host staging buffers (`cudaHostAlloc`) for pack ids; see [docs/pinned-host-staging.md](docs/pinned-host-staging.md)
 - [ ] **E6** Multi-stream / multi-event dependency graph (beyond single BATCH sync)
@@ -242,7 +242,7 @@ Broader throughput and wall-time wins beyond the GPU residency / pack / R-stack.
 - [ ] **E11** Deterministic seed path + repro JSON of CLI flags written next to the checkpoint
 - [ ] **E12** Compile profile docs: `-O3`, LTO, `ARCH=…`; clear `make` (CPU stub) vs `make cuda`
 - [ ] **E13** Inference efficiency: keep KV generate on GPU; batch generate; lean on existing int8 head path
-- [ ] **E14** Data pipeline: mmap / parallel read for wiki-scale `--stream`
+- [x] **E14** Data pipeline: mmap for wiki-scale `--stream`; see [docs/streaming-dataloader.md](docs/streaming-dataloader.md)
 - [ ] **E15** Early-stop on val NLL plateau (saves wall time; used by Autotrain phase 2)
 - [ ] **E16** **Diverge ditch:** if train or val NLL rises sharply vs the best so far (e.g. +threshold or non-finite), abort the run/config, restore the last good checkpoint, and skip remaining epochs (catches LR blow-ups like the old `0.01` D=256 case)
 

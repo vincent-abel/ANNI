@@ -367,7 +367,10 @@ typedef struct	pack_ctx {
 	int		Bmax;
 	int		T;
 	int		*ids;		/* Bmax * T (E4 steady arena) */
+	int		*ids_next;	/* E3: prefetch buffer */
 	int		ids_pinned;	/* E5: cudaHostAlloc */
+	int		next_bb;	/* E3: windows waiting in ids_next */
+	int		next_done;	/* E3: stream exhausted while prefetching */
 	pack_slot	slot[2];	/* [0] = Bmax, [1] = tail */
 } pack_ctx;
 
@@ -388,8 +391,17 @@ static void pack_ctx_free(pack_ctx *p)
 		else
 			free(p->ids);
 	}
+	if (p->ids_next) {
+		if (p->ids_pinned)
+			gpu_host_free(p->ids_next);
+		else
+			free(p->ids_next);
+	}
 	p->ids = NULL;
+	p->ids_next = NULL;
 	p->ids_pinned = 0;
+	p->next_bb = 0;
+	p->next_done = 0;
 	pack_slot_free(&p->slot[0]);
 	pack_slot_free(&p->slot[1]);
 }
@@ -423,7 +435,12 @@ static int pack_ctx_init_once(pack_ctx *p, int Bmax, int T)
 		p->ids_pinned = 1;
 	else
 		p->ids = malloc(nbytes);
-	if (!p->ids || pack_slot_get(&p->slot[0], Bmax, T) != 0) {
+	if (p->ids_pinned)
+		p->ids_next = (int *)gpu_host_alloc(nbytes);
+	else
+		p->ids_next = malloc(nbytes);
+	if (!p->ids || !p->ids_next
+	    || pack_slot_get(&p->slot[0], Bmax, T) != 0) {
 		pack_ctx_free(p);
 		return -1;
 	}
@@ -1000,22 +1017,35 @@ double lm_train_stream(lm *model, text_stream *train, lm_adam *opt,
 				b = 0;
 				ok = 1;
 				for (k = 0; k < g_grad_accum && !done && ok; k++) {
-					bb = 0;
-					while (bb < batch_size) {
-						r = text_stream_next(train,
-						    &pk.ids[bb * T], &n);
-						if (r < 0)
-							ok = 0;
-						if (r != 1 || n != T) {
+					/* E3: use prefetched ids_next when ready. */
+					if (pk.next_bb > 0) {
+						int *swap = pk.ids;
+
+						pk.ids = pk.ids_next;
+						pk.ids_next = swap;
+						bb = pk.next_bb;
+						if (pk.next_done)
 							done = 1;
-							break;
+						pk.next_bb = 0;
+					} else {
+						bb = 0;
+						while (bb < batch_size) {
+							r = text_stream_next(train,
+							    &pk.ids[bb * T], &n);
+							if (r < 0)
+								ok = 0;
+							if (r != 1 || n != T) {
+								done = 1;
+								break;
+							}
+							if (n0 == 0) {
+								memcpy(ids0,
+								    &pk.ids[bb * T],
+								    (size_t)n * sizeof(int));
+								n0 = n;
+							}
+							bb++;
 						}
-						if (n0 == 0) {
-							memcpy(ids0, &pk.ids[bb * T],
-							    (size_t)n * sizeof(int));
-							n0 = n;
-						}
-						bb++;
 					}
 					if (!ok)
 						break;
@@ -1023,6 +1053,30 @@ double lm_train_stream(lm *model, text_stream *train, lm_adam *opt,
 						ok = 0;
 						done = 1;
 						break;
+					}
+					/*
+					** E3: after GPU pack_run returns (BATCH may still
+					** be draining), fill the next ids buffer on CPU
+					** before the forced device sync below.
+					*/
+					if (!done && ok && pk.ids_next) {
+						int nb = 0;
+						int nn;
+
+						pk.next_bb = 0;
+						while (nb < batch_size) {
+							r = text_stream_next(train,
+							    &pk.ids_next[nb * T],
+							    &nn);
+							if (r < 0)
+								ok = 0;
+							if (r != 1 || nn != T) {
+								pk.next_done = 1;
+								break;
+							}
+							nb++;
+						}
+						pk.next_bb = nb;
 					}
 					b += bb;
 					tokens += (long)bb * T;
