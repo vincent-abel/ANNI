@@ -33,6 +33,8 @@ void	lm_train_set_early_stop(int patience);
 void	lm_train_set_diverge_delta(double delta);
 /* R9: request activation checkpointing when implemented (currently advisory). */
 void	lm_train_set_act_checkpoint(int on);
+/* E8: emit/pad short EOF windows and mask pad positions in CE (+ fused attn). */
+void	lm_train_set_varlen(int on);
 
 /*
 ** ckpt_path NULL = no mid-train saves. Otherwise overwrite that path after each

@@ -195,6 +195,7 @@ int main(int argc, char **argv)
 	}
 
 	lm_train_set_vram_frac(0.85);
+	lm_train_set_varlen(1);	/* E8: keep short EOF windows */
 	write_plan_json(out, data, B, window, lr, epochs, fr, tot); /* E11/AT5 */
 	/* AT7–AT9: optional short lr sweep; keep best via E15/E16 hooks. */
 	if (arg_has_sweep(argc, argv)) {

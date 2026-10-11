@@ -51,6 +51,7 @@ static double g_vram_frac = 0.85;
 static int g_early_stop_patience;
 static double g_diverge_delta;
 static int g_act_checkpoint;
+static int g_varlen;
 
 void lm_train_set_progress(train_progress_fn fn, void *userdata)
 {
@@ -359,6 +360,11 @@ void lm_train_set_act_checkpoint(int on)
 	(void)g_act_checkpoint;	/* R9: wired for callers; recompute path TBD */
 }
 
+void lm_train_set_varlen(int on)
+{
+	g_varlen = on ? 1 : 0;
+}
+
 static void apply_tokens_per_step(int B, int T)
 {
 	int tok;
@@ -387,6 +393,8 @@ typedef struct	pack_ctx {
 	int		T;
 	int		*ids;		/* Bmax * T (E4 steady arena) */
 	int		*ids_next;	/* E3: prefetch buffer */
+	int		*lens;		/* E8: real length per sequence */
+	int		*lens_next;
 	int		ids_pinned;	/* E5: cudaHostAlloc */
 	int		next_bb;	/* E3: windows waiting in ids_next */
 	int		next_done;	/* E3: stream exhausted while prefetching */
@@ -416,8 +424,12 @@ static void pack_ctx_free(pack_ctx *p)
 		else
 			free(p->ids_next);
 	}
+	free(p->lens);
+	free(p->lens_next);
 	p->ids = NULL;
 	p->ids_next = NULL;
+	p->lens = NULL;
+	p->lens_next = NULL;
 	p->ids_pinned = 0;
 	p->next_bb = 0;
 	p->next_done = 0;
@@ -458,7 +470,9 @@ static int pack_ctx_init_once(pack_ctx *p, int Bmax, int T)
 		p->ids_next = (int *)gpu_host_alloc(nbytes);
 	else
 		p->ids_next = malloc(nbytes);
-	if (!p->ids || !p->ids_next
+	p->lens = malloc((size_t)Bmax * sizeof(int));
+	p->lens_next = malloc((size_t)Bmax * sizeof(int));
+	if (!p->ids || !p->ids_next || !p->lens || !p->lens_next
 	    || pack_slot_get(&p->slot[0], Bmax, T) != 0) {
 		pack_ctx_free(p);
 		return -1;
@@ -488,14 +502,36 @@ static int pack_ctx_init(pack_ctx *p, int *Bmax, int T, int debug)
 static int pack_run(lm *model, pack_ctx *p, int b)
 {
 	pack_slot *s;
+	const int *lens;
+	int i;
+	int need_lens;
 
 	s = (b == p->Bmax) ? &p->slot[0] : &p->slot[1];
 	if (pack_slot_get(s, b, p->T) != 0)
 		return -1;
-	if (lm_forward_cache_packed(model, p->ids, b, p->T, s->c) != 0)
+	need_lens = 0;
+	lens = NULL;
+	if (g_varlen && p->lens) {
+		for (i = 0; i < b; i++) {
+			if (p->lens[i] < p->T) {
+				need_lens = 1;
+				break;
+			}
+		}
+		if (need_lens)
+			lens = p->lens;
+	}
+	gpu_attn_set_seqlens(lens);
+	if (lm_forward_cache_packed(model, p->ids, b, p->T, s->c) != 0) {
+		gpu_attn_set_seqlens(NULL);
 		return -1;
-	if (lm_loss_backward_packed(model, s->c, p->ids, b, p->T, s->dh) != 0)
+	}
+	if (lm_loss_backward_packed_lens(model, s->c, p->ids, b, p->T, lens,
+	    s->dh) != 0) {
+		gpu_attn_set_seqlens(NULL);
 		return -1;
+	}
+	gpu_attn_set_seqlens(NULL);
 	return lm_backward_packed(model, s->dh, s->c);
 }
 
@@ -1005,6 +1041,11 @@ double lm_train_stream(lm *model, text_stream *train, lm_adam *opt,
 	/* batch_size <= 0: auto (see resolve_batch). */
 	batch_size = resolve_batch(batch_size, T, model->vocab_size, 0, debug);
 	apply_tokens_per_step(batch_size, T);
+	if (g_varlen) {
+		text_stream_set_varlen(train, 1);
+		if (val)
+			text_stream_set_varlen(val, 1);
+	}
 	if (pack_ctx_init(&pk, &batch_size, T, debug) != 0)
 		return -1.0;
 	mat_try_pin(model->dw_head);
@@ -1075,9 +1116,12 @@ double lm_train_stream(lm *model, text_stream *train, lm_adam *opt,
 					/* E3: use prefetched ids_next when ready. */
 					if (pk.next_bb > 0) {
 						int *swap = pk.ids;
+						int *swap_l = pk.lens;
 
 						pk.ids = pk.ids_next;
 						pk.ids_next = swap;
+						pk.lens = pk.lens_next;
+						pk.lens_next = swap_l;
 						bb = pk.next_bb;
 						if (pk.next_done)
 							done = 1;
@@ -1089,10 +1133,16 @@ double lm_train_stream(lm *model, text_stream *train, lm_adam *opt,
 							    &pk.ids[bb * T], &n);
 							if (r < 0)
 								ok = 0;
-							if (r != 1 || n != T) {
+							if (r != 1) {
 								done = 1;
 								break;
 							}
+							if (n < 2 || (!g_varlen
+							    && n != T)) {
+								done = 1;
+								break;
+							}
+							pk.lens[bb] = n;
 							if (n0 == 0) {
 								memcpy(ids0,
 								    &pk.ids[bb * T],
@@ -1125,16 +1175,26 @@ double lm_train_stream(lm *model, text_stream *train, lm_adam *opt,
 							    &nn);
 							if (r < 0)
 								ok = 0;
-							if (r != 1 || nn != T) {
+							if (r != 1 || nn < 2
+							    || (!g_varlen
+							    && nn != T)) {
 								pk.next_done = 1;
 								break;
 							}
+							pk.lens_next[nb] = nn;
 							nb++;
 						}
 						pk.next_bb = nb;
 					}
 					b += bb;
-					tokens += (long)bb * T;
+					if (g_varlen) {
+						int ti;
+
+						for (ti = 0; ti < bb; ti++)
+							tokens += pk.lens[ti];
+					} else {
+						tokens += (long)bb * T;
+					}
 				}
 				/* G3: single sync per microbatch. */
 				if (gpu_available())

@@ -66,7 +66,10 @@ text_stream	*text_stream_open(const char *path, int window, const bpe *tok,
 			const text_split *sp, int side, int stride,
 			int shuffle_buf, unsigned int seed);
 void		text_stream_free(text_stream **s);
-/* 1 = window written to ids[window], 0 = end of epoch, -1 = error. */
+/* E8: when on, emit a final padded short window at EOF (n < window). */
+void		text_stream_set_varlen(text_stream *s, int on);
+/* 1 = window written to ids[window], 0 = end of epoch, -1 = error.
+** With varlen, *n may be < window (rest padded with VOCAB_EOS). */
 int		text_stream_next(text_stream *s, int *ids, int *n);
 /* Start a new epoch (reopens at the file start, reseeds the shuffle). */
 int		text_stream_rewind(text_stream *s);

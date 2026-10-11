@@ -213,6 +213,8 @@ static int run_lm_train_core(int argc, char **argv, int use_tower)
 		    "--early-stop-patience", "0")));
 		lm_train_set_diverge_delta(atof(arg_value(argc, argv,
 		    "--diverge-delta", "0")));
+		if (arg_flag(argc, argv, NULL, "--varlen"))
+			lm_train_set_varlen(1);
 	}
 	if (lr <= 0.0)
 		lr = 0.001;

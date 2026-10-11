@@ -271,6 +271,11 @@ int gpu_kv_attn_decode(ann_real *out, const ann_real *x,
 	return -1;
 }
 
+void gpu_attn_set_seqlens(const int *seqlens)
+{
+	(void)seqlens;
+}
+
 int gpu_attn_causal_fwd(mat *concat, mat *w, const mat *q, const mat *k,
 	const mat *v, int B, int T, int H, int dh)
 {

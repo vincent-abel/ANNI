@@ -125,6 +125,8 @@ int	gpu_attn_causal_fwd(mat *concat, mat *w, const mat *q, const mat *k,
 int	gpu_attn_causal_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat,
 		const mat *w, const mat *q, const mat *k, const mat *v,
 		int B, int T, int H, int dh);
+/* E8: optional host seqlens[B] in [1,T]; NULL clears. Active for next fused attn. */
+void	gpu_attn_set_seqlens(const int *seqlens);
 
 /*
 ** R1 residency helpers: prefer D2D when twins exist. Return 0 on success,

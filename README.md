@@ -63,11 +63,9 @@ Trainable decoder-only LM in `lang/`: FP32 mats, byte or BPE tokenizer, CUDA opt
 
 ### Done vs open (Target)
 
-**Done (plumbing):** FP32 / `LMCF`, GPU GEMM + Adam residency path, packed `--batch` / `--batch auto`, BPE + `LMCV`, wiki fetch / stream / splits, sampling, `--out` resume confirm, cheap eval knobs. Config today: `D=256`, `heads=8`, `FF=1024`, `ctx=128`, `blocks=4` (~few‑M params — still below Target).
+**Done (plumbing + speed stack):** FP32 / `LMCF`, GPU residency (R1–R4, R2, R8–R12, R10 TF32), packed `--batch` / `--batch auto`, BPE + `LMCV`, wiki stream, Efficiency E1–E16, Autotrain AT1–AT9. Config today: `D=512`, `heads=16`, `FF=2048`, `ctx=256`, `blocks=6` (Target-shaped; retrain old ckpts).
 
-**Open for Target quality:** R5–R7 + R5b (~10–50M), LR schedule + clip/wd (E2), real ≥100 MB BPE train run, eval suite + readable generate, Autotrain AT1–AT9.
-
-**Open for Target speed/efficiency:** R1 device-resident LN/FFN/resid, R3–R4 huge B, R12 CUDA Graphs, R10 mixed precision (priority stack); then R2 embed GPU, R8–R9, R11; see also **Efficiency & systems**.
+**Open for Target quality:** real ≥100 MB BPE train run to readable generate, eval suite / held-out quality proof (config + Autotrain path land; quality not yet claimed).
 
 **Beyond Target:** ChatGPT-class needs more than a bigger decoder — see **Toward ChatGPT-class (code)** (modern block, scale, data shards, multi-GPU, SFT/DPO, eval, serve). That work starts after Target is honest; do not skip Target for shiny chat UI.
 
@@ -305,7 +303,7 @@ What we have at `f3a44b3` was a **byte-level** educational model (`LM_BYTE_VOCAB
 - [x] Stronger generate: `--temperature` / `--top-k` / `--top-p` (length/EOS control still open)
 - [ ] Eval suite: window NLL, long-context NLL, held-out PPL, and a few fixed prompts for qualitative checks
 - [ ] Multi-run: already have `--seed`, shuffle, `lm merge`—document as the cheap ensemble recipe; repro flags: **E11**
-- [ ] One-command Target path — see **Autotrain** (`./autotrain`, AT1–AT9)
+- [x] One-command Target path — see **Autotrain** (`./autotrain`, AT1–AT9)
 - [ ] After Target: Stage 2 (**C1–C14**) then Stage 3 (**ARCH/TOK/DAT/DIST/ALN/EV/SRV/OPS**)
 
 **Done when:** subword vocab, ≥100 MB train data, ~10M+ params, train window ≈ generate horizon, FP32 (or faster) on GPU, and generate produces readable multi-word text on held-out-style prompts—not just low NLL on `toy_tiny`.

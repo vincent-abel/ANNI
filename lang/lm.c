@@ -587,12 +587,19 @@ int lm_forward_cache_packed(lm *model, const int *ids, int B, int T,
 int lm_loss_backward_packed(lm *model, const lm_cache *c, const int *ids,
 	int B, int T, mat *dhidden)
 {
+	return lm_loss_backward_packed_lens(model, c, ids, B, T, NULL, dhidden);
+}
+
+int lm_loss_backward_packed_lens(lm *model, const lm_cache *c, const int *ids,
+	int B, int T, const int *lens, mat *dhidden)
+{
 	mat *hc;
 	mat *dhc;
 	int *tgt;
 	int rows;
 	int b;
 	int t;
+	int L;
 	int rc;
 	size_t rb;
 
@@ -600,7 +607,7 @@ int lm_loss_backward_packed(lm *model, const lm_cache *c, const int *ids,
 	    || c->T != T || !c->hidden || dhidden->rows < B * T
 	    || dhidden->cols != LM_D_MODEL)
 		return -1;
-	if (B == 1)
+	if (B == 1 && (!lens || lens[0] >= T))
 		return lm_loss_backward(model, c, ids, T, dhidden);
 	rows = B * (T - 1);
 	rb = (size_t)LM_D_MODEL * sizeof(ann_real);
@@ -663,6 +670,22 @@ scatter_host:
 				memcpy(&dhidden->data[(size_t)b * T * LM_D_MODEL],
 				    &dhc->data[(size_t)b * (T - 1) * LM_D_MODEL],
 				    (size_t)(T - 1) * rb);
+			mat_host_dirty(dhidden);
+		}
+		/* E8: zero grads for pad predict positions (t >= L-1). */
+		if (lens) {
+			(void)mat_ensure_host(dhidden);
+			for (b = 0; b < B; b++) {
+				L = lens[b];
+				if (L < 2)
+					L = 2;
+				if (L > T)
+					L = T;
+				for (t = L - 1; t < T; t++)
+					memset(&dhidden->data[
+					    (size_t)(b * T + t) * LM_D_MODEL],
+					    0, rb);
+			}
 			mat_host_dirty(dhidden);
 		}
 	}

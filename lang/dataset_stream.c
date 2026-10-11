@@ -10,6 +10,7 @@
 #include <unistd.h>
 #include "dataset_stream.h"
 #include "tokenize.h"
+#include "vocab.h"
 
 #define DOC_MAX_BYTES	(8L * 1024 * 1024)	/* force-cut runaway "documents" */
 #define LINE_BUF	4096
@@ -505,6 +506,7 @@ struct text_stream {
 	unsigned long long rng;
 	long		count;
 	long		last_count;
+	int		varlen;	/* E8: emit padded short tail at EOF */
 };
 
 static unsigned long long rng_next(unsigned long long *s)
@@ -629,17 +631,39 @@ static int stream_refill(text_stream *s)
 	}
 }
 
-static int stream_raw_next(text_stream *s, int *out)
+/* Writes a full window, or (varlen) a short padded tail. *n_out = real len. */
+static int stream_raw_next(text_stream *s, int *out, int *n_out)
 {
+	long remain;
+	int i;
+
 	while (s->len - s->pos < s->window && !s->eof) {
 		if (stream_refill(s) != 0)
 			return -1;
 	}
-	if (s->len - s->pos < s->window)
-		return 0;
-	memcpy(out, s->buf + s->pos, (size_t)s->window * sizeof(int));
-	s->pos += s->stride;
-	return 1;
+	remain = s->len - s->pos;
+	if (remain >= s->window) {
+		memcpy(out, s->buf + s->pos, (size_t)s->window * sizeof(int));
+		s->pos += s->stride;
+		*n_out = s->window;
+		return 1;
+	}
+	/* E8: recover the short EOF tail instead of dropping it. */
+	if (s->varlen && remain >= 2) {
+		memcpy(out, s->buf + s->pos, (size_t)remain * sizeof(int));
+		for (i = (int)remain; i < s->window; i++)
+			out[i] = VOCAB_EOS;
+		s->pos = s->len;
+		*n_out = (int)remain;
+		return 1;
+	}
+	return 0;
+}
+
+void text_stream_set_varlen(text_stream *s, int on)
+{
+	if (s)
+		s->varlen = on ? 1 : 0;
 }
 
 int text_stream_next(text_stream *s, int *ids, int *n)
@@ -647,37 +671,56 @@ int text_stream_next(text_stream *s, int *ids, int *n)
 	int r;
 	int j;
 	int *slot;
+	int nn;
 
 	if (!s || !ids || !n)
 		return -1;
 	*n = s->window;
 	if (s->sb_cap <= 0) {
-		r = stream_raw_next(s, ids);
-		if (r == 1)
+		r = stream_raw_next(s, ids, &nn);
+		if (r == 1) {
+			*n = nn;
 			s->count++;
+		}
 		return r;
 	}
 	while (s->sb_n < s->sb_cap && !s->sb_done) {
-		r = stream_raw_next(s, s->sb + (size_t)s->sb_n * (size_t)s->window);
+		r = stream_raw_next(s,
+		    s->sb + (size_t)s->sb_n * (size_t)s->window, &nn);
 		if (r < 0)
 			return -1;
 		if (r == 0)
 			s->sb_done = 1;
-		else
+		else if (nn == s->window)
 			s->sb_n++;
+		else {
+			/* Short varlen tails skip the shuffle buffer. */
+			memcpy(ids, s->sb + (size_t)s->sb_n * (size_t)s->window,
+			    (size_t)s->window * sizeof(int));
+			*n = nn;
+			s->count++;
+			return 1;
+		}
 	}
 	if (s->sb_n == 0)
 		return 0;
 	j = (int)(rng_next(&s->rng) % (unsigned long long)s->sb_n);
 	slot = s->sb + (size_t)j * (size_t)s->window;
 	memcpy(ids, slot, (size_t)s->window * sizeof(int));
+	*n = s->window;
 	if (!s->sb_done) {
-		r = stream_raw_next(s, slot);
+		r = stream_raw_next(s, slot, &nn);
 		if (r < 0)
 			return -1;
-		if (r == 1) {
+		if (r == 1 && nn == s->window) {
 			s->count++;
 			return 1;
+		}
+		if (r == 1 && nn < s->window) {
+			/* Leave short tail for a later direct emit. */
+			memcpy(s->sb + (size_t)s->sb_n * (size_t)s->window,
+			    slot, (size_t)s->window * sizeof(int));
+			/* restore slot from end after pop below via done */
 		}
 		s->sb_done = 1;
 	}

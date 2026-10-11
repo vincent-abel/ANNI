@@ -957,10 +957,20 @@ __device__ static ann_real att_max(ann_real v, ann_real *sh)
 	return v;
 }
 
+/* E8: device copy of host seqlens for the current fused launch (optional). */
+static int *g_att_seqlens_dev;
+static int g_att_seqlens_B;
+static const int *g_att_seqlens_host;
+
+extern "C" void gpu_attn_set_seqlens(const int *seqlens)
+{
+	g_att_seqlens_host = seqlens;
+}
+
 /* grid = B*H*T blocks (bh, i); dyn smem = (dh + T) floats. */
 __global__ static void attn_fwd_kernel(ann_real *concat, ann_real *w,
 	const ann_real *q, const ann_real *k, const ann_real *v,
-	int T, int H, int dh, ann_real scale)
+	int T, int H, int dh, ann_real scale, const int *seqlens)
 {
 	extern __shared__ ann_real sm[];
 	__shared__ ann_real red[ATT_BLOCK];
@@ -972,6 +982,7 @@ __global__ static void attn_fwd_kernel(ann_real *concat, ann_real *w,
 	int b = bh / H;
 	int D = H * dh;
 	size_t row0 = (size_t)b * T;
+	int L = seqlens ? seqlens[b] : T;
 	int j;
 	int c;
 	ann_real mx;
@@ -979,13 +990,17 @@ __global__ static void attn_fwd_kernel(ann_real *concat, ann_real *w,
 	ann_real acc;
 	ann_real *wr = w + (size_t)blockIdx.x * T;
 
+	if (L < 1)
+		L = 1;
+	if (L > T)
+		L = T;
 	for (c = threadIdx.x; c < dh; c += blockDim.x)
 		qi[c] = q[(row0 + i) * D + h * dh + c];
 	__syncthreads();
 	mx = -1e30f;
 	for (j = threadIdx.x; j < T; j += blockDim.x) {
 		acc = 0.0f;
-		if (j <= i) {
+		if (i < L && j <= i && j < L) {
 			const ann_real *kj = k + (row0 + j) * D + h * dh;
 			for (c = 0; c < dh; c++)
 				acc += qi[c] * kj[c];
@@ -1000,11 +1015,13 @@ __global__ static void attn_fwd_kernel(ann_real *concat, ann_real *w,
 	mx = att_max(mx, red);
 	sum = 0.0f;
 	for (j = threadIdx.x; j < T; j += blockDim.x) {
-		acc = (j <= i) ? __expf(sc[j] - mx) : 0.0f;
+		acc = (i < L && j <= i && j < L) ? __expf(sc[j] - mx) : 0.0f;
 		sc[j] = acc;
 		sum += acc;
 	}
 	sum = att_sum(sum, red);
+	if (sum < 1e-20f)
+		sum = 1.0f;
 	for (j = threadIdx.x; j < T; j += blockDim.x) {
 		sc[j] /= sum;
 		wr[j] = sc[j];
@@ -1012,8 +1029,10 @@ __global__ static void attn_fwd_kernel(ann_real *concat, ann_real *w,
 	__syncthreads();
 	for (c = threadIdx.x; c < dh; c += blockDim.x) {
 		acc = 0.0f;
-		for (j = 0; j <= i; j++)
-			acc += sc[j] * v[(row0 + j) * D + h * dh + c];
+		if (i < L) {
+			for (j = 0; j <= i && j < L; j++)
+				acc += sc[j] * v[(row0 + j) * D + h * dh + c];
+		}
 		concat[(row0 + i) * D + h * dh + c] = acc;
 	}
 }
@@ -1150,8 +1169,23 @@ extern "C" int gpu_attn_causal_fwd(mat *concat, mat *w, const mat *q,
 		goto out;
 	dw = w->d_data;
 	smem = (size_t)(dh + T) * sizeof(ann_real);
+	/* E8: upload seqlens when set for this pack. */
+	if (g_att_seqlens_host) {
+		if (!g_att_seqlens_dev || g_att_seqlens_B < B) {
+			if (g_att_seqlens_dev)
+				gpu_free(g_att_seqlens_dev);
+			g_att_seqlens_dev = (int *)gpu_malloc((size_t)B
+			    * sizeof(int));
+			g_att_seqlens_B = g_att_seqlens_dev ? B : 0;
+		}
+		if (g_att_seqlens_dev
+		    && gpu_memcpy_h2d(g_att_seqlens_dev, g_att_seqlens_host,
+		    (size_t)B * sizeof(int)) != 0)
+			goto out;
+	}
 	attn_fwd_kernel<<<B * H * T, ATT_BLOCK, smem>>>(dc, dw, dq, dk, dv,
-	    T, H, dh, (ann_real)(1.0 / sqrt((double)dh)));
+	    T, H, dh, (ann_real)(1.0 / sqrt((double)dh)),
+	    g_att_seqlens_host ? g_att_seqlens_dev : NULL);
 	if (launch_done() == 0 && finish_out(concat, dc, oc) == 0) {
 		w->on_device = MAT_DEV_DEVICE;	/* host copy never read */
 		rc = 0;
