@@ -208,8 +208,8 @@ Observed headroom on a 16 GB card at current toy scale (`D=256`, `LM_BATCH_AUT
 **Priority speed stack (fixed D)**
 
 - [x] **R1** Keep LN / FFN / residual activations **device-resident** end-to-end (no per-op H↔D staging) — main lever for util ≫ 30% at fixed `D` (~2–5×); see [docs/gpu-activation-residency.md](docs/gpu-activation-residency.md)
-- [ ] **R3** Lift `LM_BATCH_AUTO_MAX` (64 → **512–2048**) and relax `lm_packed_bytes` so `--batch auto` can target most of free VRAM (**huge B**)
-- [ ] **R4** Large manual `--batch` (**128–1024+**) with OOM backoff (halve `B` on alloc fail); default/`-d` guidance for 16 GB cards
+- [x] **R3** Lift `LM_BATCH_AUTO_MAX` (64 → **1024**) and relax `lm_packed_bytes` so `--batch auto` can target most of free VRAM (**huge B**); see [docs/huge-batch-vram.md](docs/huge-batch-vram.md)
+- [x] **R4** Large manual `--batch` (**128–1024+**) with OOM backoff (halve `B` on alloc fail); default/`-d` guidance for 16 GB cards
 - [ ] **R12** **CUDA Graphs**: capture packed train microbatch (fwd+bwd+Adam) to cut launch overhead on small-`D` kernels (~2–4× when launch-bound; after R1 so the graph is device-only)
 - [ ] **R10** **Mixed precision**: enable TF32; then BF16 (or FP16+loss scale) GEMMs with FP32 master weights/Adam — after FP32 reference stays correct (~1.5–2×)
 

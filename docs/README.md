@@ -87,6 +87,7 @@
 - [Host↔device sync at batch boundaries](gpu-batch-sync.md)
 - [nvidia-smi / train util proof](gpu-train-util-proof.md)
 - [GPU activation residency (R1)](gpu-activation-residency.md)
+- [Huge batch / VRAM fill (R3–R4)](huge-batch-vram.md)
 
 ### From toy LM → small LLM
 

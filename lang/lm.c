@@ -701,7 +701,8 @@ size_t lm_packed_bytes(int B, int T, int vocab_size)
 	bytes = per_layer * (double)LM_N_BLOCKS;
 	bytes += 2.0 * rows * (double)vocab_size;	/* logits + delta */
 	bytes += 4.0 * rows * LM_D_MODEL;
-	return (size_t)(bytes * sizeof(float) * 2.0);
+	/* R3: 1.6× after R1 residency (was 2.0 for heavy host staging twins). */
+	return (size_t)(bytes * sizeof(float) * 1.6);
 }
 
 int lm_batch_auto(int T, int vocab_size, size_t free_bytes, double frac,
