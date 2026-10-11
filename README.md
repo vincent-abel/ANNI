@@ -259,7 +259,7 @@ Opinionated **second binary** (not more flags on `./ann`) so the teaching CLI st
 
 **Phase 1 — one command (MVP)**
 
-- [ ] **AT1** Makefile target `autotrain` produces `./autotrain`
+- [x] **AT1** Makefile target `autotrain` produces `./autotrain`
 - [ ] **AT2** Defaults: `--tokenizer bpe`, `--stream`, `--val-frac 0.01`, `--batch auto`, `--window` min(64, `LM_MAX_CTX`), safe FP32 `--lr`, `--epochs` from data-size heuristic
 - [ ] **AT3** If `--data` missing: run `scripts/fetch_wiki.sh`, or exit with a clear offline message
 - [ ] **AT4** Train/load vocab beside `--out`; resume when `--out` is already `LMCF` / `LMCV`
