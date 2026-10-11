@@ -50,6 +50,7 @@ static int g_grad_accum = 1;
 static double g_vram_frac = 0.85;
 static int g_early_stop_patience;
 static double g_diverge_delta;
+static int g_act_checkpoint;
 
 void lm_train_set_progress(train_progress_fn fn, void *userdata)
 {
@@ -350,6 +351,12 @@ void lm_train_set_early_stop(int patience)
 void lm_train_set_diverge_delta(double delta)
 {
 	g_diverge_delta = delta > 0.0 ? delta : 0.0;
+}
+
+void lm_train_set_act_checkpoint(int on)
+{
+	g_act_checkpoint = on ? 1 : 0;
+	(void)g_act_checkpoint;	/* R9: wired for callers; recompute path TBD */
 }
 
 static void apply_tokens_per_step(int B, int T)

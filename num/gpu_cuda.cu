@@ -923,7 +923,7 @@ extern "C" int gpu_softmax_bwd_rows(ann_real *dx, const ann_real *y,
 ** width T (rows are causal: zero for j > i). One launch per phase covers every
 ** (b, h, i) row, so the GPU sees B*H*T independent blocks.
 */
-#define ATT_BLOCK	128
+#define ATT_BLOCK	256	/* R11/R6: fused causal attn up to ctx 256 */
 
 __device__ static ann_real att_sum(ann_real v, ann_real *sh)
 {

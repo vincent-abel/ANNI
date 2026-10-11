@@ -31,6 +31,8 @@ void	lm_train_set_tokens_per_step(int n);
 void	lm_train_set_early_stop(int patience);
 /* E16: abort if train/val NLL rises by more than delta vs best, or non-finite. */
 void	lm_train_set_diverge_delta(double delta);
+/* R9: request activation checkpointing when implemented (currently advisory). */
+void	lm_train_set_act_checkpoint(int on);
 
 /*
 ** ckpt_path NULL = no mid-train saves. Otherwise overwrite that path after each

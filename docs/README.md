@@ -104,6 +104,12 @@
 - [Early-stop val plateau (E15)](early-stop-val-plateau.md)
 - [Diverge ditch (E16)](diverge-ditch.md)
 - [Mixed precision train (R10)](mixed-precision-train.md)
+- [Scale toward Target size](scale-toward-target-size.md)
+- [Attention heads scale (R5b)](attention-heads-scale.md)
+- [Activation checkpointing (R9)](activation-checkpointing.md)
+- [Flash attention (R11)](flash-attention.md)
+- [Variable-length packing (E8)](variable-length-packing.md)
+- [Compile profile (E12)](compile-profile.md)
 
 ### From toy LM → small LLM
 

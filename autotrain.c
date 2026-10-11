@@ -54,10 +54,20 @@ static void write_plan_json(const char *out, const char *data, int B, int T,
 	printf("wrote %s\n", path);
 }
 
+static int arg_has_sweep(int argc, char **argv)
+{
+	int i;
+
+	for (i = 1; i < argc; i++)
+		if (strcmp(argv[i], "--sweep") == 0)
+			return 1;
+	return 0;
+}
+
 static void usage(const char *argv0)
 {
 	fprintf(stderr,
-	    "Usage: %s [--out PATH] [--data PATH] [--epochs N] [--help]\n",
+	    "Usage: %s [--out PATH] [--data PATH] [--epochs N] [--sweep] [--help]\n",
 	    argv0);
 }
 
@@ -186,6 +196,34 @@ int main(int argc, char **argv)
 
 	lm_train_set_vram_frac(0.85);
 	write_plan_json(out, data, B, window, lr, epochs, fr, tot); /* E11/AT5 */
+	/* AT7–AT9: optional short lr sweep; keep best via E15/E16 hooks. */
+	if (arg_has_sweep(argc, argv)) {
+		const double lrs[] = { 3e-4, 1e-3, 3e-3 };
+		double best = 1e300;
+		double cand;
+		int bi = 0;
+		char trial[640];
+
+		lm_train_set_early_stop(1);
+		lm_train_set_diverge_delta(2.0);
+		for (i = 0; i < 3; i++) {
+			snprintf(trial, sizeof(trial), "%s.sweep%d", out, i);
+			cand = lm_train_stream(model, tr, opt, 1, B, lrs[i], 1,
+			    trial, 0, 1, 16, va);
+			printf("sweep lr=%g metric=%.4f\n", lrs[i], cand);
+			if (cand >= 0.0 && cand < best) {
+				best = cand;
+				bi = i;
+			}
+			text_stream_rewind(tr);
+			if (va)
+				text_stream_rewind(va);
+		}
+		printf("AT7 best sweep idx %d lr=%g\n", bi, lrs[bi]);
+		lr = lrs[bi];
+	}
+	lm_train_set_early_stop(2);
+	lm_train_set_diverge_delta(5.0);
 	loss = lm_train_stream(model, tr, opt, epochs, B, lr, 1, out, 0,
 	    1, 32, va);
 	printf("final stream train metric %.4f\n", loss);

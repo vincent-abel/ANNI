@@ -57,3 +57,8 @@ o=\sum_j a_j v_j
 ## What next
 
 [GPU support](gpu-support.md) optionally moves large GEMMs to CUDA while CPU remains the default.
+
+
+## E13 batch generate
+
+`lm_generate_batch` runs KV/full generate per prompt for concurrent chats.

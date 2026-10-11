@@ -216,13 +216,13 @@ Observed headroom on a 16 GB card at current toy scale (`D=256`, `LM_BATCH_AUT
 **Other fill / scale**
 
 - [x] **R2** GPU embed lookup + embed grad scatter; see [docs/gpu-embed-lookup.md](docs/gpu-embed-lookup.md)
-- [ ] **R5** Grow **D** (`LM_D_MODEL` 256 → 512 → 1024); set `LM_D_FF ≈ 4×D` — fattens every GEMM; **breaks old checkpoints** (retrain)
-- [ ] **R5b** Scale **attention heads** with width: keep `d_head` sensible (e.g. 32–64); today `LM_N_HEADS=8` at D=256 — at D=512 use **8 or 16** heads (`LM_N_HEADS`, Target 4–8+); must divide `D`
-- [ ] **R6** Grow context (`LM_MAX_CTX` / `--window` 128 → 256–512) for longer sequence matrices
-- [ ] **R7** Grow depth (`LM_N_BLOCKS` 4 → 6–8) toward Target 10–50M params
+- [x] **R5** Grow **D** (`LM_D_MODEL` 256 → 512 → 1024); set `LM_D_FF ≈ 4×D` — fattens every GEMM; **breaks old checkpoints** (retrain)
+- [x] **R5b** Scale **attention heads** with width: keep `d_head` sensible (e.g. 32–64); today `LM_N_HEADS=8` at D=256 — at D=512 use **8 or 16** heads (`LM_N_HEADS`, Target 4–8+); must divide `D`
+- [x] **R6** Grow context (`LM_MAX_CTX` / `--window` 128 → 256–512) for longer sequence matrices
+- [x] **R7** Grow depth (`LM_N_BLOCKS` 4 → 6–8) toward Target 10–50M params
 - [x] **R8** Async CUDA streams: overlap H2D of next microbatch with compute (only needed while any host glue remains)
-- [ ] **R9** Activation checkpointing / block-wise backward when `B·T·D` no longer fits in VRAM
-- [ ] **R11** Fused block / Flash-style attention to cut activation bytes and raise effective tokens/step
+- [x] **R9** Activation checkpointing / block-wise backward when `B·T·D` no longer fits in VRAM
+- [x] **R11** Fused block / Flash-style attention to cut activation bytes and raise effective tokens/step
 - [ ] Bench: util %, `nvidia-smi` memory, and ms/tok after **R1**, after **huge B** (R3/R4), after **R12** graphs, after **R10** mixed precision (expect util↑ / VRAM↑ / ms/tok↓ on that stack; ms/tok↑ if only R5)
 
 ### Efficiency & systems
@@ -236,12 +236,12 @@ Broader throughput and wall-time wins beyond the GPU residency / pack / R-stack.
 - [x] **E5** Pin host staging buffers (`cudaHostAlloc`) for pack ids; see [docs/pinned-host-staging.md](docs/pinned-host-staging.md)
 - [x] **E6** Multi-stream / multi-event dependency graph (beyond single BATCH sync)
 - [x] **E7** cuDNN or hand-fused LN + softmax where beneficial after R1
-- [ ] **E8** Variable-length sequence packing with attention mask (less pad waste → more real tokens/sec)
+- [x] **E8** Variable-length sequence packing with attention mask (less pad waste → more real tokens/sec)
 - [x] **E9** Gradient accumulation by **token budget** (`--tokens-per-step`); see [docs/tokens-per-step.md](docs/tokens-per-step.md)
 - [x] **E10** Throughput dashboard: tokens/sec, TFLOP/s estimate, VRAM used (`-d` / tower); see [docs/throughput-dashboard.md](docs/throughput-dashboard.md)
 - [x] **E11** Repro JSON beside checkpoint (`OUT.autotrain.json`); see [docs/repro-json-sidecar.md](docs/repro-json-sidecar.md)
-- [ ] **E12** Compile profile docs: `-O3`, LTO, `ARCH=…`; clear `make` (CPU stub) vs `make cuda`
-- [ ] **E13** Inference efficiency: keep KV generate on GPU; batch generate; lean on existing int8 head path
+- [x] **E12** Compile profile docs: `-O3`, LTO, `ARCH=…`; clear `make` (CPU stub) vs `make cuda`
+- [x] **E13** Inference efficiency: keep KV generate on GPU; batch generate; lean on existing int8 head path
 - [x] **E14** Data pipeline: mmap for wiki-scale `--stream`; see [docs/streaming-dataloader.md](docs/streaming-dataloader.md)
 - [x] **E15** Early-stop on val NLL plateau (saves wall time; used by Autotrain phase 2)
 - [x] **E16** **Diverge ditch:** if train or val NLL rises sharply vs the best so far (e.g. +threshold or non-finite), abort the run/config, restore the last good checkpoint, and skip remaining epochs (catches LR blow-ups like the old `0.01` D=256 case)
@@ -268,9 +268,9 @@ Opinionated **second binary** (not more flags on `./ann`) so the teaching CLI st
 
 **Phase 2 — light tune**
 
-- [ ] **AT7** Short sweep over `{lr}` (and optionally batch) for N steps; keep best val window NLL
-- [ ] **AT8** Continue best checkpoint for the full budget; early-stop via **E15**
-- [ ] **AT9** Apply **E16** diverge ditch during sweep and full train — rising/NaN NLL kills that trial and falls back to the best checkpoint (do not keep a blown-up epoch)
+- [x] **AT7** Short sweep over `{lr}` (and optionally batch) for N steps; keep best val window NLL
+- [x] **AT8** Continue best checkpoint for the full budget; early-stop via **E15**
+- [x] **AT9** Apply **E16** diverge ditch during sweep and full train — rising/NaN NLL kills that trial and falls back to the best checkpoint (do not keep a blown-up epoch)
 
 See [docs/autotrain.md](docs/autotrain.md).
 
@@ -297,11 +297,11 @@ What we have at `f3a44b3` was a **byte-level** educational model (`LM_BYTE_VOCAB
 
 **Capacity + training recipe (small LLM, still from-scratch C)**
 
-- [ ] Scale config toward Target: ~**10–50M** params — see **R5–R7** + **R5b** (`D`, heads **8/16**, ctx, blocks)
-- [ ] LR schedule (warmup + decay) + clip / weight decay — see **E2**
+- [x] Scale config toward Target: ~**10–50M** params — see **R5–R7** + **R5b** (`D`, heads **8/16**, ctx, blocks)
+- [x] LR schedule (warmup + decay) + clip / weight decay — see **E2**
 - [x] Batch by **tokens** via packed `--batch` / `--grad-accum` (further VRAM fill: R3–R4; token budget: **E9**)
-- [ ] Activation checkpointing when packed activations blow RAM — see **R9**
-- [ ] FP16/BF16 or TF32 GEMMs — see **R10**
+- [x] Activation checkpointing when packed activations blow RAM — see **R9**
+- [x] FP16/BF16 or TF32 GEMMs — see **R10**
 - [x] Stronger generate: `--temperature` / `--top-k` / `--top-p` (length/EOS control still open)
 - [ ] Eval suite: window NLL, long-context NLL, held-out PPL, and a few fixed prompts for qualitative checks
 - [ ] Multi-run: already have `--seed`, shuffle, `lm merge`—document as the cheap ensemble recipe; repro flags: **E11**
