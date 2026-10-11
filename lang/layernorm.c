@@ -67,6 +67,7 @@ ln_cache *ln_cache_create(int T)
 		ln_cache_free(&c);
 		return NULL;
 	}
+	mat_try_pin(c->x_hat);
 	return c;
 }
 
@@ -106,6 +107,8 @@ int layernorm_forward_cache(mat *x, layernorm *ln, ln_cache *c)
 	double var;
 	double inv_std;
 	double v;
+	ann_real *xp;
+	ann_real *xh;
 
 	if (!x || !ln || !c || !x->data)
 		return -1;
@@ -114,6 +117,18 @@ int layernorm_forward_cache(mat *x, layernorm *ln, ln_cache *c)
 
 	T = x->rows;
 	d = x->cols;
+	mat_try_pin(x);
+	mat_try_pin(c->x_hat);
+	xp = mat_compute_ptr(x);
+	xh = mat_compute_ptr(c->x_hat);
+	if (xp && xh && gpu_layernorm_forward_ex(xp, xp, ln->gamma->data,
+		ln->beta->data, xh, c->mean->data, c->inv_std->data, T, d,
+		ln->eps) == 0) {
+		mat_mark_device(x);
+		mat_mark_device(c->x_hat);
+		return 0;
+	}
+	(void)mat_ensure_host(x);
 	for (t = 0; t < T; t++) {
 		mean = 0.0;
 		for (j = 0; j < d; j++)
@@ -149,16 +164,32 @@ int layernorm_backward(mat *dx, const mat *dy, layernorm *ln, const ln_cache *c)
 	double sum_dy_xhat;
 	double dxhat;
 	double term;
+	ann_real *dxp;
+	const ann_real *dyp;
+	const ann_real *xhp;
 
 	if (!dx || !dy || !ln || !c)
 		return -1;
 	if (dx->rows != dy->rows || dx->cols != dy->cols)
 		return -1;
 	d = LM_D_MODEL;
-	if (gpu_layernorm_backward(dx, dy, ln->gamma->data, c->x_hat->data,
-		c->inv_std->data, c->T, d, ln->dgamma->data, ln->dbeta->data) == 0)
+	mat_try_pin(dx);
+	mat_try_pin((mat *)dy);
+	mat_try_pin(c->x_hat);
+	dxp = mat_compute_ptr(dx);
+	dyp = mat_compute_ptr_const(dy);
+	xhp = mat_compute_ptr_const(c->x_hat);
+	if (dxp && dyp && xhp
+	    && gpu_layernorm_backward(dx, dy, ln->gamma->data, xhp,
+		c->inv_std->data, c->T, d, ln->dgamma->data,
+		ln->dbeta->data) == 0) {
+		mat_mark_device(dx);
 		return 0;
-
+	}
+	if (mat_ensure_host((mat *)dy) != 0)
+		return -1;
+	(void)mat_ensure_host(c->x_hat);
+	mat_host_dirty(dx);
 	for (t = 0; t < c->T; t++) {
 		inv_std = c->inv_std->data[t];
 		sum_dy = 0.0;

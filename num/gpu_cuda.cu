@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 #ifdef ANN_CUBLAS
 #include <cublas_v2.h>
 #endif
@@ -41,32 +42,69 @@ static int cublas_ensure(void)
 }
 
 /* Row-major C = A B via column-major cuBLAS identity. */
-static int cublas_gemm_rm(double *dC, const double *dA, const double *dB,
+static int cublas_gemm_rm(ann_real *dC, const ann_real *dA, const ann_real *dB,
 	int M, int N, int K)
 {
-	const double alpha = 1.0;
-	const double beta = 0.0;
+	const ann_real alpha = 1.0f;
+	const ann_real beta = 0.0f;
 
 	if (cublas_ensure() != 0)
 		return -1;
-	if (cublasDgemm(g_cublas, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha,
+	if (cublasSgemm(g_cublas, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha,
 		dB, N, dA, K, &beta, dC, N) != CUBLAS_STATUS_SUCCESS)
+		return -1;
+	return 0;
+}
+
+/*
+** H2: row-major C = A B^T via column-major C^T = B A^T. A is M x K, B is
+** N x K (both row-major), C is M x N. CUBLAS_OP_T reads B transposed in place
+** -- no host (or device) transpose copy.
+*/
+static int cublas_gemm_rm_bt(ann_real *dC, const ann_real *dA,
+	const ann_real *dB, int M, int N, int K)
+{
+	const ann_real alpha = 1.0f;
+	const ann_real beta = 0.0f;
+
+	if (cublas_ensure() != 0)
+		return -1;
+	if (cublasSgemm(g_cublas, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K, &alpha,
+		dB, K, dA, K, &beta, dC, N) != CUBLAS_STATUS_SUCCESS)
+		return -1;
+	return 0;
+}
+
+/*
+** H2: row-major C (+)= A^T B via column-major C^T = B^T A. A is T x M, B is
+** T x N, C is M x N. accumulate != 0 keeps C (beta = 1: dW += A^T B).
+*/
+static int cublas_gemm_rm_at(ann_real *dC, const ann_real *dA,
+	const ann_real *dB, int T, int M, int N, int accumulate)
+{
+	const ann_real alpha = 1.0f;
+	const ann_real beta = accumulate ? 1.0f : 0.0f;
+
+	if (cublas_ensure() != 0)
+		return -1;
+	if (cublasSgemm(g_cublas, CUBLAS_OP_N, CUBLAS_OP_T, N, M, T, &alpha,
+		dB, N, dA, M, &beta, dC, N) != CUBLAS_STATUS_SUCCESS)
 		return -1;
 	return 0;
 }
 #endif
 
-__global__ static void gemm_kernel(const double *A, const double *B, double *C,
+__global__ static void gemm_kernel(const ann_real *A, const ann_real *B, ann_real *C,
 	int M, int N, int K)
 {
 	int row = blockIdx.y * blockDim.y + threadIdx.y;
 	int col = blockIdx.x * blockDim.x + threadIdx.x;
 	int k;
-	double sum;
+	ann_real sum;
 
 	if (row >= M || col >= N)
 		return;
-	sum = 0.0;
+	sum = 0.0f;
 	for (k = 0; k < K; k++)
 		sum += A[row * K + k] * B[k * N + col];
 	C[row * N + col] = sum;
@@ -79,6 +117,24 @@ extern "C" int gpu_available(void)
 	if (cudaGetDeviceCount(&n) != cudaSuccess || n <= 0)
 		return 0;
 	return 1;
+}
+
+extern "C" int gpu_mem_info(size_t *free_bytes, size_t *total_bytes)
+{
+	size_t f;
+	size_t t;
+
+	if (free_bytes)
+		*free_bytes = 0;
+	if (total_bytes)
+		*total_bytes = 0;
+	if (cudaMemGetInfo(&f, &t) != cudaSuccess)
+		return -1;
+	if (free_bytes)
+		*free_bytes = f;
+	if (total_bytes)
+		*total_bytes = t;
+	return 0;
 }
 
 extern "C" const char *gpu_backend_name(void)
@@ -140,151 +196,31 @@ extern "C" int gpu_memset(void *dst, int value, size_t nbytes)
 
 static size_t mat_bytes(const mat *m)
 {
-	return (size_t)m->rows * (size_t)m->cols * sizeof(double);
+	return (size_t)m->rows * (size_t)m->cols * sizeof(ann_real);
 }
 
-extern "C" int gpu_mat_mul(mat *c, const mat *a, const mat *b)
-{
-	double *dA;
-	double *dB;
-	double *dC;
-	int ownA;
-	int ownB;
-	int ownC;
-	dim3 block;
-	dim3 grid;
-	cudaError_t err;
-
-	if (!c || !a || !b)
-		return -1;
-	if (a->cols != b->rows || c->rows != a->rows || c->cols != b->cols)
-		return -1;
-	if (!gpu_available())
-		return -1;
-
-	ownA = ownB = ownC = 0;
-	dA = a->d_data;
-	dB = b->d_data;
-	dC = c->d_data;
-	if (!dA) {
-		if (!a->data)
-			return -1;
-		dA = (double *)gpu_malloc(mat_bytes(a));
-		if (!dA || gpu_memcpy_h2d(dA, a->data, mat_bytes(a)) != 0) {
-			gpu_free(dA);
-			return -1;
-		}
-		ownA = 1;
-	}
-	if (!dB) {
-		if (!b->data)
-			return -1;
-		dB = (double *)gpu_malloc(mat_bytes(b));
-		if (!dB || gpu_memcpy_h2d(dB, b->data, mat_bytes(b)) != 0) {
-			if (ownA)
-				gpu_free(dA);
-			gpu_free(dB);
-			return -1;
-		}
-		ownB = 1;
-	}
-	if (!dC) {
-		dC = (double *)gpu_malloc(mat_bytes(c));
-		if (!dC) {
-			if (ownA)
-				gpu_free(dA);
-			if (ownB)
-				gpu_free(dB);
-			return -1;
-		}
-		ownC = 1;
-	}
-#ifdef ANN_CUBLAS
-	if (cublas_gemm_rm(dC, dA, dB, a->rows, b->cols, a->cols) != 0) {
-#endif
-		block = dim3(16, 16);
-		grid = dim3((c->cols + 15) / 16, (c->rows + 15) / 16);
-		gemm_kernel<<<grid, block>>>(dA, dB, dC, a->rows, b->cols,
-		    a->cols);
-		err = cudaDeviceSynchronize();
-		if (err != cudaSuccess)
-			goto fail;
-#ifdef ANN_CUBLAS
-	} else {
-		err = cudaDeviceSynchronize();
-		if (err != cudaSuccess)
-			goto fail;
-	}
-#endif
-	/* Batch mode: keep result on device when c is pinned; skip PCIe D2H. */
-	if (g_sync_mode == GPU_SYNC_BATCH && c->d_data && !ownC) {
-		c->on_device = 1;
-	} else {
-		if (c->data && gpu_memcpy_d2h(c->data, dC, mat_bytes(c)) != 0)
-			goto fail;
-		if (c->d_data && !ownC)
-			c->on_device = 0;
-	}
-	if (ownA)
-		gpu_free(dA);
-	if (ownB)
-		gpu_free(dB);
-	if (ownC)
-		gpu_free(dC);
-	return 0;
-fail:
-	if (ownA)
-		gpu_free(dA);
-	if (ownB)
-		gpu_free(dB);
-	if (ownC)
-		gpu_free(dC);
-	return -1;
-}
-
-__global__ static void gemm_bt_kernel(const double *A, const double *B, double *C,
-	int M, int N, int K)
-{
-	/* C[m,n] = sum_k A[m,k] * B[n,k] */
-	int row = blockIdx.y * blockDim.y + threadIdx.y;
-	int col = blockIdx.x * blockDim.x + threadIdx.x;
-	int k;
-	double sum;
-
-	if (row >= M || col >= N)
-		return;
-	sum = 0.0;
-	for (k = 0; k < K; k++)
-		sum += A[row * K + k] * B[col * K + k];
-	C[row * N + col] = sum;
-}
-
-__global__ static void outer_add_kernel(double *DW, const double *A, const double *B,
-	int T, int M, int N)
-{
-	/* DW[m,n] += sum_t A[t,m] * B[t,n] */
-	int m = blockIdx.y * blockDim.y + threadIdx.y;
-	int n = blockIdx.x * blockDim.x + threadIdx.x;
-	int t;
-	double sum;
-
-	if (m >= M || n >= N)
-		return;
-	sum = 0.0;
-	for (t = 0; t < T; t++)
-		sum += A[t * M + m] * B[t * N + n];
-	DW[m * N + n] += sum;
-}
-
-static int ensure_dev(const mat *m, double **out, int *owned)
+/*
+** Device pointer for reading m. Pinned mats reuse m->d_data (never cudaMalloc);
+** if the host is authoritative (on_device == 0) the twin is refreshed by H2D
+** first. Unpinned mats get a temporary buffer (*owned = 1).
+*/
+static int ensure_dev(const mat *m, ann_real **out, int *owned)
 {
 	*owned = 0;
-	*out = m->d_data;
-	if (*out)
+	*out = NULL;
+	if (m->d_data) {
+		if (m->on_device != MAT_DEV_DEVICE
+		    && m->on_device != MAT_DEV_SYNCED) {
+			if (!m->data
+			    || gpu_memcpy_h2d(m->d_data, m->data, mat_bytes(m)) != 0)
+				return -1;
+		}
+		*out = m->d_data;
 		return 0;
+	}
 	if (!m->data)
 		return -1;
-	*out = (double *)gpu_malloc(mat_bytes(m));
+	*out = (ann_real *)gpu_malloc(mat_bytes(m));
 	if (!*out)
 		return -1;
 	if (gpu_memcpy_h2d(*out, m->data, mat_bytes(m)) != 0) {
@@ -296,16 +232,160 @@ static int ensure_dev(const mat *m, double **out, int *owned)
 	return 0;
 }
 
-extern "C" int gpu_mat_mul_bt(mat *c, const mat *a, const mat *b)
+/* Output buffer for a pure-write result: reuse the twin, else temp malloc. */
+static int ensure_dev_out(const mat *m, ann_real **out, int *owned)
 {
-	double *dA;
-	double *dB;
-	double *dC;
+	*owned = 0;
+	*out = m->d_data;
+	if (*out)
+		return 0;
+	*out = (ann_real *)gpu_malloc(mat_bytes(m));
+	if (!*out)
+		return -1;
+	*owned = 1;
+	return 0;
+}
+
+/*
+** After a launch: always surface launch errors; only block on the device in
+** eager mode. BATCH defers to gpu_device_sync() once per microbatch.
+*/
+static int launch_done(void)
+{
+	if (cudaGetLastError() != cudaSuccess)
+		return -1;
+	if (g_sync_mode == GPU_SYNC_BATCH)
+		return 0;
+	return cudaDeviceSynchronize() == cudaSuccess ? 0 : -1;
+}
+
+extern "C" void gpu_device_sync(void)
+{
+	cudaError_t err;
+
+	if (!gpu_available())
+		return;
+	err = cudaDeviceSynchronize();
+	if (err != cudaSuccess)
+		fprintf(stderr, "gpu_device_sync: %s\n", cudaGetErrorString(err));
+}
+
+/*
+** Finish an output mat: BATCH + pinned leaves the result on device
+** (on_device = 1, no PCIe D2H); otherwise D2H into host and mark host-auth.
+*/
+static int finish_out(mat *m, ann_real *dptr, int owned)
+{
+	if (g_sync_mode == GPU_SYNC_BATCH && m->d_data && !owned) {
+		m->on_device = MAT_DEV_DEVICE;
+		return 0;
+	}
+	if (m->data && gpu_memcpy_d2h(m->data, dptr, mat_bytes(m)) != 0)
+		return -1;
+	if (m->d_data && !owned)
+		m->on_device = MAT_DEV_HOST;
+	return 0;
+}
+
+extern "C" int gpu_mat_mul(mat *c, const mat *a, const mat *b)
+{
+	ann_real *dA;
+	ann_real *dB;
+	ann_real *dC;
 	int ownA;
 	int ownB;
 	int ownC;
 	dim3 block;
 	dim3 grid;
+	int rc;
+
+	if (!c || !a || !b)
+		return -1;
+	if (a->cols != b->rows || c->rows != a->rows || c->cols != b->cols)
+		return -1;
+	if (!gpu_available())
+		return -1;
+	if (ensure_dev(a, &dA, &ownA) != 0)
+		return -1;
+	if (ensure_dev(b, &dB, &ownB) != 0) {
+		if (ownA)
+			gpu_free(dA);
+		return -1;
+	}
+	if (ensure_dev_out(c, &dC, &ownC) != 0) {
+		if (ownA)
+			gpu_free(dA);
+		if (ownB)
+			gpu_free(dB);
+		return -1;
+	}
+#ifdef ANN_CUBLAS
+	if (cublas_gemm_rm(dC, dA, dB, a->rows, b->cols, a->cols) != 0) {
+#endif
+		block = dim3(16, 16);
+		grid = dim3((c->cols + 15) / 16, (c->rows + 15) / 16);
+		gemm_kernel<<<grid, block>>>(dA, dB, dC, a->rows, b->cols,
+		    a->cols);
+#ifdef ANN_CUBLAS
+	}
+#endif
+	rc = -1;
+	if (launch_done() == 0 && finish_out(c, dC, ownC) == 0)
+		rc = 0;
+	if (ownA)
+		gpu_free(dA);
+	if (ownB)
+		gpu_free(dB);
+	if (ownC)
+		gpu_free(dC);
+	return rc;
+}
+
+__global__ static void gemm_bt_kernel(const ann_real *A, const ann_real *B, ann_real *C,
+	int M, int N, int K)
+{
+	/* C[m,n] = sum_k A[m,k] * B[n,k] */
+	int row = blockIdx.y * blockDim.y + threadIdx.y;
+	int col = blockIdx.x * blockDim.x + threadIdx.x;
+	int k;
+	ann_real sum;
+
+	if (row >= M || col >= N)
+		return;
+	sum = 0.0f;
+	for (k = 0; k < K; k++)
+		sum += A[row * K + k] * B[col * K + k];
+	C[row * N + col] = sum;
+}
+
+__global__ static void outer_add_kernel(ann_real *DW, const ann_real *A, const ann_real *B,
+	int T, int M, int N)
+{
+	/* DW[m,n] += sum_t A[t,m] * B[t,n] */
+	int m = blockIdx.y * blockDim.y + threadIdx.y;
+	int n = blockIdx.x * blockDim.x + threadIdx.x;
+	int t;
+	ann_real sum;
+
+	if (m >= M || n >= N)
+		return;
+	sum = 0.0f;
+	for (t = 0; t < T; t++)
+		sum += A[t * M + m] * B[t * N + n];
+	DW[m * N + n] += sum;
+}
+
+extern "C" int gpu_mat_mul_bt(mat *c, const mat *a, const mat *b)
+{
+	ann_real *dA;
+	ann_real *dB;
+	ann_real *dC;
+	int ownA;
+	int ownB;
+	int ownC;
+	dim3 block;
+	dim3 grid;
+	int rc;
 
 	if (!c || !a || !b || !gpu_available())
 		return -1;
@@ -318,59 +398,120 @@ extern "C" int gpu_mat_mul_bt(mat *c, const mat *a, const mat *b)
 			gpu_free(dA);
 		return -1;
 	}
-	ownC = 0;
-	dC = c->d_data;
-	if (!dC) {
-		dC = (double *)gpu_malloc(mat_bytes(c));
-		if (!dC) {
-			if (ownA)
-				gpu_free(dA);
-			if (ownB)
-				gpu_free(dB);
-			return -1;
-		}
-		ownC = 1;
+	if (ensure_dev_out(c, &dC, &ownC) != 0) {
+		if (ownA)
+			gpu_free(dA);
+		if (ownB)
+			gpu_free(dB);
+		return -1;
 	}
-	block = dim3(16, 16);
-	grid = dim3((c->cols + 15) / 16, (c->rows + 15) / 16);
-	gemm_bt_kernel<<<grid, block>>>(dA, dB, dC, a->rows, b->rows, a->cols);
-	if (cudaDeviceSynchronize() != cudaSuccess)
-		goto fail;
-	if (g_sync_mode == GPU_SYNC_BATCH && c->d_data && !ownC) {
-		c->on_device = 1;
-	} else {
-		if (c->data && gpu_memcpy_d2h(c->data, dC, mat_bytes(c)) != 0)
-			goto fail;
-		if (c->d_data && !ownC)
-			c->on_device = 0;
+#ifdef ANN_CUBLAS
+	if (cublas_gemm_rm_bt(dC, dA, dB, a->rows, b->rows, a->cols) != 0) {
+#endif
+		block = dim3(16, 16);
+		grid = dim3((c->cols + 15) / 16, (c->rows + 15) / 16);
+		gemm_bt_kernel<<<grid, block>>>(dA, dB, dC, a->rows, b->rows,
+		    a->cols);
+#ifdef ANN_CUBLAS
 	}
+#endif
+	rc = -1;
+	if (launch_done() == 0 && finish_out(c, dC, ownC) == 0)
+		rc = 0;
 	if (ownA)
 		gpu_free(dA);
 	if (ownB)
 		gpu_free(dB);
 	if (ownC)
 		gpu_free(dC);
-	return 0;
-fail:
-	if (ownA)
-		gpu_free(dA);
-	if (ownB)
-		gpu_free(dB);
-	if (ownC)
-		gpu_free(dC);
-	return -1;
+	return rc;
 }
 
+__global__ static void gemm_at_kernel(const ann_real *A, const ann_real *B, ann_real *C,
+	int T, int M, int N)
+{
+	/* C[m,n] = sum_t A[t,m] * B[t,n] */
+	int m = blockIdx.y * blockDim.y + threadIdx.y;
+	int n = blockIdx.x * blockDim.x + threadIdx.x;
+	int t;
+	ann_real sum;
+
+	if (m >= M || n >= N)
+		return;
+	sum = 0.0f;
+	for (t = 0; t < T; t++)
+		sum += A[t * M + m] * B[t * N + n];
+	C[m * N + n] = sum;
+}
+
+/* c = a^T b ; a (T x m), b (T x n) -> c (m x n). cuBLAS OP_T when built in. */
+extern "C" int gpu_mat_mul_at(mat *c, const mat *a, const mat *b)
+{
+	ann_real *dA;
+	ann_real *dB;
+	ann_real *dC;
+	int ownA;
+	int ownB;
+	int ownC;
+	dim3 block;
+	dim3 grid;
+	int rc;
+
+	if (!c || !a || !b || !gpu_available())
+		return -1;
+	if (a->rows != b->rows || c->rows != a->cols || c->cols != b->cols)
+		return -1;
+	if (ensure_dev(a, &dA, &ownA) != 0)
+		return -1;
+	if (ensure_dev(b, &dB, &ownB) != 0) {
+		if (ownA)
+			gpu_free(dA);
+		return -1;
+	}
+	if (ensure_dev_out(c, &dC, &ownC) != 0) {
+		if (ownA)
+			gpu_free(dA);
+		if (ownB)
+			gpu_free(dB);
+		return -1;
+	}
+#ifdef ANN_CUBLAS
+	if (cublas_gemm_rm_at(dC, dA, dB, a->rows, a->cols, b->cols, 0) != 0) {
+#endif
+		block = dim3(16, 16);
+		grid = dim3((c->cols + 15) / 16, (c->rows + 15) / 16);
+		gemm_at_kernel<<<grid, block>>>(dA, dB, dC, a->rows, a->cols,
+		    b->cols);
+#ifdef ANN_CUBLAS
+	}
+#endif
+	rc = -1;
+	if (launch_done() == 0 && finish_out(c, dC, ownC) == 0)
+		rc = 0;
+	if (ownA)
+		gpu_free(dA);
+	if (ownB)
+		gpu_free(dB);
+	if (ownC)
+		gpu_free(dC);
+	return rc;
+}
+
+/*
+** dw += a^T b. dw is read-modify-write: a device-authoritative twin is used
+** as is; a host-authoritative one is uploaded first (host zero_grad etc.).
+*/
 extern "C" int gpu_mat_outer_add(mat *dw, const mat *a, const mat *b)
 {
-	double *dW;
-	double *dA;
-	double *dB;
+	ann_real *dW;
+	ann_real *dA;
+	ann_real *dB;
 	int ownW;
 	int ownA;
 	int ownB;
 	dim3 block;
 	dim3 grid;
+	int rc;
 
 	if (!dw || !a || !b || !gpu_available())
 		return -1;
@@ -383,220 +524,1046 @@ extern "C" int gpu_mat_outer_add(mat *dw, const mat *a, const mat *b)
 			gpu_free(dA);
 		return -1;
 	}
-	ownW = 0;
-	dW = dw->d_data;
-	if (!dW) {
-		dW = (double *)gpu_malloc(mat_bytes(dw));
-		if (!dW || (dw->data && gpu_memcpy_h2d(dW, dw->data, mat_bytes(dw)) != 0)) {
-			gpu_free(dW);
-			if (ownA)
-				gpu_free(dA);
-			if (ownB)
-				gpu_free(dB);
+	if (ensure_dev(dw, &dW, &ownW) != 0) {
+		if (ownA)
+			gpu_free(dA);
+		if (ownB)
+			gpu_free(dB);
+		return -1;
+	}
+#ifdef ANN_CUBLAS
+	if (cublas_gemm_rm_at(dW, dA, dB, a->rows, a->cols, b->cols, 1) != 0) {
+#endif
+		block = dim3(16, 16);
+		grid = dim3((dw->cols + 15) / 16, (dw->rows + 15) / 16);
+		outer_add_kernel<<<grid, block>>>(dW, dA, dB, a->rows, a->cols,
+		    b->cols);
+#ifdef ANN_CUBLAS
+	}
+#endif
+	rc = -1;
+	if (launch_done() == 0 && finish_out(dw, dW, ownW) == 0)
+		rc = 0;
+	if (ownA)
+		gpu_free(dA);
+	if (ownB)
+		gpu_free(dB);
+	if (ownW)
+		gpu_free(dW);
+	return rc;
+}
+
+/*
+** ---- Track K: elementwise kernels + persistent scratch ------------------
+**
+** Host pointers are staged through per-slot persistent device buffers (grown
+** on demand, never freed per call). Device pointers are used in place. One
+** mutex serialises the staged path so OpenMP callers can share the slots.
+*/
+#define EW_SLOTS	8
+#define EW_BLOCK	256
+
+static pthread_mutex_t g_ew_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static void *g_ew_buf[EW_SLOTS];
+static size_t g_ew_cap[EW_SLOTS];
+
+typedef struct {
+	ann_real	*dev;
+	void		*host;
+	size_t		bytes;
+	int		down;
+} ew_ref;
+
+static int ew_is_dev(const void *p)
+{
+	cudaPointerAttributes a;
+
+	if (cudaPointerGetAttributes(&a, p) != cudaSuccess) {
+		(void)cudaGetLastError();
+		return 0;
+	}
+	return a.type == cudaMemoryTypeDevice || a.type == cudaMemoryTypeManaged;
+}
+
+/* Bind host (or device) memory to a device pointer; slot = scratch id. */
+static int ew_acquire(ew_ref *r, int slot, const void *host, size_t bytes,
+	int up, int down)
+{
+	r->dev = NULL;
+	r->host = (void *)host;
+	r->bytes = bytes;
+	r->down = 0;
+	if (!host || bytes == 0)
+		return -1;
+	if (ew_is_dev(host)) {
+		r->dev = (ann_real *)host;
+		return 0;
+	}
+	if (g_ew_cap[slot] < bytes) {
+		if (g_ew_buf[slot])
+			cudaFree(g_ew_buf[slot]);
+		g_ew_buf[slot] = NULL;
+		g_ew_cap[slot] = 0;
+		if (cudaMalloc(&g_ew_buf[slot], bytes) != cudaSuccess) {
+			g_ew_buf[slot] = NULL;
 			return -1;
 		}
-		ownW = 1;
+		g_ew_cap[slot] = bytes;
 	}
-	block = dim3(16, 16);
-	grid = dim3((dw->cols + 15) / 16, (dw->rows + 15) / 16);
-	outer_add_kernel<<<grid, block>>>(dW, dA, dB, a->rows, a->cols, b->cols);
-	if (cudaDeviceSynchronize() != cudaSuccess)
-		goto fail;
-	if (g_sync_mode == GPU_SYNC_BATCH && dw->d_data && !ownW) {
-		dw->on_device = 1;
-	} else {
-		if (dw->data && gpu_memcpy_d2h(dw->data, dW, mat_bytes(dw)) != 0)
-			goto fail;
-		if (dw->d_data && !ownW)
-			dw->on_device = 0;
-	}
-	if (ownA)
-		gpu_free(dA);
-	if (ownB)
-		gpu_free(dB);
-	if (ownW)
-		gpu_free(dW);
+	r->dev = (ann_real *)g_ew_buf[slot];
+	if (up && cudaMemcpy(r->dev, host, bytes, cudaMemcpyHostToDevice)
+	    != cudaSuccess)
+		return -1;
+	r->down = down;
 	return 0;
-fail:
-	if (ownA)
-		gpu_free(dA);
-	if (ownB)
-		gpu_free(dB);
-	if (ownW)
-		gpu_free(dW);
-	return -1;
 }
 
-/* double atomicAdd: native on CC >= 6.0, CAS fallback otherwise. */
-__device__ static double atomicAdd_double(double *address, double val)
+/* Mark an aliased ref as needing D2H (only meaningful when staged). */
+static void ew_mark_down(ew_ref *r)
 {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 600)
-	return atomicAdd(address, val);
-#else
-	unsigned long long int *addr_as_ull = (unsigned long long int *)address;
-	unsigned long long int old = *addr_as_ull;
-	unsigned long long int assumed;
-
-	do {
-		assumed = old;
-		old = atomicCAS(addr_as_ull, assumed,
-		    __double_as_longlong(val + __longlong_as_double(assumed)));
-	} while (assumed != old);
-	return __longlong_as_double(old);
-#endif
+	if ((void *)r->dev != r->host)
+		r->down = 1;
 }
 
-__global__ static void ln_bwd_kernel(double *dx, const double *dy,
-	const double *gamma, const double *x_hat, const double *inv_std,
-	double *dgamma, double *dbeta, int T, int d)
+/* Copy back if staged; returns 1 if a (synchronising) D2H happened, -1 err. */
+static int ew_release(ew_ref *r)
 {
-	int t = blockIdx.x * blockDim.x + threadIdx.x;
+	if (!r->down)
+		return 0;
+	if (cudaMemcpy(r->host, r->dev, r->bytes, cudaMemcpyDeviceToHost)
+	    != cudaSuccess)
+		return -1;
+	return 1;
+}
+
+/* Check the launch; EAGER mode with no D2H still waits for the device. */
+static int ew_launch_ok(void)
+{
+	return cudaGetLastError() == cudaSuccess ? 0 : -1;
+}
+
+static int ew_finish_sync(int did_d2h)
+{
+	if (!did_d2h && g_sync_mode == GPU_SYNC_EAGER
+	    && cudaDeviceSynchronize() != cudaSuccess)
+		return -1;
+	return 0;
+}
+
+static int ew_block_for(int n)
+{
+	int bs;
+
+	bs = 32;
+	while (bs < n && bs < EW_BLOCK)
+		bs <<= 1;
+	return bs;
+}
+
+__device__ static ann_real ew_block_sum(ann_real v, ann_real *sh)
+{
+	int i;
+
+	sh[threadIdx.x] = v;
+	__syncthreads();
+	for (i = blockDim.x >> 1; i > 0; i >>= 1) {
+		if ((int)threadIdx.x < i)
+			sh[threadIdx.x] += sh[threadIdx.x + i];
+		__syncthreads();
+	}
+	v = sh[0];
+	__syncthreads();
+	return v;
+}
+
+__device__ static ann_real ew_block_max(ann_real v, ann_real *sh)
+{
+	int i;
+
+	sh[threadIdx.x] = v;
+	__syncthreads();
+	for (i = blockDim.x >> 1; i > 0; i >>= 1) {
+		if ((int)threadIdx.x < i && sh[threadIdx.x + i] > sh[threadIdx.x])
+			sh[threadIdx.x] = sh[threadIdx.x + i];
+		__syncthreads();
+	}
+	v = sh[0];
+	__syncthreads();
+	return v;
+}
+
+/* One block per row; each thread owns a fixed strided set of columns. */
+__global__ static void softmax_rows_kernel(ann_real *x, int n_cols)
+{
+	__shared__ ann_real sh[EW_BLOCK];
+	ann_real *row = x + (size_t)blockIdx.x * (size_t)n_cols;
+	ann_real m = -INFINITY;
+	ann_real s = 0.0f;
+	ann_real inv;
 	int j;
-	double inv;
-	double sum_dy;
-	double sum_dy_xhat;
-	double dxhat;
-	double term;
 
-	if (t >= T)
-		return;
-	inv = inv_std[t];
-	sum_dy = 0.0;
-	sum_dy_xhat = 0.0;
-	for (j = 0; j < d; j++) {
-		atomicAdd_double(&dbeta[j], dy[t * d + j]);
-		atomicAdd_double(&dgamma[j], dy[t * d + j] * x_hat[t * d + j]);
-		dxhat = dy[t * d + j] * gamma[j];
-		sum_dy += dxhat;
-		sum_dy_xhat += dxhat * x_hat[t * d + j];
+	for (j = threadIdx.x; j < n_cols; j += blockDim.x)
+		if (row[j] > m)
+			m = row[j];
+	m = ew_block_max(m, sh);
+	for (j = threadIdx.x; j < n_cols; j += blockDim.x) {
+		row[j] = expf(row[j] - m);
+		s += row[j];
 	}
-	for (j = 0; j < d; j++) {
-		dxhat = dy[t * d + j] * gamma[j];
-		term = (dxhat - (sum_dy + x_hat[t * d + j] * sum_dy_xhat) / (double)d)
-		    * inv;
-		dx[t * d + j] = term;
+	s = ew_block_sum(s, sh);
+	inv = 1.0f / s;
+	for (j = threadIdx.x; j < n_cols; j += blockDim.x)
+		row[j] *= inv;
+}
+
+/* dx may alias dy or y: dx[j] is written only by the thread that read it. */
+__global__ static void softmax_bwd_kernel(ann_real *dx, const ann_real *y,
+	const ann_real *dy, int n_cols)
+{
+	__shared__ ann_real sh[EW_BLOCK];
+	size_t off = (size_t)blockIdx.x * (size_t)n_cols;
+	ann_real s = 0.0f;
+	int j;
+
+	for (j = threadIdx.x; j < n_cols; j += blockDim.x)
+		s += y[off + j] * dy[off + j];
+	s = ew_block_sum(s, sh);
+	for (j = threadIdx.x; j < n_cols; j += blockDim.x)
+		dx[off + j] = y[off + j] * (dy[off + j] - s);
+}
+
+__global__ static void ln_fwd_kernel(ann_real *y, const ann_real *x,
+	const ann_real *gamma, const ann_real *beta, ann_real *x_hat,
+	ann_real *mean_out, ann_real *inv_out, int d, ann_real eps)
+{
+	__shared__ ann_real sh[EW_BLOCK];
+	size_t off = (size_t)blockIdx.x * (size_t)d;
+	ann_real mean = 0.0f;
+	ann_real var = 0.0f;
+	ann_real inv;
+	ann_real v;
+	ann_real xh;
+	int j;
+
+	for (j = threadIdx.x; j < d; j += blockDim.x)
+		mean += x[off + j];
+	mean = ew_block_sum(mean, sh) / (ann_real)d;
+	for (j = threadIdx.x; j < d; j += blockDim.x) {
+		v = x[off + j] - mean;
+		var += v * v;
+	}
+	var = ew_block_sum(var, sh) / (ann_real)d;
+	inv = 1.0f / sqrtf(var + eps);
+	for (j = threadIdx.x; j < d; j += blockDim.x) {
+		xh = (x[off + j] - mean) * inv;
+		if (x_hat)
+			x_hat[off + j] = xh;
+		y[off + j] = xh * gamma[j] + beta[j];	/* y may alias x */
+	}
+	if (threadIdx.x == 0) {
+		if (mean_out)
+			mean_out[blockIdx.x] = mean;
+		if (inv_out)
+			inv_out[blockIdx.x] = inv;
 	}
 }
 
-extern "C" int gpu_layernorm_backward(mat *dx, const mat *dy, const double *gamma,
-	const double *x_hat, const double *inv_std, int T, int d,
-	double *dgamma, double *dbeta)
+/* One block per row; dgamma/dbeta accumulate across rows with atomics. */
+__global__ static void ln_bwd_kernel(ann_real *dx, const ann_real *dy,
+	const ann_real *gamma, const ann_real *x_hat, const ann_real *inv_std,
+	ann_real *dgamma, ann_real *dbeta, int d)
 {
-	double *d_dx;
-	double *d_dy;
-	double *d_gamma;
-	double *d_xhat;
-	double *d_inv;
-	double *d_dg;
-	double *d_db;
-	size_t matb;
+	__shared__ ann_real sh[EW_BLOCK];
+	size_t off = (size_t)blockIdx.x * (size_t)d;
+	ann_real sum_dy = 0.0f;
+	ann_real sum_dyx = 0.0f;
+	ann_real inv = inv_std[blockIdx.x];
+	ann_real g;
+	ann_real xh;
+	int j;
+
+	for (j = threadIdx.x; j < d; j += blockDim.x) {
+		g = dy[off + j];
+		xh = x_hat[off + j];
+		atomicAdd(&dbeta[j], g);
+		atomicAdd(&dgamma[j], g * xh);
+		g *= gamma[j];
+		sum_dy += g;
+		sum_dyx += g * xh;
+	}
+	sum_dy = ew_block_sum(sum_dy, sh);
+	sum_dyx = ew_block_sum(sum_dyx, sh);
+	for (j = threadIdx.x; j < d; j += blockDim.x) {
+		g = dy[off + j] * gamma[j];
+		dx[off + j] = (g - (sum_dy + x_hat[off + j] * sum_dyx) / (ann_real)d)
+		    * inv;
+	}
+}
+
+__global__ static void bias_add_kernel(ann_real *x, const ann_real *bias,
+	int n, int cols)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+	if (i < n)
+		x[i] += bias[i % cols];
+}
+
+__global__ static void relu_fwd_kernel(ann_real *x, int n)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+	if (i < n && x[i] < 0.0f)
+		x[i] = 0.0f;
+}
+
+__global__ static void relu_bwd_kernel(ann_real *dx, const ann_real *ref, int n)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+	if (i < n && ref[i] <= 0.0f)
+		dx[i] = 0.0f;
+}
+
+static int gpu_softmax_rows_locked(ann_real *rows, int n_rows, int n_cols)
+{
+	ew_ref r;
+	int rc;
+	int dn;
+
+	if (!rows || n_rows <= 0 || n_cols <= 0 || !gpu_available())
+		return -1;
+	if (ew_acquire(&r, 0, rows,
+	    (size_t)n_rows * (size_t)n_cols * sizeof(ann_real), 1, 1) != 0)
+		return -1;
+	softmax_rows_kernel<<<n_rows, ew_block_for(n_cols)>>>(r.dev, n_cols);
+	if (ew_launch_ok() != 0)
+		return -1;
+	rc = ew_release(&r);
+	if (rc < 0)
+		return -1;
+	dn = rc;
+	return ew_finish_sync(dn) == 0 ? 0 : -1;
+}
+
+extern "C" int gpu_softmax_rows(ann_real *rows, int n_rows, int n_cols)
+{
+	int rc;
+
+	pthread_mutex_lock(&g_ew_mu);
+	rc = gpu_softmax_rows_locked(rows, n_rows, n_cols);
+	pthread_mutex_unlock(&g_ew_mu);
+	return rc;
+}
+
+static int gpu_softmax_bwd_rows_locked(ann_real *dx, const ann_real *y,
+	const ann_real *dy, int n_rows, int n_cols)
+{
+	ew_ref ry;
+	ew_ref rdy;
+	ew_ref rdx;
+	size_t nb;
+	int rc;
+
+	if (!dx || !y || !dy || n_rows <= 0 || n_cols <= 0 || !gpu_available())
+		return -1;
+	nb = (size_t)n_rows * (size_t)n_cols * sizeof(ann_real);
+	if (ew_acquire(&ry, 0, y, nb, 1, 0) != 0)
+		return -1;
+	if (dy == y)
+		rdy = ry;
+	else if (ew_acquire(&rdy, 1, dy, nb, 1, 0) != 0)
+		return -1;
+	if (dx == dy) {
+		rdx = rdy;
+		ew_mark_down(&rdx);
+	} else if (dx == y) {
+		rdx = ry;
+		ew_mark_down(&rdx);
+	} else if (ew_acquire(&rdx, 2, dx, nb, 0, 1) != 0) {
+		return -1;
+	}
+	softmax_bwd_kernel<<<n_rows, ew_block_for(n_cols)>>>(rdx.dev, ry.dev,
+	    rdy.dev, n_cols);
+	if (ew_launch_ok() != 0)
+		return -1;
+	rc = ew_release(&rdx);
+	if (rc < 0)
+		return -1;
+	return ew_finish_sync(rc) == 0 ? 0 : -1;
+}
+
+extern "C" int gpu_softmax_bwd_rows(ann_real *dx, const ann_real *y,
+	const ann_real *dy, int n_rows, int n_cols)
+{
+	int rc;
+
+	pthread_mutex_lock(&g_ew_mu);
+	rc = gpu_softmax_bwd_rows_locked(dx, y, dy, n_rows, n_cols);
+	pthread_mutex_unlock(&g_ew_mu);
+	return rc;
+}
+
+
+/*
+** M1: fused causal multi-head attention over B packed sequences (no per-head
+** host loop). Layout: q/k/v/concat are (B*T) x (H*dh) row-major; sequence b
+** owns rows [b*T, (b+1)*T). w is the softmax weights, row ((b*H+h)*T + i) of
+** width T (rows are causal: zero for j > i). One launch per phase covers every
+** (b, h, i) row, so the GPU sees B*H*T independent blocks.
+*/
+#define ATT_BLOCK	128
+
+__device__ static ann_real att_sum(ann_real v, ann_real *sh)
+{
+	int i;
+
+	sh[threadIdx.x] = v;
+	__syncthreads();
+	for (i = blockDim.x >> 1; i > 0; i >>= 1) {
+		if ((int)threadIdx.x < i)
+			sh[threadIdx.x] += sh[threadIdx.x + i];
+		__syncthreads();
+	}
+	v = sh[0];
+	__syncthreads();
+	return v;
+}
+
+__device__ static ann_real att_max(ann_real v, ann_real *sh)
+{
+	int i;
+
+	sh[threadIdx.x] = v;
+	__syncthreads();
+	for (i = blockDim.x >> 1; i > 0; i >>= 1) {
+		if ((int)threadIdx.x < i && sh[threadIdx.x + i] > sh[threadIdx.x])
+			sh[threadIdx.x] = sh[threadIdx.x + i];
+		__syncthreads();
+	}
+	v = sh[0];
+	__syncthreads();
+	return v;
+}
+
+/* grid = B*H*T blocks (bh, i); dyn smem = (dh + T) floats. */
+__global__ static void attn_fwd_kernel(ann_real *concat, ann_real *w,
+	const ann_real *q, const ann_real *k, const ann_real *v,
+	int T, int H, int dh, ann_real scale)
+{
+	extern __shared__ ann_real sm[];
+	__shared__ ann_real red[ATT_BLOCK];
+	ann_real *qi = sm;		/* dh */
+	ann_real *sc = sm + dh;		/* T */
+	int i = blockIdx.x % T;
+	int bh = blockIdx.x / T;
+	int h = bh % H;
+	int b = bh / H;
+	int D = H * dh;
+	size_t row0 = (size_t)b * T;
+	int j;
+	int c;
+	ann_real mx;
+	ann_real sum;
+	ann_real acc;
+	ann_real *wr = w + (size_t)blockIdx.x * T;
+
+	for (c = threadIdx.x; c < dh; c += blockDim.x)
+		qi[c] = q[(row0 + i) * D + h * dh + c];
+	__syncthreads();
+	mx = -1e30f;
+	for (j = threadIdx.x; j < T; j += blockDim.x) {
+		acc = 0.0f;
+		if (j <= i) {
+			const ann_real *kj = k + (row0 + j) * D + h * dh;
+			for (c = 0; c < dh; c++)
+				acc += qi[c] * kj[c];
+			acc *= scale;
+		} else {
+			acc = -1e30f;
+		}
+		sc[j] = acc;
+		if (acc > mx)
+			mx = acc;
+	}
+	mx = att_max(mx, red);
+	sum = 0.0f;
+	for (j = threadIdx.x; j < T; j += blockDim.x) {
+		acc = (j <= i) ? __expf(sc[j] - mx) : 0.0f;
+		sc[j] = acc;
+		sum += acc;
+	}
+	sum = att_sum(sum, red);
+	for (j = threadIdx.x; j < T; j += blockDim.x) {
+		sc[j] /= sum;
+		wr[j] = sc[j];
+	}
+	__syncthreads();
+	for (c = threadIdx.x; c < dh; c += blockDim.x) {
+		acc = 0.0f;
+		for (j = 0; j <= i; j++)
+			acc += sc[j] * v[(row0 + j) * D + h * dh + c];
+		concat[(row0 + i) * D + h * dh + c] = acc;
+	}
+}
+
+/*
+** Backward phase 1: per (bh, i): dA_j = do_i . v_j, dS_ij = A_ij (dA_j - sum)
+** * scale (zero for j > i), written to ds; dQ_i = sum_j dS_ij k_j.
+*/
+__global__ static void attn_bwd_rows_kernel(ann_real *dq, ann_real *ds,
+	const ann_real *dconcat, const ann_real *w, const ann_real *k,
+	const ann_real *v, int T, int H, int dh, ann_real scale)
+{
+	extern __shared__ ann_real sm[];
+	__shared__ ann_real red[ATT_BLOCK];
+	ann_real *doi = sm;		/* dh */
+	ann_real *dsr = sm + dh;	/* T */
+	int i = blockIdx.x % T;
+	int bh = blockIdx.x / T;
+	int h = bh % H;
+	int b = bh / H;
+	int D = H * dh;
+	size_t row0 = (size_t)b * T;
+	const ann_real *wr = w + (size_t)blockIdx.x * T;
+	ann_real *dsg = ds + (size_t)blockIdx.x * T;
+	int j;
+	int c;
+	ann_real acc;
+	ann_real dot;
+
+	for (c = threadIdx.x; c < dh; c += blockDim.x)
+		doi[c] = dconcat[(row0 + i) * D + h * dh + c];
+	__syncthreads();
+	dot = 0.0f;
+	for (j = threadIdx.x; j < T; j += blockDim.x) {
+		acc = 0.0f;
+		if (j <= i) {
+			const ann_real *vj = v + (row0 + j) * D + h * dh;
+			for (c = 0; c < dh; c++)
+				acc += doi[c] * vj[c];
+		}
+		dsr[j] = acc;			/* dA_j */
+		dot += wr[j] * acc;
+	}
+	dot = att_sum(dot, red);
+	for (j = threadIdx.x; j < T; j += blockDim.x) {
+		acc = (j <= i) ? wr[j] * (dsr[j] - dot) * scale : 0.0f;
+		dsr[j] = acc;
+		dsg[j] = acc;
+	}
+	__syncthreads();
+	for (c = threadIdx.x; c < dh; c += blockDim.x) {
+		acc = 0.0f;
+		for (j = 0; j <= i; j++)
+			acc += dsr[j] * k[(row0 + j) * D + h * dh + c];
+		dq[(row0 + i) * D + h * dh + c] = acc;
+	}
+}
+
+/* Backward phase 2: per (bh, j): dK_j = sum_{i>=j} dS_ij q_i, dV_j = sum A_ij do_i. */
+__global__ static void attn_bwd_cols_kernel(ann_real *dk, ann_real *dv,
+	const ann_real *dconcat, const ann_real *w, const ann_real *ds,
+	const ann_real *q, int T, int H, int dh)
+{
+	int j = blockIdx.x % T;
+	int bh = blockIdx.x / T;
+	int h = bh % H;
+	int b = bh / H;
+	int D = H * dh;
+	size_t row0 = (size_t)b * T;
+	const ann_real *wb = w + (size_t)bh * T * T;
+	const ann_real *dsb = ds + (size_t)bh * T * T;
+	int i;
+	int c;
+	ann_real ak;
+	ann_real av;
+
+	for (c = threadIdx.x; c < dh; c += blockDim.x) {
+		ak = 0.0f;
+		av = 0.0f;
+		for (i = j; i < T; i++) {
+			ak += dsb[(size_t)i * T + j]
+			    * q[(row0 + i) * D + h * dh + c];
+			av += wb[(size_t)i * T + j]
+			    * dconcat[(row0 + i) * D + h * dh + c];
+		}
+		dk[(row0 + j) * D + h * dh + c] = ak;
+		dv[(row0 + j) * D + h * dh + c] = av;
+	}
+}
+
+static pthread_mutex_t g_att_mu = PTHREAD_MUTEX_INITIALIZER;
+static ann_real *g_att_ds;
+static size_t g_att_ds_cap;
+
+static int att_args_ok(int B, int T, int H, int dh)
+{
+	return B > 0 && T > 0 && T <= ATT_BLOCK && H > 0 && dh > 0
+	    && gpu_available();
+}
+
+extern "C" int gpu_attn_causal_fwd(mat *concat, mat *w, const mat *q,
+	const mat *k, const mat *v, int B, int T, int H, int dh)
+{
+	ann_real *dq;
+	ann_real *dk;
+	ann_real *dv;
+	ann_real *dc;
+	ann_real *dw;
+	int oq;
+	int ok;
+	int ov;
+	int oc;
+	int rc;
+	size_t smem;
+
+	if (!concat || !w || !q || !k || !v || !att_args_ok(B, T, H, dh))
+		return -1;
+	if (q->rows != B * T || q->cols != H * dh || k->rows != q->rows
+	    || v->rows != q->rows || concat->rows != q->rows
+	    || concat->cols != q->cols || w->rows != B * H * T || w->cols != T
+	    || !w->d_data)
+		return -1;
+	pthread_mutex_lock(&g_att_mu);
+	rc = -1;
+	oq = ok = ov = oc = 0;
+	dq = dk = dv = dc = NULL;
+	if (ensure_dev(q, &dq, &oq) != 0)
+		goto out;
+	if (ensure_dev(k, &dk, &ok) != 0)
+		goto out;
+	if (ensure_dev(v, &dv, &ov) != 0)
+		goto out;
+	if (ensure_dev_out(concat, &dc, &oc) != 0)
+		goto out;
+	dw = w->d_data;
+	smem = (size_t)(dh + T) * sizeof(ann_real);
+	attn_fwd_kernel<<<B * H * T, ATT_BLOCK, smem>>>(dc, dw, dq, dk, dv,
+	    T, H, dh, (ann_real)(1.0 / sqrt((double)dh)));
+	if (launch_done() == 0 && finish_out(concat, dc, oc) == 0) {
+		w->on_device = MAT_DEV_DEVICE;	/* host copy never read */
+		rc = 0;
+	}
+out:
+	if (oq && dq)
+		gpu_free(dq);
+	if (ok && dk)
+		gpu_free(dk);
+	if (ov && dv)
+		gpu_free(dv);
+	if (oc && dc)
+		gpu_free(dc);
+	pthread_mutex_unlock(&g_att_mu);
+	return rc;
+}
+
+extern "C" int gpu_attn_causal_bwd(mat *dq, mat *dk, mat *dv,
+	const mat *dconcat, const mat *w, const mat *q, const mat *k,
+	const mat *v, int B, int T, int H, int dh)
+{
+	ann_real *a_dq;
+	ann_real *a_dk;
+	ann_real *a_dv;
+	ann_real *a_dc;
+	ann_real *a_q;
+	ann_real *a_k;
+	ann_real *a_v;
+	size_t need;
+	size_t smem;
+	int o[7];
+	int rc;
+	int i;
+	ann_real *ptr[7];
+
+	if (!dq || !dk || !dv || !dconcat || !w || !q || !k || !v
+	    || !att_args_ok(B, T, H, dh) || !w->d_data)
+		return -1;
+	if (q->rows != B * T || q->cols != H * dh || dq->rows != q->rows
+	    || dk->rows != q->rows || dv->rows != q->rows
+	    || dconcat->rows != q->rows || w->rows != B * H * T)
+		return -1;
+	pthread_mutex_lock(&g_att_mu);
+	rc = -1;
+	for (i = 0; i < 7; i++) {
+		o[i] = 0;
+		ptr[i] = NULL;
+	}
+	need = (size_t)B * H * T * T * sizeof(ann_real);
+	if (g_att_ds_cap < need) {
+		if (g_att_ds)
+			cudaFree(g_att_ds);
+		g_att_ds = NULL;
+		g_att_ds_cap = 0;
+		if (cudaMalloc((void **)&g_att_ds, need) != cudaSuccess) {
+			g_att_ds = NULL;
+			goto out;
+		}
+		g_att_ds_cap = need;
+	}
+	if (ensure_dev(dconcat, &ptr[0], &o[0]) != 0
+	    || ensure_dev(q, &ptr[1], &o[1]) != 0
+	    || ensure_dev(k, &ptr[2], &o[2]) != 0
+	    || ensure_dev(v, &ptr[3], &o[3]) != 0
+	    || ensure_dev_out(dq, &ptr[4], &o[4]) != 0
+	    || ensure_dev_out(dk, &ptr[5], &o[5]) != 0
+	    || ensure_dev_out(dv, &ptr[6], &o[6]) != 0)
+		goto out;
+	a_dc = ptr[0];
+	a_q = ptr[1];
+	a_k = ptr[2];
+	a_v = ptr[3];
+	a_dq = ptr[4];
+	a_dk = ptr[5];
+	a_dv = ptr[6];
+	smem = (size_t)(dh + T) * sizeof(ann_real);
+	attn_bwd_rows_kernel<<<B * H * T, ATT_BLOCK, smem>>>(a_dq, g_att_ds,
+	    a_dc, w->d_data, a_k, a_v, T, H, dh,
+	    (ann_real)(1.0 / sqrt((double)dh)));
+	attn_bwd_cols_kernel<<<B * H * T, ATT_BLOCK>>>(a_dk, a_dv, a_dc,
+	    w->d_data, g_att_ds, a_q, T, H, dh);
+	if (launch_done() == 0 && finish_out(dq, a_dq, o[4]) == 0
+	    && finish_out(dk, a_dk, o[5]) == 0
+	    && finish_out(dv, a_dv, o[6]) == 0)
+		rc = 0;
+out:
+	for (i = 0; i < 7; i++)
+		if (o[i] && ptr[i])
+			gpu_free(ptr[i]);
+	pthread_mutex_unlock(&g_att_mu);
+	return rc;
+}
+
+static int gpu_layernorm_forward_ex_locked(ann_real *y, const ann_real *x,
+	const ann_real *gamma, const ann_real *beta, ann_real *x_hat,
+	ann_real *mean, ann_real *inv_std, int T, int d, double eps)
+{
+	ew_ref rx;
+	ew_ref ry;
+	ew_ref rg;
+	ew_ref rb;
+	ew_ref rh;
+	ew_ref rm;
+	ew_ref ri;
+	size_t mb;
 	size_t vb;
 	size_t gb;
+	int did;
+	int rc;
+
+	if (!y || !x || !gamma || !beta || T <= 0 || d <= 0 || !gpu_available())
+		return -1;
+	mb = (size_t)T * (size_t)d * sizeof(ann_real);
+	vb = (size_t)T * sizeof(ann_real);
+	gb = (size_t)d * sizeof(ann_real);
+	if (ew_acquire(&rx, 0, x, mb, 1, 0) != 0)
+		return -1;
+	if (y == x) {
+		ry = rx;
+		ew_mark_down(&ry);
+	} else if (ew_acquire(&ry, 1, y, mb, 0, 1) != 0) {
+		return -1;
+	}
+	if (ew_acquire(&rg, 2, gamma, gb, 1, 0) != 0
+	    || ew_acquire(&rb, 3, beta, gb, 1, 0) != 0)
+		return -1;
+	memset(&rh, 0, sizeof(rh));
+	memset(&rm, 0, sizeof(rm));
+	memset(&ri, 0, sizeof(ri));
+	if (x_hat && ew_acquire(&rh, 4, x_hat, mb, 0, 1) != 0)
+		return -1;
+	if (mean && ew_acquire(&rm, 5, mean, vb, 0, 1) != 0)
+		return -1;
+	if (inv_std && ew_acquire(&ri, 6, inv_std, vb, 0, 1) != 0)
+		return -1;
+	ln_fwd_kernel<<<T, ew_block_for(d)>>>(ry.dev, rx.dev, rg.dev, rb.dev,
+	    x_hat ? rh.dev : NULL, mean ? rm.dev : NULL,
+	    inv_std ? ri.dev : NULL, d, (ann_real)eps);
+	if (ew_launch_ok() != 0)
+		return -1;
+	/* Download y last: with y == x a late failure must not lose the input. */
+	did = 0;
+	if (x_hat) {
+		if ((rc = ew_release(&rh)) < 0)
+			return -1;
+		did |= rc;
+	}
+	if (mean) {
+		if ((rc = ew_release(&rm)) < 0)
+			return -1;
+		did |= rc;
+	}
+	if (inv_std) {
+		if ((rc = ew_release(&ri)) < 0)
+			return -1;
+		did |= rc;
+	}
+	if ((rc = ew_release(&ry)) < 0)
+		return -1;
+	did |= rc;
+	return ew_finish_sync(did) == 0 ? 0 : -1;
+}
+
+extern "C" int gpu_layernorm_forward_ex(ann_real *y, const ann_real *x,
+	const ann_real *gamma, const ann_real *beta, ann_real *x_hat,
+	ann_real *mean, ann_real *inv_std, int T, int d, double eps)
+{
+	int rc;
+
+	pthread_mutex_lock(&g_ew_mu);
+	rc = gpu_layernorm_forward_ex_locked(y, x, gamma, beta, x_hat, mean, inv_std, T, d, eps);
+	pthread_mutex_unlock(&g_ew_mu);
+	return rc;
+}
+
+extern "C" int gpu_layernorm_forward(ann_real *y, const ann_real *x,
+	const ann_real *gamma, const ann_real *beta, ann_real *x_hat,
+	ann_real *inv_std, int T, int d)
+{
+	return gpu_layernorm_forward_ex(y, x, gamma, beta, x_hat, NULL, inv_std,
+	    T, d, 1e-5);
+}
+
+static int gpu_layernorm_backward_locked(mat *dx, const mat *dy, const ann_real *gamma,
+	const ann_real *x_hat, const ann_real *inv_std, int T, int d,
+	ann_real *dgamma, ann_real *dbeta)
+{
+	ew_ref rdx;
+	ew_ref rdy;
+	ew_ref rg;
+	ew_ref rh;
+	ew_ref ri;
+	ew_ref rdg;
+	ew_ref rdb;
+	const ann_real *dyp;
+	size_t mb;
+	size_t vb;
+	size_t gb;
+	int did;
+	int rc;
 
 	if (!dx || !dy || !gamma || !x_hat || !inv_std || !dgamma || !dbeta)
 		return -1;
 	if (!gpu_available() || T <= 0 || d <= 0)
 		return -1;
-	matb = (size_t)T * (size_t)d * sizeof(double);
-	vb = (size_t)T * sizeof(double);
-	gb = (size_t)d * sizeof(double);
-	d_dx = d_dy = d_gamma = d_xhat = d_inv = d_dg = d_db = NULL;
-	if (!(d_dx = (double *)gpu_malloc(matb))
-	    || !(d_dy = (double *)gpu_malloc(matb))
-	    || !(d_gamma = (double *)gpu_malloc(gb))
-	    || !(d_xhat = (double *)gpu_malloc(matb))
-	    || !(d_inv = (double *)gpu_malloc(vb))
-	    || !(d_dg = (double *)gpu_malloc(gb))
-	    || !(d_db = (double *)gpu_malloc(gb)))
-		goto fail;
-	if (gpu_memcpy_h2d(d_dy, dy->data, matb) != 0
-	    || gpu_memcpy_h2d(d_gamma, gamma, gb) != 0
-	    || gpu_memcpy_h2d(d_xhat, x_hat, matb) != 0
-	    || gpu_memcpy_h2d(d_inv, inv_std, vb) != 0
-	    || gpu_memcpy_h2d(d_dg, dgamma, gb) != 0
-	    || gpu_memcpy_h2d(d_db, dbeta, gb) != 0)
-		goto fail;
-	ln_bwd_kernel<<<(T + 255) / 256, 256>>>(d_dx, d_dy, d_gamma, d_xhat,
-	    d_inv, d_dg, d_db, T, d);
-	if (cudaDeviceSynchronize() != cudaSuccess)
-		goto fail;
-	if (gpu_memcpy_d2h(dx->data, d_dx, matb) != 0
-	    || gpu_memcpy_d2h(dgamma, d_dg, gb) != 0
-	    || gpu_memcpy_d2h(dbeta, d_db, gb) != 0)
-		goto fail;
-	gpu_free(d_dx);
-	gpu_free(d_dy);
-	gpu_free(d_gamma);
-	gpu_free(d_xhat);
-	gpu_free(d_inv);
-	gpu_free(d_dg);
-	gpu_free(d_db);
-	return 0;
-fail:
-	gpu_free(d_dx);
-	gpu_free(d_dy);
-	gpu_free(d_gamma);
-	gpu_free(d_xhat);
-	gpu_free(d_inv);
-	gpu_free(d_dg);
-	gpu_free(d_db);
-	return -1;
+	mb = (size_t)T * (size_t)d * sizeof(ann_real);
+	vb = (size_t)T * sizeof(ann_real);
+	gb = (size_t)d * sizeof(ann_real);
+	/* Prefer device twins when authoritative (R1 residency). */
+	dyp = (dy->d_data && dy->on_device != MAT_DEV_HOST) ? dy->d_data : dy->data;
+	if (dx->d_data) {
+		if (ew_acquire(&rdx, 0, dx->d_data, mb, 0, 0) != 0)
+			return -1;
+	} else if (ew_acquire(&rdx, 0, dx->data, mb, 0, 1) != 0)
+		return -1;
+	if (ew_acquire(&rdy, 1, dyp, mb, 1, 0) != 0
+	    || ew_acquire(&rg, 2, gamma, gb, 1, 0) != 0
+	    || ew_acquire(&rh, 3, x_hat, mb, 1, 0) != 0
+	    || ew_acquire(&ri, 4, inv_std, vb, 1, 0) != 0
+	    || ew_acquire(&rdg, 5, dgamma, gb, 1, 1) != 0
+	    || ew_acquire(&rdb, 6, dbeta, gb, 1, 1) != 0)
+		return -1;
+	ln_bwd_kernel<<<T, ew_block_for(d)>>>(rdx.dev, rdy.dev, rg.dev, rh.dev,
+	    ri.dev, rdg.dev, rdb.dev, d);
+	if (ew_launch_ok() != 0)
+		return -1;
+	/* Accumulators first: dx last so a late failure can still fall back. */
+	did = 0;
+	if ((rc = ew_release(&rdg)) < 0)
+		return -1;
+	did |= rc;
+	if ((rc = ew_release(&rdb)) < 0)
+		return -1;
+	did |= rc;
+	if ((rc = ew_release(&rdx)) < 0)
+		return -1;
+	did |= rc;
+	if (dx->d_data)
+		dx->on_device = MAT_DEV_DEVICE;
+	return ew_finish_sync(did) == 0 ? 0 : -1;
 }
 
-__global__ static void adam_kernel(double *param, double *grad, double *m,
-	double *v, int n, double lr, double beta1, double beta2, double eps,
-	double bc1, double bc2)
+extern "C" int gpu_layernorm_backward(mat *dx, const mat *dy, const ann_real *gamma,
+	const ann_real *x_hat, const ann_real *inv_std, int T, int d,
+	ann_real *dgamma, ann_real *dbeta)
+{
+	int rc;
+
+	pthread_mutex_lock(&g_ew_mu);
+	rc = gpu_layernorm_backward_locked(dx, dy, gamma, x_hat, inv_std, T, d, dgamma, dbeta);
+	pthread_mutex_unlock(&g_ew_mu);
+	return rc;
+}
+
+static int gpu_bias_row_add_locked(ann_real *x, const ann_real *bias, int rows,
+	int cols)
+{
+	ew_ref rx;
+	ew_ref rb;
+	long n;
+	int rc;
+
+	if (!x || !bias || rows <= 0 || cols <= 0 || !gpu_available())
+		return -1;
+	n = (long)rows * (long)cols;
+	if (n > 0x7fffffffL)
+		return -1;
+	if (ew_acquire(&rx, 0, x, (size_t)n * sizeof(ann_real), 1, 1) != 0
+	    || ew_acquire(&rb, 1, bias, (size_t)cols * sizeof(ann_real), 1, 0) != 0)
+		return -1;
+	bias_add_kernel<<<(int)((n + 255) / 256), 256>>>(rx.dev, rb.dev, (int)n,
+	    cols);
+	if (ew_launch_ok() != 0)
+		return -1;
+	rc = ew_release(&rx);
+	if (rc < 0)
+		return -1;
+	return ew_finish_sync(rc) == 0 ? 0 : -1;
+}
+
+extern "C" int gpu_bias_row_add(ann_real *x, const ann_real *bias, int rows,
+	int cols)
+{
+	int rc;
+
+	pthread_mutex_lock(&g_ew_mu);
+	rc = gpu_bias_row_add_locked(x, bias, rows, cols);
+	pthread_mutex_unlock(&g_ew_mu);
+	return rc;
+}
+
+static int gpu_relu_forward_locked(ann_real *x, int n)
+{
+	ew_ref rx;
+	int rc;
+
+	if (!x || n <= 0 || !gpu_available())
+		return -1;
+	if (ew_acquire(&rx, 0, x, (size_t)n * sizeof(ann_real), 1, 1) != 0)
+		return -1;
+	relu_fwd_kernel<<<(n + 255) / 256, 256>>>(rx.dev, n);
+	if (ew_launch_ok() != 0)
+		return -1;
+	rc = ew_release(&rx);
+	if (rc < 0)
+		return -1;
+	return ew_finish_sync(rc) == 0 ? 0 : -1;
+}
+
+extern "C" int gpu_relu_forward(ann_real *x, int n)
+{
+	int rc;
+
+	pthread_mutex_lock(&g_ew_mu);
+	rc = gpu_relu_forward_locked(x, n);
+	pthread_mutex_unlock(&g_ew_mu);
+	return rc;
+}
+
+static int gpu_relu_backward_locked(ann_real *dx, const ann_real *x_pre_relu_or_mask,
+	int n)
+{
+	ew_ref rdx;
+	ew_ref rr;
+	int rc;
+
+	if (!dx || !x_pre_relu_or_mask || n <= 0 || !gpu_available())
+		return -1;
+	if (ew_acquire(&rdx, 0, dx, (size_t)n * sizeof(ann_real), 1, 1) != 0
+	    || ew_acquire(&rr, 1, x_pre_relu_or_mask,
+	    (size_t)n * sizeof(ann_real), 1, 0) != 0)
+		return -1;
+	relu_bwd_kernel<<<(n + 255) / 256, 256>>>(rdx.dev, rr.dev, n);
+	if (ew_launch_ok() != 0)
+		return -1;
+	rc = ew_release(&rdx);
+	if (rc < 0)
+		return -1;
+	return ew_finish_sync(rc) == 0 ? 0 : -1;
+}
+
+extern "C" int gpu_relu_backward(ann_real *dx, const ann_real *x_pre_relu_or_mask,
+	int n)
+{
+	int rc;
+
+	pthread_mutex_lock(&g_ew_mu);
+	rc = gpu_relu_backward_locked(dx, x_pre_relu_or_mask, n);
+	pthread_mutex_unlock(&g_ew_mu);
+	return rc;
+}
+
+__global__ static void adam_kernel(ann_real *param, ann_real *grad, ann_real *m,
+	ann_real *v, int n, ann_real lr, ann_real beta1, ann_real beta2, ann_real eps,
+	ann_real bc1, ann_real bc2, ann_real gscale)
 {
 	int i = blockIdx.x * blockDim.x + threadIdx.x;
-	double g;
-	double mhat;
-	double vhat;
+	ann_real g;
+	ann_real mhat;
+	ann_real vhat;
 
 	if (i >= n)
 		return;
-	g = grad[i];
-	m[i] = beta1 * m[i] + (1.0 - beta1) * g;
-	v[i] = beta2 * v[i] + (1.0 - beta2) * g * g;
+	g = grad[i] * gscale;
+	m[i] = beta1 * m[i] + (1.0f - beta1) * g;
+	v[i] = beta2 * v[i] + (1.0f - beta2) * g * g;
 	mhat = m[i] / bc1;
 	vhat = v[i] / bc2;
-	param[i] -= lr * mhat / (sqrt(vhat) + eps);
-	grad[i] = 0.0;
+	param[i] -= lr * mhat / (sqrtf(vhat) + eps);
+	grad[i] = 0.0f;
 }
 
-extern "C" int gpu_adam_step(double *param, double *grad, double *m, double *v,
-	int n, double lr, double beta1, double beta2, double eps, int t)
+extern "C" int gpu_adam_step_dev(ann_real *d_p, ann_real *d_g, ann_real *d_m,
+	ann_real *d_v, int n, double lr, double beta1, double beta2, double eps,
+	int t, double grad_scale)
 {
-	double *d_p;
-	double *d_g;
-	double *d_m;
-	double *d_v;
-	size_t nbytes;
 	double bc1;
 	double bc2;
+
+	if (!d_p || !d_g || !d_m || !d_v || n <= 0 || lr <= 0.0 || t < 1)
+		return -1;
+	if (!gpu_available())
+		return -1;
+	bc1 = 1.0 - pow(beta1, (double)t);
+	bc2 = 1.0 - pow(beta2, (double)t);
+	if (bc1 <= 0.0 || bc2 <= 0.0)
+		return -1;
+	adam_kernel<<<(n + 255) / 256, 256>>>(d_p, d_g, d_m, d_v, n, lr, beta1,
+	    beta2, eps, bc1, bc2, (ann_real)grad_scale);
+	if (cudaDeviceSynchronize() != cudaSuccess)
+		return -1;
+	return 0;
+}
+
+extern "C" int gpu_adam_step(ann_real *param, ann_real *grad, ann_real *m, ann_real *v,
+	int n, double lr, double beta1, double beta2, double eps, int t,
+	double grad_scale)
+{
+	ann_real *d_p;
+	ann_real *d_g;
+	ann_real *d_m;
+	ann_real *d_v;
+	size_t nbytes;
 
 	if (!param || !grad || !m || !v || n <= 0 || lr <= 0.0 || t < 1)
 		return -1;
 	if (!gpu_available())
 		return -1;
-	nbytes = (size_t)n * sizeof(double);
+	nbytes = (size_t)n * sizeof(ann_real);
 	d_p = d_g = d_m = d_v = NULL;
-	bc1 = 1.0 - pow(beta1, (double)t);
-	bc2 = 1.0 - pow(beta2, (double)t);
-	if (bc1 <= 0.0 || bc2 <= 0.0)
-		return -1;
-	if (!(d_p = (double *)gpu_malloc(nbytes))
-	    || !(d_g = (double *)gpu_malloc(nbytes))
-	    || !(d_m = (double *)gpu_malloc(nbytes))
-	    || !(d_v = (double *)gpu_malloc(nbytes)))
+	if (!(d_p = (ann_real *)gpu_malloc(nbytes))
+	    || !(d_g = (ann_real *)gpu_malloc(nbytes))
+	    || !(d_m = (ann_real *)gpu_malloc(nbytes))
+	    || !(d_v = (ann_real *)gpu_malloc(nbytes)))
 		goto fail;
 	if (gpu_memcpy_h2d(d_p, param, nbytes) != 0
 	    || gpu_memcpy_h2d(d_g, grad, nbytes) != 0
 	    || gpu_memcpy_h2d(d_m, m, nbytes) != 0
 	    || gpu_memcpy_h2d(d_v, v, nbytes) != 0)
 		goto fail;
-	adam_kernel<<<(n + 255) / 256, 256>>>(d_p, d_g, d_m, d_v, n, lr, beta1,
-	    beta2, eps, bc1, bc2);
-	if (cudaDeviceSynchronize() != cudaSuccess)
+	if (gpu_adam_step_dev(d_p, d_g, d_m, d_v, n, lr, beta1, beta2, eps, t,
+	    grad_scale) != 0)
 		goto fail;
 	if (gpu_memcpy_d2h(param, d_p, nbytes) != 0
 	    || gpu_memcpy_d2h(grad, d_g, nbytes) != 0
@@ -619,61 +1586,36 @@ fail:
 extern "C" int gpu_mat_mul_backward(mat *da, mat *db, const mat *dc,
 	const mat *a, const mat *b)
 {
-	/* dA = dC * B^T ; dB = A^T * dC */
-	mat *bt;
-	mat *at;
-	int i;
-	int j;
-	int rc;
-
+	/*
+	** dA = dC * B^T ; dB = A^T * dC. H2: OP_T GEMMs read B / A in place,
+	** so no host transpose copies (and no D2H of device-resident a/b).
+	*/
 	if (!dc || !a || !b || !gpu_available())
 		return -1;
-	rc = 0;
-	if (da) {
-		/* Build B^T on host then gemm */
-		bt = mat_create(b->cols, b->rows);
-		if (!bt)
-			return -1;
-		for (i = 0; i < b->rows; i++)
-			for (j = 0; j < b->cols; j++)
-				bt->data[j * bt->cols + i] = b->data[i * b->cols + j];
-		if (gpu_mat_mul(da, dc, bt) != 0)
-			rc = -1;
-		mat_free(&bt);
-		if (rc != 0)
-			return -1;
-	}
-	if (db) {
-		at = mat_create(a->cols, a->rows);
-		if (!at)
-			return -1;
-		for (i = 0; i < a->rows; i++)
-			for (j = 0; j < a->cols; j++)
-				at->data[j * at->cols + i] = a->data[i * a->cols + j];
-		if (gpu_mat_mul(db, at, dc) != 0)
-			rc = -1;
-		mat_free(&at);
-	}
-	return rc;
+	if (da && gpu_mat_mul_bt(da, dc, b) != 0)
+		return -1;
+	if (db && gpu_mat_mul_at(db, a, dc) != 0)
+		return -1;
+	return 0;
 }
 
-__global__ static void gemv_kernel(const double *x, const double *W, double *y,
+__global__ static void gemv_kernel(const ann_real *x, const ann_real *W, ann_real *y,
 	int D)
 {
 	int j = blockIdx.x * blockDim.x + threadIdx.x;
 	int i;
-	double sum;
+	ann_real sum;
 
 	if (j >= D)
 		return;
-	sum = 0.0;
+	sum = 0.0f;
 	for (i = 0; i < D; i++)
 		sum += x[i] * W[i * D + j];
 	y[j] = sum;
 }
 
-__global__ static void kv_append_kernel(double *k_cache, double *v_cache,
-	const double *k, const double *v, int row, int D)
+__global__ static void kv_append_kernel(ann_real *k_cache, ann_real *v_cache,
+	const ann_real *k, const ann_real *v, int row, int D)
 {
 	int j = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -683,55 +1625,55 @@ __global__ static void kv_append_kernel(double *k_cache, double *v_cache,
 	v_cache[row * D + j] = v[j];
 }
 
-__global__ static void kv_scores_hd(const double *q, const double *k_cache,
-	double *scores, int len, int d_model, int off, int d, double scale)
+__global__ static void kv_scores_hd(const ann_real *q, const ann_real *k_cache,
+	ann_real *scores, int len, int d_model, int off, int d, ann_real scale)
 {
 	int j = blockIdx.x * blockDim.x + threadIdx.x;
 	int t;
-	double sum;
+	ann_real sum;
 
 	if (j >= len)
 		return;
-	sum = 0.0;
+	sum = 0.0f;
 	for (t = 0; t < d; t++)
 		sum += q[off + t] * k_cache[j * d_model + off + t];
 	scores[j] = sum * scale;
 }
 
-__global__ static void kv_av_hd(const double *scores, const double *v_cache,
-	double *otmp, int len, int d_model, int off, int d)
+__global__ static void kv_av_hd(const ann_real *scores, const ann_real *v_cache,
+	ann_real *otmp, int len, int d_model, int off, int d)
 {
 	int t = blockIdx.x * blockDim.x + threadIdx.x;
 	int j;
-	double sum;
+	ann_real sum;
 
 	if (t >= d)
 		return;
-	sum = 0.0;
+	sum = 0.0f;
 	for (j = 0; j < len; j++)
 		sum += scores[j] * v_cache[j * d_model + off + t];
 	otmp[off + t] = sum;
 }
 
-extern "C" int gpu_kv_attn_decode(double *out, const double *x,
-	const double *wq, const double *wk, const double *wv,
-	const double *wo, double *k_cache, double *v_cache,
+extern "C" int gpu_kv_attn_decode(ann_real *out, const ann_real *x,
+	const ann_real *wq, const ann_real *wk, const ann_real *wv,
+	const ann_real *wo, ann_real *k_cache, ann_real *v_cache,
 	int len, int max_T, int d_model, int n_heads, int d_head)
 {
-	double *d_x;
-	double *d_wq;
-	double *d_wk;
-	double *d_wv;
-	double *d_wo;
-	double *d_q;
-	double *d_k;
-	double *d_v;
-	double *d_kc;
-	double *d_vc;
-	double *d_otmp;
-	double *d_scores;
-	double *h_scores;
-	double *h_tmp;
+	ann_real *d_x;
+	ann_real *d_wq;
+	ann_real *d_wk;
+	ann_real *d_wv;
+	ann_real *d_wo;
+	ann_real *d_q;
+	ann_real *d_k;
+	ann_real *d_v;
+	ann_real *d_kc;
+	ann_real *d_vc;
+	ann_real *d_otmp;
+	ann_real *d_scores;
+	ann_real *h_scores;
+	ann_real *h_tmp;
 	size_t db;
 	size_t wb;
 	size_t cb;
@@ -748,28 +1690,28 @@ extern "C" int gpu_kv_attn_decode(double *out, const double *x,
 	if (!gpu_available() || len <= 0 || len > max_T || d_model <= 0
 	    || n_heads <= 0 || d_head <= 0 || n_heads * d_head != d_model)
 		return -1;
-	db = (size_t)d_model * sizeof(double);
-	wb = (size_t)d_model * (size_t)d_model * sizeof(double);
-	cb = (size_t)max_T * (size_t)d_model * sizeof(double);
+	db = (size_t)d_model * sizeof(ann_real);
+	wb = (size_t)d_model * (size_t)d_model * sizeof(ann_real);
+	cb = (size_t)max_T * (size_t)d_model * sizeof(ann_real);
 	scale = 1.0 / sqrt((double)d_head);
 	threads = 256;
 	d_x = d_wq = d_wk = d_wv = d_wo = NULL;
 	d_q = d_k = d_v = d_kc = d_vc = d_otmp = d_scores = NULL;
 	h_scores = h_tmp = NULL;
-	if (!(d_x = (double *)gpu_malloc(db))
-	    || !(d_wq = (double *)gpu_malloc(wb))
-	    || !(d_wk = (double *)gpu_malloc(wb))
-	    || !(d_wv = (double *)gpu_malloc(wb))
-	    || !(d_wo = (double *)gpu_malloc(wb))
-	    || !(d_q = (double *)gpu_malloc(db))
-	    || !(d_k = (double *)gpu_malloc(db))
-	    || !(d_v = (double *)gpu_malloc(db))
-	    || !(d_kc = (double *)gpu_malloc(cb))
-	    || !(d_vc = (double *)gpu_malloc(cb))
-	    || !(d_otmp = (double *)gpu_malloc(db))
-	    || !(d_scores = (double *)gpu_malloc((size_t)len * sizeof(double)))
-	    || !(h_scores = (double *)malloc((size_t)len * sizeof(double)))
-	    || !(h_tmp = (double *)malloc((size_t)len * sizeof(double))))
+	if (!(d_x = (ann_real *)gpu_malloc(db))
+	    || !(d_wq = (ann_real *)gpu_malloc(wb))
+	    || !(d_wk = (ann_real *)gpu_malloc(wb))
+	    || !(d_wv = (ann_real *)gpu_malloc(wb))
+	    || !(d_wo = (ann_real *)gpu_malloc(wb))
+	    || !(d_q = (ann_real *)gpu_malloc(db))
+	    || !(d_k = (ann_real *)gpu_malloc(db))
+	    || !(d_v = (ann_real *)gpu_malloc(db))
+	    || !(d_kc = (ann_real *)gpu_malloc(cb))
+	    || !(d_vc = (ann_real *)gpu_malloc(cb))
+	    || !(d_otmp = (ann_real *)gpu_malloc(db))
+	    || !(d_scores = (ann_real *)gpu_malloc((size_t)len * sizeof(ann_real)))
+	    || !(h_scores = (ann_real *)malloc((size_t)len * sizeof(ann_real)))
+	    || !(h_tmp = (ann_real *)malloc((size_t)len * sizeof(ann_real))))
 		goto fail;
 	if (gpu_memcpy_h2d(d_x, x, db) != 0
 	    || gpu_memcpy_h2d(d_wq, wq, wb) != 0
@@ -798,21 +1740,21 @@ extern "C" int gpu_kv_attn_decode(double *out, const double *x,
 		if (cudaDeviceSynchronize() != cudaSuccess)
 			goto fail;
 		if (gpu_memcpy_d2h(h_scores, d_scores,
-			(size_t)len * sizeof(double)) != 0)
+			(size_t)len * sizeof(ann_real)) != 0)
 			goto fail;
 		mx = h_scores[0];
 		for (j = 1; j < len; j++)
 			if (h_scores[j] > mx)
 				mx = h_scores[j];
-		sum = 0.0;
+		sum = 0.0f;
 		for (j = 0; j < len; j++) {
-			h_tmp[j] = exp(h_scores[j] - mx);
+			h_tmp[j] = (ann_real)exp((double)h_scores[j] - mx);
 			sum += h_tmp[j];
 		}
 		for (j = 0; j < len; j++)
 			h_scores[j] = h_tmp[j] / sum;
 		if (gpu_memcpy_h2d(d_scores, h_scores,
-			(size_t)len * sizeof(double)) != 0)
+			(size_t)len * sizeof(ann_real)) != 0)
 			goto fail;
 		kv_av_hd<<<(d_head + threads - 1) / threads, threads>>>(d_scores,
 		    d_vc, d_otmp, len, d_model, off, d_head);
@@ -856,4 +1798,105 @@ fail:
 	free(h_scores);
 	free(h_tmp);
 	return -1;
+}
+
+__global__ static void axpy_kernel(ann_real *y, const ann_real *x, ann_real a, int n)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+	if (i < n)
+		y[i] += a * x[i];
+}
+
+__global__ static void add_kernel(ann_real *y, const ann_real *x, int n)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+	if (i < n)
+		y[i] += x[i];
+}
+
+static size_t mat_nbytes(const mat *m)
+{
+	return (size_t)m->rows * (size_t)m->cols * sizeof(ann_real);
+}
+
+static int mat_ensure_dev_auth(mat *m)
+{
+	if (!m || !m->data)
+		return -1;
+	if (mat_device_alloc(m) != 0)
+		return -1;
+	if (m->on_device == MAT_DEV_HOST) {
+		if (gpu_memcpy_h2d(m->d_data, m->data, mat_nbytes(m)) != 0)
+			return -1;
+		m->on_device = MAT_DEV_SYNCED;
+	}
+	return 0;
+}
+
+extern "C" int gpu_mat_copy(mat *dst, const mat *src)
+{
+	size_t n;
+
+	if (!dst || !src || !dst->data || !src->data)
+		return -1;
+	if (dst->rows != src->rows || dst->cols != src->cols)
+		return -1;
+	if (!gpu_available())
+		return -1;
+	n = mat_nbytes(src);
+	if (mat_ensure_dev_auth((mat *)src) != 0)
+		return -1;
+	if (mat_device_alloc(dst) != 0)
+		return -1;
+	if (gpu_memcpy_d2d(dst->d_data, src->d_data, n) != 0)
+		return -1;
+	dst->on_device = MAT_DEV_DEVICE;
+	return launch_done();
+}
+
+extern "C" int gpu_mat_add(mat *dst, const mat *src)
+{
+	int n;
+	int bs;
+
+	if (!dst || !src || !dst->data || !src->data)
+		return -1;
+	if (dst->rows != src->rows || dst->cols != src->cols)
+		return -1;
+	if (!gpu_available())
+		return -1;
+	if (mat_ensure_dev_auth(dst) != 0 || mat_ensure_dev_auth((mat *)src) != 0)
+		return -1;
+	n = dst->rows * dst->cols;
+	bs = 256;
+	add_kernel<<<(n + bs - 1) / bs, bs>>>(dst->d_data, src->d_data, n);
+	if (launch_done() != 0)
+		return -1;
+	dst->on_device = MAT_DEV_DEVICE;
+	return 0;
+}
+
+extern "C" int gpu_mat_axpy(mat *y, double a, const mat *x)
+{
+	int n;
+	int bs;
+
+	if (!y || !x || !y->data || !x->data)
+		return -1;
+	if (y->rows != x->rows || y->cols != x->cols)
+		return -1;
+	if (!gpu_available())
+		return -1;
+	if (mat_ensure_dev_auth(y) != 0 || mat_ensure_dev_auth((mat *)x) != 0)
+		return -1;
+	n = y->rows * y->cols;
+	bs = 256;
+	axpy_kernel<<<(n + bs - 1) / bs, bs>>>(y->d_data, x->d_data,
+	    (ann_real)a, n);
+	if (launch_done() != 0)
+		return -1;
+	y->on_device = MAT_DEV_DEVICE;
+	return 0;
 }

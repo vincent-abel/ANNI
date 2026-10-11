@@ -9,8 +9,12 @@
 
 static void copy_mat(mat *dst, const mat *src)
 {
+	if (resid_copy(dst, src) == 0)
+		return;
+	mat_ensure_host((mat *)src);
 	memcpy(dst->data, src->data,
-	    (size_t)dst->rows * (size_t)dst->cols * sizeof(double));
+	    (size_t)dst->rows * (size_t)dst->cols * sizeof(ann_real));
+	mat_host_dirty(dst);
 }
 
 tblock *tblock_create(void)
@@ -53,34 +57,59 @@ void tblock_zero_grad(tblock *b)
 	ffn_zero_grad(b->ffn);
 }
 
-block_cache *block_cache_create(int T, const attn *a)
+static block_cache *block_cache_alloc(int B, int T, int n_heads, int d_head)
 {
 	block_cache *c;
+	int n;
 
-	if (T <= 0 || !a)
+	if (B <= 0 || T <= 0)
 		return NULL;
+	n = B * T;
 	c = malloc(sizeof(block_cache));
 	if (!c)
 		return NULL;
 	memset(c, 0, sizeof(*c));
-	c->T = T;
-	c->x_in = mat_create(T, LM_D_MODEL);
-	c->ln1_out = mat_create(T, LM_D_MODEL);
-	c->attn_out = mat_create(T, LM_D_MODEL);
-	c->x_mid = mat_create(T, LM_D_MODEL);
-	c->ln2_out = mat_create(T, LM_D_MODEL);
-	c->ffn_out = mat_create(T, LM_D_MODEL);
-	c->ln1c = ln_cache_create(T);
-	c->attnc = attn_cache_create(T, a->n_heads, a->d_head);
-	c->ln2c = ln_cache_create(T);
-	c->ffnc = ffn_cache_create(T);
+	c->T = n;
+	c->x_in = mat_create(n, LM_D_MODEL);
+	c->ln1_out = mat_create(n, LM_D_MODEL);
+	c->attn_out = mat_create(n, LM_D_MODEL);
+	c->x_mid = mat_create(n, LM_D_MODEL);
+	c->ln2_out = mat_create(n, LM_D_MODEL);
+	c->ffn_out = mat_create(n, LM_D_MODEL);
+	c->ln1c = ln_cache_create(n);
+	if (B == 1)
+		c->attnc = attn_cache_create(T, n_heads, d_head);
+	else
+		c->attnpc = attn_pcache_create(B, T, n_heads, d_head);
+	c->ln2c = ln_cache_create(n);
+	c->ffnc = ffn_cache_create(n);
 	if (!c->x_in || !c->ln1_out || !c->attn_out || !c->x_mid
-	    || !c->ln2_out || !c->ffn_out || !c->ln1c || !c->attnc
+	    || !c->ln2_out || !c->ffn_out || !c->ln1c
+	    || (!c->attnc && !c->attnpc)
 	    || !c->ln2c || !c->ffnc) {
 		block_cache_free(&c);
 		return NULL;
 	}
+	/* R1: pin activation caches so BATCH GEMM leaves results on device. */
+	mat_try_pin(c->x_in);
+	mat_try_pin(c->ln1_out);
+	mat_try_pin(c->attn_out);
+	mat_try_pin(c->x_mid);
+	mat_try_pin(c->ln2_out);
+	mat_try_pin(c->ffn_out);
 	return c;
+}
+
+block_cache *block_cache_create(int T, const attn *a)
+{
+	if (T <= 0 || !a)
+		return NULL;
+	return block_cache_alloc(1, T, a->n_heads, a->d_head);
+}
+
+block_cache *block_cache_create_packed(int B, int T, int n_heads, int d_head)
+{
+	return block_cache_alloc(B, T, n_heads, d_head);
 }
 
 void block_cache_free(block_cache **c)
@@ -95,6 +124,7 @@ void block_cache_free(block_cache **c)
 	mat_free(&(*c)->ffn_out);
 	ln_cache_free(&(*c)->ln1c);
 	attn_cache_free(&(*c)->attnc);
+	attn_pcache_free(&(*c)->attnpc);
 	ln_cache_free(&(*c)->ln2c);
 	ffn_cache_free(&(*c)->ffnc);
 	free(*c);
@@ -109,8 +139,12 @@ int tblock_forward_cache(mat *x, tblock *b, block_cache *c)
 	copy_mat(c->ln1_out, x);
 	if (layernorm_forward_cache(c->ln1_out, b->ln1, c->ln1c) != 0)
 		return -1;
-	if (attn_mha_forward_cache(c->attn_out, b->attn, c->ln1_out, 1,
-		c->attnc) != 0)
+	if (c->attnpc) {
+		if (attn_mha_forward_packed(c->attn_out, b->attn, c->ln1_out,
+		    c->attnpc) != 0)
+			return -1;
+	} else if (attn_mha_forward_cache(c->attn_out, b->attn, c->ln1_out, 1,
+	    c->attnc) != 0)
 		return -1;
 	copy_mat(c->x_mid, c->x_in);
 	if (resid_add(c->x_mid, c->attn_out) != 0)
@@ -159,6 +193,12 @@ int tblock_backward(mat *dx, const mat *dout, tblock *b, const block_cache *c)
 	tmp = mat_create(c->T, LM_D_MODEL);
 	if (!d_ffn_in || !d_mid || !d_attn_out || !d_ln1_out || !tmp)
 		goto fail;
+	mat_try_pin(d_ffn_in);
+	mat_try_pin(d_mid);
+	mat_try_pin(d_attn_out);
+	mat_try_pin(d_ln1_out);
+	mat_try_pin(tmp);
+	mat_try_pin(dx);
 
 	/* y = x_mid + ffn_out; dy splits to both */
 	copy_mat(d_mid, dout);
@@ -170,7 +210,11 @@ int tblock_backward(mat *dx, const mat *dout, tblock *b, const block_cache *c)
 
 	/* x_mid = x_in + attn_out */
 	copy_mat(dx, d_mid);
-	if (attn_mha_backward(d_attn_out, d_mid, b->attn, c->attnc) != 0)
+	if (c->attnpc) {
+		if (attn_mha_backward_packed(d_attn_out, d_mid, b->attn,
+		    c->attnpc) != 0)
+			goto fail;
+	} else if (attn_mha_backward(d_attn_out, d_mid, b->attn, c->attnc) != 0)
 		goto fail;
 	if (layernorm_backward(tmp, d_attn_out, b->ln1, c->ln1c) != 0)
 		goto fail;
@@ -248,27 +292,30 @@ void transformer_zero_grad(transformer *t)
 		tblock_zero_grad(&t->blocks[i]);
 }
 
-transformer_cache *transformer_cache_create(int T, const transformer *t)
+transformer_cache *transformer_cache_create_packed_dims(int B, int T,
+	int n_blocks, int n_heads, int d_head)
 {
 	transformer_cache *c;
 	int i;
 
-	if (T <= 0 || !t)
+	if (B <= 0 || T <= 0 || n_blocks <= 0)
 		return NULL;
 	c = malloc(sizeof(transformer_cache));
 	if (!c)
 		return NULL;
-	c->T = T;
-	c->n_blocks = t->n_blocks;
-	c->bc = calloc((size_t)t->n_blocks, sizeof(block_cache));
+	c->T = B * T;
+	c->B = B;
+	c->Tseq = T;
+	c->n_blocks = n_blocks;
+	c->bc = calloc((size_t)n_blocks, sizeof(block_cache));
 	if (!c->bc) {
 		free(c);
 		return NULL;
 	}
-	for (i = 0; i < t->n_blocks; i++) {
+	for (i = 0; i < n_blocks; i++) {
 		block_cache *bc;
 
-		bc = block_cache_create(T, t->blocks[i].attn);
+		bc = block_cache_create_packed(B, T, n_heads, d_head);
 		if (!bc) {
 			transformer_cache_free(&c);
 			return NULL;
@@ -277,6 +324,23 @@ transformer_cache *transformer_cache_create(int T, const transformer *t)
 		free(bc);
 	}
 	return c;
+}
+
+transformer_cache *transformer_cache_create(int T, const transformer *t)
+{
+	if (!t || t->n_blocks <= 0)
+		return NULL;
+	return transformer_cache_create_packed_dims(1, T, t->n_blocks,
+	    t->blocks[0].attn->n_heads, t->blocks[0].attn->d_head);
+}
+
+transformer_cache *transformer_cache_create_packed(int B, int T,
+	const transformer *t)
+{
+	if (!t || t->n_blocks <= 0)
+		return NULL;
+	return transformer_cache_create_packed_dims(B, T, t->n_blocks,
+	    t->blocks[0].attn->n_heads, t->blocks[0].attn->d_head);
 }
 
 void transformer_cache_free(transformer_cache **c)
@@ -297,6 +361,7 @@ void transformer_cache_free(transformer_cache **c)
 			mat_free(&bc->ffn_out);
 			ln_cache_free(&bc->ln1c);
 			attn_cache_free(&bc->attnc);
+			attn_pcache_free(&bc->attnpc);
 			ln_cache_free(&bc->ln2c);
 			ffn_cache_free(&bc->ffnc);
 		}

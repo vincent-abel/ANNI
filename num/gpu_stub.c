@@ -16,6 +16,15 @@ const char *gpu_backend_name(void)
 	return "cpu";
 }
 
+int gpu_mem_info(size_t *free_bytes, size_t *total_bytes)
+{
+	if (free_bytes)
+		*free_bytes = 0;
+	if (total_bytes)
+		*total_bytes = 0;
+	return -1;
+}
+
 void gpu_set_sync_mode(int mode)
 {
 	g_sync_mode = mode;
@@ -24,6 +33,10 @@ void gpu_set_sync_mode(int mode)
 int gpu_sync_mode(void)
 {
 	return g_sync_mode;
+}
+
+void gpu_device_sync(void)
+{
 }
 
 void *gpu_malloc(size_t nbytes)
@@ -96,6 +109,14 @@ int gpu_mat_mul_bt(mat *c, const mat *a, const mat *b)
 	return -1;
 }
 
+int gpu_mat_mul_at(mat *c, const mat *a, const mat *b)
+{
+	(void)c;
+	(void)a;
+	(void)b;
+	return -1;
+}
+
 int gpu_mat_outer_add(mat *dw, const mat *a, const mat *b)
 {
 	(void)dw;
@@ -104,9 +125,9 @@ int gpu_mat_outer_add(mat *dw, const mat *a, const mat *b)
 	return -1;
 }
 
-int gpu_layernorm_backward(mat *dx, const mat *dy, const double *gamma,
-	const double *x_hat, const double *inv_std, int T, int d,
-	double *dgamma, double *dbeta)
+int gpu_layernorm_backward(mat *dx, const mat *dy, const ann_real *gamma,
+	const ann_real *x_hat, const ann_real *inv_std, int T, int d,
+	ann_real *dgamma, ann_real *dbeta)
 {
 	(void)dx;
 	(void)dy;
@@ -120,8 +141,82 @@ int gpu_layernorm_backward(mat *dx, const mat *dy, const double *gamma,
 	return -1;
 }
 
-int gpu_adam_step(double *param, double *grad, double *m, double *v, int n,
-	double lr, double beta1, double beta2, double eps, int t)
+int gpu_softmax_rows(ann_real *rows, int n_rows, int n_cols)
+{
+	(void)rows;
+	(void)n_rows;
+	(void)n_cols;
+	return -1;
+}
+
+int gpu_softmax_bwd_rows(ann_real *dx, const ann_real *y, const ann_real *dy,
+	int n_rows, int n_cols)
+{
+	(void)dx;
+	(void)y;
+	(void)dy;
+	(void)n_rows;
+	(void)n_cols;
+	return -1;
+}
+
+int gpu_layernorm_forward(ann_real *y, const ann_real *x, const ann_real *gamma,
+	const ann_real *beta, ann_real *x_hat, ann_real *inv_std, int T, int d)
+{
+	(void)y;
+	(void)x;
+	(void)gamma;
+	(void)beta;
+	(void)x_hat;
+	(void)inv_std;
+	(void)T;
+	(void)d;
+	return -1;
+}
+
+int gpu_layernorm_forward_ex(ann_real *y, const ann_real *x,
+	const ann_real *gamma, const ann_real *beta, ann_real *x_hat,
+	ann_real *mean, ann_real *inv_std, int T, int d, double eps)
+{
+	(void)y;
+	(void)x;
+	(void)gamma;
+	(void)beta;
+	(void)x_hat;
+	(void)mean;
+	(void)inv_std;
+	(void)T;
+	(void)d;
+	(void)eps;
+	return -1;
+}
+
+int gpu_bias_row_add(ann_real *x, const ann_real *bias, int rows, int cols)
+{
+	(void)x;
+	(void)bias;
+	(void)rows;
+	(void)cols;
+	return -1;
+}
+
+int gpu_relu_forward(ann_real *x, int n)
+{
+	(void)x;
+	(void)n;
+	return -1;
+}
+
+int gpu_relu_backward(ann_real *dx, const ann_real *x_pre_relu_or_mask, int n)
+{
+	(void)dx;
+	(void)x_pre_relu_or_mask;
+	(void)n;
+	return -1;
+}
+
+int gpu_adam_step(ann_real *param, ann_real *grad, ann_real *m, ann_real *v, int n,
+	double lr, double beta1, double beta2, double eps, int t, double grad_scale)
 {
 	(void)param;
 	(void)grad;
@@ -133,12 +228,31 @@ int gpu_adam_step(double *param, double *grad, double *m, double *v, int n,
 	(void)beta2;
 	(void)eps;
 	(void)t;
+	(void)grad_scale;
 	return -1;
 }
 
-int gpu_kv_attn_decode(double *out, const double *x,
-	const double *wq, const double *wk, const double *wv,
-	const double *wo, double *k_cache, double *v_cache,
+int gpu_adam_step_dev(ann_real *d_param, ann_real *d_grad, ann_real *d_m,
+	ann_real *d_v, int n, double lr, double beta1, double beta2, double eps,
+	int t, double grad_scale)
+{
+	(void)d_param;
+	(void)d_grad;
+	(void)d_m;
+	(void)d_v;
+	(void)n;
+	(void)lr;
+	(void)beta1;
+	(void)beta2;
+	(void)eps;
+	(void)t;
+	(void)grad_scale;
+	return -1;
+}
+
+int gpu_kv_attn_decode(ann_real *out, const ann_real *x,
+	const ann_real *wq, const ann_real *wk, const ann_real *wv,
+	const ann_real *wo, ann_real *k_cache, ann_real *v_cache,
 	int len, int max_T, int d_model, int n_heads, int d_head)
 {
 	(void)out;
@@ -154,5 +268,61 @@ int gpu_kv_attn_decode(double *out, const double *x,
 	(void)d_model;
 	(void)n_heads;
 	(void)d_head;
+	return -1;
+}
+
+int gpu_attn_causal_fwd(mat *concat, mat *w, const mat *q, const mat *k,
+	const mat *v, int B, int T, int H, int dh)
+{
+	(void)concat;
+	(void)w;
+	(void)q;
+	(void)k;
+	(void)v;
+	(void)B;
+	(void)T;
+	(void)H;
+	(void)dh;
+	return -1;
+}
+
+int gpu_attn_causal_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat,
+	const mat *w, const mat *q, const mat *k, const mat *v,
+	int B, int T, int H, int dh)
+{
+	(void)dq;
+	(void)dk;
+	(void)dv;
+	(void)dconcat;
+	(void)w;
+	(void)q;
+	(void)k;
+	(void)v;
+	(void)B;
+	(void)T;
+	(void)H;
+	(void)dh;
+	return -1;
+}
+
+int gpu_mat_copy(mat *dst, const mat *src)
+{
+	(void)dst;
+	(void)src;
+	return -1;
+}
+
+int gpu_mat_add(mat *dst, const mat *src)
+{
+	(void)dst;
+	(void)src;
+	return -1;
+}
+
+int gpu_mat_axpy(mat *y, double a, const mat *x)
+{
+	(void)y;
+	(void)a;
+	(void)x;
 	return -1;
 }

@@ -61,6 +61,7 @@
 - [Generation from trained checkpoints](generation-from-checkpoints.md)
 - [Scale toward target size](scale-toward-target-size.md)
 - [Train / generate / load CLI](lm-cli.md)
+- [Training control tower](training-control-tower.md)
 
 ### Performance
 
@@ -85,6 +86,35 @@
 - [Optional cuBLAS / cuDNN](cublas-cudnn.md)
 - [Host↔device sync at batch boundaries](gpu-batch-sync.md)
 - [nvidia-smi / train util proof](gpu-train-util-proof.md)
+- [GPU activation residency (R1)](gpu-activation-residency.md)
+
+### From toy LM → small LLM
+
+#### Near-term
+
+- [FP32 train and inference](fp32-train-infer.md)
+- [Cheaper window eval](cheaper-window-eval.md)
+- [Train window vs generate](train-window-vs-generate.md)
+- [Generate sampling](generate-sampling.md)
+- [`--out` and resume confirmation](out-resume-confirm.md)
+- [Byte tokenizer as teaching path](byte-tokenizer-teaching-path.md)
+- [GPU-resident Adam](gpu-adam-residency.md)
+
+#### Subword
+
+- [Subword BPE tokenizer](subword-bpe-tokenizer.md)
+- [Vocab in checkpoints and CLI](vocab-checkpoint-cli.md)
+- [Real corpora at scale](real-corpora-scale.md)
+- [Held-out document split](held-out-document-split.md)
+- [Streaming dataloader](streaming-dataloader.md)
+
+#### Autotrain
+
+- [Autotrain executable](autotrain.md)
+
+#### Milestones beyond Target
+
+Full code checklists live in the root [`../README.md`](../README.md): **Capable local LLM (C1–C14)** and **Toward ChatGPT-class** (`ARCH*` / `TOK*` / `DAT*` / `DIST*` / `ALN*` / `EV*` / `SRV*` / `OPS*`). Research notes for those land here as each track starts.
 
 ---
 
@@ -260,6 +290,9 @@ Config bumps d_model to 256, heads to 8, ff to 1024, context to 128, and blocks 
 ### [Train / generate / load CLI](lm-cli.md)
 The CLI exposes lm train, lm generate, and lm load over model.bin checkpoints. Flags select data, prompt, and output paths. A bare lm [phrase] demo remains for quick smoke runs.
 
+### [Training control tower](training-control-tower.md)
+Ncurses TUI for live train metrics, loss sparkline, pause/lr/save/quit, and generate samples; plus `lm tower inspect` / `lm info` for checkpoint architecture and parameter counts.
+
 # Performance docs
 
 ### [Contiguous memory](contiguous-memory.md)
@@ -317,3 +350,46 @@ GPU_SYNC_BATCH skips per-GEMM D2H when outputs are pinned. The train loop syncs 
 
 ### [nvidia-smi / train util proof](gpu-train-util-proof.md)
 lm train --bench-gpu and lm bench --train time full train steps and print the GPU backend. Use nvidia-smi dmon alongside make cuda builds to confirm util.
+
+# From toy LM → small LLM docs
+
+Short guides for the planned path from the byte-level toy model toward a small subword LLM. Some pieces describe behavior that is planned rather than shipped; each note says where it lands in the repo.
+
+### [FP32 train and inference](fp32-train-infer.md)
+Single precision halves memory and speeds GEMMs versus today's doubles. A new LMCF checkpoint magic marks float files, and the GPU path moves to cublasSgemm. Pure FP16 is deferred.
+
+### [Cheaper window eval](cheaper-window-eval.md)
+--eval-every and --eval-windows cut the cost of lm_nll_windows during training. A fixed strided subset keeps curves comparable. A larger eval still runs at the end.
+
+### [Train window vs generate](train-window-vs-generate.md)
+The default --window becomes 64 while LM_MAX_CTX stays 128. Training length sets what the model has seen; the max sets what it accepts. Long prompts keep their most recent tokens.
+
+### [Generate sampling](generate-sampling.md)
+--temperature, --top-k, and --top-p reshape next-token odds before a draw. Temperature scales, top-k truncates by rank, top-p truncates by mass. Survivors are renormalized and sampled.
+
+### [`--out` and resume confirmation](out-resume-confirm.md)
+Writing to an existing --out without --resume warns first. On a terminal, y resumes and anything else overwrites. --force skips the prompt, and non-TTY runs never block.
+
+### [Byte tokenizer as teaching path](byte-tokenizer-teaching-path.md)
+The byte tokenizer stays as a selectable, transparent path. Tests and lessons use it; real runs use BPE. Checkpoints record the mode so the two cannot be mixed.
+
+### [GPU-resident Adam](gpu-adam-residency.md)
+Track C keeps params, grads, and Adam moments on the device. Gradient scaling happens there too. Only loss and checkpoints cross back to the host.
+
+### [Subword BPE tokenizer](subword-bpe-tokenizer.md)
+BPE merges the most frequent adjacent pair until the vocab reaches a 16k default. Bytes remain the base alphabet, so nothing is unknown. Sequences shorten by roughly 3–4× on English.
+
+### [Vocab in checkpoints and CLI](vocab-checkpoint-cli.md)
+Checkpoints carry the tokenizer mode and merge table with the weights. Generate and resume rebuild the tokenizer from the file. Mismatched vocab sizes are an error.
+
+### [Real corpora at scale](real-corpora-scale.md)
+A real run needs tens to hundreds of megabytes of cleaned text, such as a Wikipedia slice. The docs cover fetching, cleaning, and sizing by tokens per parameter. The data itself stays out of git.
+
+### [Held-out document split](held-out-document-split.md)
+Validation is chosen by whole document with a stable hash, not by window. No article appears on both sides. Windows are cut after the split.
+
+### [Streaming dataloader](streaming-dataloader.md)
+Shards are read from disk, tokenized once, and yielded as shuffled window batches. Memory holds a buffer instead of the corpus. Resume stores the shard and offset.
+
+### [Autotrain executable](autotrain.md)
+A second binary, `./autotrain`, picks Target-oriented defaults (BPE, stream, batch auto, safe LR), ensures data, trains, and smoke-generates. `./ann lm train` stays the explicit teaching CLI; phase 2 adds a light LR sweep.

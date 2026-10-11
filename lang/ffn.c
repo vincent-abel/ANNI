@@ -4,7 +4,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include "ffn.h"
+#include "gpu.h"
 #include "gradutil.h"
+#include "resid.h"
 
 static double ffn_rand_weight(void)
 {
@@ -23,10 +25,12 @@ static double ffn_relu(double x)
 
 static void copy_mat(mat *dst, const mat *src)
 {
-	int n;
-
-	n = dst->rows * dst->cols;
-	memcpy(dst->data, src->data, (size_t)n * sizeof(double));
+	if (resid_copy(dst, src) == 0)
+		return;
+	mat_ensure_host((mat *)src);
+	memcpy(dst->data, src->data,
+	    (size_t)dst->rows * (size_t)dst->cols * sizeof(ann_real));
+	mat_host_dirty(dst);
 }
 
 ffn *ffn_create(void)
@@ -60,6 +64,11 @@ ffn *ffn_create(void)
 		f->w2->data[i] = ffn_rand_weight();
 	vec_fill(f->b2, 0.0);
 	ffn_zero_grad(f);
+	/* G1: persistent device twins for weights and grads (no-op on CPU). */
+	mat_try_pin(f->w1);
+	mat_try_pin(f->w2);
+	mat_try_pin(f->dw1);
+	mat_try_pin(f->dw2);
 	return f;
 }
 
@@ -106,6 +115,9 @@ ffn_cache *ffn_cache_create(int T)
 		ffn_cache_free(&c);
 		return NULL;
 	}
+	mat_try_pin(c->x_in);
+	mat_try_pin(c->pre_act);
+	mat_try_pin(c->hidden);
 	return c;
 }
 
@@ -125,6 +137,9 @@ int ffn_forward_cache(mat *out, const mat *x, ffn *f, ffn_cache *c)
 	int t;
 	int j;
 	int T;
+	ann_real *pre;
+	ann_real *hid;
+	ann_real *op;
 
 	if (!out || !x || !f || !c || !x->data)
 		return -1;
@@ -134,19 +149,49 @@ int ffn_forward_cache(mat *out, const mat *x, ffn *f, ffn_cache *c)
 	copy_mat(c->x_in, x);
 	if (mat_mul(c->pre_act, x, f->w1) != 0)
 		return -1;
-	for (t = 0; t < T; t++) {
-		for (j = 0; j < LM_D_FF; j++) {
-			mat_set(c->pre_act, t, j,
-			    mat_get(c->pre_act, t, j) + f->b1->data[j]);
-			mat_set(c->hidden, t, j,
-			    ffn_relu(mat_get(c->pre_act, t, j)));
+	mat_try_pin(c->pre_act);
+	mat_try_pin(c->hidden);
+	mat_try_pin(out);
+	pre = mat_compute_ptr(c->pre_act);
+	hid = mat_compute_ptr(c->hidden);
+	/* pre_act += b1 ; hidden = relu(pre_act). GPU first, CPU fallback. */
+	if (pre && gpu_bias_row_add(pre, f->b1->data, T, LM_D_FF) == 0) {
+		mat_mark_device(c->pre_act);
+		if (resid_copy(c->hidden, c->pre_act) != 0)
+			copy_mat(c->hidden, c->pre_act);
+		hid = mat_compute_ptr(c->hidden);
+		if (hid && gpu_relu_forward(hid, T * LM_D_FF) == 0)
+			mat_mark_device(c->hidden);
+		else {
+			(void)mat_ensure_host(c->hidden);
+			for (t = 0; t < T; t++)
+				for (j = 0; j < LM_D_FF; j++)
+					mat_set(c->hidden, t, j, ffn_relu(
+					    mat_get(c->hidden, t, j)));
+		}
+	} else {
+		(void)mat_ensure_host(c->pre_act);
+		for (t = 0; t < T; t++) {
+			for (j = 0; j < LM_D_FF; j++) {
+				mat_set(c->pre_act, t, j,
+				    mat_get(c->pre_act, t, j) + f->b1->data[j]);
+				mat_set(c->hidden, t, j,
+				    ffn_relu(mat_get(c->pre_act, t, j)));
+			}
 		}
 	}
 	if (mat_mul(out, c->hidden, f->w2) != 0)
 		return -1;
-	for (t = 0; t < T; t++) {
-		for (j = 0; j < LM_D_MODEL; j++)
-			mat_set(out, t, j, mat_get(out, t, j) + f->b2->data[j]);
+	op = mat_compute_ptr(out);
+	if (op && gpu_bias_row_add(op, f->b2->data, T, LM_D_MODEL) == 0)
+		mat_mark_device(out);
+	else {
+		(void)mat_ensure_host(out);
+		for (t = 0; t < T; t++) {
+			for (j = 0; j < LM_D_MODEL; j++)
+				mat_set(out, t, j,
+				    mat_get(out, t, j) + f->b2->data[j]);
+		}
 	}
 	return 0;
 }
@@ -174,75 +219,62 @@ int ffn_forward(mat *x, const ffn *f)
 	return rc;
 }
 
-static int ffn_transpose(mat *dst, const mat *src)
-{
-	int i;
-	int j;
-
-	if (!dst || !src || dst->rows != src->cols || dst->cols != src->rows)
-		return -1;
-	for (i = 0; i < src->rows; i++)
-		for (j = 0; j < src->cols; j++)
-			dst->data[j * dst->cols + i] = src->data[i * src->cols + j];
-	return 0;
-}
-
 int ffn_backward(mat *dx, const mat *dout, ffn *f, const ffn_cache *c)
 {
 	mat *dh;
-	mat *w2t;
-	mat *w1t;
 	int t;
 	int j;
 	int T;
+	ann_real *dhp;
+	const ann_real *prep;
 
 	if (!dx || !dout || !f || !c)
 		return -1;
 	T = c->T;
 	dh = mat_create(T, LM_D_FF);
-	w2t = mat_create(LM_D_MODEL, LM_D_FF);
-	w1t = mat_create(LM_D_FF, LM_D_MODEL);
-	if (!dh || !w2t || !w1t) {
-		mat_free(&dh);
-		mat_free(&w2t);
-		mat_free(&w1t);
+	if (!dh) {
 		return -1;
 	}
+	mat_try_pin(dh);
+	mat_try_pin(dx);
 
 	if (mat_outer_add(f->dw2, c->hidden, dout) != 0)
 		goto fail;
+	(void)mat_ensure_host((mat *)dout);
 	for (t = 0; t < T; t++) {
 		for (j = 0; j < LM_D_MODEL; j++)
 			f->db2->data[j] += dout->data[t * LM_D_MODEL + j];
 	}
 	/* dh = dout * W2^T then ReLU mask (GEMM may use GPU). */
-	if (ffn_transpose(w2t, f->w2) != 0)
+	if (mat_mul_wt(dh, dout, f->w2) != 0)
 		goto fail;
-	if (mat_mul(dh, dout, w2t) != 0)
-		goto fail;
-	for (t = 0; t < T; t++) {
-		for (j = 0; j < LM_D_FF; j++) {
-			if (c->pre_act->data[t * LM_D_FF + j] <= 0.0)
-				dh->data[t * LM_D_FF + j] = 0.0;
+	dhp = mat_compute_ptr(dh);
+	prep = mat_compute_ptr_const(c->pre_act);
+	if (!dhp || !prep
+	    || gpu_relu_backward(dhp, prep, T * LM_D_FF) != 0) {
+		(void)mat_ensure_host(dh);
+		(void)mat_ensure_host((mat *)c->pre_act);
+		for (t = 0; t < T; t++) {
+			for (j = 0; j < LM_D_FF; j++) {
+				if (c->pre_act->data[t * LM_D_FF + j] <= 0.0)
+					dh->data[t * LM_D_FF + j] = 0.0;
+			}
 		}
-	}
+		mat_host_dirty(dh);
+	} else
+		mat_mark_device(dh);
 	if (mat_outer_add(f->dw1, c->x_in, dh) != 0)
 		goto fail;
+	(void)mat_ensure_host(dh);
 	for (t = 0; t < T; t++) {
 		for (j = 0; j < LM_D_FF; j++)
 			f->db1->data[j] += dh->data[t * LM_D_FF + j];
 	}
-	if (ffn_transpose(w1t, f->w1) != 0)
-		goto fail;
-	if (mat_mul(dx, dh, w1t) != 0)
+	if (mat_mul_wt(dx, dh, f->w1) != 0)
 		goto fail;
 	mat_free(&dh);
-	mat_free(&w2t);
-	mat_free(&w1t);
 	return 0;
 fail:
 	mat_free(&dh);
-	mat_free(&w2t);
-	mat_free(&w1t);
 	return -1;
 }

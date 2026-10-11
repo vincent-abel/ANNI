@@ -4,17 +4,26 @@
 #ifndef GPU_H__
 #define GPU_H__
 
+#include "real.h"
 #include "mat.h"
 #include <stddef.h>
 
 int	gpu_available(void);
 const char	*gpu_backend_name(void);
+/* Free / total device memory in bytes (cudaMemGetInfo). 0 on success, -1 = no GPU. */
+int	gpu_mem_info(size_t *free_bytes, size_t *total_bytes);
 
 /* Eager (default): D2H after each op. Batch: leave results on device when d_data set. */
 #define GPU_SYNC_EAGER	0
 #define GPU_SYNC_BATCH	1
 void	gpu_set_sync_mode(int mode);
 int	gpu_sync_mode(void);
+/*
+** Block until all queued device work finishes. In GPU_SYNC_BATCH mode the
+** individual GEMM/outer-add launches do not sync; call this once per
+** microbatch (e.g. before reading device-authoritative grads). No-op on CPU.
+*/
+void	gpu_device_sync(void);
 
 void	*gpu_malloc(size_t nbytes);
 void	gpu_free(void *p);
@@ -32,24 +41,99 @@ int	gpu_mat_mul(mat *c, const mat *a, const mat *b);
 int	gpu_mat_mul_backward(mat *da, mat *db, const mat *dc,
 		const mat *a, const mat *b);
 int	gpu_mat_mul_bt(mat *c, const mat *a, const mat *b);
+/* c = a^T b (a: T x m, b: T x n -> c: m x n); cuBLAS OP_T when built in. */
+int	gpu_mat_mul_at(mat *c, const mat *a, const mat *b);
 int	gpu_mat_outer_add(mat *dw, const mat *a, const mat *b);
 /* Row LayerNorm backward; 0 = done on device, -1 = use CPU. */
-int	gpu_layernorm_backward(mat *dx, const mat *dy, const double *gamma,
-		const double *x_hat, const double *inv_std, int T, int d,
-		double *dgamma, double *dbeta);
+int	gpu_layernorm_backward(mat *dx, const mat *dy, const ann_real *gamma,
+		const ann_real *x_hat, const ann_real *inv_std, int T, int d,
+		ann_real *dgamma, ann_real *dbeta);
 /*
-** Flat Adam step on device buffers (param/grad/m/v length n).
+** Flat Adam step on host buffers (param/grad/m/v length n); uploads, runs,
+** downloads. grad is scaled by grad_scale before the moment update.
 ** Updates param/m/v in place; zeros grad. Returns 0 on success, -1 = CPU.
 */
-int	gpu_adam_step(double *param, double *grad, double *m, double *v, int n,
-		double lr, double beta1, double beta2, double eps, int t);
+int	gpu_adam_step(ann_real *param, ann_real *grad, ann_real *m, ann_real *v, int n,
+		double lr, double beta1, double beta2, double eps, int t,
+		double grad_scale);
+/*
+** Same update on device pointers (no copies): d_param/d_grad/d_m/d_v are
+** gpu_malloc'd length n. g = grad_scale * d_grad; d_grad is zeroed after.
+** Returns 0 on success, -1 = CPU (stub or invalid args).
+*/
+int	gpu_adam_step_dev(ann_real *d_param, ann_real *d_grad, ann_real *d_m,
+		ann_real *d_v, int n, double lr, double beta1, double beta2,
+		double eps, int t, double grad_scale);
 /*
 ** One decode-step MHA: QKV proj, append K/V at row len-1, attend, Wo.
 ** k_cache/v_cache are max_T x d_model (host). Returns 0 on success, -1 = CPU.
 */
-int	gpu_kv_attn_decode(double *out, const double *x,
-		const double *wq, const double *wk, const double *wv,
-		const double *wo, double *k_cache, double *v_cache,
+int	gpu_kv_attn_decode(ann_real *out, const ann_real *x,
+		const ann_real *wq, const ann_real *wk, const ann_real *wv,
+		const ann_real *wo, ann_real *k_cache, ann_real *v_cache,
 		int len, int max_T, int d_model, int n_heads, int d_head);
+
+/*
+** Track K: elementwise kernels. Every pointer below may be a host pointer
+** (staged through persistent device scratch, uploaded/downloaded around the
+** launch) or a device pointer from gpu_malloc / mat.d_data (used in place, no
+** copies; synchronised only in GPU_SYNC_EAGER). All return 0 on success and
+** -1 when the caller must use its CPU path (stub, no device, bad args).
+*/
+
+/* In-place row softmax over a row-major n_rows x n_cols block. */
+int	gpu_softmax_rows(ann_real *rows, int n_rows, int n_cols);
+/*
+** Row softmax backward: dx = y * (dy - sum(y * dy)) per row. y is the
+** softmax output. dx may alias dy (or y) for in-place use.
+*/
+int	gpu_softmax_bwd_rows(ann_real *dx, const ann_real *y,
+		const ann_real *dy, int n_rows, int n_cols);
+/*
+** Row LayerNorm forward over T x d: x_hat = (x-mean)*inv_std,
+** y = x_hat*gamma + beta. y may alias x. x_hat / inv_std may be NULL.
+** Uses eps = 1e-5; gpu_layernorm_forward_ex takes eps and also stores the
+** per-row mean (mean may be NULL).
+*/
+int	gpu_layernorm_forward(ann_real *y, const ann_real *x,
+		const ann_real *gamma, const ann_real *beta,
+		ann_real *x_hat, ann_real *inv_std, int T, int d);
+int	gpu_layernorm_forward_ex(ann_real *y, const ann_real *x,
+		const ann_real *gamma, const ann_real *beta,
+		ann_real *x_hat, ann_real *mean, ann_real *inv_std,
+		int T, int d, double eps);
+/* x[r, c] += bias[c] for a row-major rows x cols block. */
+int	gpu_bias_row_add(ann_real *x, const ann_real *bias, int rows, int cols);
+/* x[i] = max(x[i], 0) in place over n elements. */
+int	gpu_relu_forward(ann_real *x, int n);
+/*
+** ReLU backward in place: dx[i] = 0 where ref[i] <= 0, else unchanged.
+** Mask convention: ref is the pre-activation (z) or the post-ReLU output /
+** a 0-1 mask -- all three agree because z > 0 <=> relu(z) > 0 <=> mask != 0.
+*/
+int	gpu_relu_backward(ann_real *dx, const ann_real *x_pre_relu_or_mask, int n);
+
+/*
+** M1: fused causal MHA over B packed sequences (B*T) x (H*dh), one launch per
+** phase for every (b, h, i). w is the (B*H*T) x T softmax-weight buffer (must
+** be pinned: device-resident, host copy never read). T <= 128. Return 0 on
+** success, -1 = caller must use the per-head path (stub, no device, bad args).
+** bwd consumes the w written by fwd; dq/dk/dv are overwritten.
+*/
+int	gpu_attn_causal_fwd(mat *concat, mat *w, const mat *q, const mat *k,
+		const mat *v, int B, int T, int H, int dh);
+int	gpu_attn_causal_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat,
+		const mat *w, const mat *q, const mat *k, const mat *v,
+		int B, int T, int H, int dh);
+
+/*
+** R1 residency helpers: prefer D2D when twins exist. Return 0 on success,
+** -1 = CPU fallback. After success, dst is device-authoritative when pinned.
+*/
+int	gpu_mat_copy(mat *dst, const mat *src);
+/* dst += src (elementwise). */
+int	gpu_mat_add(mat *dst, const mat *src);
+/* y += a * x (elementwise). */
+int	gpu_mat_axpy(mat *y, double a, const mat *x);
 
 #endif

@@ -13,7 +13,7 @@ mat *mat_create(int rows, int cols)
 	m = malloc(sizeof(mat));
 	if (!m)
 		return NULL;
-	m->data = calloc((size_t)rows * (size_t)cols, sizeof(double));
+	m->data = calloc((size_t)rows * (size_t)cols, sizeof(ann_real));
 	if (!m->data) {
 		free(m);
 		return NULL;
@@ -45,8 +45,8 @@ int mat_device_alloc(mat *m)
 		return 0;
 	if (!gpu_available())
 		return -1;
-	n = (size_t)m->rows * (size_t)m->cols * sizeof(double);
-	m->d_data = (double *)gpu_malloc(n);
+	n = (size_t)m->rows * (size_t)m->cols * sizeof(ann_real);
+	m->d_data = (ann_real *)gpu_malloc(n);
 	return m->d_data ? 0 : -1;
 }
 
@@ -67,10 +67,10 @@ int mat_to_device(mat *m)
 		return -1;
 	if (mat_device_alloc(m) != 0)
 		return -1;
-	n = (size_t)m->rows * (size_t)m->cols * sizeof(double);
+	n = (size_t)m->rows * (size_t)m->cols * sizeof(ann_real);
 	if (gpu_memcpy_h2d(m->d_data, m->data, n) != 0)
 		return -1;
-	m->on_device = 1;
+	m->on_device = MAT_DEV_DEVICE;
 	return 0;
 }
 
@@ -80,10 +80,10 @@ int mat_to_host(mat *m)
 
 	if (!m || !m->data || !m->d_data)
 		return -1;
-	n = (size_t)m->rows * (size_t)m->cols * sizeof(double);
+	n = (size_t)m->rows * (size_t)m->cols * sizeof(ann_real);
 	if (gpu_memcpy_d2h(m->data, m->d_data, n) != 0)
 		return -1;
-	m->on_device = 0;
+	m->on_device = MAT_DEV_HOST;
 	return 0;
 }
 
@@ -91,9 +91,46 @@ int mat_ensure_host(mat *m)
 {
 	if (!m)
 		return -1;
-	if (m->on_device && m->d_data)
+	if (m->on_device == MAT_DEV_DEVICE && m->d_data)
 		return mat_to_host(m);
 	return 0;
+}
+
+/* Read-only pull: D2H when device-authoritative, host+twin end up identical. */
+int mat_pull_host(mat *m)
+{
+	size_t n;
+
+	if (!m)
+		return -1;
+	if (m->on_device != MAT_DEV_DEVICE || !m->d_data)
+		return 0;
+	if (!m->data)
+		return -1;
+	n = (size_t)m->rows * (size_t)m->cols * sizeof(ann_real);
+	if (gpu_memcpy_d2h(m->data, m->d_data, n) != 0)
+		return -1;
+	m->on_device = MAT_DEV_SYNCED;
+	return 0;
+}
+
+int mat_sync_device(mat *m)
+{
+	size_t n;
+
+	if (!m || !m->data || !m->d_data)
+		return -1;
+	n = (size_t)m->rows * (size_t)m->cols * sizeof(ann_real);
+	if (gpu_memcpy_h2d(m->d_data, m->data, n) != 0)
+		return -1;
+	m->on_device = MAT_DEV_SYNCED;
+	return 0;
+}
+
+void mat_host_dirty(mat *m)
+{
+	if (m)
+		m->on_device = MAT_DEV_HOST;
 }
 
 void mat_try_pin(mat *m)
@@ -103,35 +140,65 @@ void mat_try_pin(mat *m)
 	(void)mat_device_alloc(m);
 }
 
-double mat_get(const mat *m, int row, int col)
+ann_real *mat_compute_ptr(mat *m)
+{
+	if (!m || !m->data)
+		return NULL;
+	if (m->d_data && m->on_device != MAT_DEV_HOST)
+		return m->d_data;
+	return m->data;
+}
+
+const ann_real *mat_compute_ptr_const(const mat *m)
+{
+	if (!m || !m->data)
+		return NULL;
+	if (m->d_data && m->on_device != MAT_DEV_HOST)
+		return m->d_data;
+	return m->data;
+}
+
+void mat_mark_device(mat *m)
+{
+	if (m && m->d_data)
+		m->on_device = MAT_DEV_DEVICE;
+}
+
+ann_real mat_get(const mat *m, int row, int col)
 {
 	if (!m || !m->data || row < 0 || col < 0 || row >= m->rows || col >= m->cols)
-		return 0.0;
+		return 0.0f;
+	mat_ensure_host((mat *)m);
 	return m->data[row * m->cols + col];
 }
 
-void mat_set(mat *m, int row, int col, double value)
+void mat_set(mat *m, int row, int col, ann_real value)
 {
 	if (!m || !m->data || row < 0 || col < 0 || row >= m->rows || col >= m->cols)
 		return;
+	mat_ensure_host(m);
+	mat_host_dirty(m);
 	m->data[row * m->cols + col] = value;
 }
 
-double *mat_row(mat *m, int row)
+ann_real *mat_row(mat *m, int row)
 {
 	if (!m || !m->data || row < 0 || row >= m->rows)
 		return NULL;
+	mat_ensure_host(m);
+	mat_host_dirty(m);	/* caller may write through the pointer */
 	return &m->data[row * m->cols];
 }
 
-const double *mat_row_const(const mat *m, int row)
+const ann_real *mat_row_const(const mat *m, int row)
 {
 	if (!m || !m->data || row < 0 || row >= m->rows)
 		return NULL;
+	mat_ensure_host((mat *)m);
 	return &m->data[row * m->cols];
 }
 
-void mat_fill(mat *m, double value)
+void mat_fill(mat *m, ann_real value)
 {
 	int i;
 	int n;
@@ -141,6 +208,7 @@ void mat_fill(mat *m, double value)
 	n = m->rows * m->cols;
 	for (i = 0; i < n; i++)
 		m->data[i] = value;
+	mat_host_dirty(m);
 }
 
 int mat_vec_mul(vec *y, const mat *a, const vec *x)
@@ -206,7 +274,10 @@ int mat_mul(mat *c, const mat *a, const mat *b)
 	if (gpu_available() && gpu_mat_mul(c, a, b) == 0)
 		return 0;
 
-	mat_fill(c, 0.0);
+	/* CPU path: inputs may be device-authoritative (BATCH mode). */
+	mat_ensure_host((mat *)a);
+	mat_ensure_host((mat *)b);
+	mat_fill(c, 0.0f);
 #ifdef _OPENMP
 #pragma omp parallel for private(j0, k0, i, j, k, i_max, j_max, k_max, sum)
 #endif
@@ -243,8 +314,8 @@ int mat_mul_bt(mat *c, const mat *a, const mat *b)
 	int j;
 	int t;
 	double sum;
-	const double *ar;
-	const double *br;
+	const ann_real *ar;
+	const ann_real *br;
 
 	if (!c || !a || !b || !c->data || !a->data || !b->data)
 		return -1;
@@ -252,6 +323,9 @@ int mat_mul_bt(mat *c, const mat *a, const mat *b)
 		return -1;
 	if (gpu_mat_mul_bt(c, a, b) == 0)
 		return 0;
+	mat_ensure_host((mat *)a);
+	mat_ensure_host((mat *)b);
+	mat_host_dirty(c);
 	for (i = 0; i < a->rows; i++) {
 		ar = &a->data[i * a->cols];
 		for (j = 0; j < b->rows; j++) {
