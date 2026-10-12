@@ -1,15 +1,42 @@
-# Speed stack bench (S6)
+# Speed stack bench (S6 / S10 / S15)
 
 ## Abstract
 
-After Wave 1 glue + graphs + mixed precision, record util / VRAM / ms/tok for regression.
+Record util / VRAM / ms/step (and packed ms/tok) after each speed-stack wave.
 
-## Snapshot (this machine)
+## Wave 1 (S6)
 
 | Mode | Result |
 |------|--------|
-| `./anni lm train --bench-gpu --tokens 32 --steps 15` | mean **257 ms/step** (~8 ms/tok @ B=1 synthetic) backend=cuda+cublas |
+| `./anni lm train --bench-gpu --tokens 32 --steps 15` | mean **~257–540 ms/step** (B=1 synthetic; variance by load) |
 | Packed wiki train (pre-stack, B=128, T=128) | ~**0.23–0.36 ms/tok** live progress |
 | Flags to A/B | `--cuda-graphs`, `--bf16`, `--fp16` |
 
-Packed throughput (not `--bench-gpu`) is the metric that matters for wiki; re-run after enabling graphs/MP and note util via `nvidia-smi`.
+## Wave 2 (S10) — this machine (RTX 5070 Ti)
+
+| Mode | mean_ms / step (`--bench-gpu --tokens 32 --steps 12`) |
+|------|--------|
+| baseline FP32+TF32 | **537.5** |
+| `--flash-attn` | **283.3** (~1.9×) |
+| `--flash-attn --bf16` | **250.8** (~2.1×) |
+
+`nvidia-smi` during idle after runs: util low (bench ends), ~329 MiB reported at sample. Packed wiki ms/tok remains the production metric.
+
+## Wave 3 (S15)
+
+| Mode | Notes |
+|------|--------|
+| `--flash-attn --act-checkpoint` | VRAM↓ via recompute; expect ms/step ↑ vs flash alone |
+| `--adam-offload` | VRAM↓ for m/v; PCIe cost |
+| `--batch auto` after S14 | larger B when flash/ckpt flags set before train |
+
+Re-run packed:
+
+```bash
+./anni lm train --data data/toy_micro.txt --epochs 1 --batch 8 --window 64 \
+  --flash-attn --bf16
+```
+
+## W2 gate (VRAM feed for W3)
+
+Dominators at D=512 / T=256: head `rows×V` CE buffer, Adam flats, then pack activations. Flash removes persistent scores; bwd still peaks one `wtmp`. Wave 3: S11 ckpt, S12 reuse, S13 offload, S14 auto-B retune.
