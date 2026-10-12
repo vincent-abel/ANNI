@@ -104,6 +104,7 @@ lm_adam *lm_adam_create(lm *model)
 	opt->d_param = opt->d_grad = opt->d_m = opt->d_v = NULL;
 	opt->dev_mv = 0;
 	opt->params_valid = 0;
+	opt->offload_mv = 0;
 	opt->beta1 = 0.9;
 	opt->beta2 = 0.999;
 	opt->eps = 1e-8;
@@ -171,36 +172,75 @@ void lm_adam_invalidate(lm_adam *opt)
 		opt->params_valid = 0;
 }
 
+static int g_adam_offload;
+
+void lm_adam_set_offload(int on)
+{
+	g_adam_offload = on ? 1 : 0;
+}
+
 /* Allocate persistent device flats once; m/v are uploaded on first use. */
 static int gpu_buffers_init(lm_adam *opt)
 {
 	size_t nbytes;
 	int i;
 
-	if (opt->d_param)
-		return 0;
+	if (!opt->d_param) {
+		nbytes = (size_t)opt->n * sizeof(ann_real);
+		opt->h_m = malloc(nbytes);
+		opt->h_v = malloc(nbytes);
+		opt->d_param = gpu_malloc(nbytes);
+		opt->d_grad = gpu_malloc(nbytes);
+		if (!opt->h_m || !opt->h_v || !opt->d_param || !opt->d_grad) {
+			release_gpu(opt);
+			return -1;
+		}
+		for (i = 0; i < opt->n; i++) {
+			opt->h_m[i] = opt->slots[i].m;
+			opt->h_v[i] = opt->slots[i].v;
+		}
+	}
 	nbytes = (size_t)opt->n * sizeof(ann_real);
-	opt->h_m = malloc(nbytes);
-	opt->h_v = malloc(nbytes);
-	opt->d_param = gpu_malloc(nbytes);
-	opt->d_grad = gpu_malloc(nbytes);
-	opt->d_m = gpu_malloc(nbytes);
-	opt->d_v = gpu_malloc(nbytes);
-	if (!opt->h_m || !opt->h_v
-	    || !opt->d_param || !opt->d_grad || !opt->d_m || !opt->d_v) {
-		release_gpu(opt);
-		return -1;
+	/* S13: re-alloc m/v each step when offloaded between steps. */
+	if (!opt->d_m) {
+		opt->d_m = gpu_malloc(nbytes);
+		opt->d_v = gpu_malloc(nbytes);
+		if (!opt->d_m || !opt->d_v) {
+			release_gpu(opt);
+			return -1;
+		}
+		if (gpu_memcpy_h2d(opt->d_m, opt->h_m, nbytes) != 0
+		    || gpu_memcpy_h2d(opt->d_v, opt->h_v, nbytes) != 0) {
+			release_gpu(opt);
+			return -1;
+		}
 	}
-	for (i = 0; i < opt->n; i++) {
-		opt->h_m[i] = opt->slots[i].m;
-		opt->h_v[i] = opt->slots[i].v;
-	}
-	if (gpu_memcpy_h2d(opt->d_m, opt->h_m, nbytes) != 0
-	    || gpu_memcpy_h2d(opt->d_v, opt->h_v, nbytes) != 0) {
-		release_gpu(opt);
-		return -1;
-	}
+	if (opt->offload_mv || g_adam_offload)
+		opt->offload_mv = 1;
 	return 0;
+}
+
+/* After step: D2H m/v and free device twins to reclaim VRAM. */
+static void adam_offload_mv(lm_adam *opt)
+{
+	size_t nbytes;
+	int i;
+
+	if (!opt || !opt->offload_mv || !opt->d_m || !opt->d_v || !opt->h_m
+	    || !opt->h_v)
+		return;
+	nbytes = (size_t)opt->n * sizeof(ann_real);
+	if (gpu_memcpy_d2h(opt->h_m, opt->d_m, nbytes) != 0
+	    || gpu_memcpy_d2h(opt->h_v, opt->d_v, nbytes) != 0)
+		return;
+	for (i = 0; i < opt->n; i++) {
+		opt->slots[i].m = opt->h_m[i];
+		opt->slots[i].v = opt->h_v[i];
+	}
+	gpu_free(opt->d_m);
+	gpu_free(opt->d_v);
+	opt->d_m = opt->d_v = NULL;
+	opt->dev_mv = 0;
 }
 
 void lm_adam_sync_host(lm_adam *opt)
@@ -320,6 +360,9 @@ static int adam_step_gpu(lm_adam *opt, double lr, double grad_scale)
 		if (seg_scatter(opt, &opt->segs[i]) != 0)
 			goto fail;
 	opt->params_valid = 1;
+	if (g_adam_offload)
+		opt->offload_mv = 1;
+	adam_offload_mv(opt);
 	return 0;
 fail:
 	opt->params_valid = 0;
