@@ -220,7 +220,11 @@ Observed headroom on a 16 GB card at current toy scale (`D=256`, `LM_BATCH_AUT
 - [x] **S4** Wire CUDA Graphs into packed train (finish R12); see [docs/cuda-graphs-train.md](docs/cuda-graphs-train.md)
 - [x] **S5a** BF16 GEMMs + FP32 masters (`--bf16`); see [docs/mixed-precision-train.md](docs/mixed-precision-train.md)
 - [x] **S5b** FP16 + dynamic loss scaling (`--fp16`); see [docs/fp16-loss-scaling.md](docs/fp16-loss-scaling.md)
-- [ ] **S6** Bench util / VRAM / ms/tok after S1–S5; see [docs/speed-stack-bench.md](docs/speed-stack-bench.md)
+- [x] **S6** Bench util / VRAM / ms/tok after S1–S5; see [docs/speed-stack-bench.md](docs/speed-stack-bench.md)
+
+### Speed stack wave 2 (after W1)
+
+Remaining bound: launch tax + materialized `B·H·T·T` attn. Next: **S7** Flash (no full `T×T`), **S8** fused epilogues, **S9** multi-stream.
 
 **Other fill / scale**
 
