@@ -711,7 +711,8 @@ static void test_lm_packed_matches_sequential(void)
 	lm_zero_grad(model);
 	for (b = 0; b < NB; b++) {
 		assert(lm_forward_cache(model, &ids[b * TT], TT, c1) == 0);
-		assert(lm_loss_backward(model, c1, &ids[b * TT], TT, dh1) == 0);
+		assert(lm_loss_backward(model, c1, &ids[b * TT], TT, dh1,
+		    NULL) == 0);
 		assert(lm_backward(model, dh1, c1) == 0);
 	}
 	seq_norm = lm_grad_abs_sum(model);
@@ -719,7 +720,7 @@ static void test_lm_packed_matches_sequential(void)
 
 	lm_zero_grad(model);
 	assert(lm_forward_cache_packed(model, ids, NB, TT, cp) == 0);
-	assert(lm_loss_backward_packed(model, cp, ids, NB, TT, dhp) == 0);
+	assert(lm_loss_backward_packed(model, cp, ids, NB, TT, dhp, NULL) == 0);
 	assert(lm_backward_packed(model, dhp, cp) == 0);
 	pack_norm = lm_grad_abs_sum(model);
 	pack_head = mat_abs_sum(model->dw_head);
@@ -1118,7 +1119,7 @@ static void test_lm_backprop_head(void)
 	assert(cache && dhidden);
 	lm_zero_grad(model);
 	assert(lm_forward_cache(model, ids, n, cache) == 0);
-	assert(lm_loss_backward(model, cache, ids, n, dhidden) == 0);
+	assert(lm_loss_backward(model, cache, ids, n, dhidden, NULL) == 0);
 	assert(lm_backward(model, dhidden, cache) == 0);
 	g_analytic = mat_get(model->dw_head, 0, ids[1]);
 	eps = 1e-2;
