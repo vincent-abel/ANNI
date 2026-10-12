@@ -209,7 +209,7 @@ Observed headroom on a 16 GB card at current toy scale (`D=256`, `LM_BATCH_AUT
 - [x] **R1** Keep LN / FFN / residual activations **device-resident** end-to-end (no per-op H↔D staging) — main lever for util ≫ 30% at fixed `D` (~2–5×); see [docs/gpu-activation-residency.md](docs/gpu-activation-residency.md)
 - [x] **R3** Lift `LM_BATCH_AUTO_MAX` (64 → **1024**) and relax `lm_packed_bytes` so `--batch auto` can target most of free VRAM (**huge B**); see [docs/huge-batch-vram.md](docs/huge-batch-vram.md)
 - [x] **R4** Large manual `--batch` (**128–1024+**) with OOM backoff (halve `B` on alloc fail); default/`-d` guidance for 16 GB cards
-- [ ] **R12** **CUDA Graphs**: API present; wire into `pack_run` under **S4** (capture fails while host ops remain)
+- [x] **R12** **CUDA Graphs**: wired into `pack_run` via `--cuda-graphs` (**S4**); capture fails if host ops remain
 - [ ] **R10** **Mixed precision**: TF32 on; BF16/FP16+loss-scale under **S5a/S5b** (C13)
 
 **Speed stack wave 1 (glue → graphs → MP)**
@@ -217,7 +217,7 @@ Observed headroom on a 16 GB card at current toy scale (`D=256`, `LM_BATCH_AUT
 - [x] **S1** Device-fused CE (no full logits D2H); see [docs/device-fused-ce.md](docs/device-fused-ce.md)
 - [x] **S2** GPU packed posenc; see [docs/gpu-posenc.md](docs/gpu-posenc.md)
 - [x] **S3** GPU FFN bias column-sum grads; see [docs/gpu-bias-grad-reduce.md](docs/gpu-bias-grad-reduce.md)
-- [ ] **S4** Wire CUDA Graphs into packed train (finish R12); see [docs/cuda-graphs-train.md](docs/cuda-graphs-train.md)
+- [x] **S4** Wire CUDA Graphs into packed train (finish R12); see [docs/cuda-graphs-train.md](docs/cuda-graphs-train.md)
 - [ ] **S5a** BF16 GEMMs + FP32 masters (`--bf16`); see [docs/mixed-precision-train.md](docs/mixed-precision-train.md)
 - [ ] **S5b** FP16 + dynamic loss scaling (`--fp16`); see [docs/fp16-loss-scaling.md](docs/fp16-loss-scaling.md)
 - [ ] **S6** Bench util / VRAM / ms/tok after S1–S5; see [docs/speed-stack-bench.md](docs/speed-stack-bench.md)

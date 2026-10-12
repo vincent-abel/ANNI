@@ -52,6 +52,10 @@ static int g_early_stop_patience;
 static double g_diverge_delta;
 static int g_act_checkpoint;
 static int g_varlen;
+static int g_cuda_graphs;
+static int g_graph_B;
+static int g_graph_T;
+static int g_graph_ready;
 
 void lm_train_set_progress(train_progress_fn fn, void *userdata)
 {
@@ -376,6 +380,15 @@ void lm_train_set_varlen(int on)
 	g_varlen = on ? 1 : 0;
 }
 
+void lm_train_set_cuda_graphs(int on)
+{
+	g_cuda_graphs = on ? 1 : 0;
+	g_graph_ready = 0;
+	g_graph_B = 0;
+	g_graph_T = 0;
+	gpu_graph_destroy();
+}
+
 static void apply_tokens_per_step(int B, int T)
 {
 	int tok;
@@ -544,7 +557,25 @@ static int train_mid_val_due(int done, int total, int *next_pct)
 }
 
 /* Forward + loss + backward for the first b sequences already in p->ids.
-** mean_ce may be NULL; otherwise receives mean CE over predicting rows. */
+** mean_ce may be NULL; otherwise receives mean CE over predicting rows.
+** S4: optional CUDA Graph capture/replay when B,T steady and no varlen lens. */
+static int pack_run_body(lm *model, pack_ctx *p, int b, double *mean_ce,
+	pack_slot *s, const int *lens)
+{
+	gpu_attn_set_seqlens(lens);
+	if (lm_forward_cache_packed(model, p->ids, b, p->T, s->c) != 0) {
+		gpu_attn_set_seqlens(NULL);
+		return -1;
+	}
+	if (lm_loss_backward_packed_lens(model, s->c, p->ids, b, p->T, lens,
+	    s->dh, mean_ce) != 0) {
+		gpu_attn_set_seqlens(NULL);
+		return -1;
+	}
+	gpu_attn_set_seqlens(NULL);
+	return lm_backward_packed(model, s->dh, s->c);
+}
+
 static int pack_run(lm *model, pack_ctx *p, int b, double *mean_ce)
 {
 	pack_slot *s;
@@ -567,18 +598,37 @@ static int pack_run(lm *model, pack_ctx *p, int b, double *mean_ce)
 		if (need_lens)
 			lens = p->lens;
 	}
-	gpu_attn_set_seqlens(lens);
-	if (lm_forward_cache_packed(model, p->ids, b, p->T, s->c) != 0) {
-		gpu_attn_set_seqlens(NULL);
-		return -1;
+	/*
+	** Graphs need fixed device addresses and no host ops in the region.
+	** Skip when varlen seqlens change the mask, or B/T changes.
+	*/
+	/* mean_ce unavailable on replay (capture uses NULL); leave unset. */
+	if (g_cuda_graphs && gpu_available() && !lens) {
+		if (g_graph_ready && g_graph_B == b && g_graph_T == p->T) {
+			if (gpu_graph_replay() == 0) {
+				if (mean_ce)
+					*mean_ce = -1.0;
+				return 0;
+			}
+			g_graph_ready = 0;
+			gpu_graph_destroy();
+		}
+		if ((!g_graph_ready || g_graph_B != b || g_graph_T != p->T)
+		    && gpu_graph_begin() == 0) {
+			if (pack_run_body(model, p, b, NULL, s, NULL) == 0
+			    && gpu_graph_end() == 0) {
+				g_graph_ready = 1;
+				g_graph_B = b;
+				g_graph_T = p->T;
+				if (mean_ce)
+					*mean_ce = -1.0;
+				return 0;
+			}
+			gpu_graph_destroy();
+			g_graph_ready = 0;
+		}
 	}
-	if (lm_loss_backward_packed_lens(model, s->c, p->ids, b, p->T, lens,
-	    s->dh, mean_ce) != 0) {
-		gpu_attn_set_seqlens(NULL);
-		return -1;
-	}
-	gpu_attn_set_seqlens(NULL);
-	return lm_backward_packed(model, s->dh, s->c);
+	return pack_run_body(model, p, b, mean_ce, s, lens);
 }
 
 /*

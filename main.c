@@ -215,6 +215,8 @@ static int run_lm_train_core(int argc, char **argv, int use_tower)
 		    "--diverge-delta", "0")));
 		if (arg_flag(argc, argv, NULL, "--varlen"))
 			lm_train_set_varlen(1);
+		if (arg_flag(argc, argv, NULL, "--cuda-graphs"))
+			lm_train_set_cuda_graphs(1);
 	}
 	if (lr <= 0.0)
 		lr = 0.001;
