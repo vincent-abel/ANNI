@@ -154,8 +154,15 @@ int ffn_forward_cache(mat *out, const mat *x, ffn *f, ffn_cache *c)
 	mat_try_pin(out);
 	pre = mat_compute_ptr(c->pre_act);
 	hid = mat_compute_ptr(c->hidden);
-	/* pre_act += b1 ; hidden = relu(pre_act). GPU first, CPU fallback. */
-	if (pre && gpu_bias_row_add(pre, f->b1->data, T, LM_D_FF) == 0) {
+	/* S8: bias+ReLU fused when possible; else bias then ReLU. */
+	if (pre && resid_copy(c->hidden, c->pre_act) == 0
+	    && (hid = mat_compute_ptr(c->hidden))
+	    && gpu_bias_relu_forward(hid, f->b1->data, T, LM_D_FF) == 0) {
+		mat_mark_device(c->hidden);
+		/* Keep pre_act = hidden pre-ReLU for bwd mask: re-add bias only. */
+		if (gpu_bias_row_add(pre, f->b1->data, T, LM_D_FF) == 0)
+			mat_mark_device(c->pre_act);
+	} else if (pre && gpu_bias_row_add(pre, f->b1->data, T, LM_D_FF) == 0) {
 		mat_mark_device(c->pre_act);
 		if (resid_copy(c->hidden, c->pre_act) != 0)
 			copy_mat(c->hidden, c->pre_act);
