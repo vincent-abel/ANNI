@@ -45,6 +45,9 @@ typedef struct	transformer_cache {
 	int		Tseq;		/* per-sequence length */
 } transformer_cache;
 
+/* S11/R9: drop device activations after each block; recompute in backward. */
+void		block_set_act_checkpoint(int on);
+int		block_act_checkpoint_enabled(void);
 tblock		*tblock_create(void);
 void		tblock_free(tblock **b);
 void		tblock_zero_grad(tblock *b);
@@ -65,7 +68,7 @@ int		transformer_forward(mat *x, transformer *t);
 int		transformer_forward_cache(mat *x, transformer *t,
 			transformer_cache *c);
 int		transformer_backward(mat *dx, const mat *dout, transformer *t,
-			const transformer_cache *c);
+			transformer_cache *c);
 
 transformer_cache	*transformer_cache_create(int T, const transformer *t);
 transformer_cache	*transformer_cache_create_packed(int B, int T,

@@ -7,6 +7,50 @@
 #include "gradutil.h"
 #include "resid.h"
 
+static int g_act_checkpoint;
+
+void block_set_act_checkpoint(int on)
+{
+	g_act_checkpoint = on ? 1 : 0;
+}
+
+int block_act_checkpoint_enabled(void)
+{
+	return g_act_checkpoint;
+}
+
+/* S11: free device twins of recomputable activations; keep x_in. */
+static void block_cache_drop_device(block_cache *bc)
+{
+	if (!bc)
+		return;
+	mat_device_free(bc->ln1_out);
+	mat_device_free(bc->attn_out);
+	mat_device_free(bc->x_mid);
+	mat_device_free(bc->ln2_out);
+	mat_device_free(bc->ffn_out);
+	if (bc->ffnc) {
+		mat_device_free(bc->ffnc->x_in);
+		mat_device_free(bc->ffnc->pre_act);
+		mat_device_free(bc->ffnc->hidden);
+	}
+	if (bc->attnpc) {
+		mat_device_free(bc->attnpc->x_in);
+		mat_device_free(bc->attnpc->q);
+		mat_device_free(bc->attnpc->k);
+		mat_device_free(bc->attnpc->v);
+		mat_device_free(bc->attnpc->concat);
+		mat_device_free(bc->attnpc->w_all);
+	}
+	if (bc->attnc) {
+		mat_device_free(bc->attnc->x_in);
+		mat_device_free(bc->attnc->q);
+		mat_device_free(bc->attnc->k);
+		mat_device_free(bc->attnc->v);
+		mat_device_free(bc->attnc->concat);
+	}
+}
+
 static void copy_mat(mat *dst, const mat *src)
 {
 	if (resid_copy(dst, src) == 0)
@@ -380,6 +424,9 @@ int transformer_forward_cache(mat *x, transformer *t, transformer_cache *c)
 	for (i = 0; i < t->n_blocks; i++) {
 		if (tblock_forward_cache(x, &t->blocks[i], &c->bc[i]) != 0)
 			return -1;
+		/* S11: release per-block device acts; x_in stays for recompute. */
+		if (g_act_checkpoint)
+			block_cache_drop_device(&c->bc[i]);
 	}
 	return 0;
 }
@@ -400,29 +447,48 @@ int transformer_forward(mat *x, transformer *t)
 }
 
 int transformer_backward(mat *dx, const mat *dout, transformer *t,
-	const transformer_cache *c)
+	transformer_cache *c)
 {
 	mat *cur;
 	mat *prev;
 	mat *swap;
+	mat *scratch;
 	int i;
 
 	if (!dx || !dout || !t || !c)
 		return -1;
 	cur = mat_create(c->T, LM_D_MODEL);
 	prev = mat_create(c->T, LM_D_MODEL);
-	if (!cur || !prev) {
+	scratch = g_act_checkpoint ? mat_create(c->T, LM_D_MODEL) : NULL;
+	if (!cur || !prev || (g_act_checkpoint && !scratch)) {
 		mat_free(&cur);
 		mat_free(&prev);
+		mat_free(&scratch);
 		return -1;
 	}
+	if (scratch)
+		mat_try_pin(scratch);
 	copy_mat(cur, dout);
 	for (i = t->n_blocks - 1; i >= 0; i--) {
+		if (g_act_checkpoint) {
+			/* Recompute block activations from saved x_in. */
+			copy_mat(scratch, c->bc[i].x_in);
+			if (tblock_forward_cache(scratch, &t->blocks[i],
+			    &c->bc[i]) != 0) {
+				mat_free(&cur);
+				mat_free(&prev);
+				mat_free(&scratch);
+				return -1;
+			}
+		}
 		if (tblock_backward(prev, cur, &t->blocks[i], &c->bc[i]) != 0) {
 			mat_free(&cur);
 			mat_free(&prev);
+			mat_free(&scratch);
 			return -1;
 		}
+		if (g_act_checkpoint)
+			block_cache_drop_device(&c->bc[i]);
 		swap = cur;
 		cur = prev;
 		prev = swap;
@@ -430,5 +496,6 @@ int transformer_backward(mat *dx, const mat *dout, transformer *t,
 	copy_mat(dx, cur);
 	mat_free(&cur);
 	mat_free(&prev);
+	mat_free(&scratch);
 	return 0;
 }
