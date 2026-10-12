@@ -25,13 +25,13 @@ Budget \(B_{\max}=\max\{B: \widehat{M}(B,T,V)\le f\cdot M_{\mathrm{free}}\}\) wi
 ## How it shows up in this repo
 
 - [`lang/lm_train.h`](../lang/lm_train.h): `LM_BATCH_AUTO_MAX` 1024
-- [`lang/lm.c`](../lang/lm.c): `lm_packed_bytes` ×1.6
+- [`lang/lm.c`](../lang/lm.c): `lm_packed_bytes` — **S14** safety ×1.35; flash counts one layer of scores; act-checkpoint uses ~2 live blocks
 - [`lang/lm_train.c`](../lang/lm_train.c): `resolve_batch`, `pack_ctx_init` OOM halve
 
 ## Tiny worked example
 
-Free 14 GB, frac 0.85 → budget ≈ 12 GB. At T=64, D=256 the estimate may allow B in the hundreds where the old cap stopped at 64.
+Free 14 GB, frac 0.85 → budget ≈ 12 GB. At T=64, D=256 the estimate may allow B in the hundreds where the old cap stopped at 64. With `--flash-attn --act-checkpoint` the estimate frees more budget for auto-B.
 
 ## What comes next
 
-[CUDA Graphs](cuda-graphs-train.md) after residency; [activation checkpointing](activation-checkpointing.md) when B·T·D no longer fits.
+[activation checkpointing](activation-checkpointing.md) / [adam offload](adam-cpu-offload.md) when still VRAM-bound; SOTA memory notes in [sota-memory.md](sota-memory.md).
