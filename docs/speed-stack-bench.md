@@ -22,18 +22,17 @@ Record util / VRAM / ms/step (and packed ms/tok) after each speed-stack wave.
 
 `nvidia-smi` during idle after runs: util low (bench ends), ~329 MiB reported at sample. Packed wiki ms/tok remains the production metric.
 
-## Wave 3 (S15)
+## Wave 3 (S15) — this machine
 
-| Mode | Notes |
+| Mode | mean_ms / step (`--bench-gpu --tokens 32 --steps 10`) |
 |------|--------|
-| `--flash-attn --act-checkpoint` | VRAM↓ via recompute; expect ms/step ↑ vs flash alone |
-| `--adam-offload` | VRAM↓ for m/v; PCIe cost |
-| `--batch auto` after S14 | larger B when flash/ckpt flags set before train |
+| `--flash-attn --act-checkpoint` | **256.9** |
+| `--flash-attn --adam-offload` | **252.0** |
 
-Re-run packed:
+Checkpoint/offload are VRAM levers; ms/step can match flash-alone when synthetic B=1 is not VRAM-bound. Prefer packed train + `nvidia-smi` memory for the real tradeoff.
 
 ```bash
-./anni lm train --data data/toy_micro.txt --epochs 1 --batch 8 --window 64 \
+./anni lm train --data data/toy_micro.txt --epochs 1 --batch 4 --window 64 \
   --flash-attn --bf16
 ```
 
