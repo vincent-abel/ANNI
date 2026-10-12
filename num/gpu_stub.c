@@ -191,6 +191,16 @@ int gpu_layernorm_forward_ex(ann_real *y, const ann_real *x,
 	return -1;
 }
 
+void gpu_set_compute_prec(int prec)
+{
+	(void)prec;
+}
+
+int gpu_compute_prec(void)
+{
+	return GPU_PREC_FP32;
+}
+
 int gpu_bias_row_add(ann_real *x, const ann_real *bias, int rows, int cols)
 {
 	(void)x;

@@ -1,4 +1,5 @@
 #include "main.h"
+#include "gpu.h"
 #include <unistd.h>
 
 static int arg_eq(const char *a, const char *b)
@@ -217,6 +218,20 @@ static int run_lm_train_core(int argc, char **argv, int use_tower)
 			lm_train_set_varlen(1);
 		if (arg_flag(argc, argv, NULL, "--cuda-graphs"))
 			lm_train_set_cuda_graphs(1);
+		{
+			int bf16 = arg_flag(argc, argv, NULL, "--bf16");
+			int fp16 = arg_flag(argc, argv, NULL, "--fp16");
+
+			if (bf16 && fp16) {
+				fprintf(stderr,
+				    "lm train: use only one of --bf16 / --fp16\n");
+				return 1;
+			}
+			if (bf16)
+				lm_train_set_compute_prec(GPU_PREC_BF16);
+			else if (fp16)
+				lm_train_set_compute_prec(GPU_PREC_FP16);
+		}
 	}
 	if (lr <= 0.0)
 		lr = 0.001;

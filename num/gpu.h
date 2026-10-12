@@ -18,6 +18,13 @@ int	gpu_mem_info(size_t *free_bytes, size_t *total_bytes);
 #define GPU_SYNC_BATCH	1
 void	gpu_set_sync_mode(int mode);
 int	gpu_sync_mode(void);
+
+/* S5: compute dtype for cuBLAS GemmEx (weights/Adam masters stay FP32). */
+#define GPU_PREC_FP32	0
+#define GPU_PREC_BF16	1
+#define GPU_PREC_FP16	2
+void	gpu_set_compute_prec(int prec);	/* FP32/BF16/FP16 */
+int	gpu_compute_prec(void);
 /*
 ** Block until all queued device work finishes. In GPU_SYNC_BATCH mode the
 ** individual GEMM/outer-add launches do not sync; call this once per

@@ -210,7 +210,7 @@ Observed headroom on a 16 GB card at current toy scale (`D=256`, `LM_BATCH_AUT
 - [x] **R3** Lift `LM_BATCH_AUTO_MAX` (64 → **1024**) and relax `lm_packed_bytes` so `--batch auto` can target most of free VRAM (**huge B**); see [docs/huge-batch-vram.md](docs/huge-batch-vram.md)
 - [x] **R4** Large manual `--batch` (**128–1024+**) with OOM backoff (halve `B` on alloc fail); default/`-d` guidance for 16 GB cards
 - [x] **R12** **CUDA Graphs**: wired into `pack_run` via `--cuda-graphs` (**S4**); capture fails if host ops remain
-- [ ] **R10** **Mixed precision**: TF32 on; BF16/FP16+loss-scale under **S5a/S5b** (C13)
+- [x] **R10** **Mixed precision**: TF32 on; **`--bf16` / `--fp16`** GemmEx + FP32 masters (**S5a/S5b**, C13)
 
 **Speed stack wave 1 (glue → graphs → MP)**
 
@@ -218,8 +218,8 @@ Observed headroom on a 16 GB card at current toy scale (`D=256`, `LM_BATCH_AUT
 - [x] **S2** GPU packed posenc; see [docs/gpu-posenc.md](docs/gpu-posenc.md)
 - [x] **S3** GPU FFN bias column-sum grads; see [docs/gpu-bias-grad-reduce.md](docs/gpu-bias-grad-reduce.md)
 - [x] **S4** Wire CUDA Graphs into packed train (finish R12); see [docs/cuda-graphs-train.md](docs/cuda-graphs-train.md)
-- [ ] **S5a** BF16 GEMMs + FP32 masters (`--bf16`); see [docs/mixed-precision-train.md](docs/mixed-precision-train.md)
-- [ ] **S5b** FP16 + dynamic loss scaling (`--fp16`); see [docs/fp16-loss-scaling.md](docs/fp16-loss-scaling.md)
+- [x] **S5a** BF16 GEMMs + FP32 masters (`--bf16`); see [docs/mixed-precision-train.md](docs/mixed-precision-train.md)
+- [x] **S5b** FP16 + dynamic loss scaling (`--fp16`); see [docs/fp16-loss-scaling.md](docs/fp16-loss-scaling.md)
 - [ ] **S6** Bench util / VRAM / ms/tok after S1–S5; see [docs/speed-stack-bench.md](docs/speed-stack-bench.md)
 
 **Other fill / scale**
@@ -359,7 +359,7 @@ Single-node / few-GPU path between Target and ChatGPT-class. Still from-scratch 
 
 - [ ] **C11** Grad clip + weight decay + warmup/cosine — land **E1–E2** for real
 - [ ] **C12** Token-budget steps (`--tokens-per-step`) — **E9**; epoch = token budget not file passes
-- [ ] **C13** BF16/FP16 train path with FP32 master weights — **R10**
+- [x] **C13** BF16/FP16 train path with FP32 master weights — **R10** / **S5a/S5b**
 - [ ] **C14** Data: multi-file shard reader + shuffle across shards (**E14** + beyond wiki dump)
 
 **Done when:** one machine can train/resume a ~100M+ RoPE/RMSNorm model on multi‑GB text and generate coherent paragraphs (still not ChatGPT).

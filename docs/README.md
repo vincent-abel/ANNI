@@ -108,6 +108,7 @@
 - [Device-fused CE (S1)](device-fused-ce.md)
 - [GPU positional encoding (S2)](gpu-posenc.md)
 - [GPU bias grad reduce (S3)](gpu-bias-grad-reduce.md)
+- [FP16 loss scaling (S5b)](fp16-loss-scaling.md)
 - [Scale toward Target size](scale-toward-target-size.md)
 - [Attention heads scale (R5b)](attention-heads-scale.md)
 - [Activation checkpointing (R9)](activation-checkpointing.md)
