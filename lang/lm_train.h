@@ -37,6 +37,9 @@ void	lm_train_set_act_checkpoint(int on);
 void	lm_train_set_varlen(int on);
 /* S4/R12: capture/replay packed fwd+bwd when shapes are steady (0 = off). */
 void	lm_train_set_cuda_graphs(int on);
+/* S5a/S5b: GPU_PREC_*; FP16 enables dynamic loss scaling. */
+void	lm_train_set_compute_prec(int prec);
+double	lm_train_loss_scale(void);	/* current scale (1.0 if not FP16) */
 
 /*
 ** ckpt_path NULL = no mid-train saves. Otherwise overwrite that path after each

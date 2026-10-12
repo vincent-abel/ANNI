@@ -56,6 +56,9 @@ static int g_cuda_graphs;
 static int g_graph_B;
 static int g_graph_T;
 static int g_graph_ready;
+static int g_compute_prec;
+static double g_loss_scale = 1.0;
+static int g_loss_scale_good;
 
 void lm_train_set_progress(train_progress_fn fn, void *userdata)
 {
@@ -387,6 +390,46 @@ void lm_train_set_cuda_graphs(int on)
 	g_graph_B = 0;
 	g_graph_T = 0;
 	gpu_graph_destroy();
+}
+
+void lm_train_set_compute_prec(int prec)
+{
+	if (prec != GPU_PREC_BF16 && prec != GPU_PREC_FP16)
+		prec = GPU_PREC_FP32;
+	g_compute_prec = prec;
+	gpu_set_compute_prec(prec);
+	g_loss_scale = (prec == GPU_PREC_FP16) ? 1024.0 : 1.0;
+	g_loss_scale_good = 0;
+	/* Dtype change invalidates captured graphs. */
+	if (g_cuda_graphs)
+		lm_train_set_cuda_graphs(1);
+}
+
+double lm_train_loss_scale(void)
+{
+	return g_loss_scale > 0.0 ? g_loss_scale : 1.0;
+}
+
+/* Unscale factor for Adam; update dynamic loss scale for FP16. */
+static double train_grad_unscale(int step_ok)
+{
+	if (g_compute_prec != GPU_PREC_FP16)
+		return 1.0;
+	if (!step_ok) {
+		g_loss_scale *= 0.5;
+		if (g_loss_scale < 1.0)
+			g_loss_scale = 1.0;
+		g_loss_scale_good = 0;
+		return 0.0;	/* caller skips Adam */
+	}
+	g_loss_scale_good++;
+	if (g_loss_scale_good >= 2000) {
+		g_loss_scale *= 2.0;
+		if (g_loss_scale > 65536.0)
+			g_loss_scale = 65536.0;
+		g_loss_scale_good = 0;
+	}
+	return 1.0 / g_loss_scale;
 }
 
 static void apply_tokens_per_step(int B, int T)
@@ -946,7 +989,16 @@ double lm_train_corpus_val(lm *model, text_dataset *ds, lm_adam *opt,
 				step_lr = train_step_lr(lr, opt->t);
 				opt->weight_decay = g_weight_decay;
 				opt->grad_clip = g_grad_clip;
-				lm_adam_step_scaled(opt, step_lr, 1.0 / (double)b);
+				{
+					double us = train_grad_unscale(
+					    isfinite(last));
+
+					if (us > 0.0)
+						lm_adam_step_scaled(opt, step_lr,
+						    us / (double)b);
+					else
+						lm_adam_zero_grad(model);
+				}
 				elapsed = wall_sec() - t0;
 				tp.epoch = ep;
 				tp.epoch_done = idx;
@@ -1396,7 +1448,16 @@ double lm_train_stream(lm *model, text_stream *train, lm_adam *opt,
 				step_lr = train_step_lr(lr, opt->t);
 				opt->weight_decay = g_weight_decay;
 				opt->grad_clip = g_grad_clip;
-				lm_adam_step_scaled(opt, step_lr, 1.0 / (double)b);
+				{
+					double us = train_grad_unscale(
+					    isfinite(last));
+
+					if (us > 0.0)
+						lm_adam_step_scaled(opt, step_lr,
+						    us / (double)b);
+					else
+						lm_adam_zero_grad(model);
+				}
 				steps++;
 				el = wall_sec() - ep_t0;
 				tp.epoch = ep;

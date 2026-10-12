@@ -2,6 +2,10 @@
 **	Optional CUDA backend (build with: make cuda)
 */
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#if CUDART_VERSION >= 11000
+#include <cuda_bf16.h>
+#endif
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,10 +20,23 @@ extern "C" {
 }
 
 static int g_sync_mode;
+static int g_compute_prec;
 static cudaStream_t g_copy_stream;
 static cudaGraph_t g_graph;
 static cudaGraphExec_t g_graph_exec;
 static int g_graph_ok;
+
+extern "C" void gpu_set_compute_prec(int prec)
+{
+	if (prec != GPU_PREC_BF16 && prec != GPU_PREC_FP16)
+		prec = GPU_PREC_FP32;
+	g_compute_prec = prec;
+}
+
+extern "C" int gpu_compute_prec(void)
+{
+	return g_compute_prec;
+}
 
 extern "C" void gpu_set_sync_mode(int mode)
 {
@@ -51,19 +68,121 @@ static int cublas_ensure(void)
 	return 0;
 }
 
+__global__ static void f32_to_f16_kernel(half *dst, const float *src, int n)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+	if (i < n)
+		dst[i] = __float2half(src[i]);
+}
+
+#if CUDART_VERSION >= 11000
+__global__ static void f32_to_bf16_kernel(__nv_bfloat16 *dst, const float *src,
+	int n)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+	if (i < n)
+		dst[i] = __float2bfloat16(src[i]);
+}
+#endif
+
+static void *g_half_A;
+static void *g_half_B;
+static size_t g_half_A_cap;
+static size_t g_half_B_cap;
+
+static int ensure_half_buf(void **buf, size_t *cap, size_t bytes)
+{
+	if (*cap >= bytes)
+		return 0;
+	if (*buf)
+		cudaFree(*buf);
+	*buf = NULL;
+	*cap = 0;
+	if (cudaMalloc(buf, bytes) != cudaSuccess) {
+		*buf = NULL;
+		return -1;
+	}
+	*cap = bytes;
+	return 0;
+}
+
+static int cublas_gemm_ex_f16(cublasOperation_t opa, cublasOperation_t opb,
+	int N, int M, int K, const float *alpha, const void *B, int ldb,
+	const void *A, int lda, const float *beta, float *C, int ldc)
+{
+#if CUDART_VERSION >= 11000
+	return cublasGemmEx(g_cublas, opa, opb, N, M, K, alpha, B, CUDA_R_16F,
+	    ldb, A, CUDA_R_16F, lda, beta, C, CUDA_R_32F, ldc,
+	    CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP)
+	    == CUBLAS_STATUS_SUCCESS ? 0 : -1;
+#else
+	return cublasGemmEx(g_cublas, opa, opb, N, M, K, alpha, B, CUDA_R_16F,
+	    ldb, A, CUDA_R_16F, lda, beta, C, CUDA_R_32F, ldc, CUDA_R_32F,
+	    CUBLAS_GEMM_DEFAULT) == CUBLAS_STATUS_SUCCESS ? 0 : -1;
+#endif
+}
+
+#if CUDART_VERSION >= 11000
+static int cublas_gemm_ex_bf16(cublasOperation_t opa, cublasOperation_t opb,
+	int N, int M, int K, const float *alpha, const void *B, int ldb,
+	const void *A, int lda, const float *beta, float *C, int ldc)
+{
+	return cublasGemmEx(g_cublas, opa, opb, N, M, K, alpha, B, CUDA_R_16BF,
+	    ldb, A, CUDA_R_16BF, lda, beta, C, CUDA_R_32F, ldc,
+	    CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP)
+	    == CUBLAS_STATUS_SUCCESS ? 0 : -1;
+}
+#endif
+
 /* Row-major C = A B via column-major cuBLAS identity. */
 static int cublas_gemm_rm(ann_real *dC, const ann_real *dA, const ann_real *dB,
 	int M, int N, int K)
 {
 	const ann_real alpha = 1.0f;
 	const ann_real beta = 0.0f;
+	size_t nA;
+	size_t nB;
+	int threads = 256;
+	int use_bf16;
 
 	if (cublas_ensure() != 0)
 		return -1;
-	if (cublasSgemm(g_cublas, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha,
-		dB, N, dA, K, &beta, dC, N) != CUBLAS_STATUS_SUCCESS)
+	use_bf16 = (g_compute_prec == GPU_PREC_BF16);
+#if CUDART_VERSION < 11000
+	/* Pre-11 toolkits: treat --bf16 as FP16 GemmEx. */
+	if (use_bf16)
+		use_bf16 = 0;
+#endif
+	if (g_compute_prec == GPU_PREC_FP32) {
+		if (cublasSgemm(g_cublas, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K,
+		    &alpha, dB, N, dA, K, &beta, dC, N)
+		    != CUBLAS_STATUS_SUCCESS)
+			return -1;
+		return 0;
+	}
+	nA = (size_t)M * (size_t)K;
+	nB = (size_t)K * (size_t)N;
+	if (ensure_half_buf(&g_half_A, &g_half_A_cap, nA * 2) != 0
+	    || ensure_half_buf(&g_half_B, &g_half_B_cap, nB * 2) != 0)
 		return -1;
-	return 0;
+#if CUDART_VERSION >= 11000
+	if (use_bf16) {
+		f32_to_bf16_kernel<<<(int)((nA + threads - 1) / threads),
+		    threads>>>((__nv_bfloat16 *)g_half_A, dA, (int)nA);
+		f32_to_bf16_kernel<<<(int)((nB + threads - 1) / threads),
+		    threads>>>((__nv_bfloat16 *)g_half_B, dB, (int)nB);
+		return cublas_gemm_ex_bf16(CUBLAS_OP_N, CUBLAS_OP_N, N, M, K,
+		    &alpha, g_half_B, N, g_half_A, K, &beta, dC, N);
+	}
+#endif
+	f32_to_f16_kernel<<<(int)((nA + threads - 1) / threads), threads>>>(
+	    (half *)g_half_A, dA, (int)nA);
+	f32_to_f16_kernel<<<(int)((nB + threads - 1) / threads), threads>>>(
+	    (half *)g_half_B, dB, (int)nB);
+	return cublas_gemm_ex_f16(CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha,
+	    g_half_B, N, g_half_A, K, &beta, dC, N);
 }
 
 /*
@@ -76,13 +195,40 @@ static int cublas_gemm_rm_bt(ann_real *dC, const ann_real *dA,
 {
 	const ann_real alpha = 1.0f;
 	const ann_real beta = 0.0f;
+	size_t nA;
+	size_t nB;
+	int threads = 256;
 
 	if (cublas_ensure() != 0)
 		return -1;
-	if (cublasSgemm(g_cublas, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K, &alpha,
-		dB, K, dA, K, &beta, dC, N) != CUBLAS_STATUS_SUCCESS)
+	if (g_compute_prec == GPU_PREC_FP32) {
+		if (cublasSgemm(g_cublas, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K,
+		    &alpha, dB, K, dA, K, &beta, dC, N)
+		    != CUBLAS_STATUS_SUCCESS)
+			return -1;
+		return 0;
+	}
+	nA = (size_t)M * (size_t)K;
+	nB = (size_t)N * (size_t)K;
+	if (ensure_half_buf(&g_half_A, &g_half_A_cap, nA * 2) != 0
+	    || ensure_half_buf(&g_half_B, &g_half_B_cap, nB * 2) != 0)
 		return -1;
-	return 0;
+#if CUDART_VERSION >= 11000
+	if (g_compute_prec == GPU_PREC_BF16) {
+		f32_to_bf16_kernel<<<(int)((nA + threads - 1) / threads),
+		    threads>>>((__nv_bfloat16 *)g_half_A, dA, (int)nA);
+		f32_to_bf16_kernel<<<(int)((nB + threads - 1) / threads),
+		    threads>>>((__nv_bfloat16 *)g_half_B, dB, (int)nB);
+		return cublas_gemm_ex_bf16(CUBLAS_OP_T, CUBLAS_OP_N, N, M, K,
+		    &alpha, g_half_B, K, g_half_A, K, &beta, dC, N);
+	}
+#endif
+	f32_to_f16_kernel<<<(int)((nA + threads - 1) / threads), threads>>>(
+	    (half *)g_half_A, dA, (int)nA);
+	f32_to_f16_kernel<<<(int)((nB + threads - 1) / threads), threads>>>(
+	    (half *)g_half_B, dB, (int)nB);
+	return cublas_gemm_ex_f16(CUBLAS_OP_T, CUBLAS_OP_N, N, M, K, &alpha,
+	    g_half_B, K, g_half_A, K, &beta, dC, N);
 }
 
 /*
@@ -94,13 +240,40 @@ static int cublas_gemm_rm_at(ann_real *dC, const ann_real *dA,
 {
 	const ann_real alpha = 1.0f;
 	const ann_real beta = accumulate ? 1.0f : 0.0f;
+	size_t nA;
+	size_t nB;
+	int threads = 256;
 
 	if (cublas_ensure() != 0)
 		return -1;
-	if (cublasSgemm(g_cublas, CUBLAS_OP_N, CUBLAS_OP_T, N, M, T, &alpha,
-		dB, N, dA, M, &beta, dC, N) != CUBLAS_STATUS_SUCCESS)
+	if (g_compute_prec == GPU_PREC_FP32) {
+		if (cublasSgemm(g_cublas, CUBLAS_OP_N, CUBLAS_OP_T, N, M, T,
+		    &alpha, dB, N, dA, M, &beta, dC, N)
+		    != CUBLAS_STATUS_SUCCESS)
+			return -1;
+		return 0;
+	}
+	nA = (size_t)T * (size_t)M;
+	nB = (size_t)T * (size_t)N;
+	if (ensure_half_buf(&g_half_A, &g_half_A_cap, nA * 2) != 0
+	    || ensure_half_buf(&g_half_B, &g_half_B_cap, nB * 2) != 0)
 		return -1;
-	return 0;
+#if CUDART_VERSION >= 11000
+	if (g_compute_prec == GPU_PREC_BF16) {
+		f32_to_bf16_kernel<<<(int)((nA + threads - 1) / threads),
+		    threads>>>((__nv_bfloat16 *)g_half_A, dA, (int)nA);
+		f32_to_bf16_kernel<<<(int)((nB + threads - 1) / threads),
+		    threads>>>((__nv_bfloat16 *)g_half_B, dB, (int)nB);
+		return cublas_gemm_ex_bf16(CUBLAS_OP_N, CUBLAS_OP_T, N, M, T,
+		    &alpha, g_half_B, N, g_half_A, M, &beta, dC, N);
+	}
+#endif
+	f32_to_f16_kernel<<<(int)((nA + threads - 1) / threads), threads>>>(
+	    (half *)g_half_A, dA, (int)nA);
+	f32_to_f16_kernel<<<(int)((nB + threads - 1) / threads), threads>>>(
+	    (half *)g_half_B, dB, (int)nB);
+	return cublas_gemm_ex_f16(CUBLAS_OP_N, CUBLAS_OP_T, N, M, T, &alpha,
+	    g_half_B, N, g_half_A, M, &beta, dC, N);
 }
 #endif
 
