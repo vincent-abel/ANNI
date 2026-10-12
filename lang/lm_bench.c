@@ -97,7 +97,7 @@ double lm_bench_train_ms(lm *model, lm_adam *opt, int n, int n_steps)
 	/* Warmup one full train step. */
 	lm_adam_zero_grad(model);
 	if (lm_forward_cache(model, ids, n, c) != 0
-	    || lm_loss_backward(model, c, ids, n, dhidden) != 0
+	    || lm_loss_backward(model, c, ids, n, dhidden, NULL) != 0
 	    || lm_backward(model, dhidden, c) != 0) {
 		gpu_set_sync_mode(GPU_SYNC_EAGER);
 		free(ids);
@@ -114,7 +114,7 @@ double lm_bench_train_ms(lm *model, lm_adam *opt, int n, int n_steps)
 		if (gpu_available())
 			gpu_set_sync_mode(GPU_SYNC_BATCH);
 		if (lm_forward_cache(model, ids, n, c) != 0
-		    || lm_loss_backward(model, c, ids, n, dhidden) != 0
+		    || lm_loss_backward(model, c, ids, n, dhidden, NULL) != 0
 		    || lm_backward(model, dhidden, c) != 0) {
 			gpu_set_sync_mode(GPU_SYNC_EAGER);
 			free(ids);

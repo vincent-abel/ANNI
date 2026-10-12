@@ -509,8 +509,22 @@ static int pack_ctx_init(pack_ctx *p, int *Bmax, int T, int debug)
 	return 0;
 }
 
-/* Forward + loss + backward for the first b sequences already in p->ids. */
-static int pack_run(lm *model, pack_ctx *p, int b)
+/* Blend microbatch mean CE into a live train-NLL EMA (ema < 0 = unset). */
+static void train_ema_ce(double *ema, double ce, int weight)
+{
+	const double alpha = 0.05;
+
+	if (!ema || weight <= 0 || ce < 0.0 || !isfinite(ce))
+		return;
+	if (*ema < 0.0)
+		*ema = ce;
+	else
+		*ema = (1.0 - alpha) * (*ema) + alpha * ce;
+}
+
+/* Forward + loss + backward for the first b sequences already in p->ids.
+** mean_ce may be NULL; otherwise receives mean CE over predicting rows. */
+static int pack_run(lm *model, pack_ctx *p, int b, double *mean_ce)
 {
 	pack_slot *s;
 	const int *lens;
@@ -538,7 +552,7 @@ static int pack_run(lm *model, pack_ctx *p, int b)
 		return -1;
 	}
 	if (lm_loss_backward_packed_lens(model, s->c, p->ids, b, p->T, lens,
-	    s->dh) != 0) {
+	    s->dh, mean_ce) != 0) {
 		gpu_attn_set_seqlens(NULL);
 		return -1;
 	}
@@ -787,26 +801,44 @@ double lm_train_corpus_val(lm *model, text_dataset *ds, lm_adam *opt,
 				*/
 				win_tot = 0;
 				ok = 1;
-				for (k = 0; k < g_grad_accum && idx < nw && ok; k++) {
-					bb = nw - idx < batch_size ? nw - idx
-					    : batch_size;
-					for (j = 0; j < bb; j++) {
-						if (text_dataset_window(ds,
-						    order[idx + j],
-						    &pk.ids[j * ds->window], &n)
-						    != 0 || n != ds->window) {
+				{
+					double ce_sum = 0.0;
+					int ce_w = 0;
+
+					for (k = 0; k < g_grad_accum && idx < nw
+					    && ok; k++) {
+						double mb_ce = -1.0;
+
+						bb = nw - idx < batch_size
+						    ? nw - idx : batch_size;
+						for (j = 0; j < bb; j++) {
+							if (text_dataset_window(ds,
+							    order[idx + j],
+							    &pk.ids[j * ds->window],
+							    &n) != 0
+							    || n != ds->window) {
+								ok = 0;
+								break;
+							}
+						}
+						if (!ok || pack_run(model, &pk, bb,
+						    &mb_ce) != 0) {
 							ok = 0;
 							break;
 						}
+						if (mb_ce >= 0.0) {
+							ce_sum += mb_ce
+							    * (double)bb;
+							ce_w += bb;
+						}
+						idx += bb;
+						win_tot += bb;
+						done_steps += bb;
+						tokens_done += bb * ds->window;
 					}
-					if (!ok || pack_run(model, &pk, bb) != 0) {
-						ok = 0;
-						break;
-					}
-					idx += bb;
-					win_tot += bb;
-					done_steps += bb;
-					tokens_done += bb * ds->window;
+					if (ok && ce_w > 0)
+						train_ema_ce(&last,
+						    ce_sum / (double)ce_w, 1);
 				}
 				if (!ok) {
 					gpu_set_sync_mode(GPU_SYNC_EAGER);
@@ -844,6 +876,9 @@ double lm_train_corpus_val(lm *model, text_dataset *ds, lm_adam *opt,
 				tp.epoch_done = idx;
 				tp.done_steps = done_steps;
 				tp.tokens_done = tokens_done;
+				tp.nll = last;
+				tp.win_nll = win;
+				tp.val_nll = val ? win : -1.0;
 				tp.lr = step_lr;
 				tp.adam_t = opt->t;
 				tp.elapsed_sec = elapsed;
@@ -1089,6 +1124,7 @@ double lm_train_stream(lm *model, text_stream *train, lm_adam *opt,
 		}
 		for (ep = 0; ep < epochs; ep++) {
 			int quit;
+			double ep_t0;
 
 			quit = 0;
 			if ((ep > 0 || text_stream_count(train) > 0)
@@ -1101,6 +1137,8 @@ double lm_train_stream(lm *model, text_stream *train, lm_adam *opt,
 			tokens = 0;
 			n0 = 0;
 			done = 0;
+			/* Throughput must use this-epoch wall time (tokens reset). */
+			ep_t0 = wall_sec();
 			while (!done) {
 				double step_lr;
 
@@ -1120,10 +1158,11 @@ double lm_train_stream(lm *model, text_stream *train, lm_adam *opt,
 				tp.val_nll = val ? win : -1.0;
 				tp.lr = train_step_lr(lr, opt->t);
 				tp.adam_t = opt->t;
-				el = wall_sec() - t0;
-				tp.elapsed_sec = el;
+				el = wall_sec() - ep_t0;
+				tp.elapsed_sec = wall_sec() - t0;
 				tp.ms_tok = (tokens > 0 && el > 0.0)
 				    ? 1000.0 * el / (double)tokens : -1.0;
+				fill_throughput(&tp, (int)tokens, el);
 				if (train_poll_control(&tp)) {
 					quit = 1;
 					break;
@@ -1135,89 +1174,118 @@ double lm_train_stream(lm *model, text_stream *train, lm_adam *opt,
 				gpu_set_sync_mode(GPU_SYNC_BATCH);
 				b = 0;
 				ok = 1;
-				for (k = 0; k < g_grad_accum && !done && ok; k++) {
-					/* E3: use prefetched ids_next when ready. */
-					if (pk.next_bb > 0) {
-						int *swap = pk.ids;
-						int *swap_l = pk.lens;
+				{
+					double ce_sum = 0.0;
+					int ce_w = 0;
 
-						pk.ids = pk.ids_next;
-						pk.ids_next = swap;
-						pk.lens = pk.lens_next;
-						pk.lens_next = swap_l;
-						bb = pk.next_bb;
-						if (pk.next_done)
-							done = 1;
-						pk.next_bb = 0;
-					} else {
-						bb = 0;
-						while (bb < batch_size) {
-							r = text_stream_next(train,
-							    &pk.ids[bb * T], &n);
-							if (r < 0)
-								ok = 0;
-							if (r != 1) {
+					for (k = 0; k < g_grad_accum && !done
+					    && ok; k++) {
+						double mb_ce = -1.0;
+
+						/* E3: use prefetched ids_next when ready. */
+						if (pk.next_bb > 0) {
+							int *swap = pk.ids;
+							int *swap_l = pk.lens;
+
+							pk.ids = pk.ids_next;
+							pk.ids_next = swap;
+							pk.lens = pk.lens_next;
+							pk.lens_next = swap_l;
+							bb = pk.next_bb;
+							if (pk.next_done)
 								done = 1;
-								break;
-							}
-							if (n < 2 || (!g_varlen
-							    && n != T)) {
-								done = 1;
-								break;
-							}
-							pk.lens[bb] = n;
-							if (n0 == 0) {
-								memcpy(ids0,
+							pk.next_bb = 0;
+						} else {
+							bb = 0;
+							while (bb < batch_size) {
+								r = text_stream_next(
+								    train,
 								    &pk.ids[bb * T],
-								    (size_t)n * sizeof(int));
-								n0 = n;
+								    &n);
+								if (r < 0)
+									ok = 0;
+								if (r != 1) {
+									done = 1;
+									break;
+								}
+								if (n < 2
+								    || (!g_varlen
+								    && n != T)) {
+									done = 1;
+									break;
+								}
+								pk.lens[bb] = n;
+								if (n0 == 0) {
+									memcpy(ids0,
+									    &pk.ids[
+									    bb * T],
+									    (size_t)n
+									    * sizeof(
+									    int));
+									n0 = n;
+								}
+								bb++;
 							}
-							bb++;
+						}
+						if (!ok)
+							break;
+						if (bb > 0 && pack_run(model, &pk,
+						    bb, &mb_ce) != 0) {
+							ok = 0;
+							done = 1;
+							break;
+						}
+						if (bb > 0 && mb_ce >= 0.0) {
+							ce_sum += mb_ce
+							    * (double)bb;
+							ce_w += bb;
+						}
+						/*
+						** E3: after GPU pack_run returns
+						** (BATCH may still be draining), fill
+						** the next ids buffer on CPU before
+						** the forced device sync below.
+						*/
+						if (!done && ok && pk.ids_next) {
+							int nb = 0;
+							int nn;
+
+							pk.next_bb = 0;
+							while (nb < batch_size) {
+								r = text_stream_next(
+								    train,
+								    &pk.ids_next[
+								    nb * T], &nn);
+								if (r < 0)
+									ok = 0;
+								if (r != 1
+								    || nn < 2
+								    || (!g_varlen
+								    && nn != T)) {
+									pk.next_done
+									    = 1;
+									break;
+								}
+								pk.lens_next[nb]
+								    = nn;
+								nb++;
+							}
+							pk.next_bb = nb;
+						}
+						b += bb;
+						if (g_varlen) {
+							int ti;
+
+							for (ti = 0; ti < bb; ti++)
+								tokens +=
+								    pk.lens[ti];
+						} else {
+							tokens += (long)bb * T;
 						}
 					}
-					if (!ok)
-						break;
-					if (bb > 0 && pack_run(model, &pk, bb) != 0) {
-						ok = 0;
-						done = 1;
-						break;
-					}
-					/*
-					** E3: after GPU pack_run returns (BATCH may still
-					** be draining), fill the next ids buffer on CPU
-					** before the forced device sync below.
-					*/
-					if (!done && ok && pk.ids_next) {
-						int nb = 0;
-						int nn;
-
-						pk.next_bb = 0;
-						while (nb < batch_size) {
-							r = text_stream_next(train,
-							    &pk.ids_next[nb * T],
-							    &nn);
-							if (r < 0)
-								ok = 0;
-							if (r != 1 || nn < 2
-							    || (!g_varlen
-							    && nn != T)) {
-								pk.next_done = 1;
-								break;
-							}
-							pk.lens_next[nb] = nn;
-							nb++;
-						}
-						pk.next_bb = nb;
-					}
-					b += bb;
-					if (g_varlen) {
-						int ti;
-
-						for (ti = 0; ti < bb; ti++)
-							tokens += pk.lens[ti];
-					} else {
-						tokens += (long)bb * T;
-					}
+					if (ok && ce_w > 0)
+						train_ema_ce(&last,
+						    ce_sum / (double)ce_w, 1);
 				}
 				/* G3: single sync per microbatch. */
 				if (gpu_available())
@@ -1232,7 +1300,7 @@ double lm_train_stream(lm *model, text_stream *train, lm_adam *opt,
 				opt->grad_clip = g_grad_clip;
 				lm_adam_step_scaled(opt, step_lr, 1.0 / (double)b);
 				steps++;
-				el = wall_sec() - t0;
+				el = wall_sec() - ep_t0;
 				tp.epoch = ep;
 				tp.epoch_done = (int)text_stream_count(train);
 				{
@@ -1244,14 +1312,18 @@ double lm_train_stream(lm *model, text_stream *train, lm_adam *opt,
 				}
 				tp.done_steps = (int)steps;
 				tp.tokens_done = (int)tokens;
+				tp.nll = last;
+				tp.win_nll = win;
+				tp.val_nll = val ? win : -1.0;
 				tp.lr = step_lr;
 				tp.adam_t = opt->t;
-				tp.elapsed_sec = el;
+				tp.elapsed_sec = wall_sec() - t0;
 				tp.ms_tok = tokens > 0 && el > 0.0
 				    ? 1000.0 * el / (double)tokens : -1.0;
 				tp.event = TRAIN_EV_STEP;
 				tp.msg = NULL;
 				if (g_progress_fn) {
+					fill_throughput(&tp, (int)tokens, el);
 					emit_progress(&tp);
 				} else if (debug) {
 					/* Live \\r line (throttled); not every-200 stamps. */
@@ -1271,7 +1343,7 @@ double lm_train_stream(lm *model, text_stream *train, lm_adam *opt,
 					dbg_progress(ep, epochs, (int)steps,
 					    step_total > 0 ? step_total
 					    : (int)steps, win_done, win_total,
-					    last, win, t0, (int)tokens, 0);
+					    last, win, ep_t0, (int)tokens, 0);
 				}
 				if (g_train_ctl && g_train_ctl->quit_save) {
 					quit = 1;
@@ -1280,7 +1352,9 @@ double lm_train_stream(lm *model, text_stream *train, lm_adam *opt,
 			}
 			if (n0 == 0)
 				goto fail;	/* empty stream */
-			last = lm_nll(model, ids0, n0);
+			/* Keep live train CE EMA; fallback probe only if no steps. */
+			if (last < 0.0 && n0 > 0)
+				last = lm_nll(model, ids0, n0);
 			if (val && eval_every > 0 && ((ep + 1) % eval_every) == 0)
 				win = lm_nll_stream(model, val, eval_windows);
 			epoch_num = epoch_base + ep + 1;
@@ -1303,9 +1377,11 @@ double lm_train_stream(lm *model, text_stream *train, lm_adam *opt,
 			}
 			tp.lr = train_step_lr(lr, opt->t);
 			tp.adam_t = opt->t;
+			el = wall_sec() - ep_t0;
 			tp.elapsed_sec = wall_sec() - t0;
-			tp.ms_tok = tokens > 0 && tp.elapsed_sec > 0.0
-			    ? 1000.0 * tp.elapsed_sec / (double)tokens : -1.0;
+			tp.ms_tok = tokens > 0 && el > 0.0
+			    ? 1000.0 * el / (double)tokens : -1.0;
+			fill_throughput(&tp, (int)tokens, el);
 			tp.event = TRAIN_EV_EPOCH;
 			if (win >= 0.0)
 				snprintf(msg, sizeof(msg),

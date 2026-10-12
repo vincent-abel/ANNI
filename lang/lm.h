@@ -73,8 +73,9 @@ int	lm_forward(mat *hidden, const lm *model, const int *ids, int n);
 int	lm_forward_cache(lm *model, const int *ids, int n, lm_cache *c);
 int	lm_logits_at(vec *logits, const lm *model, const mat *hidden, int t);
 int	lm_quantize_head(lm *model);
+/* mean_ce may be NULL; otherwise receives mean softmax CE over predicting rows. */
 int	lm_loss_backward(lm *model, const lm_cache *c, const int *ids, int n,
-		mat *dhidden);
+		mat *dhidden, double *mean_ce);
 int	lm_backward(lm *model, const mat *dhidden, const lm_cache *c);
 double	lm_nll(const lm *model, const int *ids, int n);
 double	lm_perplexity(const lm *model, const int *ids, int n);
@@ -95,11 +96,13 @@ lm_cache	*lm_cache_create_packed(int B, int T);
 int	lm_forward_cache_packed(lm *model, const int *ids, int B, int T,
 		lm_cache *c);
 /* dhidden is (B*T) x D; the last row of each sequence gets zero gradient.
-** lens optional (E8): lens[b] in [2,T] real tokens; pad rows get zero grad. */
+** lens optional (E8): lens[b] in [2,T] real tokens; pad rows get zero grad.
+** mean_ce may be NULL; otherwise mean CE over B*(T-1) predicting rows. */
 int	lm_loss_backward_packed(lm *model, const lm_cache *c, const int *ids,
-		int B, int T, mat *dhidden);
+		int B, int T, mat *dhidden, double *mean_ce);
 int	lm_loss_backward_packed_lens(lm *model, const lm_cache *c,
-		const int *ids, int B, int T, const int *lens, mat *dhidden);
+		const int *ids, int B, int T, const int *lens, mat *dhidden,
+		double *mean_ce);
 int	lm_backward_packed(lm *model, const mat *dhidden, const lm_cache *c);
 
 /*

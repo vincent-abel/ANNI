@@ -361,12 +361,14 @@ int lm_logits_at(vec *logits, const lm *model, const mat *hidden, int t)
 ** accumulates dW_head / db_head. Also used by the packed path with gathered rows.
 */
 static int ce_rows_backward(lm *model, const mat *hv, const int *tgt, int rows,
-	mat *dhv)
+	mat *dhv, double *mean_ce_out)
 {
 	mat *delta;
 	vec lrow;
 	ann_real *tmp;
 	ann_real *row;
+	double ce_sum;
+	double p;
 	int V;
 	int t;
 	int v;
@@ -430,14 +432,24 @@ static int ce_rows_backward(lm *model, const mat *hv, const int *tgt, int rows,
 		}
 	}
 
-	/* 3. CE delta and db_head reduce (needs host one-hot edit). */
+	/*
+	** 3. Mean CE from softmax probs (before one-hot), then CE delta and
+	** db_head reduce. Host touch is already required for the one-hot edit.
+	*/
 	(void)mat_ensure_host(delta);
+	ce_sum = 0.0;
 	for (t = 0; t < rows; t++) {
 		row = &delta->data[(size_t)t * V];
+		p = (double)row[tgt[t]];
+		if (p < 1e-12)
+			p = 1e-12;
+		ce_sum += -log(p);
 		row[tgt[t]] -= 1.0f;
 		for (v = 0; v < V; v++)
 			model->db_head->data[v] += row[v];
 	}
+	if (mean_ce_out)
+		*mean_ce_out = rows > 0 ? ce_sum / (double)rows : -1.0;
 	mat_host_dirty(delta);
 
 	/* 4. dW_head += H^T delta. */
@@ -464,7 +476,7 @@ fail:
 ** The T x V logits/delta matrix is built once and reused in place.
 */
 int lm_loss_backward(lm *model, const lm_cache *c, const int *ids, int n,
-	mat *dhidden)
+	mat *dhidden, double *mean_ce)
 {
 	mat hv;
 	mat dhv;
@@ -489,7 +501,7 @@ int lm_loss_backward(lm *model, const lm_cache *c, const int *ids, int n,
 	dhv.on_device = MAT_DEV_HOST;
 	dhv.rows = rows;
 	dhv.cols = LM_D_MODEL;
-	if (ce_rows_backward(model, &hv, ids + 1, rows, &dhv) != 0)
+	if (ce_rows_backward(model, &hv, ids + 1, rows, &dhv, mean_ce) != 0)
 		return -1;
 	mat_host_dirty(dhidden);
 	return 0;
@@ -585,13 +597,14 @@ int lm_forward_cache_packed(lm *model, const int *ids, int B, int T,
 ** them, then scatter dhidden back (the last row of each sequence stays zero).
 */
 int lm_loss_backward_packed(lm *model, const lm_cache *c, const int *ids,
-	int B, int T, mat *dhidden)
+	int B, int T, mat *dhidden, double *mean_ce)
 {
-	return lm_loss_backward_packed_lens(model, c, ids, B, T, NULL, dhidden);
+	return lm_loss_backward_packed_lens(model, c, ids, B, T, NULL, dhidden,
+	    mean_ce);
 }
 
 int lm_loss_backward_packed_lens(lm *model, const lm_cache *c, const int *ids,
-	int B, int T, const int *lens, mat *dhidden)
+	int B, int T, const int *lens, mat *dhidden, double *mean_ce)
 {
 	mat *hc;
 	mat *dhc;
@@ -608,7 +621,7 @@ int lm_loss_backward_packed_lens(lm *model, const lm_cache *c, const int *ids,
 	    || dhidden->cols != LM_D_MODEL)
 		return -1;
 	if (B == 1 && (!lens || lens[0] >= T))
-		return lm_loss_backward(model, c, ids, T, dhidden);
+		return lm_loss_backward(model, c, ids, T, dhidden, mean_ce);
 	rows = B * (T - 1);
 	rb = (size_t)LM_D_MODEL * sizeof(ann_real);
 	hc = mat_create(rows, LM_D_MODEL);
@@ -649,7 +662,7 @@ gather_host:
 	}
 	mat_host_dirty(hc);
 gather_done:
-	rc = ce_rows_backward(model, hc, tgt, rows, dhc);
+	rc = ce_rows_backward(model, hc, tgt, rows, dhc, mean_ce);
 	if (rc == 0) {
 		mat_zero_dev(dhidden);
 		if (dhc->d_data && dhc->on_device != MAT_DEV_HOST
@@ -837,7 +850,8 @@ double lm_train_steps(lm *model, const char *text, int steps, double lr)
 			lm_adam_zero_grad(model);
 			if (lm_forward_cache(model, ids, n, cache) != 0)
 				break;
-			if (lm_loss_backward(model, cache, ids, n, dhidden) != 0)
+			if (lm_loss_backward(model, cache, ids, n, dhidden,
+			    NULL) != 0)
 				break;
 			if (lm_backward(model, dhidden, cache) != 0)
 				break;
