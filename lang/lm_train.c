@@ -522,6 +522,27 @@ static void train_ema_ce(double *ema, double ce, int weight)
 		*ema = (1.0 - alpha) * (*ema) + alpha * ce;
 }
 
+/*
+** Default mid-epoch val subsample when --eval-windows is unset (0 = all would
+** be too expensive to run 20× per epoch).
+*/
+#define TRAIN_MID_VAL_DEFAULT_WINS	32
+
+/* Advance *next_pct (5,10,...,95) after a probe; return 1 if due now. */
+static int train_mid_val_due(int done, int total, int *next_pct)
+{
+	int pct;
+
+	if (!next_pct || total <= 0 || *next_pct <= 0 || *next_pct >= 100)
+		return 0;
+	pct = (int)(100.0 * (double)done / (double)total);
+	if (pct < *next_pct)
+		return 0;
+	while (*next_pct <= pct && *next_pct < 100)
+		*next_pct += 5;
+	return 1;
+}
+
 /* Forward + loss + backward for the first b sequences already in p->ids.
 ** mean_ce may be NULL; otherwise receives mean CE over predicting rows. */
 static int pack_run(lm *model, pack_ctx *p, int b, double *mean_ce)
@@ -746,8 +767,13 @@ double lm_train_corpus_val(lm *model, text_dataset *ds, lm_adam *opt,
 		}
 		for (ep = 0; ep < epochs; ep++) {
 			int quit;
+			int next_mid_pct;
+			int mid_wins;
 
 			quit = 0;
+			next_mid_pct = 5;
+			mid_wins = eval_windows > 0 ? eval_windows
+			    : TRAIN_MID_VAL_DEFAULT_WINS;
 			if (debug && !g_progress_fn) {
 				snprintf(msg, sizeof(msg), "epoch %d/%d starting",
 				    ep + 1, epochs);
@@ -876,6 +902,23 @@ double lm_train_corpus_val(lm *model, text_dataset *ds, lm_adam *opt,
 				tp.epoch_done = idx;
 				tp.done_steps = done_steps;
 				tp.tokens_done = tokens_done;
+				if (val && eval_every > 0
+				    && train_mid_val_due(idx, nw, &next_mid_pct)) {
+					double v;
+					int pct = (int)(100.0 * (double)idx
+					    / (double)nw);
+
+					v = lm_nll_windows(model, val, mid_wins);
+					if (v >= 0.0)
+						win = v;
+					if (debug && !g_progress_fn) {
+						snprintf(msg, sizeof(msg),
+						    "mid-epoch %d%%  val NLL %.4f"
+						    " (%d windows)",
+						    pct, win, mid_wins);
+						dbg_stamp(msg);
+					}
+				}
 				tp.nll = last;
 				tp.win_nll = win;
 				tp.val_nll = val ? win : -1.0;
@@ -1124,9 +1167,14 @@ double lm_train_stream(lm *model, text_stream *train, lm_adam *opt,
 		}
 		for (ep = 0; ep < epochs; ep++) {
 			int quit;
+			int next_mid_pct;
+			int mid_wins;
 			double ep_t0;
 
 			quit = 0;
+			next_mid_pct = 5;
+			mid_wins = eval_windows > 0 ? eval_windows
+			    : TRAIN_MID_VAL_DEFAULT_WINS;
 			if ((ep > 0 || text_stream_count(train) > 0)
 			    && text_stream_rewind(train) != 0)
 				goto fail;
@@ -1312,6 +1360,30 @@ double lm_train_stream(lm *model, text_stream *train, lm_adam *opt,
 				}
 				tp.done_steps = (int)steps;
 				tp.tokens_done = (int)tokens;
+				/*
+				** Mid-epoch val subsample every ~5% (cheap vs train;
+				** ~1–2% wall with M=32). Skip 100% — epoch-end does it.
+				*/
+				if (val && eval_every > 0
+				    && train_mid_val_due(tp.epoch_done, tp.nw,
+				    &next_mid_pct)) {
+					double v;
+					int pct = tp.nw > 0
+					    ? (int)(100.0
+					    * (double)tp.epoch_done
+					    / (double)tp.nw) : 0;
+
+					v = lm_nll_stream(model, val, mid_wins);
+					if (v >= 0.0)
+						win = v;
+					if (debug && !g_progress_fn) {
+						snprintf(msg, sizeof(msg),
+						    "mid-epoch %d%%  val NLL %.4f"
+						    " (%d windows)",
+						    pct, win, mid_wins);
+						dbg_stamp(msg);
+					}
+				}
 				tp.nll = last;
 				tp.win_nll = win;
 				tp.val_nll = val ? win : -1.0;
