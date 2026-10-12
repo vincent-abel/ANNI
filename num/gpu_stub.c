@@ -210,6 +210,42 @@ int gpu_bias_row_add(ann_real *x, const ann_real *bias, int rows, int cols)
 	return -1;
 }
 
+int gpu_attn_flash_fwd(mat *concat, const mat *q, const mat *k, const mat *v,
+	int B, int T, int H, int dh)
+{
+	(void)concat;
+	(void)q;
+	(void)k;
+	(void)v;
+	(void)B;
+	(void)T;
+	(void)H;
+	(void)dh;
+	return -1;
+}
+
+int gpu_attn_recompute_w(mat *w, const mat *q, const mat *k, int B, int T,
+	int H, int dh)
+{
+	(void)w;
+	(void)q;
+	(void)k;
+	(void)B;
+	(void)T;
+	(void)H;
+	(void)dh;
+	return -1;
+}
+
+int gpu_bias_relu_forward(ann_real *x, const ann_real *bias, int rows, int cols)
+{
+	(void)x;
+	(void)bias;
+	(void)rows;
+	(void)cols;
+	return -1;
+}
+
 int gpu_ce_delta_from_softmax(ann_real *probs, const int *tgt, int rows, int V,
 	ann_real *db_host, double *mean_ce)
 {

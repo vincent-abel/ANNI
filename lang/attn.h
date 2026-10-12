@@ -81,6 +81,9 @@ typedef struct	attn_pcache {
 	int		d_head;
 } attn_pcache;
 
+/* S7: skip storing B·H·T·T weights; recompute in backward. */
+void		attn_set_flash(int on);
+int		attn_flash_enabled(void);
 attn_pcache	*attn_pcache_create(int B, int T, int n_heads, int d_head);
 void		attn_pcache_free(attn_pcache **c);
 int		attn_mha_forward_packed(mat *out, attn *a, const mat *x,

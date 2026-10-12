@@ -1161,7 +1161,7 @@ __global__ static void attn_fwd_kernel(ann_real *concat, ann_real *w,
 	ann_real mx;
 	ann_real sum;
 	ann_real acc;
-	ann_real *wr = w + (size_t)blockIdx.x * T;
+	ann_real *wr = w ? w + (size_t)blockIdx.x * T : NULL;
 
 	if (L < 1)
 		L = 1;
@@ -1197,7 +1197,8 @@ __global__ static void attn_fwd_kernel(ann_real *concat, ann_real *w,
 		sum = 1.0f;
 	for (j = threadIdx.x; j < T; j += blockDim.x) {
 		sc[j] /= sum;
-		wr[j] = sc[j];
+		if (wr)
+			wr[j] = sc[j];
 	}
 	__syncthreads();
 	for (c = threadIdx.x; c < dh; c += blockDim.x) {
@@ -1208,6 +1209,64 @@ __global__ static void attn_fwd_kernel(ann_real *concat, ann_real *w,
 		}
 		concat[(row0 + i) * D + h * dh + c] = acc;
 	}
+}
+
+/* S7: write softmax weights only (for bwd recompute after flash fwd). */
+__global__ static void attn_recompute_w_kernel(ann_real *w, const ann_real *q,
+	const ann_real *k, int T, int H, int dh, ann_real scale,
+	const int *seqlens)
+{
+	extern __shared__ ann_real sm[];
+	__shared__ ann_real red[ATT_BLOCK];
+	ann_real *qi = sm;
+	ann_real *sc = sm + dh;
+	int i = blockIdx.x % T;
+	int bh = blockIdx.x / T;
+	int h = bh % H;
+	int b = bh / H;
+	int D = H * dh;
+	size_t row0 = (size_t)b * T;
+	int L = seqlens ? seqlens[b] : T;
+	int j;
+	int c;
+	ann_real mx;
+	ann_real sum;
+	ann_real acc;
+	ann_real *wr = w + (size_t)blockIdx.x * T;
+
+	if (L < 1)
+		L = 1;
+	if (L > T)
+		L = T;
+	for (c = threadIdx.x; c < dh; c += blockDim.x)
+		qi[c] = q[(row0 + i) * D + h * dh + c];
+	__syncthreads();
+	mx = -1e30f;
+	for (j = threadIdx.x; j < T; j += blockDim.x) {
+		acc = 0.0f;
+		if (i < L && j <= i && j < L) {
+			const ann_real *kj = k + (row0 + j) * D + h * dh;
+			for (c = 0; c < dh; c++)
+				acc += qi[c] * kj[c];
+			acc *= scale;
+		} else
+			acc = -1e30f;
+		sc[j] = acc;
+		if (acc > mx)
+			mx = acc;
+	}
+	mx = att_max(mx, red);
+	sum = 0.0f;
+	for (j = threadIdx.x; j < T; j += blockDim.x) {
+		acc = (i < L && j <= i && j < L) ? __expf(sc[j] - mx) : 0.0f;
+		sc[j] = acc;
+		sum += acc;
+	}
+	sum = att_sum(sum, red);
+	if (sum < 1e-20f)
+		sum = 1.0f;
+	for (j = threadIdx.x; j < T; j += blockDim.x)
+		wr[j] = sc[j] / sum;
 }
 
 /*
@@ -1373,6 +1432,156 @@ out:
 	if (oc && dc)
 		gpu_free(dc);
 	pthread_mutex_unlock(&g_att_mu);
+	return rc;
+}
+
+extern "C" int gpu_attn_flash_fwd(mat *concat, const mat *q, const mat *k,
+	const mat *v, int B, int T, int H, int dh)
+{
+	ann_real *dq;
+	ann_real *dk;
+	ann_real *dv;
+	ann_real *dc;
+	int oq;
+	int ok;
+	int ov;
+	int oc;
+	int rc;
+	size_t smem;
+
+	if (!concat || !q || !k || !v || !att_args_ok(B, T, H, dh))
+		return -1;
+	if (q->rows != B * T || q->cols != H * dh || k->rows != q->rows
+	    || v->rows != q->rows || concat->rows != q->rows
+	    || concat->cols != q->cols)
+		return -1;
+	pthread_mutex_lock(&g_att_mu);
+	rc = -1;
+	oq = ok = ov = oc = 0;
+	dq = dk = dv = dc = NULL;
+	if (ensure_dev(q, &dq, &oq) != 0)
+		goto flash_out;
+	if (ensure_dev(k, &dk, &ok) != 0)
+		goto flash_out;
+	if (ensure_dev(v, &dv, &ov) != 0)
+		goto flash_out;
+	if (ensure_dev_out(concat, &dc, &oc) != 0)
+		goto flash_out;
+	smem = (size_t)(dh + T) * sizeof(ann_real);
+	if (g_att_seqlens_host) {
+		if (!g_att_seqlens_dev || g_att_seqlens_B < B) {
+			if (g_att_seqlens_dev)
+				gpu_free(g_att_seqlens_dev);
+			g_att_seqlens_dev = (int *)gpu_malloc((size_t)B
+			    * sizeof(int));
+			g_att_seqlens_B = g_att_seqlens_dev ? B : 0;
+		}
+		if (g_att_seqlens_dev
+		    && gpu_memcpy_h2d(g_att_seqlens_dev, g_att_seqlens_host,
+		    (size_t)B * sizeof(int)) != 0)
+			goto flash_out;
+	}
+	attn_fwd_kernel<<<B * H * T, ATT_BLOCK, smem>>>(dc, NULL, dq, dk, dv,
+	    T, H, dh, (ann_real)(1.0 / sqrt((double)dh)),
+	    g_att_seqlens_host ? g_att_seqlens_dev : NULL);
+	if (launch_done() == 0 && finish_out(concat, dc, oc) == 0)
+		rc = 0;
+flash_out:
+	if (oq && dq)
+		gpu_free(dq);
+	if (ok && dk)
+		gpu_free(dk);
+	if (ov && dv)
+		gpu_free(dv);
+	if (oc && dc)
+		gpu_free(dc);
+	pthread_mutex_unlock(&g_att_mu);
+	return rc;
+}
+
+extern "C" int gpu_attn_recompute_w(mat *w, const mat *q, const mat *k, int B,
+	int T, int H, int dh)
+{
+	ann_real *dq;
+	ann_real *dk;
+	ann_real *dw;
+	int oq;
+	int ok;
+	int rc;
+	size_t smem;
+
+	if (!w || !q || !k || !att_args_ok(B, T, H, dh) || !w->d_data)
+		return -1;
+	if (q->rows != B * T || w->rows != B * H * T || w->cols != T)
+		return -1;
+	pthread_mutex_lock(&g_att_mu);
+	rc = -1;
+	oq = ok = 0;
+	if (ensure_dev(q, &dq, &oq) != 0)
+		goto rec_out;
+	if (ensure_dev(k, &dk, &ok) != 0)
+		goto rec_out;
+	dw = w->d_data;
+	smem = (size_t)(dh + T) * sizeof(ann_real);
+	attn_recompute_w_kernel<<<B * H * T, ATT_BLOCK, smem>>>(dw, dq, dk, T,
+	    H, dh, (ann_real)(1.0 / sqrt((double)dh)),
+	    g_att_seqlens_host ? g_att_seqlens_dev : NULL);
+	if (launch_done() == 0) {
+		w->on_device = MAT_DEV_DEVICE;
+		rc = 0;
+	}
+rec_out:
+	if (oq && dq)
+		gpu_free(dq);
+	if (ok && dk)
+		gpu_free(dk);
+	pthread_mutex_unlock(&g_att_mu);
+	return rc;
+}
+
+extern "C" int gpu_bias_relu_forward(ann_real *x, const ann_real *bias,
+	int rows, int cols)
+{
+	ew_ref rx;
+	ew_ref rb;
+	size_t nb;
+	int n;
+	int rc;
+	int dn;
+
+	if (!x || !bias || rows <= 0 || cols <= 0 || !gpu_available())
+		return -1;
+	n = rows * cols;
+	nb = (size_t)n * sizeof(ann_real);
+	pthread_mutex_lock(&g_ew_mu);
+	if (ew_acquire(&rx, 0, x, nb, 1, 1) != 0) {
+		pthread_mutex_unlock(&g_ew_mu);
+		return -1;
+	}
+	if (ew_acquire(&rb, 1, bias, (size_t)cols * sizeof(ann_real), 1, 0)
+	    != 0) {
+		pthread_mutex_unlock(&g_ew_mu);
+		return -1;
+	}
+	bias_add_kernel<<<(n + EW_BLOCK - 1) / EW_BLOCK, EW_BLOCK>>>(rx.dev,
+	    rb.dev, n, cols);
+	if (ew_launch_ok() != 0) {
+		pthread_mutex_unlock(&g_ew_mu);
+		return -1;
+	}
+	relu_fwd_kernel<<<(n + EW_BLOCK - 1) / EW_BLOCK, EW_BLOCK>>>(rx.dev, n);
+	if (ew_launch_ok() != 0) {
+		pthread_mutex_unlock(&g_ew_mu);
+		return -1;
+	}
+	rc = ew_release(&rx);
+	if (rc < 0) {
+		pthread_mutex_unlock(&g_ew_mu);
+		return -1;
+	}
+	dn = rc;
+	rc = ew_finish_sync(dn) == 0 ? 0 : -1;
+	pthread_mutex_unlock(&g_ew_mu);
 	return rc;
 }
 
