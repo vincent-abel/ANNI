@@ -35,6 +35,8 @@ void	lm_train_set_diverge_delta(double delta);
 void	lm_train_set_act_checkpoint(int on);
 /* E8: emit/pad short EOF windows and mask pad positions in CE (+ fused attn). */
 void	lm_train_set_varlen(int on);
+/* S4/R12: capture/replay packed fwd+bwd when shapes are steady (0 = off). */
+void	lm_train_set_cuda_graphs(int on);
 
 /*
 ** ckpt_path NULL = no mid-train saves. Otherwise overwrite that path after each
