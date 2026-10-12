@@ -4,6 +4,8 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#include "attn.h"
+#include "block.h"
 #include "gpu.h"
 #include "gradutil.h"
 #include "lm_adam.h"
@@ -15,6 +17,22 @@
 static double rand_w(void)
 {
 	return ((double)rand() / (double)RAND_MAX * 2.0 - 1.0) * 0.02;
+}
+
+/* S12: reuse CE / pack scratch across microbatches (steady B,T). */
+static mat *g_ce_delta;
+static mat *g_pack_hc;
+static mat *g_pack_dhc;
+
+static mat *reuse_mat(mat **slot, int rows, int cols)
+{
+	if (*slot && (*slot)->rows == rows && (*slot)->cols == cols)
+		return *slot;
+	mat_free(slot);
+	*slot = mat_create(rows, cols);
+	if (*slot)
+		mat_try_pin(*slot);
+	return *slot;
 }
 
 static void copy_mat(mat *dst, const mat *src)
@@ -377,10 +395,9 @@ static int ce_rows_backward(lm *model, const mat *hv, const int *tgt, int rows,
 	for (t = 0; t < rows; t++)
 		if (tgt[t] < 0 || tgt[t] >= V)
 			return -1;
-	delta = mat_create(rows, V);
+	delta = reuse_mat(&g_ce_delta, rows, V);
 	if (!delta)
 		return -1;
-	mat_try_pin(delta);
 	mat_try_pin(dhv);
 
 	/* 1. logits for every position. */
@@ -473,10 +490,9 @@ static int ce_rows_backward(lm *model, const mat *hv, const int *tgt, int rows,
 	/* 5. dhv = delta W_head^T. */
 	if (mat_mul_wt(dhv, delta, model->w_head) != 0)
 		goto fail;
-	mat_free(&delta);
 	return 0;
 fail:
-	mat_free(&delta);
+	/* Keep g_ce_delta for reuse; caller sees failure. */
 	return -1;
 }
 
@@ -647,17 +663,13 @@ int lm_loss_backward_packed_lens(lm *model, const lm_cache *c, const int *ids,
 		return lm_loss_backward(model, c, ids, T, dhidden, mean_ce);
 	rows = B * (T - 1);
 	rb = (size_t)LM_D_MODEL * sizeof(ann_real);
-	hc = mat_create(rows, LM_D_MODEL);
-	dhc = mat_create(rows, LM_D_MODEL);
+	hc = reuse_mat(&g_pack_hc, rows, LM_D_MODEL);
+	dhc = reuse_mat(&g_pack_dhc, rows, LM_D_MODEL);
 	tgt = malloc((size_t)rows * sizeof(int));
 	if (!hc || !dhc || !tgt) {
-		mat_free(&hc);
-		mat_free(&dhc);
 		free(tgt);
 		return -1;
 	}
-	mat_try_pin(hc);
-	mat_try_pin(dhc);
 	mat_try_pin(dhidden);
 	/* Gather: prefer D2D when hidden is device-resident (R1). */
 	if (c->hidden->d_data && c->hidden->on_device != MAT_DEV_HOST
@@ -725,8 +737,6 @@ scatter_host:
 			mat_host_dirty(dhidden);
 		}
 	}
-	mat_free(&hc);
-	mat_free(&dhc);
 	free(tgt);
 	return rc;
 }
@@ -743,27 +753,40 @@ int lm_backward_packed(lm *model, const mat *dhidden, const lm_cache *c)
 ** Rough working set of one packed step. Per layer, in B*T*D floats: block
 ** buffers (x_in, ln1, attn_out, x_mid, ln2, ffn_out = 6), LN x_hat (2), attn
 ** (x_in, q, k, v, concat = 5), FFN (x_in + pre_act + hidden = 1 + 2*D_FF/D) and
-** ~6 live backward temporaries; plus B*H*T*T attention scores per layer. Each
-** is doubled for device twins / staging. Head: logits+delta over B*(T-1) x V,
-** plus the gathered hidden / dhidden.
+** ~6 live backward temporaries; plus attention scores. Head: logits+delta over
+** B*(T-1) x V, plus gathered hidden / dhidden. S14 retunes for flash / ckpt.
 */
 size_t lm_packed_bytes(int B, int T, int vocab_size)
 {
-	double per_layer;
+	double per_layer_acts;
+	double scores;
 	double rows;
 	double bytes;
+	double live_blocks;
+	double safety;
 
 	if (B <= 0 || T <= 0 || vocab_size <= 0)
 		return 0;
 	rows = (double)B * (double)T;
-	per_layer = (6.0 + 2.0 + 5.0 + 1.0 + 2.0 * (double)LM_D_FF / LM_D_MODEL
-	    + 6.0) * rows * LM_D_MODEL
-	    + (double)B * LM_N_HEADS * (double)T * (double)T;
-	bytes = per_layer * (double)LM_N_BLOCKS;
+	per_layer_acts = (6.0 + 2.0 + 5.0 + 1.0
+	    + 2.0 * (double)LM_D_FF / LM_D_MODEL + 6.0) * rows * LM_D_MODEL;
+	scores = (double)B * LM_N_HEADS * (double)T * (double)T;
+	/*
+	** S11: checkpoint keeps ~2 live blocks of acts. S7 flash: no persistent
+	** w_all; bwd still peaks at one layer of recomputed scores.
+	*/
+	live_blocks = block_act_checkpoint_enabled() ? 2.0
+	    : (double)LM_N_BLOCKS;
+	bytes = per_layer_acts * live_blocks;
+	if (attn_flash_enabled())
+		bytes += scores;		/* peak recompute, not ×N_BLOCKS */
+	else
+		bytes += scores * (double)LM_N_BLOCKS;
 	bytes += 2.0 * rows * (double)vocab_size;	/* logits + delta */
 	bytes += 4.0 * rows * LM_D_MODEL;
-	/* R3: 1.6× after R1 residency (was 2.0 for heavy host staging twins). */
-	return (size_t)(bytes * sizeof(float) * 1.6);
+	/* S14: 1.35× after S12 reuse (was 1.6). */
+	safety = 1.35;
+	return (size_t)(bytes * sizeof(float) * safety);
 }
 
 int lm_batch_auto(int T, int vocab_size, size_t free_bytes, double frac,
