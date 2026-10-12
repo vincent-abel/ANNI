@@ -104,6 +104,23 @@ int	gpu_layernorm_forward_ex(ann_real *y, const ann_real *x,
 		int T, int d, double eps);
 /* x[r, c] += bias[c] for a row-major rows x cols block. */
 int	gpu_bias_row_add(ann_real *x, const ann_real *bias, int rows, int cols);
+/*
+** S1: After row-softmax, subtract one-hot(tgt), accumulate column sums into
+** db_host[V], and optionally write mean CE (-log p[tgt]). probs stays device
+** when already on device (no full logits D2H). tgt is host ints, length rows.
+*/
+int	gpu_ce_delta_from_softmax(ann_real *probs, const int *tgt, int rows,
+		int V, ann_real *db_host, double *mean_ce);
+/*
+** S2: Add sinusoidal posenc in place to packed (B*T) x D; position t restarts
+** each sequence. x may be device-resident.
+*/
+int	gpu_posenc_add_packed(ann_real *x, int B, int T, int D);
+/*
+** S3: db_host[cols] += column sums of rows x cols matrix (device preferred).
+*/
+int	gpu_mat_col_sum_add(ann_real *db_host, const ann_real *x, int rows,
+		int cols);
 /* x[i] = max(x[i], 0) in place over n elements. */
 int	gpu_relu_forward(ann_real *x, int n);
 /*

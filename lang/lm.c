@@ -433,24 +433,38 @@ static int ce_rows_backward(lm *model, const mat *hv, const int *tgt, int rows,
 	}
 
 	/*
-	** 3. Mean CE from softmax probs (before one-hot), then CE delta and
-	** db_head reduce. Host touch is already required for the one-hot edit.
+	** 3. S1: CE delta + db_head on GPU when softmax left delta device-side
+	** (no full logits D2H). Host fallback otherwise.
 	*/
-	(void)mat_ensure_host(delta);
-	ce_sum = 0.0;
-	for (t = 0; t < rows; t++) {
-		row = &delta->data[(size_t)t * V];
-		p = (double)row[tgt[t]];
-		if (p < 1e-12)
-			p = 1e-12;
-		ce_sum += -log(p);
-		row[tgt[t]] -= 1.0f;
-		for (v = 0; v < V; v++)
-			model->db_head->data[v] += row[v];
+	{
+		ann_real *dp = mat_compute_ptr(delta);
+
+		ce_sum = -1.0;
+		if (dp
+		    && gpu_ce_delta_from_softmax(dp, tgt, rows, V,
+		    model->db_head->data, mean_ce_out ? &ce_sum : NULL) == 0) {
+			mat_mark_device(delta);
+			if (mean_ce_out)
+				*mean_ce_out = ce_sum;
+		} else {
+			(void)mat_ensure_host(delta);
+			ce_sum = 0.0;
+			for (t = 0; t < rows; t++) {
+				row = &delta->data[(size_t)t * V];
+				p = (double)row[tgt[t]];
+				if (p < 1e-12)
+					p = 1e-12;
+				ce_sum += -log(p);
+				row[tgt[t]] -= 1.0f;
+				for (v = 0; v < V; v++)
+					model->db_head->data[v] += row[v];
+			}
+			if (mean_ce_out)
+				*mean_ce_out = rows > 0
+				    ? ce_sum / (double)rows : -1.0;
+			mat_host_dirty(delta);
+		}
 	}
-	if (mean_ce_out)
-		*mean_ce_out = rows > 0 ? ce_sum / (double)rows : -1.0;
-	mat_host_dirty(delta);
 
 	/* 4. dW_head += H^T delta. */
 	if (mat_outer_add(model->dw_head, hv, delta) != 0)
@@ -581,13 +595,22 @@ int lm_forward_cache_packed(lm *model, const int *ids, int B, int T,
 	/* Embed all B*T ids once, then add positions restarting per sequence. */
 	if (embed_lookup(c->hidden, model->embed, ids, n) != 0)
 		return -1;
-	/* Posenc still host; pull after R2 GPU gather, then dirty for stack. */
-	(void)mat_ensure_host(c->hidden);
-	for (b = 0; b < B; b++)
-		for (t = 0; t < T; t++)
-			posenc_add_row(&c->hidden->data[(size_t)(b * T + t)
-			    * LM_D_MODEL], t);
-	mat_host_dirty(c->hidden);
+	/* S2: GPU posenc when hidden is device-resident after embed gather. */
+	{
+		ann_real *hp = mat_compute_ptr(c->hidden);
+
+		if (!hp
+		    || gpu_posenc_add_packed(hp, B, T, LM_D_MODEL) != 0) {
+			(void)mat_ensure_host(c->hidden);
+			for (b = 0; b < B; b++)
+				for (t = 0; t < T; t++)
+					posenc_add_row(&c->hidden->data[
+					    (size_t)(b * T + t) * LM_D_MODEL],
+					    t);
+			mat_host_dirty(c->hidden);
+		} else
+			mat_mark_device(c->hidden);
+	}
 	return transformer_forward_cache(c->hidden, model->tr, c->trc);
 }
 

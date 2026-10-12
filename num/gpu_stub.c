@@ -200,6 +200,36 @@ int gpu_bias_row_add(ann_real *x, const ann_real *bias, int rows, int cols)
 	return -1;
 }
 
+int gpu_ce_delta_from_softmax(ann_real *probs, const int *tgt, int rows, int V,
+	ann_real *db_host, double *mean_ce)
+{
+	(void)probs;
+	(void)tgt;
+	(void)rows;
+	(void)V;
+	(void)db_host;
+	(void)mean_ce;
+	return -1;
+}
+
+int gpu_posenc_add_packed(ann_real *x, int B, int T, int D)
+{
+	(void)x;
+	(void)B;
+	(void)T;
+	(void)D;
+	return -1;
+}
+
+int gpu_mat_col_sum_add(ann_real *db_host, const ann_real *x, int rows, int cols)
+{
+	(void)db_host;
+	(void)x;
+	(void)rows;
+	(void)cols;
+	return -1;
+}
+
 int gpu_relu_forward(ann_real *x, int n)
 {
 	(void)x;

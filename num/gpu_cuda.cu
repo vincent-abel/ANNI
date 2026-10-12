@@ -2090,6 +2090,232 @@ extern "C" void gpu_stream_sync_copy(void)
 		(void)cudaStreamSynchronize(g_copy_stream);
 }
 
+/*
+** S1/S2/S3: CE delta, packed posenc, column-sum bias grads (device-first).
+*/
+__global__ static void ce_onehot_ce_kernel(ann_real *probs, const int *tgt,
+	int rows, int V, float *ce_sum)
+{
+	int r = blockIdx.x * blockDim.x + threadIdx.x;
+	int t;
+	float p;
+
+	if (r >= rows)
+		return;
+	t = tgt[r];
+	if (t < 0 || t >= V)
+		return;
+	p = probs[(size_t)r * (size_t)V + (size_t)t];
+	if (p < 1e-12f)
+		p = 1e-12f;
+	atomicAdd(ce_sum, -logf(p));
+	probs[(size_t)r * (size_t)V + (size_t)t] -= 1.0f;
+}
+
+__global__ static void col_sum_kernel(ann_real *db, const ann_real *x,
+	int rows, int cols)
+{
+	int c = blockIdx.x * blockDim.x + threadIdx.x;
+	int r;
+	double s;
+
+	if (c >= cols)
+		return;
+	s = 0.0;
+	for (r = 0; r < rows; r++)
+		s += (double)x[(size_t)r * (size_t)cols + (size_t)c];
+	atomicAdd(&db[c], (ann_real)s);
+}
+
+__global__ static void posenc_packed_kernel(ann_real *x, int B, int T, int D)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	int n = B * T * D;
+	int tok;
+	int t;
+	int d;
+	int pair;
+	float log_base;
+	float angle;
+
+	if (i >= n)
+		return;
+	tok = i / D;
+	d = i % D;
+	t = tok % T;
+	pair = d / 2;
+	log_base = -logf(10000.0f) / (float)D;
+	angle = (float)t * expf((2.0f * (float)pair) * log_base);
+	if ((d & 1) == 0)
+		x[i] += sinf(angle);
+	else
+		x[i] += cosf(angle);
+}
+
+extern "C" int gpu_ce_delta_from_softmax(ann_real *probs, const int *tgt,
+	int rows, int V, ann_real *db_host, double *mean_ce)
+{
+	ew_ref rp;
+	ew_ref rt;
+	ann_real *db_dev = NULL;
+	float *ce_dev = NULL;
+	float ce_h;
+	size_t nb;
+	size_t nbt;
+	int rc;
+	int dn;
+	int j;
+	ann_real *db_tmp = NULL;
+
+	if (!probs || !tgt || !db_host || rows <= 0 || V <= 0 || !gpu_available())
+		return -1;
+	nb = (size_t)rows * (size_t)V * sizeof(ann_real);
+	nbt = (size_t)rows * sizeof(int);
+	pthread_mutex_lock(&g_ew_mu);
+	if (ew_acquire(&rp, 0, probs, nb, 1, 1) != 0) {
+		pthread_mutex_unlock(&g_ew_mu);
+		return -1;
+	}
+	if (ew_acquire(&rt, 1, tgt, nbt, 1, 0) != 0) {
+		pthread_mutex_unlock(&g_ew_mu);
+		return -1;
+	}
+	if (cudaMalloc((void **)&ce_dev, sizeof(float)) != cudaSuccess
+	    || cudaMalloc((void **)&db_dev, (size_t)V * sizeof(ann_real))
+	    != cudaSuccess) {
+		if (ce_dev)
+			cudaFree(ce_dev);
+		pthread_mutex_unlock(&g_ew_mu);
+		return -1;
+	}
+	cudaMemset(ce_dev, 0, sizeof(float));
+	cudaMemset(db_dev, 0, (size_t)V * sizeof(ann_real));
+	ce_onehot_ce_kernel<<<(rows + EW_BLOCK - 1) / EW_BLOCK, EW_BLOCK>>>(
+	    rp.dev, (const int *)rt.dev, rows, V, ce_dev);
+	if (ew_launch_ok() != 0)
+		goto ce_fail;
+	col_sum_kernel<<<(V + EW_BLOCK - 1) / EW_BLOCK, EW_BLOCK>>>(db_dev,
+	    rp.dev, rows, V);
+	if (ew_launch_ok() != 0)
+		goto ce_fail;
+	rc = ew_release(&rp);
+	if (rc < 0)
+		goto ce_fail;
+	dn = rc;
+	if (ew_finish_sync(dn) != 0)
+		goto ce_fail;
+	if (cudaMemcpy(&ce_h, ce_dev, sizeof(float), cudaMemcpyDeviceToHost)
+	    != cudaSuccess)
+		goto ce_fail;
+	db_tmp = (ann_real *)malloc((size_t)V * sizeof(ann_real));
+	if (!db_tmp
+	    || cudaMemcpy(db_tmp, db_dev, (size_t)V * sizeof(ann_real),
+	    cudaMemcpyDeviceToHost) != cudaSuccess) {
+		free(db_tmp);
+		goto ce_fail;
+	}
+	for (j = 0; j < V; j++)
+		db_host[j] += db_tmp[j];
+	free(db_tmp);
+	if (mean_ce)
+		*mean_ce = rows > 0 ? (double)ce_h / (double)rows : -1.0;
+	cudaFree(ce_dev);
+	cudaFree(db_dev);
+	pthread_mutex_unlock(&g_ew_mu);
+	return 0;
+ce_fail:
+	cudaFree(ce_dev);
+	cudaFree(db_dev);
+	pthread_mutex_unlock(&g_ew_mu);
+	return -1;
+}
+
+extern "C" int gpu_posenc_add_packed(ann_real *x, int B, int T, int D)
+{
+	ew_ref rx;
+	size_t nb;
+	int n;
+	int rc;
+	int dn;
+
+	if (!x || B <= 0 || T <= 0 || D <= 0 || !gpu_available())
+		return -1;
+	n = B * T * D;
+	nb = (size_t)n * sizeof(ann_real);
+	pthread_mutex_lock(&g_ew_mu);
+	if (ew_acquire(&rx, 0, x, nb, 1, 1) != 0) {
+		pthread_mutex_unlock(&g_ew_mu);
+		return -1;
+	}
+	posenc_packed_kernel<<<(n + EW_BLOCK - 1) / EW_BLOCK, EW_BLOCK>>>(rx.dev,
+	    B, T, D);
+	if (ew_launch_ok() != 0) {
+		pthread_mutex_unlock(&g_ew_mu);
+		return -1;
+	}
+	rc = ew_release(&rx);
+	if (rc < 0) {
+		pthread_mutex_unlock(&g_ew_mu);
+		return -1;
+	}
+	dn = rc;
+	rc = ew_finish_sync(dn) == 0 ? 0 : -1;
+	pthread_mutex_unlock(&g_ew_mu);
+	return rc;
+}
+
+extern "C" int gpu_mat_col_sum_add(ann_real *db_host, const ann_real *x,
+	int rows, int cols)
+{
+	ew_ref rx;
+	ann_real *db_dev = NULL;
+	ann_real *db_tmp = NULL;
+	size_t nb;
+	int j;
+
+	if (!db_host || !x || rows <= 0 || cols <= 0 || !gpu_available())
+		return -1;
+	nb = (size_t)rows * (size_t)cols * sizeof(ann_real);
+	pthread_mutex_lock(&g_ew_mu);
+	if (ew_acquire(&rx, 0, x, nb, 1, 0) != 0) {
+		pthread_mutex_unlock(&g_ew_mu);
+		return -1;
+	}
+	if (cudaMalloc((void **)&db_dev, (size_t)cols * sizeof(ann_real))
+	    != cudaSuccess) {
+		pthread_mutex_unlock(&g_ew_mu);
+		return -1;
+	}
+	cudaMemset(db_dev, 0, (size_t)cols * sizeof(ann_real));
+	col_sum_kernel<<<(cols + EW_BLOCK - 1) / EW_BLOCK, EW_BLOCK>>>(db_dev,
+	    rx.dev, rows, cols);
+	if (ew_launch_ok() != 0) {
+		cudaFree(db_dev);
+		pthread_mutex_unlock(&g_ew_mu);
+		return -1;
+	}
+	if (cudaDeviceSynchronize() != cudaSuccess) {
+		cudaFree(db_dev);
+		pthread_mutex_unlock(&g_ew_mu);
+		return -1;
+	}
+	db_tmp = (ann_real *)malloc((size_t)cols * sizeof(ann_real));
+	if (!db_tmp
+	    || cudaMemcpy(db_tmp, db_dev, (size_t)cols * sizeof(ann_real),
+	    cudaMemcpyDeviceToHost) != cudaSuccess) {
+		free(db_tmp);
+		cudaFree(db_dev);
+		pthread_mutex_unlock(&g_ew_mu);
+		return -1;
+	}
+	for (j = 0; j < cols; j++)
+		db_host[j] += db_tmp[j];
+	free(db_tmp);
+	cudaFree(db_dev);
+	pthread_mutex_unlock(&g_ew_mu);
+	return 0;
+}
+
 extern "C" int gpu_graph_begin(void)
 {
 	if (!gpu_available())

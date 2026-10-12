@@ -240,10 +240,20 @@ int ffn_backward(mat *dx, const mat *dout, ffn *f, const ffn_cache *c)
 
 	if (mat_outer_add(f->dw2, c->hidden, dout) != 0)
 		goto fail;
-	(void)mat_ensure_host((mat *)dout);
-	for (t = 0; t < T; t++) {
-		for (j = 0; j < LM_D_MODEL; j++)
-			f->db2->data[j] += dout->data[t * LM_D_MODEL + j];
+	/* S3: column-sum db2 without forcing dout D2H when device-resident. */
+	{
+		const ann_real *doutp = mat_compute_ptr_const(dout);
+
+		if (!doutp
+		    || gpu_mat_col_sum_add(f->db2->data, doutp, T, LM_D_MODEL)
+		    != 0) {
+			(void)mat_ensure_host((mat *)dout);
+			for (t = 0; t < T; t++) {
+				for (j = 0; j < LM_D_MODEL; j++)
+					f->db2->data[j] += dout->data[
+					    t * LM_D_MODEL + j];
+			}
+		}
 	}
 	/* dh = dout * W2^T then ReLU mask (GEMM may use GPU). */
 	if (mat_mul_wt(dh, dout, f->w2) != 0)
@@ -265,10 +275,19 @@ int ffn_backward(mat *dx, const mat *dout, ffn *f, const ffn_cache *c)
 		mat_mark_device(dh);
 	if (mat_outer_add(f->dw1, c->x_in, dh) != 0)
 		goto fail;
-	(void)mat_ensure_host(dh);
-	for (t = 0; t < T; t++) {
-		for (j = 0; j < LM_D_FF; j++)
-			f->db1->data[j] += dh->data[t * LM_D_FF + j];
+	{
+		ann_real *dhptr = mat_compute_ptr(dh);
+
+		if (!dhptr
+		    || gpu_mat_col_sum_add(f->db1->data, dhptr, T, LM_D_FF)
+		    != 0) {
+			(void)mat_ensure_host(dh);
+			for (t = 0; t < T; t++) {
+				for (j = 0; j < LM_D_FF; j++)
+					f->db1->data[j] += dh->data[
+					    t * LM_D_FF + j];
+			}
+		}
 	}
 	if (mat_mul_wt(dx, dh, f->w1) != 0)
 		goto fail;
