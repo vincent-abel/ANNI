@@ -209,8 +209,18 @@ Observed headroom on a 16 GB card at current toy scale (`D=256`, `LM_BATCH_AUT
 - [x] **R1** Keep LN / FFN / residual activations **device-resident** end-to-end (no per-op H↔D staging) — main lever for util ≫ 30% at fixed `D` (~2–5×); see [docs/gpu-activation-residency.md](docs/gpu-activation-residency.md)
 - [x] **R3** Lift `LM_BATCH_AUTO_MAX` (64 → **1024**) and relax `lm_packed_bytes` so `--batch auto` can target most of free VRAM (**huge B**); see [docs/huge-batch-vram.md](docs/huge-batch-vram.md)
 - [x] **R4** Large manual `--batch` (**128–1024+**) with OOM backoff (halve `B` on alloc fail); default/`-d` guidance for 16 GB cards
-- [x] **R12** **CUDA Graphs**: capture packed train microbatch (fwd+bwd+Adam) to cut launch overhead on small-`D` kernels (~2–4× when launch-bound; after R1 so the graph is device-only)
-- [x] **R10** **Mixed precision**: enable TF32; then BF16 (or FP16+loss scale) GEMMs with FP32 master weights/Adam — after FP32 reference stays correct (~1.5–2×)
+- [ ] **R12** **CUDA Graphs**: API present; wire into `pack_run` under **S4** (capture fails while host ops remain)
+- [ ] **R10** **Mixed precision**: TF32 on; BF16/FP16+loss-scale under **S5a/S5b** (C13)
+
+**Speed stack wave 1 (glue → graphs → MP)**
+
+- [x] **S1** Device-fused CE (no full logits D2H); see [docs/device-fused-ce.md](docs/device-fused-ce.md)
+- [x] **S2** GPU packed posenc; see [docs/gpu-posenc.md](docs/gpu-posenc.md)
+- [x] **S3** GPU FFN bias column-sum grads; see [docs/gpu-bias-grad-reduce.md](docs/gpu-bias-grad-reduce.md)
+- [ ] **S4** Wire CUDA Graphs into packed train (finish R12); see [docs/cuda-graphs-train.md](docs/cuda-graphs-train.md)
+- [ ] **S5a** BF16 GEMMs + FP32 masters (`--bf16`); see [docs/mixed-precision-train.md](docs/mixed-precision-train.md)
+- [ ] **S5b** FP16 + dynamic loss scaling (`--fp16`); see [docs/fp16-loss-scaling.md](docs/fp16-loss-scaling.md)
+- [ ] **S6** Bench util / VRAM / ms/tok after S1–S5; see [docs/speed-stack-bench.md](docs/speed-stack-bench.md)
 
 **Other fill / scale**
 
@@ -220,8 +230,8 @@ Observed headroom on a 16 GB card at current toy scale (`D=256`, `LM_BATCH_AUT
 - [x] **R6** Grow context (`LM_MAX_CTX` / `--window` 128 → 256–512) for longer sequence matrices
 - [x] **R7** Grow depth (`LM_N_BLOCKS` 4 → 6–8) toward Target 10–50M params
 - [x] **R8** Async CUDA streams: overlap H2D of next microbatch with compute (only needed while any host glue remains)
-- [x] **R9** Activation checkpointing / block-wise backward when `B·T·D` no longer fits in VRAM
-- [x] **R11** Fused block / Flash-style attention to cut activation bytes and raise effective tokens/step
+- [ ] **R9** Activation checkpointing — stub today; real recompute under **S11**; see [docs/activation-checkpointing.md](docs/activation-checkpointing.md)
+- [ ] **R11** Flash-style attention (no full `T×T`) under **S7**; fused cap T≤256 today; see [docs/flash-attention.md](docs/flash-attention.md)
 - [ ] Bench: util %, `nvidia-smi` memory, and ms/tok after **R1**, after **huge B** (R3/R4), after **R12** graphs, after **R10** mixed precision (expect util↑ / VRAM↑ / ms/tok↓ on that stack; ms/tok↑ if only R5)
 
 ### Efficiency & systems
