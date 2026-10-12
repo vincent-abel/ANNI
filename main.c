@@ -232,6 +232,12 @@ static int run_lm_train_core(int argc, char **argv, int use_tower)
 			else if (fp16)
 				lm_train_set_compute_prec(GPU_PREC_FP16);
 		}
+		if (arg_flag(argc, argv, NULL, "--flash-attn"))
+			lm_train_set_flash_attn(1);
+		if (arg_flag(argc, argv, NULL, "--act-checkpoint"))
+			lm_train_set_act_checkpoint(1);
+		if (arg_flag(argc, argv, NULL, "--adam-offload"))
+			lm_train_set_adam_offload(1);
 	}
 	if (lr <= 0.0)
 		lr = 0.001;

@@ -222,9 +222,22 @@ Observed headroom on a 16 GB card at current toy scale (`D=256`, `LM_BATCH_AUT
 - [x] **S5b** FP16 + dynamic loss scaling (`--fp16`); see [docs/fp16-loss-scaling.md](docs/fp16-loss-scaling.md)
 - [x] **S6** Bench util / VRAM / ms/tok after S1–S5; see [docs/speed-stack-bench.md](docs/speed-stack-bench.md)
 
-### Speed stack wave 2 (after W1)
+**W1 gate:** Packed CE keeps logits/delta on device (no full D2H). Graphs wire via `--cuda-graphs` (skip varlen; CE malloc/D2H scalar can still fail capture). Remaining bound: launch tax + materialized/`recompute` `B·H·T·T` attn — Wave 2.
 
-Remaining bound: launch tax + materialized `B·H·T·T` attn. Next: **S7** Flash (no full `T×T`), **S8** fused epilogues, **S9** multi-stream.
+### Speed stack wave 2 (Flash → epilogues → streams)
+
+- [x] **S7** Flash-style attn (`--flash-attn`, finish **R11**); see [docs/flash-attention.md](docs/flash-attention.md)
+- [x] **S8** Fused bias+ReLU epilogue; see [docs/fused-epilogues.md](docs/fused-epilogues.md)
+- [x] **S9** Multi-stream overlap (copy stream + docs); see [docs/multi-stream-train.md](docs/multi-stream-train.md)
+- [x] **S10** Wave 2 bench; see [docs/speed-stack-bench.md](docs/speed-stack-bench.md)
+
+### Speed stack wave 3 (VRAM → larger B)
+
+- [x] **S11** Real act-checkpoint (`--act-checkpoint`, finish **R9**); see [docs/activation-checkpointing.md](docs/activation-checkpointing.md)
+- [x] **S12** Logits/delta / pack buffer reuse; see [docs/activation-buffer-reuse.md](docs/activation-buffer-reuse.md)
+- [x] **S13** Optional `--adam-offload` async m/v; see [docs/adam-cpu-offload.md](docs/adam-cpu-offload.md)
+- [x] **S14** Retune `lm_packed_bytes` / auto-B; see [docs/huge-batch-vram.md](docs/huge-batch-vram.md)
+- [x] **S15** Final bench vs baseline; see [docs/speed-stack-bench.md](docs/speed-stack-bench.md)
 
 **Other fill / scale**
 
@@ -234,9 +247,9 @@ Remaining bound: launch tax + materialized `B·H·T·T` attn. Next: **S7** Flash
 - [x] **R6** Grow context (`LM_MAX_CTX` / `--window` 128 → 256–512) for longer sequence matrices
 - [x] **R7** Grow depth (`LM_N_BLOCKS` 4 → 6–8) toward Target 10–50M params
 - [x] **R8** Async CUDA streams: overlap H2D of next microbatch with compute (only needed while any host glue remains)
-- [ ] **R9** Activation checkpointing — stub today; real recompute under **S11**; see [docs/activation-checkpointing.md](docs/activation-checkpointing.md)
-- [ ] **R11** Flash-style attention (no full `T×T`) under **S7**; fused cap T≤256 today; see [docs/flash-attention.md](docs/flash-attention.md)
-- [ ] Bench: util %, `nvidia-smi` memory, and ms/tok after **R1**, after **huge B** (R3/R4), after **R12** graphs, after **R10** mixed precision (expect util↑ / VRAM↑ / ms/tok↓ on that stack; ms/tok↑ if only R5)
+- [x] **R9** Activation checkpointing — `--act-checkpoint` recompute (**S11**); see [docs/activation-checkpointing.md](docs/activation-checkpointing.md)
+- [x] **R11** Flash-style attention (`--flash-attn`, **S7**); fused cap T≤256; see [docs/flash-attention.md](docs/flash-attention.md)
+- [x] Bench: util %, `nvidia-smi` memory, and ms/tok after speed-stack waves — [docs/speed-stack-bench.md](docs/speed-stack-bench.md)
 
 ### Efficiency & systems
 
@@ -348,7 +361,7 @@ Single-node / few-GPU path between Target and ChatGPT-class. Still from-scratch 
 - [ ] **C1** Runtime model config (not only `lm_config.h` macros): load `D`, heads, blocks, ctx, vocab from checkpoint header / JSON
 - [ ] **C2** Grow to ~**100M–1B** params via C1 + R5–R7 (example: D=768–2048, blocks=12–24, ctx=2048+)
 - [ ] **C3** Weight tying option (embed ↔ LM head) + optional bias-free linear layers
-- [ ] **C4** Gradient checkpointing wired for packed train at this scale — see **R9**
+- [x] **C4** Gradient checkpointing wired for packed train (`--act-checkpoint`, **S11**/R9)
 - [ ] **C5** Sharded checkpoint I/O (multi-file or mmap) so save/load fits host RAM
 
 **Modern decoder block (code in `lang/`)**

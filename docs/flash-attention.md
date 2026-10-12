@@ -1,10 +1,16 @@
-# Flash-style attention (R11)
+# Flash-style attention (R11 / S7)
 
 ## Abstract
 
-Fused causal attn kernels now accept T≤256 (shared-memory block). Full Flash tiling that avoids materializing `B·H·T·T` weights remains future work; raising the fuse cap unblocks R6 ctx=256.
+`--flash-attn` skips persistent `B·H·T·T` attention weight storage across the forward. The fused causal kernel still computes softmax in shared memory per row; backward recomputes weights into a temporary buffer before the existing fused bwd.
 
 ## How it shows up in this repo
 
-- `ATT_BLOCK 256` in [`num/gpu_cuda.cu`](../num/gpu_cuda.cu)
-- [`lang/attn.c`](../lang/attn.c) pcache fuse gate
+- CLI: `--flash-attn` → `lm_train_set_flash_attn` → `attn_set_flash`
+- [`lang/attn.c`](../lang/attn.c): no `w_all` / host `seq[]` when flash; `fused == 2` path
+- `gpu_attn_flash_fwd` / `gpu_attn_recompute_w` in [`num/gpu_cuda.cu`](../num/gpu_cuda.cu)
+- Cap remains **T ≤ 256** (`ATT_BLOCK`)
+
+## Status vs full FlashAttention
+
+This is Flash-*style* residency (no persistent scores), not IO-aware tiled FlashAttention-2/3. Backward still materializes one full `B·H·T·T` temp. Materialized fused attn (`w_all`) remains the default and fallback.

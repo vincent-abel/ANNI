@@ -31,7 +31,7 @@ void	lm_train_set_tokens_per_step(int n);
 void	lm_train_set_early_stop(int patience);
 /* E16: abort if train/val NLL rises by more than delta vs best, or non-finite. */
 void	lm_train_set_diverge_delta(double delta);
-/* R9: request activation checkpointing when implemented (currently advisory). */
+/* R9/S11: block activation checkpointing (recompute in bwd). */
 void	lm_train_set_act_checkpoint(int on);
 /* E8: emit/pad short EOF windows and mask pad positions in CE (+ fused attn). */
 void	lm_train_set_varlen(int on);
@@ -40,6 +40,10 @@ void	lm_train_set_cuda_graphs(int on);
 /* S5a/S5b: GPU_PREC_*; FP16 enables dynamic loss scaling. */
 void	lm_train_set_compute_prec(int prec);
 double	lm_train_loss_scale(void);	/* current scale (1.0 if not FP16) */
+/* S7: Flash-style attn (no persistent B·H·T·T weights). */
+void	lm_train_set_flash_attn(int on);
+/* S13: optional CPU offload of Adam m/v between steps. */
+void	lm_train_set_adam_offload(int on);
 
 /*
 ** ckpt_path NULL = no mid-train saves. Otherwise overwrite that path after each

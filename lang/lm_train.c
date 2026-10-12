@@ -7,6 +7,8 @@
 #include <string.h>
 #include <sys/time.h>
 #include <time.h>
+#include "attn.h"
+#include "block.h"
 #include "gpu.h"
 #include "gradutil.h"
 #include "lm_config.h"
@@ -375,7 +377,17 @@ void lm_train_set_diverge_delta(double delta)
 void lm_train_set_act_checkpoint(int on)
 {
 	g_act_checkpoint = on ? 1 : 0;
-	(void)g_act_checkpoint;	/* R9: wired for callers; recompute path TBD */
+	block_set_act_checkpoint(g_act_checkpoint);
+}
+
+void lm_train_set_flash_attn(int on)
+{
+	attn_set_flash(on);
+}
+
+void lm_train_set_adam_offload(int on)
+{
+	lm_adam_set_offload(on);
 }
 
 void lm_train_set_varlen(int on)
@@ -527,6 +539,8 @@ static int pack_ctx_init_once(pack_ctx *p, int Bmax, int T)
 	memset(p, 0, sizeof(*p));
 	p->Bmax = Bmax;
 	p->T = T;
+	/* S9: ensure non-blocking copy stream exists for async H2D overlap. */
+	(void)gpu_copy_stream();
 	nbytes = (size_t)Bmax * (size_t)T * sizeof(int);
 	p->ids = (int *)gpu_host_alloc(nbytes);
 	if (p->ids)
