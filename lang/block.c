@@ -40,7 +40,7 @@ static void block_cache_drop_device(block_cache *bc)
 		mat_device_free(bc->attnpc->k);
 		mat_device_free(bc->attnpc->v);
 		mat_device_free(bc->attnpc->concat);
-		mat_device_free(bc->attnpc->w_all);
+		/* Keep w_all: TC/flash bwd recomputes scores into it. */
 	}
 	if (bc->attnc) {
 		mat_device_free(bc->attnc->x_in);

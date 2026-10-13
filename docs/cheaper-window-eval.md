@@ -21,7 +21,7 @@ With windows \(w_1,\ldots,w_M\) and per-window mean NLL \(\ell_i\), the full met
 - **Fixed subset:** use the same evenly strided windows each time so curves stay comparable between evals.
 - **Final eval:** always run one full (or large) eval at the end of training.
 - **Perplexity:** \(\exp(\hat\ell)\) inherits the noise; do not compare two runs that used different \(K\).
-- **Defaults:** keep today's behavior (eval everything) when flags are absent.
+- **Defaults:** `--eval-every 1` and `--eval-windows 32`. Pass `--eval-windows 0` for a full pass (can dominate tiny smokes).
 
 ## How it shows up in this repo
 

@@ -149,11 +149,29 @@ int	gpu_attn_causal_fwd(mat *concat, mat *w, const mat *q, const mat *k,
 /* S7: like fwd but does not materialize w (Flash-style); recompute w in bwd. */
 int	gpu_attn_flash_fwd(mat *concat, const mat *q, const mat *k,
 		const mat *v, int B, int T, int H, int dh);
+/* FA-2 tiled bwd: uses logsumexp from flash_fwd; no B·H·T·T scores buffer. */
+int	gpu_attn_tiled_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat,
+		const mat *concat, const mat *q, const mat *k, const mat *v,
+		int B, int T, int H, int dh);
 int	gpu_attn_recompute_w(mat *w, const mat *q, const mat *k, int B, int T,
 		int H, int dh);
 int	gpu_attn_causal_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat,
 		const mat *w, const mat *q, const mat *k, const mat *v,
 		int B, int T, int H, int dh);
+/*
+** TC path (40TF wave): pack heads + strided-batched GemmEx QK/AV + fused
+** causal softmax. w is (B*H*T) x T (pinned). Prefer this over row-wise kernels.
+*/
+int	gpu_attn_tc_fwd(mat *concat, mat *w, const mat *q, const mat *k,
+		const mat *v, int B, int T, int H, int dh);
+int	gpu_attn_tc_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat,
+		mat *w, const mat *q, const mat *k, const mat *v,
+		int B, int T, int H, int dh);
+/* Pack CE gather: dst[b*(T-1)+t] = src[b*T+t] for t in [0,T-1). */
+int	gpu_pack_seq_rows(ann_real *dst, const ann_real *src, int B, int T,
+		int D);
+int	gpu_unpack_seq_rows(ann_real *dst, const ann_real *src, int B, int T,
+		int D);
 /* S8: x += bias then ReLU in one launch (rows x cols). */
 int	gpu_bias_relu_forward(ann_real *x, const ann_real *bias, int rows,
 		int cols);

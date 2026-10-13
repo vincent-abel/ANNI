@@ -2,6 +2,7 @@
 **	Attention (QKV + scaled dot-product + multi-head + causal + backward)
 */
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "attn.h"
@@ -209,6 +210,7 @@ int attn_qkv_project(mat *q, mat *k, mat *v, const attn *a, const mat *x)
 {
 	if (!q || !k || !v || !a || !x)
 		return -1;
+	/* Three GEMMs back-to-back (GemmEx when --bf16/--fp16); fused W_qkv later. */
 	if (mat_mul(q, x, a->wq) != 0)
 		return -1;
 	if (mat_mul(k, x, a->wk) != 0)
@@ -634,16 +636,23 @@ attn_pcache *attn_pcache_create(int B, int T, int n_heads, int d_head)
 	mat_try_pin(c->k);
 	mat_try_pin(c->v);
 	mat_try_pin(c->concat);
-	/* S7 flash: do not keep B·H·T·T weights across the step. */
-	if (gpu_available() && T <= 256 && !g_flash_attn) {
-		/* Fused path: one weight buffer, device-resident. */
-		c->w_all = mat_create(B * n_heads * T, T);
-		if (c->w_all)
-			mat_try_pin(c->w_all);
-		if (c->w_all && !c->w_all->d_data)
-			mat_free(&c->w_all);
+	/*
+	** Score buffer (B·H·T)×T for TC/fused. Cap at 256 MiB so large-B
+	** --flash-attn can omit it and use the no-w_all flash kernel.
+	*/
+	if (gpu_available() && T <= 256) {
+		size_t sb = (size_t)B * (size_t)n_heads * (size_t)T
+		    * (size_t)T * sizeof(ann_real);
+
+		if (!g_flash_attn || sb <= (size_t)256 * 1024 * 1024) {
+			c->w_all = mat_create(B * n_heads * T, T);
+			if (c->w_all)
+				mat_try_pin(c->w_all);
+			if (c->w_all && !c->w_all->d_data)
+				mat_free(&c->w_all);
+		}
 	}
-	/* Host per-sequence caches only when neither fused nor flash. */
+	/* Host per-sequence caches only when no GPU score buffer. */
 	if (!c->w_all && !g_flash_attn) {
 		for (b = 0; b < B; b++) {
 			c->seq[b] = attn_cache_alloc(T, n_heads, d_head, 1);
@@ -758,12 +767,36 @@ int attn_mha_forward_packed(mat *out, attn *a, const mat *x, attn_pcache *c)
 	/* Fat projections: one (B*T) x D GEMM each. */
 	if (attn_qkv_project(c->q, c->k, c->v, a, x) != 0)
 		return -1;
-	/* M1 / S7: fused or flash (no w_all) launch; q/k/v/concat on device. */
+	/*
+	** --flash-attn: tiled FA (fused==4, no T×T HBM) first for VRAM;
+	** then TC GemmEx (3) if w_all fits; else legacy flash (2) / fused (1).
+	*/
 	c->fused = 0;
 	if (g_flash_attn
 	    && gpu_attn_flash_fwd(c->concat, c->q, c->k, c->v, c->B, T, nh,
 	    a->d_head) == 0) {
-		c->fused = 2;	/* flash: recompute w in bwd */
+		static int s_fa_once;
+
+		c->fused = 4;
+		if (!s_fa_once) {
+			s_fa_once = 1;
+			fprintf(stderr,
+			    "[attn] tiled flash (logsumexp, no T×T HBM)\n");
+			fflush(stderr);
+		}
+		return mat_mul(out, c->concat, a->wo);
+	}
+	if (g_flash_attn && c->w_all
+	    && gpu_attn_tc_fwd(c->concat, c->w_all, c->q, c->k, c->v, c->B, T,
+	    nh, a->d_head) == 0) {
+		static int s_tc_once;
+
+		c->fused = 3;
+		if (!s_tc_once) {
+			s_tc_once = 1;
+			fprintf(stderr, "[attn] Tensor-Core strided QK/AV path\n");
+			fflush(stderr);
+		}
 		return mat_mul(out, c->concat, a->wo);
 	}
 	if (c->w_all && gpu_attn_causal_fwd(c->concat, c->w_all, c->q, c->k,
@@ -840,22 +873,47 @@ int attn_mha_backward_packed(mat *dx, const mat *dout, attn *a,
 		return -1;
 	if (mat_mul_wt(dconcat, dout, a->wo) != 0)
 		return -1;
+	if (c->fused == 4) {
+		if (gpu_attn_tiled_bwd(dq, dk, dv, dconcat, c->concat, c->q,
+		    c->k, c->v, c->B, T, nh, a->d_head) != 0)
+			return -1;
+		goto proj;
+	}
+	if (c->fused == 3) {
+		if (!c->w_all
+		    || gpu_attn_tc_bwd(dq, dk, dv, dconcat, c->w_all, c->q,
+		    c->k, c->v, c->B, T, nh, a->d_head) != 0)
+			return -1;
+		goto proj;
+	}
 	if (c->fused == 2) {
 		mat *wtmp;
 
-		wtmp = mat_create(c->B * nh * T, T);
-		if (!wtmp)
-			return -1;
-		mat_try_pin(wtmp);
-		if (!wtmp->d_data
-		    || gpu_attn_recompute_w(wtmp, c->q, c->k, c->B, T, nh,
+		/* Prefer tiled bwd if logsumexp from a prior flash_fwd is live. */
+		if (gpu_attn_tiled_bwd(dq, dk, dv, dconcat, c->concat, c->q,
+		    c->k, c->v, c->B, T, nh, a->d_head) == 0)
+			goto proj;
+		wtmp = c->w_all;
+		if (!wtmp) {
+			wtmp = mat_create(c->B * nh * T, T);
+			if (!wtmp)
+				return -1;
+			mat_try_pin(wtmp);
+			if (!wtmp->d_data) {
+				mat_free(&wtmp);
+				return -1;
+			}
+		}
+		if (gpu_attn_recompute_w(wtmp, c->q, c->k, c->B, T, nh,
 		    a->d_head) != 0
 		    || gpu_attn_causal_bwd(dq, dk, dv, dconcat, wtmp, c->q,
 		    c->k, c->v, c->B, T, nh, a->d_head) != 0) {
-			mat_free(&wtmp);
+			if (wtmp != c->w_all)
+				mat_free(&wtmp);
 			return -1;
 		}
-		mat_free(&wtmp);
+		if (wtmp != c->w_all)
+			mat_free(&wtmp);
 		goto proj;
 	}
 	if (c->fused == 1) {

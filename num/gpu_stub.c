@@ -224,6 +224,79 @@ int gpu_attn_flash_fwd(mat *concat, const mat *q, const mat *k, const mat *v,
 	return -1;
 }
 
+int gpu_attn_tiled_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat,
+	const mat *concat, const mat *q, const mat *k, const mat *v, int B,
+	int T, int H, int dh)
+{
+	(void)dq;
+	(void)dk;
+	(void)dv;
+	(void)dconcat;
+	(void)concat;
+	(void)q;
+	(void)k;
+	(void)v;
+	(void)B;
+	(void)T;
+	(void)H;
+	(void)dh;
+	return -1;
+}
+
+int gpu_attn_tc_fwd(mat *concat, mat *w, const mat *q, const mat *k,
+	const mat *v, int B, int T, int H, int dh)
+{
+	(void)concat;
+	(void)w;
+	(void)q;
+	(void)k;
+	(void)v;
+	(void)B;
+	(void)T;
+	(void)H;
+	(void)dh;
+	return -1;
+}
+
+int gpu_attn_tc_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat, mat *w,
+	const mat *q, const mat *k, const mat *v, int B, int T, int H, int dh)
+{
+	(void)dq;
+	(void)dk;
+	(void)dv;
+	(void)dconcat;
+	(void)w;
+	(void)q;
+	(void)k;
+	(void)v;
+	(void)B;
+	(void)T;
+	(void)H;
+	(void)dh;
+	return -1;
+}
+
+int gpu_pack_seq_rows(ann_real *dst, const ann_real *src, int B, int T, int D)
+{
+	(void)dst;
+	(void)src;
+	(void)B;
+	(void)T;
+	(void)D;
+	return -1;
+}
+
+int gpu_unpack_seq_rows(ann_real *dst, const ann_real *src, int B, int T,
+	int D)
+{
+	(void)dst;
+	(void)src;
+	(void)B;
+	(void)T;
+	(void)D;
+	return -1;
+}
+
 int gpu_attn_recompute_w(mat *w, const mat *q, const mat *k, int B, int T,
 	int H, int dh)
 {
