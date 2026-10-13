@@ -59,11 +59,11 @@ Current implementation:
 - FP32 (`ann_real`), generate sampling, `--out` resume confirm, BPE + streaming data path
 - Target-shaped config (~36M @ 16k BPE); quality run Q1–Q5 still open — see **Target quality run**
 
-Trainable decoder-only LM in `lang/`: FP32 mats, byte or BPE tokenizer, CUDA optional, checkpoint/resume, eval knobs, streaming splits, `lm merge`. Config is Target-shaped (`D=512`, 6 blocks, ctx=256 → ~**36M** params at 16k BPE); readable generate / chat gated on **Q1–Q5**.
+Trainable decoder-only LM in `lang/`: FP32 mats, byte or BPE tokenizer, CUDA optional, checkpoint/resume, eval knobs, streaming splits, `lm merge`. Config is 40TF-shaped (`D=1024`, 12 blocks, ctx=256 → ~**280M** params at 16k BPE; older D=512 ckpts need retrain); readable generate / chat gated on **Q1–Q5**.
 
 ### Done vs open (Target)
 
-**Done (plumbing + speed stack):** FP32 / `LMCF`, GPU residency (R1–R4, R2, R8–R12, R10 TF32), packed `--batch` / `--batch auto`, BPE + `LMCV`, wiki stream, Efficiency E1–E16, Autotrain AT1–AT9. Config today: `D=512`, `heads=16`, `FF=2048`, `ctx=256`, `blocks=6` (~36M @ 16k BPE; retrain old d=256 ckpts).
+**Done (plumbing + speed stack):** FP32 / `LMCF`, GPU residency (R1–R4, R2, R8–R12, R10 TF32), packed `--batch` / `--batch auto`, BPE + `LMCV`, wiki stream, Efficiency E1–E16, Autotrain AT1–AT9. Config today: `D=1024`, `heads=16`, `FF=4096`, `ctx=256`, `blocks=12` (~280M @ 16k BPE; 40TF T2 — retrain older D=512 ckpts).
 
 **Open for Target quality:** Q1–Q5 (rebuild → autotrain wiki → honest val metrics → gate → flip Hit Target). Config + Autotrain path land; quality not yet claimed.
 
@@ -244,7 +244,7 @@ Observed headroom on a 16 GB card at current toy scale (`D=256`, `LM_BATCH_AUT
 Stretch goal on RTX 5070 Ti (~88 TF BF16 peak / ~40 TF realistic). Meter is \(6P\cdot(\mathrm{tok/s})/10^{12}\); D=512 alone cannot hit 40 TF at realistic tok/s — need **tiled FA (VRAM)** + **D=1024/L=12 (fat GEMMs)** + fusion/graphs. Gates: ~5 TF → ~15 TF → ~40 TF. See [docs/sota-train-systems.md](docs/sota-train-systems.md).
 
 - [x] **T1** Tiled flash attn fwd+bwd (no `T×T` HBM, logsumexp only); see [docs/tiled-flash-attention.md](docs/tiled-flash-attention.md)
-- [ ] **T2** Scale config `D=1024`, heads=16, `FF=4096`, blocks=12; see [docs/scale-d1024-40tf.md](docs/scale-d1024-40tf.md)
+- [x] **T2** Scale config `D=1024`, heads=16, `FF=4096`, blocks=12; see [docs/scale-d1024-40tf.md](docs/scale-d1024-40tf.md)
 - [ ] **T3** Fused QKV + CE hot path / graphs-safe pack; see [docs/fused-qkv-ce-40tf.md](docs/fused-qkv-ce-40tf.md)
 - [ ] **T4** Bench milestones 5 / 15 / 40 TF; see [docs/speed-stack-bench.md](docs/speed-stack-bench.md)
 
