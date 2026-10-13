@@ -1140,10 +1140,14 @@ extern "C" void gpu_attn_set_seqlens(const int *seqlens)
 	g_att_seqlens_host = seqlens;
 }
 
-/* grid = B*H*T blocks (bh, i); dyn smem = (dh + T) floats. */
+/*
+** grid = B*H*T blocks (bh, i); dyn smem = (dh + T) floats.
+** Optional L[block] = logsumexp for tiled bwd (no T×T HBM).
+*/
 __global__ static void attn_fwd_kernel(ann_real *concat, ann_real *w,
 	const ann_real *q, const ann_real *k, const ann_real *v,
-	int T, int H, int dh, ann_real scale, const int *seqlens)
+	int T, int H, int dh, ann_real scale, const int *seqlens,
+	ann_real *Lstat)
 {
 	extern __shared__ ann_real sm[];
 	__shared__ ann_real red[ATT_BLOCK];
@@ -1195,6 +1199,8 @@ __global__ static void attn_fwd_kernel(ann_real *concat, ann_real *w,
 	sum = att_sum(sum, red);
 	if (sum < 1e-20f)
 		sum = 1.0f;
+	if (Lstat && threadIdx.x == 0)
+		Lstat[blockIdx.x] = mx + __logf(sum);
 	for (j = threadIdx.x; j < T; j += blockDim.x) {
 		sc[j] /= sum;
 		if (wr)
@@ -1358,6 +1364,12 @@ __global__ static void attn_bwd_cols_kernel(ann_real *dk, ann_real *dv,
 static pthread_mutex_t g_att_mu = PTHREAD_MUTEX_INITIALIZER;
 static ann_real *g_att_ds;
 static size_t g_att_ds_cap;
+/* Flash/tiled: per-row logsumexp (B·H·T), not T×T scores. */
+static ann_real *g_fa_L;
+static size_t g_fa_L_cap;
+static int g_fa_L_n;
+
+#define FA_BC	32	/* KV tile width for tiled bwd */
 
 static int att_args_ok(int B, int T, int H, int dh)
 {
@@ -1417,7 +1429,7 @@ extern "C" int gpu_attn_causal_fwd(mat *concat, mat *w, const mat *q,
 	}
 	attn_fwd_kernel<<<B * H * T, ATT_BLOCK, smem>>>(dc, dw, dq, dk, dv,
 	    T, H, dh, (ann_real)(1.0 / sqrt((double)dh)),
-	    g_att_seqlens_host ? g_att_seqlens_dev : NULL);
+	    g_att_seqlens_host ? g_att_seqlens_dev : NULL, NULL);
 	if (launch_done() == 0 && finish_out(concat, dc, oc) == 0) {
 		w->on_device = MAT_DEV_DEVICE;	/* host copy never read */
 		rc = 0;
@@ -1481,11 +1493,29 @@ extern "C" int gpu_attn_flash_fwd(mat *concat, const mat *q, const mat *k,
 		    (size_t)B * sizeof(int)) != 0)
 			goto flash_out;
 	}
+	{
+		size_t need_L = (size_t)B * (size_t)H * (size_t)T
+		    * sizeof(ann_real);
+
+		if (g_fa_L_cap < need_L) {
+			if (g_fa_L)
+				cudaFree(g_fa_L);
+			g_fa_L = NULL;
+			g_fa_L_cap = 0;
+			g_fa_L_n = 0;
+			if (cudaMalloc((void **)&g_fa_L, need_L) != cudaSuccess)
+				goto flash_out;
+			g_fa_L_cap = need_L;
+		}
+		g_fa_L_n = B * H * T;
+	}
 	attn_fwd_kernel<<<B * H * T, ATT_BLOCK, smem>>>(dc, NULL, dq, dk, dv,
 	    T, H, dh, (ann_real)(1.0 / sqrt((double)dh)),
-	    g_att_seqlens_host ? g_att_seqlens_dev : NULL);
+	    g_att_seqlens_host ? g_att_seqlens_dev : NULL, g_fa_L);
 	if (launch_done() == 0 && finish_out(concat, dc, oc) == 0)
 		rc = 0;
+	else
+		g_fa_L_n = 0;
 flash_out:
 	if (oq && dq)
 		gpu_free(dq);
@@ -1495,6 +1525,181 @@ flash_out:
 		gpu_free(dv);
 	if (oc && dc)
 		gpu_free(dc);
+	pthread_mutex_unlock(&g_att_mu);
+	return rc;
+}
+
+/*
+** Tiled FA-2 style bwd: recompute P from Q,K and Lstat in FA_BC tiles.
+** Never materializes B·H·T·T in HBM (no g_att_ds / w). dK/dV via atomics.
+*/
+__global__ static void attn_tiled_bwd_kernel(ann_real *dq, ann_real *dk,
+	ann_real *dv, const ann_real *dO, const ann_real *O, const ann_real *q,
+	const ann_real *k, const ann_real *v, const ann_real *Lstat, int T,
+	int H, int dh, ann_real scale, const int *seqlens)
+{
+	extern __shared__ ann_real sm[];
+	__shared__ ann_real red[ATT_BLOCK];
+	ann_real *qi = sm;
+	ann_real *doi = sm + dh;
+	ann_real *oi = sm + 2 * dh;
+	ann_real *dqi = sm + 3 * dh;
+	ann_real *Kt = sm + 4 * dh;
+	ann_real *Vt = Kt + FA_BC * dh;
+	int i = blockIdx.x % T;
+	int bh = blockIdx.x / T;
+	int h = bh % H;
+	int b = bh / H;
+	int D = H * dh;
+	size_t row0 = (size_t)b * T;
+	int L = seqlens ? seqlens[b] : T;
+	int j0;
+	int j;
+	int c;
+	ann_real Di;
+	ann_real Li;
+
+	if (L < 1)
+		L = 1;
+	if (L > T)
+		L = T;
+	for (c = threadIdx.x; c < dh; c += blockDim.x) {
+		qi[c] = q[(row0 + i) * D + h * dh + c];
+		doi[c] = dO[(row0 + i) * D + h * dh + c];
+		oi[c] = O[(row0 + i) * D + h * dh + c];
+		dqi[c] = 0.0f;
+	}
+	__syncthreads();
+	Di = 0.0f;
+	for (c = threadIdx.x; c < dh; c += blockDim.x)
+		Di += doi[c] * oi[c];
+	Di = att_sum(Di, red);
+	Li = Lstat[blockIdx.x];
+	if (!(i < L)) {
+		for (c = threadIdx.x; c < dh; c += blockDim.x)
+			dq[(row0 + i) * D + h * dh + c] = 0.0f;
+		return;
+	}
+	for (j0 = 0; j0 < T; j0 += FA_BC) {
+		int j1 = j0 + FA_BC;
+
+		if (j1 > T)
+			j1 = T;
+		for (j = j0 + (int)threadIdx.x; j < j1; j += (int)blockDim.x) {
+			const ann_real *kj = k + (row0 + j) * D + h * dh;
+			const ann_real *vj = v + (row0 + j) * D + h * dh;
+			int t;
+
+			for (t = 0; t < dh; t++) {
+				Kt[(j - j0) * dh + t] = kj[t];
+				Vt[(j - j0) * dh + t] = vj[t];
+			}
+		}
+		__syncthreads();
+		for (j = j0; j < j1; j++) {
+			ann_real s;
+			ann_real p;
+			ann_real dp;
+			ann_real ds;
+			int ok = (j <= i && j < L) ? 1 : 0;
+
+			s = 0.0f;
+			if (ok) {
+				for (c = threadIdx.x; c < dh; c += blockDim.x)
+					s += qi[c] * Kt[(j - j0) * dh + c];
+			}
+			s = att_sum(s, red) * scale;
+			p = ok ? __expf(s - Li) : 0.0f;
+			dp = 0.0f;
+			if (ok) {
+				for (c = threadIdx.x; c < dh; c += blockDim.x)
+					dp += doi[c] * Vt[(j - j0) * dh + c];
+			}
+			dp = att_sum(dp, red);
+			ds = ok ? p * (dp - Di) * scale : 0.0f;
+			if (ok) {
+				for (c = threadIdx.x; c < dh; c += blockDim.x) {
+					dqi[c] += ds * Kt[(j - j0) * dh + c];
+					atomicAdd(&dk[(row0 + j) * D + h * dh
+					    + c], ds * qi[c]);
+					atomicAdd(&dv[(row0 + j) * D + h * dh
+					    + c], p * doi[c]);
+				}
+			}
+			__syncthreads();
+		}
+		__syncthreads();
+	}
+	for (c = threadIdx.x; c < dh; c += blockDim.x)
+		dq[(row0 + i) * D + h * dh + c] = dqi[c];
+}
+
+extern "C" int gpu_attn_tiled_bwd(mat *dq, mat *dk, mat *dv,
+	const mat *dconcat, const mat *concat, const mat *q, const mat *k,
+	const mat *v, int B, int T, int H, int dh)
+{
+	ann_real *a_dq;
+	ann_real *a_dk;
+	ann_real *a_dv;
+	ann_real *a_dc;
+	ann_real *a_o;
+	ann_real *a_q;
+	ann_real *a_k;
+	ann_real *a_v;
+	size_t smem;
+	size_t nbytes;
+	int o[8];
+	ann_real *ptr[8];
+	int i;
+	int rc;
+
+	if (!dq || !dk || !dv || !dconcat || !concat || !q || !k || !v
+	    || !att_args_ok(B, T, H, dh) || !g_fa_L || g_fa_L_n != B * H * T)
+		return -1;
+	if (q->rows != B * T || q->cols != H * dh || dq->rows != q->rows
+	    || dk->rows != q->rows || dv->rows != q->rows
+	    || dconcat->rows != q->rows || concat->rows != q->rows)
+		return -1;
+	pthread_mutex_lock(&g_att_mu);
+	rc = -1;
+	for (i = 0; i < 8; i++) {
+		o[i] = 0;
+		ptr[i] = NULL;
+	}
+	if (ensure_dev(dconcat, &ptr[0], &o[0]) != 0
+	    || ensure_dev(concat, &ptr[1], &o[1]) != 0
+	    || ensure_dev(q, &ptr[2], &o[2]) != 0
+	    || ensure_dev(k, &ptr[3], &o[3]) != 0
+	    || ensure_dev(v, &ptr[4], &o[4]) != 0
+	    || ensure_dev_out(dq, &ptr[5], &o[5]) != 0
+	    || ensure_dev_out(dk, &ptr[6], &o[6]) != 0
+	    || ensure_dev_out(dv, &ptr[7], &o[7]) != 0)
+		goto tiled_bwd_out;
+	a_dc = ptr[0];
+	a_o = ptr[1];
+	a_q = ptr[2];
+	a_k = ptr[3];
+	a_v = ptr[4];
+	a_dq = ptr[5];
+	a_dk = ptr[6];
+	a_dv = ptr[7];
+	nbytes = (size_t)B * (size_t)T * (size_t)(H * dh) * sizeof(ann_real);
+	if (cudaMemset(a_dk, 0, nbytes) != cudaSuccess
+	    || cudaMemset(a_dv, 0, nbytes) != cudaSuccess)
+		goto tiled_bwd_out;
+	smem = (size_t)(4 * dh + 2 * FA_BC * dh) * sizeof(ann_real);
+	attn_tiled_bwd_kernel<<<B * H * T, ATT_BLOCK, smem>>>(a_dq, a_dk, a_dv,
+	    a_dc, a_o, a_q, a_k, a_v, g_fa_L, T, H, dh,
+	    (ann_real)(1.0 / sqrt((double)dh)),
+	    g_att_seqlens_host ? g_att_seqlens_dev : NULL);
+	if (launch_done() == 0 && finish_out(dq, a_dq, o[5]) == 0
+	    && finish_out(dk, a_dk, o[6]) == 0
+	    && finish_out(dv, a_dv, o[7]) == 0)
+		rc = 0;
+tiled_bwd_out:
+	for (i = 0; i < 8; i++)
+		if (o[i] && ptr[i])
+			gpu_free(ptr[i]);
 	pthread_mutex_unlock(&g_att_mu);
 	return rc;
 }
@@ -1659,6 +1864,631 @@ out:
 			gpu_free(ptr[i]);
 	pthread_mutex_unlock(&g_att_mu);
 	return rc;
+}
+
+/* ---- TC batched attention (40TF wave): pack heads + strided GemmEx ---- */
+
+static ann_real *g_tc_q;
+static ann_real *g_tc_k;
+static ann_real *g_tc_v;
+static ann_real *g_tc_o;
+static ann_real *g_tc_dp;
+static size_t g_tc_pack_cap;
+static size_t g_tc_score_cap;
+static void *g_tc_half_q;
+static void *g_tc_half_k;
+static size_t g_tc_half_q_cap;
+static size_t g_tc_half_k_cap;
+
+__global__ static void attn_pack_heads_kernel(ann_real *out, const ann_real *in,
+	int B, int T, int H, int dh)
+{
+	int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	int n = B * T * H * dh;
+	int c;
+	int t;
+	int h;
+	int b;
+	int D;
+
+	if (idx >= n)
+		return;
+	D = H * dh;
+	c = idx % dh;
+	t = (idx / dh) % T;
+	h = (idx / (dh * T)) % H;
+	b = idx / (dh * T * H);
+	out[((b * H + h) * T + t) * dh + c] =
+	    in[(b * T + t) * D + h * dh + c];
+}
+
+__global__ static void attn_unpack_heads_kernel(ann_real *out,
+	const ann_real *in, int B, int T, int H, int dh)
+{
+	int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	int n = B * T * H * dh;
+	int c;
+	int t;
+	int h;
+	int b;
+	int D;
+
+	if (idx >= n)
+		return;
+	D = H * dh;
+	c = idx % dh;
+	t = (idx / dh) % T;
+	h = (idx / (dh * T)) % H;
+	b = idx / (dh * T * H);
+	out[(b * T + t) * D + h * dh + c] =
+	    in[((b * H + h) * T + t) * dh + c];
+}
+
+/* One block per (b,h,i) row: causal scale+softmax (parallel reduce; T<=256). */
+__global__ static void attn_tc_softmax_kernel(ann_real *w, int T, int H,
+	ann_real scale, const int *seqlens)
+{
+	__shared__ ann_real red[ATT_BLOCK];
+	int bh = blockIdx.x;
+	int b = bh / H;
+	int i = blockIdx.y;
+	int L = seqlens ? seqlens[b] : T;
+	int j;
+	ann_real mx;
+	ann_real sum;
+	ann_real *wr = w + (size_t)bh * T * T + (size_t)i * T;
+
+	if (i >= T)
+		return;
+	if (L < 1)
+		L = 1;
+	if (L > T)
+		L = T;
+	for (j = (int)threadIdx.x; j < T; j += (int)blockDim.x) {
+		ann_real a = wr[j] * scale;
+
+		if (!(i < L && j <= i && j < L))
+			a = -1e30f;
+		wr[j] = a;
+	}
+	__syncthreads();
+	mx = -1e30f;
+	for (j = (int)threadIdx.x; j < T; j += (int)blockDim.x)
+		if (wr[j] > mx)
+			mx = wr[j];
+	mx = att_max(mx, red);
+	sum = 0.0f;
+	for (j = (int)threadIdx.x; j < T; j += (int)blockDim.x) {
+		ann_real a = (i < L && j <= i && j < L) ? __expf(wr[j] - mx)
+		    : 0.0f;
+
+		wr[j] = a;
+		sum += a;
+	}
+	sum = att_sum(sum, red);
+	if (sum < 1e-20f)
+		sum = 1.0f;
+	for (j = (int)threadIdx.x; j < T; j += (int)blockDim.x)
+		wr[j] /= sum;
+}
+
+/* Softmax bwd: dP = P * (dP - sum_k P_k * dP_k) in place on dp; uses w. */
+__global__ static void attn_tc_softmax_bwd_kernel(ann_real *dp, const ann_real *w,
+	int T, int H, const int *seqlens)
+{
+	__shared__ ann_real red[ATT_BLOCK];
+	int bh = blockIdx.x;
+	int b = bh / H;
+	int i = blockIdx.y;
+	int L = seqlens ? seqlens[b] : T;
+	int j;
+	ann_real dot;
+	ann_real *drow = dp + (size_t)bh * T * T + (size_t)i * T;
+	const ann_real *prow = w + (size_t)bh * T * T + (size_t)i * T;
+
+	if (L < 1)
+		L = 1;
+	if (L > T)
+		L = T;
+	if (i >= T)
+		return;
+	if (i >= L) {
+		for (j = (int)threadIdx.x; j < T; j += (int)blockDim.x)
+			drow[j] = 0.0f;
+		return;
+	}
+	dot = 0.0f;
+	for (j = (int)threadIdx.x; j < T; j += (int)blockDim.x)
+		if (j <= i && j < L)
+			dot += prow[j] * drow[j];
+	dot = att_sum(dot, red);
+	for (j = (int)threadIdx.x; j < T; j += (int)blockDim.x) {
+		if (j <= i && j < L)
+			drow[j] = prow[j] * (drow[j] - dot);
+		else
+			drow[j] = 0.0f;
+	}
+}
+
+static int tc_ensure_pack(size_t n_elems)
+{
+	size_t bytes = n_elems * sizeof(ann_real);
+
+	if (g_tc_pack_cap >= bytes)
+		return 0;
+	if (g_tc_q)
+		cudaFree(g_tc_q);
+	if (g_tc_k)
+		cudaFree(g_tc_k);
+	if (g_tc_v)
+		cudaFree(g_tc_v);
+	if (g_tc_o)
+		cudaFree(g_tc_o);
+	g_tc_q = g_tc_k = g_tc_v = g_tc_o = NULL;
+	g_tc_pack_cap = 0;
+	if (cudaMalloc((void **)&g_tc_q, bytes) != cudaSuccess
+	    || cudaMalloc((void **)&g_tc_k, bytes) != cudaSuccess
+	    || cudaMalloc((void **)&g_tc_v, bytes) != cudaSuccess
+	    || cudaMalloc((void **)&g_tc_o, bytes) != cudaSuccess)
+		return -1;
+	g_tc_pack_cap = bytes;
+	return 0;
+}
+
+static int tc_ensure_dp(size_t bytes)
+{
+	if (g_tc_score_cap >= bytes)
+		return 0;
+	if (g_tc_dp)
+		cudaFree(g_tc_dp);
+	g_tc_dp = NULL;
+	g_tc_score_cap = 0;
+	if (cudaMalloc((void **)&g_tc_dp, bytes) != cudaSuccess)
+		return -1;
+	g_tc_score_cap = bytes;
+	return 0;
+}
+
+#ifdef ANN_CUBLAS
+/* Prefer Tensor Core strided GemmEx; fall back to FP32 SgemmStridedBatched. */
+static int tc_gemm_qk_batched(ann_real *scores, const ann_real *Q,
+	const ann_real *K, int T, int dh, int batch)
+{
+	const float alpha = 1.0f;
+	const float beta = 0.0f;
+	long long stride = (long long)T * dh;
+	long long stride_s = (long long)T * T;
+	size_t n;
+	int threads = 256;
+
+	if (cublas_ensure() != 0)
+		return -1;
+	if (g_compute_prec == GPU_PREC_FP32) {
+		return cublasSgemmStridedBatched(g_cublas, CUBLAS_OP_T,
+		    CUBLAS_OP_N, T, T, dh, &alpha, K, dh, stride, Q, dh, stride,
+		    &beta, scores, T, stride_s, batch)
+		    == CUBLAS_STATUS_SUCCESS ? 0 : -1;
+	}
+	n = (size_t)batch * (size_t)T * (size_t)dh;
+	if (ensure_half_buf(&g_tc_half_q, &g_tc_half_q_cap, n * 2) != 0
+	    || ensure_half_buf(&g_tc_half_k, &g_tc_half_k_cap, n * 2) != 0)
+		return -1;
+#if CUDART_VERSION >= 11000
+	if (g_compute_prec == GPU_PREC_BF16) {
+		f32_to_bf16_kernel<<<(int)((n + threads - 1) / threads),
+		    threads>>>((__nv_bfloat16 *)g_tc_half_q, Q, (int)n);
+		f32_to_bf16_kernel<<<(int)((n + threads - 1) / threads),
+		    threads>>>((__nv_bfloat16 *)g_tc_half_k, K, (int)n);
+		return cublasGemmStridedBatchedEx(g_cublas, CUBLAS_OP_T,
+		    CUBLAS_OP_N, T, T, dh, &alpha, g_tc_half_k, CUDA_R_16BF,
+		    dh, stride, g_tc_half_q, CUDA_R_16BF, dh, stride, &beta,
+		    scores, CUDA_R_32F, T, stride_s, batch, CUBLAS_COMPUTE_32F,
+		    CUBLAS_GEMM_DEFAULT_TENSOR_OP) == CUBLAS_STATUS_SUCCESS
+		    ? 0 : -1;
+	}
+#endif
+	f32_to_f16_kernel<<<(int)((n + threads - 1) / threads), threads>>>(
+	    (half *)g_tc_half_q, Q, (int)n);
+	f32_to_f16_kernel<<<(int)((n + threads - 1) / threads), threads>>>(
+	    (half *)g_tc_half_k, K, (int)n);
+#if CUDART_VERSION >= 11000
+	return cublasGemmStridedBatchedEx(g_cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+	    T, T, dh, &alpha, g_tc_half_k, CUDA_R_16F, dh, stride, g_tc_half_q,
+	    CUDA_R_16F, dh, stride, &beta, scores, CUDA_R_32F, T, stride_s,
+	    batch, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP)
+	    == CUBLAS_STATUS_SUCCESS ? 0 : -1;
+#else
+	return cublasSgemmStridedBatched(g_cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+	    T, T, dh, &alpha, K, dh, stride, Q, dh, stride, &beta, scores, T,
+	    stride_s, batch) == CUBLAS_STATUS_SUCCESS ? 0 : -1;
+#endif
+}
+
+static int tc_gemm_pv_batched(ann_real *O, const ann_real *W, const ann_real *V,
+	int T, int dh, int batch)
+{
+	const float alpha = 1.0f;
+	const float beta = 0.0f;
+	long long stride_v = (long long)T * dh;
+	long long stride_w = (long long)T * T;
+
+	if (cublas_ensure() != 0)
+		return -1;
+	/*
+	** O = W * V. Use FP32 SgemmStridedBatched for W (already softmax
+	** probs) — casting dense T×T W to BF16 each step is bandwidth-heavy;
+	** QK path owns the TC win.
+	*/
+	return cublasSgemmStridedBatched(g_cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+	    dh, T, T, &alpha, V, dh, stride_v, W, T, stride_w, &beta, O, dh,
+	    stride_v, batch) == CUBLAS_STATUS_SUCCESS ? 0 : -1;
+}
+
+static int tc_gemm_wt_do(ann_real *dV, const ann_real *W, const ann_real *dO,
+	int T, int dh, int batch)
+{
+	const float alpha = 1.0f;
+	const float beta = 0.0f;
+	long long stride_v = (long long)T * dh;
+	long long stride_w = (long long)T * T;
+
+	if (cublas_ensure() != 0)
+		return -1;
+	/* dV = W^T * dO */
+	return cublasSgemmStridedBatched(g_cublas, CUBLAS_OP_N, CUBLAS_OP_T,
+	    dh, T, T, &alpha, dO, dh, stride_v, W, T, stride_w, &beta, dV, dh,
+	    stride_v, batch) == CUBLAS_STATUS_SUCCESS ? 0 : -1;
+}
+
+static int tc_gemm_do_vt(ann_real *dP, const ann_real *dO, const ann_real *V,
+	int T, int dh, int batch)
+{
+	const float alpha = 1.0f;
+	const float beta = 0.0f;
+	long long stride_v = (long long)T * dh;
+	long long stride_s = (long long)T * T;
+
+	if (cublas_ensure() != 0)
+		return -1;
+	/* dP = dO * V^T  (T x T) */
+	return cublasSgemmStridedBatched(g_cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+	    T, T, dh, &alpha, V, dh, stride_v, dO, dh, stride_v, &beta, dP, T,
+	    stride_s, batch) == CUBLAS_STATUS_SUCCESS ? 0 : -1;
+}
+
+static int tc_gemm_ds_k(ann_real *dQ, const ann_real *dS, const ann_real *K,
+	int T, int dh, int batch, float scale)
+{
+	const float alpha = scale;
+	const float beta = 0.0f;
+	long long stride_v = (long long)T * dh;
+	long long stride_s = (long long)T * T;
+
+	if (cublas_ensure() != 0)
+		return -1;
+	/* dQ = dS * K */
+	return cublasSgemmStridedBatched(g_cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+	    dh, T, T, &alpha, K, dh, stride_v, dS, T, stride_s, &beta, dQ, dh,
+	    stride_v, batch) == CUBLAS_STATUS_SUCCESS ? 0 : -1;
+}
+
+static int tc_gemm_dst_q(ann_real *dK, const ann_real *dS, const ann_real *Q,
+	int T, int dh, int batch, float scale)
+{
+	const float alpha = scale;
+	const float beta = 0.0f;
+	long long stride_v = (long long)T * dh;
+	long long stride_s = (long long)T * T;
+
+	if (cublas_ensure() != 0)
+		return -1;
+	/* dK = dS^T * Q */
+	return cublasSgemmStridedBatched(g_cublas, CUBLAS_OP_N, CUBLAS_OP_T,
+	    dh, T, T, &alpha, Q, dh, stride_v, dS, T, stride_s, &beta, dK, dh,
+	    stride_v, batch) == CUBLAS_STATUS_SUCCESS ? 0 : -1;
+}
+#endif /* ANN_CUBLAS */
+
+static int tc_upload_seqlens(int B)
+{
+	if (!g_att_seqlens_host)
+		return 0;
+	if (!g_att_seqlens_dev || g_att_seqlens_B < B) {
+		if (g_att_seqlens_dev)
+			gpu_free(g_att_seqlens_dev);
+		g_att_seqlens_dev = (int *)gpu_malloc((size_t)B * sizeof(int));
+		g_att_seqlens_B = g_att_seqlens_dev ? B : 0;
+	}
+	if (!g_att_seqlens_dev)
+		return -1;
+	return gpu_memcpy_h2d(g_att_seqlens_dev, g_att_seqlens_host,
+	    (size_t)B * sizeof(int));
+}
+
+extern "C" int gpu_attn_tc_fwd(mat *concat, mat *w, const mat *q, const mat *k,
+	const mat *v, int B, int T, int H, int dh)
+{
+#ifdef ANN_CUBLAS
+	ann_real *dq;
+	ann_real *dk;
+	ann_real *dv;
+	ann_real *dc;
+	ann_real *dw;
+	int oq;
+	int ok;
+	int ov;
+	int oc;
+	int rc;
+	int batch;
+	int npack;
+	int threads = 256;
+	dim3 sgrid;
+	ann_real scale;
+
+	if (!concat || !w || !q || !k || !v || !att_args_ok(B, T, H, dh))
+		return -1;
+	if (q->rows != B * T || q->cols != H * dh || w->rows != B * H * T
+	    || w->cols != T)
+		return -1;
+	/* Act-checkpoint may have dropped d_data; repin score buffer. */
+	if (!w->d_data) {
+		mat_try_pin(w);
+		if (!w->d_data)
+			return -1;
+	}
+	batch = B * H;
+	npack = batch * T * dh;
+	pthread_mutex_lock(&g_att_mu);
+	rc = -1;
+	oq = ok = ov = oc = 0;
+	if (tc_ensure_pack((size_t)npack) != 0)
+		goto tc_fwd_out;
+	if (ensure_dev(q, &dq, &oq) != 0 || ensure_dev(k, &dk, &ok) != 0
+	    || ensure_dev(v, &dv, &ov) != 0
+	    || ensure_dev_out(concat, &dc, &oc) != 0)
+		goto tc_fwd_out;
+	dw = w->d_data;
+	if (tc_upload_seqlens(B) != 0)
+		goto tc_fwd_out;
+	attn_pack_heads_kernel<<<(npack + threads - 1) / threads, threads>>>(
+	    g_tc_q, dq, B, T, H, dh);
+	attn_pack_heads_kernel<<<(npack + threads - 1) / threads, threads>>>(
+	    g_tc_k, dk, B, T, H, dh);
+	attn_pack_heads_kernel<<<(npack + threads - 1) / threads, threads>>>(
+	    g_tc_v, dv, B, T, H, dh);
+	if (tc_gemm_qk_batched(dw, g_tc_q, g_tc_k, T, dh, batch) != 0)
+		goto tc_fwd_out;
+	scale = (ann_real)(1.0 / sqrt((double)dh));
+	sgrid = dim3(batch, T, 1);
+	{
+		int nth = 32;
+
+		while (nth < T && nth < ATT_BLOCK)
+			nth <<= 1;
+		attn_tc_softmax_kernel<<<sgrid, nth>>>(dw, T, H, scale,
+		    g_att_seqlens_host ? g_att_seqlens_dev : NULL);
+	}
+	if (tc_gemm_pv_batched(g_tc_o, dw, g_tc_v, T, dh, batch) != 0)
+		goto tc_fwd_out;
+	attn_unpack_heads_kernel<<<(npack + threads - 1) / threads, threads>>>(
+	    dc, g_tc_o, B, T, H, dh);
+	if (launch_done() == 0 && finish_out(concat, dc, oc) == 0) {
+		w->on_device = MAT_DEV_DEVICE;
+		rc = 0;
+	}
+tc_fwd_out:
+	if (oq && dq)
+		gpu_free(dq);
+	if (ok && dk)
+		gpu_free(dk);
+	if (ov && dv)
+		gpu_free(dv);
+	if (oc && dc)
+		gpu_free(dc);
+	pthread_mutex_unlock(&g_att_mu);
+	return rc;
+#else
+	(void)concat;
+	(void)w;
+	(void)q;
+	(void)k;
+	(void)v;
+	(void)B;
+	(void)T;
+	(void)H;
+	(void)dh;
+	return -1;
+#endif
+}
+
+extern "C" int gpu_attn_tc_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat,
+	mat *w, const mat *q, const mat *k, const mat *v, int B, int T, int H,
+	int dh)
+{
+#ifdef ANN_CUBLAS
+	ann_real *a_q;
+	ann_real *a_k;
+	ann_real *a_v;
+	ann_real *a_dc;
+	ann_real *a_dq;
+	ann_real *a_dk;
+	ann_real *a_dv;
+	ann_real *dw;
+	int o[7];
+	ann_real *ptr[7];
+	int i;
+	int rc;
+	int batch;
+	int npack;
+	int threads = 256;
+	dim3 sgrid;
+	float scale;
+	size_t score_bytes;
+
+	if (!dq || !dk || !dv || !dconcat || !w || !q || !k || !v
+	    || !att_args_ok(B, T, H, dh))
+		return -1;
+	if (!w->d_data) {
+		mat_try_pin(w);
+		if (!w->d_data)
+			return -1;
+	}
+	batch = B * H;
+	npack = batch * T * dh;
+	score_bytes = (size_t)batch * (size_t)T * (size_t)T * sizeof(ann_real);
+	pthread_mutex_lock(&g_att_mu);
+	rc = -1;
+	for (i = 0; i < 7; i++) {
+		o[i] = 0;
+		ptr[i] = NULL;
+	}
+	if (tc_ensure_pack((size_t)npack) != 0 || tc_ensure_dp(score_bytes) != 0)
+		goto tc_bwd_out;
+	if (ensure_dev(dconcat, &ptr[0], &o[0]) != 0
+	    || ensure_dev(q, &ptr[1], &o[1]) != 0
+	    || ensure_dev(k, &ptr[2], &o[2]) != 0
+	    || ensure_dev(v, &ptr[3], &o[3]) != 0
+	    || ensure_dev_out(dq, &ptr[4], &o[4]) != 0
+	    || ensure_dev_out(dk, &ptr[5], &o[5]) != 0
+	    || ensure_dev_out(dv, &ptr[6], &o[6]) != 0)
+		goto tc_bwd_out;
+	a_dc = ptr[0];
+	a_q = ptr[1];
+	a_k = ptr[2];
+	a_v = ptr[3];
+	a_dq = ptr[4];
+	a_dk = ptr[5];
+	a_dv = ptr[6];
+	dw = w->d_data;
+	if (tc_upload_seqlens(B) != 0)
+		goto tc_bwd_out;
+	/* Pack Q/K/V and dO. */
+	attn_pack_heads_kernel<<<(npack + threads - 1) / threads, threads>>>(
+	    g_tc_q, a_q, B, T, H, dh);
+	attn_pack_heads_kernel<<<(npack + threads - 1) / threads, threads>>>(
+	    g_tc_k, a_k, B, T, H, dh);
+	attn_pack_heads_kernel<<<(npack + threads - 1) / threads, threads>>>(
+	    g_tc_v, a_v, B, T, H, dh);
+	attn_pack_heads_kernel<<<(npack + threads - 1) / threads, threads>>>(
+	    g_tc_o, a_dc, B, T, H, dh);
+	/* Recompute W = softmax(scale Q K^T) (no separate host wtmp). */
+	scale = (float)(1.0 / sqrt((double)dh));
+	if (tc_gemm_qk_batched(dw, g_tc_q, g_tc_k, T, dh, batch) != 0)
+		goto tc_bwd_out;
+	sgrid = dim3(batch, T, 1);
+	{
+		int nth = 32;
+
+		while (nth < T && nth < ATT_BLOCK)
+			nth <<= 1;
+		attn_tc_softmax_kernel<<<sgrid, nth>>>(dw, T, H, (ann_real)scale,
+		    g_att_seqlens_host ? g_att_seqlens_dev : NULL);
+		/* dP = dO V^T (needs V); then dV = W^T dO (overwrites V). */
+		if (tc_gemm_do_vt(g_tc_dp, g_tc_o, g_tc_v, T, dh, batch) != 0)
+			goto tc_bwd_out;
+		if (tc_gemm_wt_do(g_tc_v, dw, g_tc_o, T, dh, batch) != 0)
+			goto tc_bwd_out;
+		attn_tc_softmax_bwd_kernel<<<sgrid, nth>>>(g_tc_dp, dw, T, H,
+		    g_att_seqlens_host ? g_att_seqlens_dev : NULL);
+	}
+	/* dQ = dS K -> g_tc_o; dK = dS^T Q -> g_tc_k (Q still in g_tc_q). */
+	if (tc_gemm_ds_k(g_tc_o, g_tc_dp, g_tc_k, T, dh, batch, scale) != 0)
+		goto tc_bwd_out;
+	if (tc_gemm_dst_q(g_tc_k, g_tc_dp, g_tc_q, T, dh, batch, scale) != 0)
+		goto tc_bwd_out;
+	attn_unpack_heads_kernel<<<(npack + threads - 1) / threads, threads>>>(
+	    a_dq, g_tc_o, B, T, H, dh);
+	attn_unpack_heads_kernel<<<(npack + threads - 1) / threads, threads>>>(
+	    a_dk, g_tc_k, B, T, H, dh);
+	attn_unpack_heads_kernel<<<(npack + threads - 1) / threads, threads>>>(
+	    a_dv, g_tc_v, B, T, H, dh);
+	if (launch_done() == 0 && finish_out(dq, a_dq, o[4]) == 0
+	    && finish_out(dk, a_dk, o[5]) == 0
+	    && finish_out(dv, a_dv, o[6]) == 0)
+		rc = 0;
+tc_bwd_out:
+	for (i = 0; i < 7; i++)
+		if (o[i] && ptr[i])
+			gpu_free(ptr[i]);
+	pthread_mutex_unlock(&g_att_mu);
+	return rc;
+#else
+	(void)dq;
+	(void)dk;
+	(void)dv;
+	(void)dconcat;
+	(void)w;
+	(void)q;
+	(void)k;
+	(void)v;
+	(void)B;
+	(void)T;
+	(void)H;
+	(void)dh;
+	return -1;
+#endif
+}
+
+__global__ static void pack_seq_rows_kernel(ann_real *dst, const ann_real *src,
+	int B, int T, int D)
+{
+	int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	int n = B * (T - 1) * D;
+	int b;
+	int t;
+	int c;
+
+	if (idx >= n || T < 2)
+		return;
+	c = idx % D;
+	t = (idx / D) % (T - 1);
+	b = idx / (D * (T - 1));
+	dst[idx] = src[(b * T + t) * D + c];
+}
+
+__global__ static void unpack_seq_rows_kernel(ann_real *dst, const ann_real *src,
+	int B, int T, int D)
+{
+	int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	int n = B * (T - 1) * D;
+	int b;
+	int t;
+	int c;
+
+	if (idx >= n || T < 2)
+		return;
+	c = idx % D;
+	t = (idx / D) % (T - 1);
+	b = idx / (D * (T - 1));
+	dst[(b * T + t) * D + c] = src[idx];
+}
+
+extern "C" int gpu_pack_seq_rows(ann_real *dst, const ann_real *src, int B,
+	int T, int D)
+{
+	int n;
+	int threads = 256;
+
+	if (!dst || !src || B <= 0 || T < 2 || D <= 0 || !gpu_available())
+		return -1;
+	n = B * (T - 1) * D;
+	pack_seq_rows_kernel<<<(n + threads - 1) / threads, threads>>>(dst, src,
+	    B, T, D);
+	return launch_done();
+}
+
+extern "C" int gpu_unpack_seq_rows(ann_real *dst, const ann_real *src, int B,
+	int T, int D)
+{
+	int n;
+	int threads = 256;
+
+	if (!dst || !src || B <= 0 || T < 2 || D <= 0 || !gpu_available())
+		return -1;
+	n = B * (T - 1) * D;
+	unpack_seq_rows_kernel<<<(n + threads - 1) / threads, threads>>>(dst,
+	    src, B, T, D);
+	return launch_done();
 }
 
 static int gpu_layernorm_forward_ex_locked(ann_real *y, const ann_real *x,

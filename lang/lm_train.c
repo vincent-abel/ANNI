@@ -619,6 +619,7 @@ static int train_mid_val_due(int done, int total, int *next_pct)
 static int pack_run_body(lm *model, pack_ctx *p, int b, double *mean_ce,
 	pack_slot *s, const int *lens)
 {
+	/* Keep seqlens through transformer bwd (TC/FA masks). */
 	gpu_attn_set_seqlens(lens);
 	if (lm_forward_cache_packed(model, p->ids, b, p->T, s->c) != 0) {
 		gpu_attn_set_seqlens(NULL);
@@ -629,8 +630,12 @@ static int pack_run_body(lm *model, pack_ctx *p, int b, double *mean_ce,
 		gpu_attn_set_seqlens(NULL);
 		return -1;
 	}
-	gpu_attn_set_seqlens(NULL);
-	return lm_backward_packed(model, s->dh, s->c);
+	{
+		int rc = lm_backward_packed(model, s->dh, s->c);
+
+		gpu_attn_set_seqlens(NULL);
+		return rc;
+	}
 }
 
 static int pack_run(lm *model, pack_ctx *p, int b, double *mean_ce)
@@ -832,11 +837,20 @@ double lm_train_corpus_val(lm *model, text_dataset *ds, lm_adam *opt,
 		eval_every = 1;
 	if (eval_windows < 0)
 		eval_windows = 0;
+	if (debug && !g_progress_fn)
+		dbg_stamp("computing start NLL");
 	last = lm_nll(model, ds->ids,
 	    ds->n_ids < LM_MAX_CTX ? ds->n_ids : LM_MAX_CTX);
 	win = -1.0;
-	if (eval_every > 0)
+	if (eval_every > 0) {
+		if (debug && !g_progress_fn) {
+			snprintf(msg, sizeof(msg),
+			    "computing start window NLL (eval_windows=%d)",
+			    eval_windows);
+			dbg_stamp(msg);
+		}
 		win = lm_nll_windows(model, val ? val : ds, eval_windows);
+	}
 	t0 = wall_sec();
 	{
 		train_progress tp;
@@ -1058,9 +1072,22 @@ double lm_train_corpus_val(lm *model, text_dataset *ds, lm_adam *opt,
 					break;
 				}
 			}
-			/* Epoch boundary: long ctx NLL; optional window subsample. */
-			last = lm_nll(model, ds->ids,
-			    ds->n_ids < LM_MAX_CTX ? ds->n_ids : LM_MAX_CTX);
+			/*
+			** Epoch boundary: keep live train-CE EMA in `last`;
+			** long-ctx lm_nll is a separate probe (do not clobber).
+			*/
+			{
+				double ctx_nll = lm_nll(model, ds->ids,
+				    ds->n_ids < LM_MAX_CTX ? ds->n_ids
+				    : LM_MAX_CTX);
+
+				if (debug && !g_progress_fn && ctx_nll >= 0.0) {
+					snprintf(msg, sizeof(msg),
+					    "epoch %d ctx NLL %.4f (train EMA %.4f)",
+					    ep + 1, ctx_nll, last);
+					dbg_stamp(msg);
+				}
+			}
 			if (eval_every > 0 && ((ep + 1) % eval_every) == 0)
 				win = lm_nll_windows(model, val ? val : ds,
 				    eval_windows);

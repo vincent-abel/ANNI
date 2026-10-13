@@ -120,6 +120,7 @@
 - [Attention heads scale (R5b)](attention-heads-scale.md)
 - [Activation checkpointing (R9/S11)](activation-checkpointing.md)
 - [Flash attention (R11/S7)](flash-attention.md)
+- [Tiled flash attention (40TF T1)](tiled-flash-attention.md)
 - [Variable-length packing (E8)](variable-length-packing.md)
 - [Compile profile (E12)](compile-profile.md)
 
@@ -394,7 +395,7 @@ Short guides for the planned path from the byte-level toy model toward a small s
 Single precision halves memory and speeds GEMMs versus today's doubles. A new LMCF checkpoint magic marks float files, and the GPU path moves to cublasSgemm. Pure FP16 is deferred.
 
 ### [Cheaper window eval](cheaper-window-eval.md)
---eval-every and --eval-windows cut the cost of lm_nll_windows during training. A fixed strided subset keeps curves comparable. A larger eval still runs at the end.
+--eval-every and --eval-windows cut the cost of lm_nll_windows during training (defaults: every epoch, 32 windows; `0` windows = full pass). A fixed strided subset keeps curves comparable. A larger eval still runs at the end.
 
 ### [Train window vs generate](train-window-vs-generate.md)
 The default --window becomes 64 while LM_MAX_CTX stays 128. Training length sets what the model has seen; the max sets what it accepts. Long prompts keep their most recent tokens.

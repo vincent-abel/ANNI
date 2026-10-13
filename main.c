@@ -160,7 +160,8 @@ static int run_lm_train_core(int argc, char **argv, int use_tower)
 	window = atoi(arg_value(argc, argv, "--window", "64"));
 	seed = atoi(arg_value(argc, argv, "--seed", "1"));
 	eval_every = atoi(arg_value(argc, argv, "--eval-every", "1"));
-	eval_windows = atoi(arg_value(argc, argv, "--eval-windows", "0"));
+	/* 0 = all windows (slow); default 32 matches mid-epoch subsample. */
+	eval_windows = atoi(arg_value(argc, argv, "--eval-windows", "32"));
 	debug = arg_flag(argc, argv, "-d", "--debug");
 	force = arg_flag(argc, argv, "-y", "--force");
 	gen_prompt = arg_value(argc, argv, "--prompt", "The ");

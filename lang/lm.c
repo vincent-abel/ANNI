@@ -671,7 +671,17 @@ int lm_loss_backward_packed_lens(lm *model, const lm_cache *c, const int *ids,
 		return -1;
 	}
 	mat_try_pin(dhidden);
-	/* Gather: prefer D2D when hidden is device-resident (R1). */
+	/* Gather: prefer one kernel; else B× D2D; else host. */
+	if (c->hidden->d_data && c->hidden->on_device != MAT_DEV_HOST
+	    && hc->d_data && gpu_available()
+	    && gpu_pack_seq_rows(hc->d_data, c->hidden->d_data, B, T,
+	    LM_D_MODEL) == 0) {
+		for (b = 0; b < B; b++)
+			for (t = 0; t < T - 1; t++)
+				tgt[b * (T - 1) + t] = ids[b * T + t + 1];
+		hc->on_device = MAT_DEV_DEVICE;
+		goto gather_done;
+	}
 	if (c->hidden->d_data && c->hidden->on_device != MAT_DEV_HOST
 	    && hc->d_data && gpu_available()) {
 		for (b = 0; b < B; b++) {
@@ -701,6 +711,11 @@ gather_done:
 	if (rc == 0) {
 		mat_zero_dev(dhidden);
 		if (dhc->d_data && dhc->on_device != MAT_DEV_HOST
+		    && dhidden->d_data && gpu_available()
+		    && gpu_unpack_seq_rows(dhidden->d_data, dhc->d_data, B, T,
+		    LM_D_MODEL) == 0) {
+			dhidden->on_device = MAT_DEV_DEVICE;
+		} else if (dhc->d_data && dhc->on_device != MAT_DEV_HOST
 		    && dhidden->d_data && gpu_available()) {
 			for (b = 0; b < B; b++) {
 				if (gpu_memcpy_d2d(
@@ -772,16 +787,17 @@ size_t lm_packed_bytes(int B, int T, int vocab_size)
 	    + 2.0 * (double)LM_D_FF / LM_D_MODEL + 6.0) * rows * LM_D_MODEL;
 	scores = (double)B * LM_N_HEADS * (double)T * (double)T;
 	/*
-	** S11: checkpoint keeps ~2 live blocks of acts. S7 flash: no persistent
-	** w_all; bwd still peaks at one layer of recomputed scores.
+	** S11: checkpoint keeps ~2 live blocks of acts. Tiled flash (S7/40TF):
+	** no T×T HBM — only B·H·T logsumexp (~scores/T). Non-flash keeps
+	** scores × live layers (or ×N_BLOCKS without ckpt).
 	*/
 	live_blocks = block_act_checkpoint_enabled() ? 2.0
 	    : (double)LM_N_BLOCKS;
 	bytes = per_layer_acts * live_blocks;
 	if (attn_flash_enabled())
-		bytes += scores;		/* peak recompute, not ×N_BLOCKS */
+		bytes += (double)B * LM_N_HEADS * (double)T;	/* Lstat only */
 	else
-		bytes += scores * (double)LM_N_BLOCKS;
+		bytes += scores * live_blocks;
 	bytes += 2.0 * rows * (double)vocab_size;	/* logits + delta */
 	bytes += 4.0 * rows * LM_D_MODEL;
 	/* S14: 1.35× after S12 reuse (was 1.6). */

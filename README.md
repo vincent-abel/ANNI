@@ -226,7 +226,7 @@ Observed headroom on a 16 GB card at current toy scale (`D=256`, `LM_BATCH_AUT
 
 ### Speed stack wave 2 (Flash → epilogues → streams)
 
-- [x] **S7** Flash-style attn (`--flash-attn`, finish **R11**); see [docs/flash-attention.md](docs/flash-attention.md)
+- [x] **S7** Flash-style attn (`--flash-attn`, finish **R11**); TC GemmEx QK/AV under the same flag; see [docs/flash-attention.md](docs/flash-attention.md)
 - [x] **S8** Fused bias+ReLU epilogue; see [docs/fused-epilogues.md](docs/fused-epilogues.md)
 - [x] **S9** Multi-stream overlap (copy stream + docs); see [docs/multi-stream-train.md](docs/multi-stream-train.md)
 - [x] **S10** Wave 2 bench; see [docs/speed-stack-bench.md](docs/speed-stack-bench.md)
@@ -238,6 +238,15 @@ Observed headroom on a 16 GB card at current toy scale (`D=256`, `LM_BATCH_AUT
 - [x] **S13** Optional `--adam-offload` async m/v; see [docs/adam-cpu-offload.md](docs/adam-cpu-offload.md)
 - [x] **S14** Retune `lm_packed_bytes` / auto-B; see [docs/huge-batch-vram.md](docs/huge-batch-vram.md)
 - [x] **S15** Final bench vs baseline; see [docs/speed-stack-bench.md](docs/speed-stack-bench.md)
+
+### Reach ~40 TF on 16GB (scale + tiled FA)
+
+Stretch goal on RTX 5070 Ti (~88 TF BF16 peak / ~40 TF realistic). Meter is \(6P\cdot(\mathrm{tok/s})/10^{12}\); D=512 alone cannot hit 40 TF at realistic tok/s — need **tiled FA (VRAM)** + **D=1024/L=12 (fat GEMMs)** + fusion/graphs. Gates: ~5 TF → ~15 TF → ~40 TF. See [docs/sota-train-systems.md](docs/sota-train-systems.md).
+
+- [x] **T1** Tiled flash attn fwd+bwd (no `T×T` HBM, logsumexp only); see [docs/tiled-flash-attention.md](docs/tiled-flash-attention.md)
+- [ ] **T2** Scale config `D=1024`, heads=16, `FF=4096`, blocks=12; see [docs/scale-d1024-40tf.md](docs/scale-d1024-40tf.md)
+- [ ] **T3** Fused QKV + CE hot path / graphs-safe pack; see [docs/fused-qkv-ce-40tf.md](docs/fused-qkv-ce-40tf.md)
+- [ ] **T4** Bench milestones 5 / 15 / 40 TF; see [docs/speed-stack-bench.md](docs/speed-stack-bench.md)
 
 **Other fill / scale**
 
