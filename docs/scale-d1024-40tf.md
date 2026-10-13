@@ -40,3 +40,4 @@ Expect auto-B ≫ 1 and a `[attn] tiled flash` log line. Wiki resume of D=512 bi
 
 - First alloc / Adam state is heavy; OOM → lower `--vram-frac` or rely on act-checkpoint.
 - Live NLL EMA is train CE; ctx NLL is stamped separately at epoch end.
+- Prefer `--lr 3e-4` (or lower) at D=1024; weight init scales as \(0.02\sqrt{512/D}\).

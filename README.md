@@ -245,7 +245,7 @@ Stretch goal on RTX 5070 Ti (~88 TF BF16 peak / ~40 TF realistic). Meter is \(6P
 
 - [x] **T1** Tiled flash attn fwd+bwd (no `T×T` HBM, logsumexp only); see [docs/tiled-flash-attention.md](docs/tiled-flash-attention.md)
 - [x] **T2** Scale config `D=1024`, heads=16, `FF=4096`, blocks=12; see [docs/scale-d1024-40tf.md](docs/scale-d1024-40tf.md)
-- [ ] **T3** Fused QKV + CE hot path / graphs-safe pack; see [docs/fused-qkv-ce-40tf.md](docs/fused-qkv-ce-40tf.md)
+- [x] **T3** Fused QKV + CE hot path / graphs-safe pack; see [docs/fused-qkv-ce-40tf.md](docs/fused-qkv-ce-40tf.md)
 - [ ] **T4** Bench milestones 5 / 15 / 40 TF; see [docs/speed-stack-bench.md](docs/speed-stack-bench.md)
 
 **Other fill / scale**

@@ -276,6 +276,19 @@ int gpu_attn_tc_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat, mat *w,
 	return -1;
 }
 
+int gpu_attn_qkv_fused(mat *q, mat *k, mat *v, const mat *x, const mat *wq,
+	const mat *wk, const mat *wv)
+{
+	(void)q;
+	(void)k;
+	(void)v;
+	(void)x;
+	(void)wq;
+	(void)wk;
+	(void)wv;
+	return -1;
+}
+
 int gpu_pack_seq_rows(ann_real *dst, const ann_real *src, int B, int T, int D)
 {
 	(void)dst;

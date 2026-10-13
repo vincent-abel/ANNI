@@ -383,6 +383,9 @@ void lm_train_set_act_checkpoint(int on)
 void lm_train_set_flash_attn(int on)
 {
 	attn_set_flash(on);
+	/* New attn launch set invalidates captured graphs. */
+	if (g_cuda_graphs)
+		lm_train_set_cuda_graphs(1);
 }
 
 void lm_train_set_adam_offload(int on)

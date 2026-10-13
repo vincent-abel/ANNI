@@ -167,6 +167,9 @@ int	gpu_attn_tc_fwd(mat *concat, mat *w, const mat *q, const mat *k,
 int	gpu_attn_tc_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat,
 		mat *w, const mat *q, const mat *k, const mat *v,
 		int B, int T, int H, int dh);
+/* One GEMM X@ [Wq|Wk|Wv] then split into q,k,v (D x D weights). */
+int	gpu_attn_qkv_fused(mat *q, mat *k, mat *v, const mat *x,
+		const mat *wq, const mat *wk, const mat *wv);
 /* Pack CE gather: dst[b*(T-1)+t] = src[b*T+t] for t in [0,T-1). */
 int	gpu_pack_seq_rows(ann_real *dst, const ann_real *src, int B, int T,
 		int D);
