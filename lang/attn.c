@@ -13,7 +13,10 @@
 
 static double rand_w(void)
 {
-	return ((double)rand() / (double)RAND_MAX * 2.0 - 1.0) * 0.02;
+	/* Scale noise with width (0.02 at D=512); D=1024 needs smaller init. */
+	double s = 0.02 * sqrt(512.0 / (double)LM_D_MODEL);
+
+	return ((double)rand() / (double)RAND_MAX * 2.0 - 1.0) * s;
 }
 
 static void fill_rand(mat *m)
@@ -210,7 +213,13 @@ int attn_qkv_project(mat *q, mat *k, mat *v, const attn *a, const mat *x)
 {
 	if (!q || !k || !v || !a || !x)
 		return -1;
-	/* Three GEMMs back-to-back (GemmEx when --bf16/--fp16); fused W_qkv later. */
+	/*
+	** Fused X@[Wq|Wk|Wv] when CUDA (one GemmEx). Falls back to three
+	** mat_muls if pack/GEMM/split fails.
+	*/
+	if (gpu_available()
+	    && gpu_attn_qkv_fused(q, k, v, x, a->wq, a->wk, a->wv) == 0)
+		return 0;
 	if (mat_mul(q, x, a->wq) != 0)
 		return -1;
 	if (mat_mul(k, x, a->wk) != 0)

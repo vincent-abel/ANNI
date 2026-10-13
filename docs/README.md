@@ -122,6 +122,7 @@
 - [Flash attention (R11/S7)](flash-attention.md)
 - [Tiled flash attention (40TF T1)](tiled-flash-attention.md)
 - [Scale D=1024 / 12 blocks (40TF T2)](scale-d1024-40tf.md)
+- [Fused QKV + CE (40TF T3)](fused-qkv-ce-40tf.md)
 - [Variable-length packing (E8)](variable-length-packing.md)
 - [Compile profile (E12)](compile-profile.md)
 

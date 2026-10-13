@@ -16,7 +16,8 @@
 
 static double rand_w(void)
 {
-	return ((double)rand() / (double)RAND_MAX * 2.0 - 1.0) * 0.02;
+	return ((double)rand() / (double)RAND_MAX * 2.0 - 1.0)
+	    * (0.02 * sqrt(512.0 / (double)LM_D_MODEL));
 }
 
 /* S12: reuse CE / pack scratch across microbatches (steady B,T). */

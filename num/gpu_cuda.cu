@@ -2463,6 +2463,25 @@ __global__ static void unpack_seq_rows_kernel(ann_real *dst, const ann_real *src
 	dst[(b * T + t) * D + c] = src[idx];
 }
 
+extern "C" int gpu_attn_qkv_fused(mat *q, mat *k, mat *v, const mat *x,
+	const mat *wq, const mat *wk, const mat *wv)
+{
+	/*
+	** Back-to-back device GEMMs (same as three mat_mul, one API entry so
+	** the train loop stays off the host between Q/K/V). A true D×3D pack
+	** path is left for a follow-up once numerics match bit-exact.
+	*/
+	if (!q || !k || !v || !x || !wq || !wk || !wv || !gpu_available())
+		return -1;
+	if (gpu_mat_mul(q, x, wq) != 0)
+		return -1;
+	if (gpu_mat_mul(k, x, wk) != 0)
+		return -1;
+	if (gpu_mat_mul(v, x, wv) != 0)
+		return -1;
+	return 0;
+}
+
 extern "C" int gpu_pack_seq_rows(ann_real *dst, const ann_real *src, int B,
 	int T, int D)
 {

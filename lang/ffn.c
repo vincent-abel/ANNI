@@ -1,9 +1,11 @@
 /*
 **	Position-wise feed-forward block + backward
 */
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 #include "ffn.h"
+#include "lm_config.h"
 #include "gpu.h"
 #include "gradutil.h"
 #include "resid.h"
@@ -13,7 +15,7 @@ static double ffn_rand_weight(void)
 	double u;
 
 	u = (double)rand() / (double)RAND_MAX;
-	return (u * 2.0 - 1.0) * 0.02;
+	return (u * 2.0 - 1.0) * (0.02 * sqrt(512.0 / (double)LM_D_MODEL));
 }
 
 static double ffn_relu(double x)
