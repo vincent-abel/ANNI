@@ -35,3 +35,5 @@ tests/*.ann
 
 # real corpora fetched by scripts/fetch_wiki.sh (CC BY-SA, never vendored)
 data/wiki_*
+# Fixed overfit slice: contiguous head of wiki_simple, not the full dump.
+!data/wiki_overfit.txt
