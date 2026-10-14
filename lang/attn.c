@@ -646,6 +646,16 @@ attn_pcache *attn_pcache_create(int B, int T, int n_heads, int d_head)
 	mat_try_pin(c->v);
 	mat_try_pin(c->concat);
 	/*
+	** Per-layer causal logsumexp (B·H·T), not a shared global. The tiled
+	** backward of this block must use the softmax this forward wrote.
+	*/
+	c->lse = mat_create(B * n_heads * T, 1);
+	if (c->lse) {
+		mat_try_pin(c->lse);
+		if (gpu_available() && !c->lse->d_data)
+			mat_free(&c->lse);
+	}
+	/*
 	** Score buffer (B·H·T)×T for TC/fused. Cap at 256 MiB so large-B
 	** --flash-attn can omit it and use the no-w_all flash kernel.
 	*/
@@ -722,6 +732,7 @@ void attn_pcache_free(attn_pcache **c)
 	mat_free(&(*c)->v);
 	mat_free(&(*c)->concat);
 	mat_free(&(*c)->w_all);
+	mat_free(&(*c)->lse);
 	mat_free(&(*c)->dq);
 	mat_free(&(*c)->dk);
 	mat_free(&(*c)->dv);
@@ -783,7 +794,7 @@ int attn_mha_forward_packed(mat *out, attn *a, const mat *x, attn_pcache *c)
 	c->fused = 0;
 	if (g_flash_attn
 	    && gpu_attn_flash_fwd(c->concat, c->q, c->k, c->v, c->B, T, nh,
-	    a->d_head) == 0) {
+	    a->d_head, c->lse) == 0) {
 		static int s_fa_once;
 
 		c->fused = 4;
@@ -884,7 +895,7 @@ int attn_mha_backward_packed(mat *dx, const mat *dout, attn *a,
 		return -1;
 	if (c->fused == 4) {
 		if (gpu_attn_tiled_bwd(dq, dk, dv, dconcat, c->concat, c->q,
-		    c->k, c->v, c->B, T, nh, a->d_head) != 0)
+		    c->k, c->v, c->lse, c->B, T, nh, a->d_head) != 0)
 			return -1;
 		goto proj;
 	}
@@ -896,33 +907,17 @@ int attn_mha_backward_packed(mat *dx, const mat *dout, attn *a,
 		goto proj;
 	}
 	if (c->fused == 2) {
-		mat *wtmp;
-
-		/* Prefer tiled bwd if logsumexp from a prior flash_fwd is live. */
-		if (gpu_attn_tiled_bwd(dq, dk, dv, dconcat, c->concat, c->q,
-		    c->k, c->v, c->B, T, nh, a->d_head) == 0)
-			goto proj;
-		wtmp = c->w_all;
-		if (!wtmp) {
-			wtmp = mat_create(c->B * nh * T, T);
-			if (!wtmp)
-				return -1;
-			mat_try_pin(wtmp);
-			if (!wtmp->d_data) {
-				mat_free(&wtmp);
-				return -1;
-			}
-		}
-		if (gpu_attn_recompute_w(wtmp, c->q, c->k, c->B, T, nh,
+		/*
+		** Slow path used to fill a B·H·T·T score tensor
+		** (gpu_attn_recompute_w) and then a second dS tensor.
+		** Recompute only the row logsumexp of the same causal
+		** softmax, then the tiled backward. T stays the train window.
+		*/
+		if (gpu_attn_recompute_w(c->lse, c->q, c->k, c->B, T, nh,
 		    a->d_head) != 0
-		    || gpu_attn_causal_bwd(dq, dk, dv, dconcat, wtmp, c->q,
-		    c->k, c->v, c->B, T, nh, a->d_head) != 0) {
-			if (wtmp != c->w_all)
-				mat_free(&wtmp);
+		    || gpu_attn_tiled_bwd(dq, dk, dv, dconcat, c->concat,
+		    c->q, c->k, c->v, c->lse, c->B, T, nh, a->d_head) != 0)
 			return -1;
-		}
-		if (wtmp != c->w_all)
-			mat_free(&wtmp);
 		goto proj;
 	}
 	if (c->fused == 1) {
