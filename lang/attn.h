@@ -68,6 +68,7 @@ typedef struct	attn_pcache {
 	mat		*concat;
 	attn_cache	**seq;		/* B per-sequence score caches (host path) */
 	mat		*w_all;		/* (B*H*T) x T weights, fused GPU path */
+	mat		*lse;		/* (B*H*T) x 1 causal logsumexp, not T×T */
 	mat		*dq;		/* backward scratch, lazily created */
 	mat		*dk;
 	mat		*dv;
