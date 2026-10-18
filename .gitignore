@@ -4,6 +4,17 @@
 .project
 .settings/
 
+# Cursor local state / rules / session handoff (never vendored)
+.cursor/
+
+# secrets and local credentials
+.webui_secret_key
+.env
+.env.*
+*.pem
+*credentials*
+*secret*
+
 #files being edited
 *~
 
@@ -11,6 +22,8 @@
 *.lst
 *.o
 *.bin
+*.bin.best
+*.best
 objects/
 *.eep
 *.lss
@@ -24,6 +37,12 @@ autotrain
 tests/test_ann
 gui/ann-gui
 gui/__pycache__/
+scripts/pretok_ids
+
+# models, vocabs, local train artifacts (never vendored)
+models/
+*.vocab
+*.autotrain.json
 
 # serialized models from tests
 *.ann

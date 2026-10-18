@@ -102,6 +102,7 @@ lm_adam *lm_adam_create(lm *model)
 	opt->t = 0;
 	opt->h_m = opt->h_v = NULL;
 	opt->d_param = opt->d_grad = opt->d_m = opt->d_v = NULL;
+	opt->d_param_bf16 = NULL;
 	opt->dev_mv = 0;
 	opt->params_valid = 0;
 	opt->offload_mv = 0;
@@ -136,13 +137,16 @@ lm_adam *lm_adam_create(lm *model)
 
 static void release_gpu(lm_adam *opt)
 {
+	gpu_adam_set_bf16_flat(NULL, NULL, 0);
 	gpu_free(opt->d_param);
+	gpu_free(opt->d_param_bf16);
 	gpu_free(opt->d_grad);
 	gpu_free(opt->d_m);
 	gpu_free(opt->d_v);
 	free(opt->h_m);
 	free(opt->h_v);
 	opt->d_param = opt->d_grad = opt->d_m = opt->d_v = NULL;
+	opt->d_param_bf16 = NULL;
 	opt->h_m = opt->h_v = NULL;
 	opt->dev_mv = 0;
 	opt->params_valid = 0;
@@ -191,7 +195,10 @@ static int gpu_buffers_init(lm_adam *opt)
 		opt->h_v = malloc(nbytes);
 		opt->d_param = gpu_malloc(nbytes);
 		opt->d_grad = gpu_malloc(nbytes);
-		if (!opt->h_m || !opt->h_v || !opt->d_param || !opt->d_grad) {
+		/* BF16 twin of the flat masters (GEMM path; ~0.5 GB @ 252M). */
+		opt->d_param_bf16 = gpu_malloc((size_t)opt->n * 2u);
+		if (!opt->h_m || !opt->h_v || !opt->d_param || !opt->d_grad
+		    || !opt->d_param_bf16) {
 			release_gpu(opt);
 			return -1;
 		}
@@ -199,6 +206,47 @@ static int gpu_buffers_init(lm_adam *opt)
 			opt->h_m[i] = opt->slots[i].m;
 			opt->h_v[i] = opt->slots[i].v;
 		}
+		/*
+		** Alias mat weight/grad twins into the flat buffers so gather /
+		** scatter become no-ops (Adam updates weights in place).
+		*/
+		for (i = 0; i < opt->n_segs; i++) {
+			lm_adam_seg *s = &opt->segs[i];
+			size_t nb;
+			ann_real *dp;
+			ann_real *dg;
+
+			if (!s->w || !s->dw || s->host_use)
+				continue;
+			nb = (size_t)s->n * sizeof(ann_real);
+			dp = opt->d_param + s->off;
+			dg = opt->d_grad + s->off;
+			if (s->w->d_data && s->w->on_device != MAT_DEV_HOST) {
+				if (gpu_memcpy_d2d(dp, s->w->d_data, nb) != 0)
+					return -1;
+				mat_device_free(s->w);
+			} else if (s->w->data) {
+				if (gpu_memcpy_h2d(dp, s->w->data, nb) != 0)
+					return -1;
+				mat_device_free(s->w);
+			} else
+				continue;
+			s->w->d_data = dp;
+			s->w->on_device = MAT_DEV_ALIASED;
+			mat_device_free(s->dw);
+			s->dw->d_data = dg;
+			s->dw->on_device = MAT_DEV_ALIASED;
+			(void)gpu_memset(dg, 0, nb);
+		}
+		opt->params_valid = 1;
+		gpu_half_wt_invalidate(NULL);	/* old twin addrs are gone */
+		gpu_adam_set_bf16_flat(opt->d_param_bf16, opt->d_param, opt->n);
+		if (gpu_adam_seed_bf16_flat(opt->d_param_bf16, opt->d_param,
+		    opt->n) != 0) {
+			release_gpu(opt);
+			return -1;
+		}
+		gpu_device_sync();
 	}
 	nbytes = (size_t)opt->n * sizeof(ann_real);
 	/* S13: re-alloc m/v each step when offloaded between steps. */
@@ -288,6 +336,10 @@ static int seg_gather(lm_adam *opt, const lm_adam_seg *s)
 	}
 	w = s->w;
 	dw = s->dw;
+	/* Aliased into d_param/d_grad: already in place. */
+	if (w->on_device == MAT_DEV_ALIASED && dw->on_device == MAT_DEV_ALIASED
+	    && w->d_data == dp && dw->d_data == dg)
+		return 0;
 	if (w->d_data && w->on_device != MAT_DEV_HOST) {
 		/* Device twin is current (device- or host-synced). */
 		if (!opt->params_valid
@@ -311,12 +363,23 @@ static int seg_scatter(lm_adam *opt, const lm_adam_seg *s)
 	nb = (size_t)s->n * sizeof(ann_real);
 	dp = opt->d_param + s->off;
 	if (s->wv) {
-		if (gpu_memcpy_d2h(s->wv->data, dp, nb) != 0)
+		/* One stream sync after every vec, not one sync per vec. */
+		if (gpu_host_pin(s->wv->data, nb) != 0
+		    || gpu_memcpy_d2h_async(s->wv->data, dp, nb) != 0)
 			return -1;
 		vec_zero(s->dwv);
 		return 0;
 	}
 	w = s->w;
+	if (w->on_device == MAT_DEV_ALIASED && w->d_data == dp) {
+		/* In-place Adam already wrote w->d_data; flat d_grad zeroed once. */
+		if (s->host_use && w->data
+		    && gpu_memcpy_d2h(w->data, dp, nb) != 0)
+			return -1;
+		if (s->host_use)
+			mat_zero(s->dw);
+		return 0;
+	}
 	if (w->d_data && gpu_memcpy_d2d(w->d_data, dp, nb) == 0) {
 		if (!s->host_use)
 			w->on_device = MAT_DEV_DEVICE;	/* host stale until pulled */
@@ -348,17 +411,28 @@ static int adam_step_gpu(lm_adam *opt, double lr, double grad_scale)
 
 	if (gpu_buffers_init(opt) != 0)
 		return -1;
-	gpu_device_sync();	/* grads written by queued batch kernels */
+	/*
+	** Same-stream gather → Adam → scatter (async D2D). One sync after
+	** scatter so host bias/LN mirrors from D2H are visible before return.
+	*/
 	for (i = 0; i < opt->n_segs; i++)
 		if (seg_gather(opt, &opt->segs[i]) != 0)
 			goto fail;
-	if (gpu_adam_step_dev(opt->d_param, opt->d_grad, opt->d_m, opt->d_v,
-	    opt->n, lr, opt->beta1, opt->beta2, opt->eps, opt->t, grad_scale) != 0)
+	if (gpu_adam_step_dev_bf16(opt->d_param, opt->d_param_bf16,
+	    opt->d_grad, opt->d_m, opt->d_v, opt->n, lr, opt->beta1, opt->beta2,
+	    opt->eps, opt->t, grad_scale) != 0)
 		goto fail;
 	opt->dev_mv = 1;
 	for (i = 0; i < opt->n_segs; i++)
 		if (seg_scatter(opt, &opt->segs[i]) != 0)
 			goto fail;
+	if (gpu_stream_sync() != 0)
+		goto fail;
+	/* adam_kernel zeros d_grad; BF16 flat twins already rewritten in-kernel. */
+	/*
+	** No device-wide sync here. Epoch save pulls host via
+	** lm_weights_ensure_host.
+	*/
 	opt->params_valid = 1;
 	if (g_adam_offload)
 		opt->offload_mv = 1;

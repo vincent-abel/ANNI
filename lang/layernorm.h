@@ -28,6 +28,9 @@ void		layernorm_free(layernorm **ln);
 void		layernorm_zero_grad(layernorm *ln);
 int		layernorm_forward(mat *x, const layernorm *ln);
 int		layernorm_forward_cache(mat *x, layernorm *ln, ln_cache *c);
+/* out = LN(in); avoids copy_mat(out, in) before in-place LN. */
+int		layernorm_forward_into(mat *out, const mat *in, layernorm *ln,
+			ln_cache *c);
 int		layernorm_backward(mat *dx, const mat *dy, layernorm *ln,
 			const ln_cache *c);
 

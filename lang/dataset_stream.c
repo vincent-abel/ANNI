@@ -5,9 +5,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/mman.h>
 #include <sys/stat.h>
+#ifdef _WIN32
+#include "ann_posix.h"
+#else
+#include <sys/mman.h>
 #include <unistd.h>
+#endif
 #include "dataset_stream.h"
 #include "tokenize.h"
 #include "vocab.h"
@@ -106,8 +110,6 @@ struct text_docs {
 text_docs *text_docs_open(const char *path)
 {
 	text_docs *d;
-	int fd;
-	struct stat st;
 
 	if (!path)
 		return NULL;
@@ -118,21 +120,29 @@ text_docs *text_docs_open(const char *path)
 	d->cap = 4096;
 	d->buf = malloc(d->cap);
 	d->at_line_start = 1;
-	fd = open(path, O_RDONLY);
-	if (fd >= 0 && fstat(fd, &st) == 0 && st.st_size > 0) {
-		d->map = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE,
-		    fd, 0);
-		if (d->map != MAP_FAILED) {
-			d->map_len = (size_t)st.st_size;
-			close(fd);
-			if (!d->buf) {
-				text_docs_free(&d);
-				return NULL;
+#ifndef _WIN32
+	{
+		int fd;
+		struct stat st;
+
+		/* E14: mmap whole file when possible (Windows uses fread path). */
+		fd = open(path, O_RDONLY);
+		if (fd >= 0 && fstat(fd, &st) == 0 && st.st_size > 0) {
+			d->map = mmap(NULL, (size_t)st.st_size, PROT_READ,
+			    MAP_PRIVATE, fd, 0);
+			if (d->map != MAP_FAILED) {
+				d->map_len = (size_t)st.st_size;
+				close(fd);
+				if (!d->buf) {
+					text_docs_free(&d);
+					return NULL;
+				}
+				return d;
 			}
-			return d;
+			close(fd);
 		}
-		close(fd);
 	}
+#endif
 	d->fp = fopen(path, "rb");
 	if (!d->fp || !d->buf) {
 		text_docs_free(&d);
@@ -145,8 +155,10 @@ void text_docs_free(text_docs **d)
 {
 	if (!d || !*d)
 		return;
+#ifndef _WIN32
 	if ((*d)->map != MAP_FAILED && (*d)->map)
 		munmap((*d)->map, (*d)->map_len);
+#endif
 	if ((*d)->fp)
 		fclose((*d)->fp);
 	free((*d)->buf);

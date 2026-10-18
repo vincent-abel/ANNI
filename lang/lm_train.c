@@ -5,8 +5,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/time.h>
 #include <time.h>
+#ifdef _WIN32
+#include "ann_posix.h"
+#else
+#include <sys/time.h>
+#endif
 #include "attn.h"
 #include "block.h"
 #include "gpu.h"
@@ -35,7 +39,23 @@ static void fill_throughput(train_progress *tp, int tokens_done, double elapsed)
 	}
 	fr = 0;
 	tot = 0;
-	if (gpu_available() && gpu_mem_info(&fr, &tot) == 0 && tot > 0)
+	/*
+	** cudaMemGetInfo stalls the device. The meter calls this every step,
+	** so reuse the last sample for a few steps.
+	*/
+	{
+		static unsigned mem_tick;
+		static size_t mem_fr;
+		static size_t mem_tot;
+
+		if ((++mem_tick & 7u) == 1u && gpu_available()
+		    && gpu_mem_info(&mem_fr, &mem_tot) == 0) {
+			/* kept */
+		}
+		fr = mem_fr;
+		tot = mem_tot;
+	}
+	if (tot > 0)
 		tp->vram_used_mb = (double)(tot - fr) / 1048576.0;
 }
 
@@ -58,6 +78,7 @@ static int g_cuda_graphs;
 static int g_graph_B;
 static int g_graph_T;
 static int g_graph_ready;
+static int g_graph_warmed;
 static int g_compute_prec;
 static double g_loss_scale = 1.0;
 static int g_loss_scale_good;
@@ -238,10 +259,26 @@ static void dbg_progress(int ep, int epochs, int done, int total,
 	size_t fr;
 	size_t tot;
 	static double last_print;
+	static double last_tok_t;
+	static int last_tok_n;
+	double interval_ts;
+	int dtok;
+	double dt;
 
 	now = wall_sec();
-	if (!force && last_print > 0.0 && (now - last_print) < 0.25)
+	/* 0.5s cadence: cudaMemGetInfo each frame can stall the GPU. */
+	if (!force && last_print > 0.0 && (now - last_print) < 0.5)
 		return;
+	/* Interval tok/s between progress frames (gate uses this after warmup). */
+	interval_ts = -1.0;
+	if (last_tok_t > 0.0 && tokens_done > last_tok_n) {
+		dtok = tokens_done - last_tok_n;
+		dt = now - last_tok_t;
+		if (dt > 0.0)
+			interval_ts = (double)dtok / dt;
+	}
+	last_tok_t = now;
+	last_tok_n = tokens_done;
 	last_print = now;
 
 	width = 12;
@@ -275,7 +312,10 @@ static void dbg_progress(int ep, int epochs, int done, int total,
 			eta = elapsed * (double)(total - done) / (double)done;
 		if (tokens_done > 0) {
 			ms_tok = 1000.0 * elapsed / (double)tokens_done;
-			tok_sec = (double)tokens_done / elapsed;
+			/* Prefer interval tok/s for the meter; fall back to cum. */
+			tok_sec = interval_ts > 0.0
+			    ? interval_ts
+			    : (double)tokens_done / elapsed;
 			/* Rough decoder train FLOPs ~ 6 * N_params * tokens. */
 			tflops = 6.0 * (double)(LM_N_BLOCKS
 			    * (12L * LM_D_MODEL * LM_D_MODEL
@@ -311,8 +351,20 @@ static void dbg_progress(int ep, int epochs, int done, int total,
 		    " ~%.2fTF", tflops);
 	fr = 0;
 	tot = 0;
-	if (gpu_available() && gpu_mem_info(&fr, &tot) == 0 && tot > 0
-	    && (size_t)nline < sizeof(line))
+	{
+		static double mem_t;
+		static size_t mem_fr;
+		static size_t mem_tot;
+
+		if (gpu_available() && (mem_t <= 0.0 || (now - mem_t) > 2.0
+		    || force)) {
+			if (gpu_mem_info(&mem_fr, &mem_tot) == 0)
+				mem_t = now;
+		}
+		fr = mem_fr;
+		tot = mem_tot;
+	}
+	if (tot > 0 && (size_t)nline < sizeof(line))
 		nline += snprintf(line + nline, sizeof(line) - (size_t)nline,
 		    " %.0fMB", (double)(tot - fr) / 1048576.0);
 	if (eta >= 0.0 && (size_t)nline < sizeof(line))
@@ -402,6 +454,7 @@ void lm_train_set_cuda_graphs(int on)
 {
 	g_cuda_graphs = on ? 1 : 0;
 	g_graph_ready = 0;
+	g_graph_warmed = 0;
 	g_graph_B = 0;
 	g_graph_T = 0;
 	gpu_graph_destroy();
@@ -416,6 +469,21 @@ void lm_train_set_compute_prec(int prec)
 	g_loss_scale = (prec == GPU_PREC_FP16) ? 1024.0 : 1.0;
 	g_loss_scale_good = 0;
 	/* Dtype change invalidates captured graphs. */
+	if (g_cuda_graphs)
+		lm_train_set_cuda_graphs(1);
+}
+
+void lm_train_set_fp8(int on)
+{
+	/* Enables fwd E4M3 + dgrad E5M2 inside gpu_set_fp8. */
+	gpu_set_fp8(on);
+	if (g_cuda_graphs)
+		lm_train_set_cuda_graphs(1);
+}
+
+void lm_train_set_fp8_dgrad(int on)
+{
+	gpu_set_fp8_dgrad(on);
 	if (g_cuda_graphs)
 		lm_train_set_cuda_graphs(1);
 }
@@ -525,7 +593,7 @@ static int pack_slot_get(pack_slot *s, int B, int T)
 		return 0;
 	pack_slot_free(s);
 	s->c = lm_cache_create_packed(B, T);
-	s->dh = mat_create(B * T, LM_D_MODEL);
+	s->dh = mat_create_dev(B * T, LM_D_MODEL);
 	if (!s->c || !s->dh) {
 		pack_slot_free(s);
 		return -1;
@@ -622,23 +690,62 @@ static int train_mid_val_due(int done, int total, int *next_pct)
 static int pack_run_body(lm *model, pack_ctx *p, int b, double *mean_ce,
 	pack_slot *s, const int *lens)
 {
+	static int s_prof_left;
+	static int s_prof_init;
+	struct timeval tv0;
+	struct timeval tv1;
+	struct timeval tv2;
+	struct timeval tv3;
+	int rc;
+
+	if (!s_prof_init) {
+		const char *e = getenv("ANN_STEP_PROF");
+
+		s_prof_left = (e && e[0] == '1') ? 8 : 0;
+		s_prof_init = 1;
+	}
 	/* Keep seqlens through transformer bwd (TC/FA masks). */
 	gpu_attn_set_seqlens(lens);
+	if (s_prof_left > 0)
+		gettimeofday(&tv0, NULL);
 	if (lm_forward_cache_packed(model, p->ids, b, p->T, s->c) != 0) {
 		gpu_attn_set_seqlens(NULL);
 		return -1;
+	}
+	if (s_prof_left > 0) {
+		gpu_device_sync();
+		gettimeofday(&tv1, NULL);
 	}
 	if (lm_loss_backward_packed_lens(model, s->c, p->ids, b, p->T, lens,
 	    s->dh, mean_ce) != 0) {
 		gpu_attn_set_seqlens(NULL);
 		return -1;
 	}
-	{
-		int rc = lm_backward_packed(model, s->dh, s->c);
-
-		gpu_attn_set_seqlens(NULL);
-		return rc;
+	if (s_prof_left > 0) {
+		gpu_device_sync();
+		gettimeofday(&tv2, NULL);
 	}
+	rc = lm_backward_packed(model, s->dh, s->c);
+	gpu_attn_set_seqlens(NULL);
+	if (s_prof_left > 0) {
+		double ms0;
+		double ms1;
+		double ms2;
+
+		gpu_device_sync();
+		gettimeofday(&tv3, NULL);
+		ms0 = (tv1.tv_sec - tv0.tv_sec) * 1e3
+		    + (tv1.tv_usec - tv0.tv_usec) / 1e3;
+		ms1 = (tv2.tv_sec - tv1.tv_sec) * 1e3
+		    + (tv2.tv_usec - tv1.tv_usec) / 1e3;
+		ms2 = (tv3.tv_sec - tv2.tv_sec) * 1e3
+		    + (tv3.tv_usec - tv2.tv_usec) / 1e3;
+		fprintf(stderr,
+		    "[stepprof] fwd=%.1fms loss=%.1fms bwd=%.1fms total=%.1fms\n",
+		    ms0, ms1, ms2, ms0 + ms1 + ms2);
+		s_prof_left--;
+	}
+	return rc;
 }
 
 static int pack_run(lm *model, pack_ctx *p, int b, double *mean_ce)
@@ -648,6 +755,14 @@ static int pack_run(lm *model, pack_ctx *p, int b, double *mean_ce)
 	int i;
 	int need_lens;
 
+	/*
+	** One live packed slot only. Keeping Bmax + tail slots doubled peak
+	** VRAM and OOM'd the last partial batch at B≈120 on 16GB cards.
+	*/
+	if (b != p->Bmax && p->slot[0].B)
+		pack_slot_free(&p->slot[0]);
+	if (b == p->Bmax && p->slot[1].B)
+		pack_slot_free(&p->slot[1]);
 	s = (b == p->Bmax) ? &p->slot[0] : &p->slot[1];
 	if (pack_slot_get(s, b, p->T) != 0)
 		return -1;
@@ -667,28 +782,51 @@ static int pack_run(lm *model, pack_ctx *p, int b, double *mean_ce)
 	** Graphs need fixed device addresses and no host ops in the region.
 	** Skip when varlen seqlens change the mask, or B/T changes.
 	*/
-	/* mean_ce unavailable on replay (capture uses NULL); leave unset. */
+	/* Graph capture includes CE→pinned D2H; fetch mean after replay. */
 	if (g_cuda_graphs && gpu_available() && !lens) {
 		if (g_graph_ready && g_graph_B == b && g_graph_T == p->T) {
 			if (gpu_graph_replay() == 0) {
-				if (mean_ce)
-					*mean_ce = -1.0;
+				if (mean_ce) {
+					int rows = b * (p->T > 1 ? p->T - 1 : 1);
+
+					if (gpu_ce_fetch_mean(mean_ce, rows) != 0)
+						*mean_ce = -1.0;
+				}
 				return 0;
 			}
 			g_graph_ready = 0;
 			gpu_graph_destroy();
 		}
-		if ((!g_graph_ready || g_graph_B != b || g_graph_T != p->T)
-		    && gpu_graph_begin() == 0) {
-			if (pack_run_body(model, p, b, NULL, s, NULL) == 0
-			    && gpu_graph_end() == 0) {
+		/*
+		** Warm one uncaptured step so cudaMalloc/scratch resize happen
+		** outside BeginCapture (malloc during capture segfaults).
+		*/
+		if (!g_graph_warmed || g_graph_B != b || g_graph_T != p->T) {
+			int rc;
+
+			rc = pack_run_body(model, p, b, mean_ce, s, NULL);
+			g_graph_warmed = 1;
+			g_graph_B = b;
+			g_graph_T = p->T;
+			g_graph_ready = 0;
+			return rc;
+		}
+		if (gpu_graph_begin() == 0) {
+			int body_rc = pack_run_body(model, p, b, NULL, s, NULL);
+
+			if (body_rc == 0 && gpu_graph_end() == 0) {
 				g_graph_ready = 1;
-				g_graph_B = b;
-				g_graph_T = p->T;
-				if (mean_ce)
-					*mean_ce = -1.0;
+				if (mean_ce) {
+					int rows = b * (p->T > 1 ? p->T - 1 : 1);
+
+					if (gpu_ce_fetch_mean(mean_ce, rows) != 0)
+						*mean_ce = -1.0;
+				}
 				return 0;
 			}
+			/* Must leave capture mode even when body fails. */
+			if (body_rc != 0)
+				(void)gpu_graph_end();
 			gpu_graph_destroy();
 			g_graph_ready = 0;
 		}
@@ -942,7 +1080,13 @@ double lm_train_corpus_val(lm *model, text_dataset *ds, lm_adam *opt,
 					pack_ctx_free(&pk);
 					return -1.0;
 				}
-				lm_adam_zero_grad(model);
+				/*
+				** Device grads are aliased into d_grad and zeroed
+				** by the Adam kernel. Zeroing each mat here was a
+				** stack of sync memsets (~30ms). Host db_head is the
+				** one accumulator CE adds on the CPU.
+				*/
+				vec_zero(model->db_head);
 				/* Defer GEMM D2H until the optimizer step boundary. */
 				gpu_set_sync_mode(GPU_SYNC_BATCH);
 				/*
@@ -954,6 +1098,9 @@ double lm_train_corpus_val(lm *model, text_dataset *ds, lm_adam *opt,
 				{
 					double ce_sum = 0.0;
 					int ce_w = 0;
+					double t_win = 0.0;
+					double t_pack = 0.0;
+					double ts;
 
 					for (k = 0; k < g_grad_accum && idx < nw
 					    && ok; k++) {
@@ -961,6 +1108,7 @@ double lm_train_corpus_val(lm *model, text_dataset *ds, lm_adam *opt,
 
 						bb = nw - idx < batch_size
 						    ? nw - idx : batch_size;
+						ts = wall_sec();
 						for (j = 0; j < bb; j++) {
 							if (text_dataset_window(ds,
 							    order[idx + j],
@@ -971,10 +1119,26 @@ double lm_train_corpus_val(lm *model, text_dataset *ds, lm_adam *opt,
 								break;
 							}
 						}
-						if (!ok || pack_run(model, &pk, bb,
-						    &mb_ce) != 0) {
-							ok = 0;
-							break;
+						t_win += wall_sec() - ts;
+						/*
+						** Sample CE every 8 microbatches:
+						** skips CE D2H most steps (meter EMA).
+						*/
+						{
+							static unsigned ce_tick;
+							double *ce_ptr = NULL;
+
+							if (((++ce_tick) & 7u)
+							    == 0u)
+								ce_ptr = &mb_ce;
+							ts = wall_sec();
+							if (!ok || pack_run(model,
+							    &pk, bb, ce_ptr)
+							    != 0) {
+								ok = 0;
+								break;
+							}
+							t_pack += wall_sec() - ts;
 						}
 						if (mb_ce >= 0.0) {
 							ce_sum += mb_ce
@@ -989,6 +1153,17 @@ double lm_train_corpus_val(lm *model, text_dataset *ds, lm_adam *opt,
 					if (ok && ce_w > 0)
 						train_ema_ce(&last,
 						    ce_sum / (double)ce_w, 1);
+					{
+						static int s_loop_log = 6;
+						const char *pe = getenv("ANN_STEP_PROF");
+
+						if (s_loop_log > 0 && pe && pe[0] == '1') {
+							fprintf(stderr,
+							    "[loop] win=%.1fms pack=%.1fms\n",
+							    t_win * 1e3, t_pack * 1e3);
+							s_loop_log--;
+						}
+					}
 				}
 				if (!ok) {
 					gpu_set_sync_mode(GPU_SYNC_EAGER);
@@ -1007,12 +1182,12 @@ double lm_train_corpus_val(lm *model, text_dataset *ds, lm_adam *opt,
 					break;
 				}
 				/*
-				** G3: one device sync per microbatch (not per GEMM),
-				** then pull device-authoritative dW to host.
+				** Stay in BATCH sync through Adam: gather/update
+				** are same-stream D2D after bwd, so a full
+				** device sync here only stalls the CPU before
+				** the next window pack. Progress/CE already
+				** sample infrequently.
 				*/
-				if (gpu_available())
-					gpu_device_sync();
-				gpu_set_sync_mode(GPU_SYNC_EAGER);
 				/*
 				** A1: Adam gathers device-authoritative dW D2D and
 				** leaves weights device-authoritative.
@@ -1024,12 +1199,25 @@ double lm_train_corpus_val(lm *model, text_dataset *ds, lm_adam *opt,
 					double us = train_grad_unscale(
 					    isfinite(last));
 
-					if (us > 0.0)
+					if (us > 0.0) {
+						double ta = wall_sec();
+						static int s_adam_log = 6;
+						const char *pe = getenv(
+						    "ANN_STEP_PROF");
+
 						lm_adam_step_scaled(opt, step_lr,
 						    us / (double)b);
-					else
+						if (s_adam_log > 0 && pe
+						    && pe[0] == '1') {
+							fprintf(stderr,
+							    "[adam] %.1fms\n",
+							    (wall_sec() - ta) * 1e3);
+							s_adam_log--;
+						}
+					} else
 						lm_adam_zero_grad(model);
 				}
+				/* Stay BATCH into the next microbatch. */
 				elapsed = wall_sec() - t0;
 				tp.epoch = ep;
 				tp.epoch_done = idx;
@@ -1371,6 +1559,9 @@ double lm_train_stream(lm *model, text_stream *train, lm_adam *opt,
 				{
 					double ce_sum = 0.0;
 					int ce_w = 0;
+					double t_pack = 0.0;
+					double t_pref = 0.0;
+					double ts;
 
 					for (k = 0; k < g_grad_accum && !done
 					    && ok; k++) {
@@ -1423,12 +1614,14 @@ double lm_train_stream(lm *model, text_stream *train, lm_adam *opt,
 						}
 						if (!ok)
 							break;
+						ts = wall_sec();
 						if (bb > 0 && pack_run(model, &pk,
 						    bb, &mb_ce) != 0) {
 							ok = 0;
 							done = 1;
 							break;
 						}
+						t_pack += wall_sec() - ts;
 						if (bb > 0 && mb_ce >= 0.0) {
 							ce_sum += mb_ce
 							    * (double)bb;
@@ -1440,6 +1633,7 @@ double lm_train_stream(lm *model, text_stream *train, lm_adam *opt,
 						** the next ids buffer on CPU before
 						** the forced device sync below.
 						*/
+						ts = wall_sec();
 						if (!done && ok && pk.ids_next) {
 							int nb = 0;
 							int nn;
@@ -1466,6 +1660,7 @@ double lm_train_stream(lm *model, text_stream *train, lm_adam *opt,
 							}
 							pk.next_bb = nb;
 						}
+						t_pref += wall_sec() - ts;
 						b += bb;
 						if (g_varlen) {
 							int ti;
@@ -1480,15 +1675,27 @@ double lm_train_stream(lm *model, text_stream *train, lm_adam *opt,
 					if (ok && ce_w > 0)
 						train_ema_ce(&last,
 						    ce_sum / (double)ce_w, 1);
+					{
+						static int s_loop_log = 6;
+						const char *pe = getenv("ANN_STEP_PROF");
+
+						if (s_loop_log > 0 && pe && pe[0] == '1') {
+							fprintf(stderr,
+							    "[loop] pack=%.1fms pref=%.1fms\n",
+							    t_pack * 1e3, t_pref * 1e3);
+							s_loop_log--;
+						}
+					}
 				}
-				/* G3: single sync per microbatch. */
-				if (gpu_available())
-					gpu_device_sync();
-				gpu_set_sync_mode(GPU_SYNC_EAGER);
-				if (!ok)
+				/* BATCH through Adam — same-stream after bwd. */
+				if (!ok) {
+					gpu_set_sync_mode(GPU_SYNC_EAGER);
 					goto fail;
-				if (b <= 0)
+				}
+				if (b <= 0) {
+					gpu_set_sync_mode(GPU_SYNC_EAGER);
 					break;
+				}
 				step_lr = train_step_lr(lr, opt->t);
 				opt->weight_decay = g_weight_decay;
 				opt->grad_clip = g_grad_clip;
@@ -1496,12 +1703,23 @@ double lm_train_stream(lm *model, text_stream *train, lm_adam *opt,
 					double us = train_grad_unscale(
 					    isfinite(last));
 
-					if (us > 0.0)
+					if (us > 0.0) {
+						double ta = wall_sec();
+						static int s_adam_log = 6;
+						const char *pe = getenv("ANN_STEP_PROF");
+
 						lm_adam_step_scaled(opt, step_lr,
 						    us / (double)b);
-					else
+						if (s_adam_log > 0 && pe && pe[0] == '1') {
+							fprintf(stderr,
+							    "[adam] %.1fms\n",
+							    (wall_sec() - ta) * 1e3);
+							s_adam_log--;
+						}
+					} else
 						lm_adam_zero_grad(model);
 				}
+				gpu_set_sync_mode(GPU_SYNC_EAGER);
 				steps++;
 				el = wall_sec() - ep_t0;
 				tp.epoch = ep;

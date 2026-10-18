@@ -5,7 +5,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#ifdef _WIN32
+#include "ann_posix.h"
+#else
 #include <unistd.h>
+#endif
 #include "bpe.h"
 #include "dataset_stream.h"
 #include "generate.h"

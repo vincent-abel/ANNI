@@ -42,6 +42,7 @@ typedef struct	lm_adam {
 	ann_real	*h_m;	/* host staging for m/v checkpoint sync only */
 	ann_real	*h_v;
 	ann_real	*d_param;	/* A1: source of truth between steps */
+	void		*d_param_bf16;	/* Adam-fused BF16 twins (GEMM path) */
 	ann_real	*d_grad;
 	ann_real	*d_m;	/* device m/v stay resident across steps */
 	ann_real	*d_v;

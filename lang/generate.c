@@ -2,10 +2,12 @@
 **	Autoregressive decode (greedy, temperature, top-k / top-p)
 */
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "decode.h"
 #include "generate.h"
-#include "kv.h"
+#include "gpu.h"
 #include "ops.h"
 #include "tokenize.h"
 #include "vocab.h"
@@ -132,57 +134,205 @@ int lm_sample_id(const vec *logits, double temperature, int top_k, double top_p)
 	return best;
 }
 
+struct cap_buf {
+	char	*out;
+	int	cap;
+	int	n;
+};
+
+static void cap_append(const char *s, int n, void *ud)
+{
+	struct cap_buf *b;
+	int room;
+
+	b = ud;
+	if (!b || !b->out || b->cap <= 1 || !s || n <= 0)
+		return;
+	room = b->cap - 1 - b->n;
+	if (room <= 0)
+		return;
+	if (n > room)
+		n = room;
+	memcpy(b->out + b->n, s, (size_t)n);
+	b->n += n;
+	b->out[b->n] = '\0';
+}
+
 int lm_generate(lm *model, const char *prompt, char *out, int out_cap,
 	int max_new, double temperature, int top_k, double top_p)
 {
-	int n;
-	int i;
-	int next;
-	int ids[LM_MAX_CTX];
-	mat *hidden;
-	vec *logits;
+	struct cap_buf b;
 
-	n = lm_generate_kv(model, prompt, out, out_cap, max_new, temperature,
-	    top_k, top_p);
-	if (n >= 0)
-		return n;
 	if (!model || !prompt || !out || out_cap <= 1 || max_new < 0)
 		return -1;
-	n = lm_encode(model, prompt, ids, LM_MAX_CTX);
-	if (n <= 0)
-		return -1;
-	hidden = mat_create(LM_MAX_CTX, LM_D_MODEL);
-	logits = vec_create(model->vocab_size);
-	if (!hidden || !logits) {
-		mat_free(&hidden);
-		vec_free(&logits);
-		return -1;
-	}
-	for (i = 0; i < max_new && n < LM_MAX_CTX; i++) {
-		hidden->rows = n;
-		if (lm_forward(hidden, model, ids, n) != 0) {
-			mat_free(&hidden);
-			vec_free(&logits);
-			return -1;
+	b.out = out;
+	b.cap = out_cap;
+	b.n = 0;
+	out[0] = '\0';
+	cap_append(prompt, (int)strlen(prompt), &b);
+	/* Same forward as lm_generate_stream. KV decode does not match it. */
+	return lm_generate_stream(model, prompt, max_new, temperature, top_k,
+	    top_p, cap_append, &b);
+}
+
+/*
+** ANN_DECODE_CHECK=N: for the first N decode steps, also run the full
+** forward and print the max |logit| difference to stderr.
+*/
+static void decode_check(lm *model, const int *ids, int n, const vec *logits,
+	int step)
+{
+	static int limit = -1;
+	lm_cache *c;
+	vec *ref;
+	double diff;
+	double d;
+	int ref_arg;
+	int dec_arg;
+	int v;
+
+	if (limit < 0)
+		limit = getenv("ANN_DECODE_CHECK")
+		    ? atoi(getenv("ANN_DECODE_CHECK")) : 0;
+	if (step >= limit)
+		return;
+	c = lm_cache_create(n);
+	ref = vec_create(model->vocab_size);
+	if (c && ref && lm_forward_cache(model, ids, n, c) == 0
+	    && lm_logits_at(ref, model, c->hidden, n - 1) == 0) {
+		diff = 0.0;
+		ref_arg = 0;
+		dec_arg = 0;
+		for (v = 0; v < ref->n; v++) {
+			d = fabs((double)ref->data[v] - (double)logits->data[v]);
+			if (d > diff)
+				diff = d;
+			if (ref->data[v] > ref->data[ref_arg])
+				ref_arg = v;
+			if (logits->data[v] > logits->data[dec_arg])
+				dec_arg = v;
 		}
-		if (lm_logits_at(logits, model, hidden, n - 1) != 0) {
-			mat_free(&hidden);
-			vec_free(&logits);
-			return -1;
+		fprintf(stderr, "[decode-check] step %d pos %d max|dlogit| %.3g"
+		    " argmax ref %d dec %d\n", step, n - 1, diff, ref_arg,
+		    dec_arg);
+	}
+	vec_free(&ref);
+	lm_cache_free(&c);
+}
+
+/* KV-cache decode on the GPU; -2 when the decoder is unavailable. */
+static int generate_stream_dec(lm *model, int *ids, int n, int max_new,
+	double temperature, int top_k, double top_p,
+	void (*on_text)(const char *s, int n, void *ud), void *ud)
+{
+	lm_decoder *dec;
+	vec *logits;
+	char piece[1024];
+	int nnew;
+	int next;
+	int pn;
+	int i;
+
+	dec = lm_decoder_create(model);
+	if (!dec)
+		return -2;
+	logits = vec_create(model->vocab_size);
+	if (!logits || lm_decoder_prefill(dec, ids, n, logits) != 0) {
+		vec_free(&logits);
+		lm_decoder_free(&dec);
+		return -2;
+	}
+	nnew = 0;
+	for (i = 0; i < max_new && n < LM_MAX_CTX; i++) {
+		if (i > 0) {
+			if (lm_decoder_step(dec, ids[n - 1], logits) != 0)
+				goto fail;
+			decode_check(model, ids, n, logits, i - 1);
 		}
 		next = lm_sample_id(logits, temperature, top_k, top_p);
 		if (next == VOCAB_EOS)
 			break;
 		ids[n++] = next;
+		nnew++;
+		pn = lm_decode(model, &next, 1, piece, (int)sizeof(piece));
+		if (pn < 0)
+			goto fail;
+		if (on_text && pn > 0)
+			on_text(piece, pn, ud);
 	}
-	if (lm_decode(model, ids, n, out, out_cap) < 0) {
-		mat_free(&hidden);
-		vec_free(&logits);
-		return -1;
-	}
-	mat_free(&hidden);
 	vec_free(&logits);
-	return n;
+	lm_decoder_free(&dec);
+	return nnew;
+fail:
+	vec_free(&logits);
+	lm_decoder_free(&dec);
+	return -1;
+}
+
+int lm_generate_stream(lm *model, const char *prompt, int max_new,
+	double temperature, int top_k, double top_p,
+	void (*on_text)(const char *s, int n, void *ud), void *ud)
+{
+	int ids[LM_MAX_CTX];
+	int n;
+	int i;
+	int next;
+	int pn;
+	int nnew;
+	char piece[1024];
+	lm_cache *cache;
+	vec *logits;
+	int sync_was;
+
+	if (!model || !prompt || max_new < 0)
+		return -1;
+	n = lm_encode(model, prompt, ids, LM_MAX_CTX);
+	if (n <= 0)
+		return -1;
+	logits = vec_create(model->vocab_size);
+	if (!logits)
+		return -1;
+	/* One upload; later steps read the device twin.
+	** BATCH is the mode the B=1 attention pull was fixed for. */
+	lm_weights_to_device(model);
+	sync_was = gpu_sync_mode();
+	gpu_set_sync_mode(GPU_SYNC_BATCH);
+	nnew = generate_stream_dec(model, ids, n, max_new, temperature, top_k,
+	    top_p, on_text, ud);
+	if (nnew != -2) {
+		gpu_set_sync_mode(sync_was);
+		vec_free(&logits);
+		return nnew;
+	}
+	nnew = 0;
+	for (i = 0; i < max_new && n < LM_MAX_CTX; i++) {
+		cache = lm_cache_create(n);
+		if (!cache)
+			goto fail;
+		if (lm_forward_cache(model, ids, n, cache) != 0
+		    || lm_logits_at(logits, model, cache->hidden, n - 1) != 0) {
+			lm_cache_free(&cache);
+			goto fail;
+		}
+		lm_cache_free(&cache);
+		next = lm_sample_id(logits, temperature, top_k, top_p);
+		if (next == VOCAB_EOS)
+			break;
+		ids[n++] = next;
+		nnew++;
+		pn = lm_decode(model, &next, 1, piece, (int)sizeof(piece));
+		if (pn < 0)
+			goto fail;
+		if (on_text && pn > 0)
+			on_text(piece, pn, ud);
+	}
+	gpu_set_sync_mode(sync_was);
+	vec_free(&logits);
+	return nnew;
+fail:
+	gpu_set_sync_mode(sync_was);
+	vec_free(&logits);
+	return -1;
 }
 
 int lm_generate_batch(lm *model, const char *const *prompts, char **outs,

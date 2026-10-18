@@ -1186,8 +1186,7 @@ static void test_gpu_gemm_bwd_stub(void)
 	    0.01, 0.9, 0.999, 1e-8, 1, 1.0) != 0);
 	assert(gpu_adam_step_dev(a->data, b->data, c->data, da->data, 4,
 	    0.01, 0.9, 0.999, 1e-8, 1, 1.0) != 0);
-	assert(gpu_kv_attn_decode(a->data, b->data, c->data, da->data, db->data,
-	    a->data, b->data, c->data, 1, 2, 2, 1, 2) != 0);
+	assert(gpu_dec_create(1, 2, 2, 2, 2, 1) == NULL);
 	mat_free(&a);
 	mat_free(&b);
 	mat_free(&c);
@@ -1209,7 +1208,7 @@ static void test_mat_device_pin_cpu(void)
 	mat_free(&m);
 }
 
-static void test_lm_generate_kv(void)
+static void test_lm_decoder_cpu(void)
 {
 	lm *model;
 	char out[128];
@@ -1218,7 +1217,8 @@ static void test_lm_generate_kv(void)
 	srand(31);
 	model = lm_create();
 	assert(model);
-	n = lm_generate_kv(model, "hi", out, (int)sizeof(out), 4, 0.0, 0, 1.0);
+	assert(lm_decoder_create(model) == NULL);
+	n = lm_generate(model, "hi", out, (int)sizeof(out), 4, 0.0, 0, 1.0);
 	assert(n > 0);
 	assert(out[0] != '\0');
 	lm_free(&model);
@@ -1407,7 +1407,7 @@ int main(void)
 	test_mat_mul_bt_known();
 	test_ann_dot_simd();
 	test_qmat_roundtrip();
-	test_lm_generate_kv();
+	test_lm_decoder_cpu();
 	test_gpu_stub();
 	test_mat_device_pin_cpu();
 	test_gpu_gemm_bwd_stub();

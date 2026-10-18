@@ -12,6 +12,7 @@
 #include "lm.h"
 #include "ops.h"
 #include "posenc.h"
+#include "resid.h"
 #include "tokenize.h"
 
 static double rand_w(void)
@@ -38,8 +39,13 @@ static mat *reuse_mat(mat **slot, int rows, int cols)
 
 static void copy_mat(mat *dst, const mat *src)
 {
+	if (resid_copy(dst, src) == 0)
+		return;
+	if (mat_ensure_host((mat *)src) != 0 || mat_ensure_host(dst) != 0)
+		return;
 	memcpy(dst->data, src->data,
 	    (size_t)dst->rows * (size_t)dst->cols * sizeof(ann_real));
+	mat_host_dirty(dst);
 }
 
 static void softmax_inplace(ann_real *x, int n, ann_real *tmp)
@@ -335,7 +341,11 @@ int lm_logits_at(vec *logits, const lm *model, const mat *hidden, int t)
 	int v;
 	const ann_real *h;
 
-	if (!logits || !model || !hidden || !logits->data || !hidden->data)
+	if (!logits || !model || !hidden || !logits->data)
+		return -1;
+	/* Forward leaves the row on the device twin. Host data is still the
+	** mat_create zeros, so reading it samples the bias and repeats one id. */
+	if (mat_pull_host((mat *)hidden) != 0 || !hidden->data)
 		return -1;
 	if (t < 0 || t >= hidden->rows)
 		return -1;
@@ -346,7 +356,7 @@ int lm_logits_at(vec *logits, const lm *model, const mat *hidden, int t)
 		if (qmat_gemv_t(logits, model->w_head_q, h) != 0)
 			return -1;
 	} else {
-		/* Stack row views are host-only: no device twin. */
+		/* Stack row views start host-only. The GEMM may pin a twin. */
 		hrow.data = (ann_real *)h;
 		hrow.d_data = NULL;
 		hrow.on_device = MAT_DEV_HOST;
@@ -359,6 +369,13 @@ int lm_logits_at(vec *logits, const lm *model, const mat *hidden, int t)
 		lrow.cols = model->vocab_size;
 		if (mat_mul(&lrow, &hrow, model->w_head) != 0)
 			return -1;
+		/* BATCH GEMM attaches a twin to the stack view and leaves the
+		** result there; pull it into logits and drop the twin. */
+		if (mat_ensure_host(&lrow) != 0) {
+			mat_device_free(&lrow);
+			return -1;
+		}
+		mat_device_free(&lrow);
 	}
 	for (v = 0; v < model->vocab_size; v++)
 		logits->data[v] += model->b_head->data[v];
@@ -576,7 +593,7 @@ lm_cache *lm_cache_create_packed(int B, int T)
 	c->T = T;
 	c->n = B * T;
 	c->ids = calloc((size_t)c->n, sizeof(int));
-	c->hidden = mat_create(c->n, LM_D_MODEL);
+	c->hidden = mat_create_dev(c->n, LM_D_MODEL);
 	/* n_blocks / heads are the LM_* constants (transformer_create). */
 	if (c->ids && c->hidden)
 		c->trc = transformer_cache_create_packed_dims(B, T,
@@ -792,7 +809,9 @@ size_t lm_packed_bytes(int B, int T, int vocab_size)
 	** no T×T HBM — only B·H·T logsumexp (~scores/T). Non-flash keeps
 	** scores × live layers (or ×N_BLOCKS without ckpt).
 	*/
-	live_blocks = block_act_checkpoint_enabled() ? 2.0
+	/* Stride-2 checkpoint keeps ~half the layers live (+1 working). */
+	live_blocks = block_act_checkpoint_enabled()
+	    ? ((double)LM_N_BLOCKS * 0.5 + 1.0)
 	    : (double)LM_N_BLOCKS;
 	bytes = per_layer_acts * live_blocks;
 	if (attn_flash_enabled())
@@ -819,8 +838,11 @@ int lm_batch_auto(int T, int vocab_size, size_t free_bytes, double frac,
 	if (free_bytes == 0)
 		return fallback < max_b ? fallback : max_b;
 	if (frac <= 0.0 || frac > 1.0)
-		frac = 0.85;
+		frac = 0.70;	/* was 0.85; leave headroom for Adam/ fragmented VRAM */
 	budget = frac * (double)free_bytes;
+	/* Reserve cuBLASLt workspace (~64 MiB) so max B does not OOM. */
+	if (budget > 64.0 * 1048576.0)
+		budget -= 64.0 * 1048576.0;
 	for (b = 1; b < max_b; b++)
 		if ((double)lm_packed_bytes(b + 1, T, vocab_size) >= budget)
 			break;

@@ -39,7 +39,7 @@
 #include "arena.h"
 #include "simd.h"
 #include "quant.h"
-#include "kv.h"
+#include "decode.h"
 #include "gpu.h"
 #include "tower.h"
 #include "chat_session.h"

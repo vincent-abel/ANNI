@@ -7,10 +7,18 @@
 
 void mat_zero(mat *m)
 {
-	if (m && m->data) {
-		memset(m->data, 0, (size_t)m->rows * (size_t)m->cols * sizeof(ann_real));
-		mat_host_dirty(m);	/* host zero is authoritative; twin is stale */
+	if (!m)
+		return;
+	if (m->d_data && m->on_device != MAT_DEV_HOST && gpu_available()
+	    && gpu_memset(m->d_data, 0,
+	    (size_t)m->rows * (size_t)m->cols * sizeof(ann_real)) == 0) {
+		mat_mark_device(m);
+		return;
 	}
+	if (mat_ensure_host(m) != 0 || !m->data)
+		return;
+	memset(m->data, 0, (size_t)m->rows * (size_t)m->cols * sizeof(ann_real));
+	mat_host_dirty(m);
 }
 
 /*
@@ -20,14 +28,25 @@ void mat_zero(mat *m)
 */
 void mat_zero_dev(mat *m)
 {
-	if (!m || !m->data)
+	if (!m)
+		return;
+	if (m->d_data && gpu_available()
+	    && gpu_memset(m->d_data, 0,
+	    (size_t)m->rows * (size_t)m->cols * sizeof(ann_real)) == 0) {
+		if (m->on_device == MAT_DEV_ALIASED)
+			return;	/* keep external-buffer alias */
+		if (m->data) {
+			memset(m->data, 0,
+			    (size_t)m->rows * (size_t)m->cols * sizeof(ann_real));
+			m->on_device = MAT_DEV_SYNCED;
+		} else
+			mat_mark_device(m);
+		return;
+	}
+	if (mat_ensure_host(m) != 0 || !m->data)
 		return;
 	memset(m->data, 0, (size_t)m->rows * (size_t)m->cols * sizeof(ann_real));
-	if (m->d_data && gpu_memset(m->d_data, 0,
-	    (size_t)m->rows * (size_t)m->cols * sizeof(ann_real)) == 0)
-		m->on_device = MAT_DEV_SYNCED;
-	else
-		mat_host_dirty(m);
+	mat_host_dirty(m);
 }
 
 void vec_zero(vec *v)
@@ -41,14 +60,14 @@ void mat_axpy(mat *y, double a, const mat *x)
 	int i;
 	int n;
 
-	if (!y || !x || !y->data || !x->data)
+	if (!y || !x)
 		return;
 	if (y->rows != x->rows || y->cols != x->cols)
 		return;
 	if (gpu_mat_axpy(y, a, x) == 0)
 		return;
-	mat_ensure_host(y);
-	mat_ensure_host((mat *)x);
+	if (mat_ensure_host(y) != 0 || mat_ensure_host((mat *)x) != 0)
+		return;
 	mat_host_dirty(y);
 	n = y->rows * y->cols;
 	for (i = 0; i < n; i++)
@@ -65,15 +84,15 @@ int mat_outer_add(mat *dw, const mat *a, const mat *b)
 	const ann_real *ar;
 	const ann_real *br;
 
-	if (!dw || !a || !b || !dw->data || !a->data || !b->data)
+	if (!dw || !a || !b)
 		return -1;
 	if (a->rows != b->rows || dw->rows != a->cols || dw->cols != b->cols)
 		return -1;
 	if (gpu_mat_outer_add(dw, a, b) == 0)
 		return 0;
-	mat_ensure_host(dw);
-	mat_ensure_host((mat *)a);
-	mat_ensure_host((mat *)b);
+	if (mat_ensure_host(dw) != 0 || mat_ensure_host((mat *)a) != 0
+	    || mat_ensure_host((mat *)b) != 0)
+		return -1;
 	mat_host_dirty(dw);
 	for (t = 0; t < a->rows; t++) {
 		ar = &a->data[t * a->cols];
@@ -95,14 +114,15 @@ int mat_mul_at(mat *c, const mat *a, const mat *b)
 	int t;
 	double sum;
 
-	if (!c || !a || !b || !c->data || !a->data || !b->data)
+	if (!c || !a || !b)
 		return -1;
 	if (a->rows != b->rows || c->rows != a->cols || c->cols != b->cols)
 		return -1;
 	if (gpu_mat_mul_at(c, a, b) == 0)	/* cuBLAS OP_T, no transpose copy */
 		return 0;
-	mat_ensure_host((mat *)a);
-	mat_ensure_host((mat *)b);
+	if (mat_ensure_host(c) != 0 || mat_ensure_host((mat *)a) != 0
+	    || mat_ensure_host((mat *)b) != 0)
+		return -1;
 	mat_host_dirty(c);
 	for (i = 0; i < a->cols; i++) {
 		for (j = 0; j < b->cols; j++) {
@@ -127,7 +147,7 @@ int mat_mul_wt(mat *c, const mat *a, const mat *w)
 	int j;
 	int rc;
 
-	if (!c || !a || !w || !c->data || !a->data || !w->data)
+	if (!c || !a || !w)
 		return -1;
 	if (a->cols != w->cols || c->rows != a->rows || c->cols != w->rows)
 		return -1;
@@ -136,7 +156,11 @@ int mat_mul_wt(mat *c, const mat *a, const mat *w)
 	wt = mat_create(w->cols, w->rows);
 	if (!wt)
 		return -1;
-	mat_ensure_host((mat *)w);
+	if (mat_ensure_host((mat *)w) != 0 || mat_ensure_host(c) != 0
+	    || mat_ensure_host((mat *)a) != 0) {
+		mat_free(&wt);
+		return -1;
+	}
 	for (i = 0; i < w->rows; i++)
 		for (j = 0; j < w->cols; j++)
 			wt->data[j * wt->cols + i] = w->data[i * w->cols + j];

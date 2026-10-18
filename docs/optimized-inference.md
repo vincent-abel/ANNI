@@ -39,14 +39,14 @@ o=\sum_j a_j v_j
 
 **Prefill** still walks the prompt one token at a time (simple, correct). A batched prefill GEMM remains future work.
 
-**Fallback.** `lm_generate` calls `lm_generate_kv` first; on failure it uses the original full-prefix loop.
+**Fallback.** `lm_generate` goes through `lm_generate_stream`, which tries the device decoder (`lm_decoder_*`, one CUDA graph per token) first; on CPU or failure it uses the original full-prefix loop.
 
 **Training** unchanged — KV path is inference-only.
 
 ## How it shows up in this repo
 
-- [`lang/kv.h`](../lang/kv.h) / [`lang/kv.c`](../lang/kv.c): `lm_kv`, `lm_generate_kv`
-- [`lang/generate.c`](../lang/generate.c): prefers KV decode
+- [`lang/decode.h`](../lang/decode.h) / [`lang/decode.c`](../lang/decode.c): `lm_decoder`, prefill then device steps (`gpu_dec_*` in `num/gpu_cuda.cu`)
+- [`lang/generate.c`](../lang/generate.c): prefers the device decoder
 - [`lang/embed.c`](../lang/embed.c): `embed_lookup_row`
 - [`lang/posenc.c`](../lang/posenc.c): `posenc_add_row`
 

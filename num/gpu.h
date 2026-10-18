@@ -26,6 +26,14 @@ int	gpu_sync_mode(void);
 void	gpu_set_compute_prec(int prec);	/* FP32/BF16/FP16 */
 int	gpu_compute_prec(void);
 /*
+** Mixed FP8: E4M3 forward, E5M2 dgrad, BF16 wgrad, FP32 Adam. gpu_set_fp8(1)
+** also enables dgrad. Wgrad never uses FP8 (outer-product underflow).
+*/
+void	gpu_set_fp8(int on);
+void	gpu_set_fp8_dgrad(int on);
+int	gpu_fp8_dgrad(void);
+int	gpu_fp8(void);
+/*
 ** Block until all queued device work finishes. In GPU_SYNC_BATCH mode the
 ** individual GEMM/outer-add launches do not sync; call this once per
 ** microbatch (e.g. before reading device-authoritative grads). No-op on CPU.
@@ -36,14 +44,37 @@ void	*gpu_malloc(size_t nbytes);
 void	gpu_free(void *p);
 int	gpu_memcpy_h2d(void *dst, const void *src, size_t nbytes);
 int	gpu_memcpy_d2h(void *dst, const void *src, size_t nbytes);
+/* Pin host memory so a later async D2H does not sync per call. */
+int	gpu_host_pin(void *p, size_t nbytes);
+int	gpu_memcpy_d2h_async(void *dst, const void *src, size_t nbytes);
+int	gpu_stream_sync(void);
 int	gpu_memcpy_d2d(void *dst, const void *src, size_t nbytes);
 int	gpu_memset(void *dst, int value, size_t nbytes);
+/* Drop cached BF16/FP16 twin after an in-place FP32 weight write (Adam). */
+void	gpu_half_wt_invalidate(const ann_real *fp32_dev);
+/* Reconvert all cached weight twins in place (stable addresses; after Adam). */
+void	gpu_half_wt_refresh_all(void);
+/*
+** Register a flat BF16 twin of Adam's d_param. half_wt_get serves slices from
+** this buffer; Adam updates it in the same kernel as the FP32 master.
+*/
+void	gpu_adam_set_bf16_flat(void *bf16, const ann_real *fp32, int n);
+/* One-shot FP32→BF16 of the flat Adam buffer (call once after alias setup). */
+int	gpu_adam_seed_bf16_flat(void *bf16, const ann_real *fp32, int n);
+/* Last device CE sum from gpu_ce_delta_from_softmax (for graph replay NLL). */
+int	gpu_ce_fetch_mean(double *mean_ce, int rows);
 
 /*
 ** Try GPU mat_mul; returns 0 on success, -1 to fall back to CPU.
 ** Uses mat.d_data when both inputs/outputs are on device.
 */
 int	gpu_mat_mul(mat *c, const mat *a, const mat *b);
+/* c = a b + bias (bias length = c->cols); cuBLASLt BIAS epilogue when BF16. */
+int	gpu_mat_mul_bias(mat *c, const mat *a, const mat *b,
+		const ann_real *bias);
+/* c = ReLU(a b + bias); cuBLASLt RELU_BIAS. Publishes BF16 twin of c. */
+int	gpu_mat_mul_bias_relu(mat *c, const mat *a, const mat *b,
+		const ann_real *bias);
 /* dA = dC * B^T, dB = A^T * dC (NULL skips that output). */
 int	gpu_mat_mul_backward(mat *da, mat *db, const mat *dc,
 		const mat *a, const mat *b);
@@ -71,15 +102,11 @@ int	gpu_adam_step(ann_real *param, ann_real *grad, ann_real *m, ann_real *v, int
 int	gpu_adam_step_dev(ann_real *d_param, ann_real *d_grad, ann_real *d_m,
 		ann_real *d_v, int n, double lr, double beta1, double beta2,
 		double eps, int t, double grad_scale);
-/*
-** One decode-step MHA: QKV proj, append K/V at row len-1, attend, Wo.
-** k_cache/v_cache are max_T x d_model (host). Returns 0 on success, -1 = CPU.
-*/
-int	gpu_kv_attn_decode(ann_real *out, const ann_real *x,
-		const ann_real *wq, const ann_real *wk, const ann_real *wv,
-		const ann_real *wo, ann_real *k_cache, ann_real *v_cache,
-		int len, int max_T, int d_model, int n_heads, int d_head);
-
+/* Like gpu_adam_step_dev; when d_param_bf16 non-NULL and BF16 prec, writes twins. */
+int	gpu_adam_step_dev_bf16(ann_real *d_param, void *d_param_bf16,
+		ann_real *d_grad, ann_real *d_m, ann_real *d_v, int n,
+		double lr, double beta1, double beta2, double eps, int t,
+		double grad_scale);
 /*
 ** Track K: elementwise kernels. Every pointer below may be a host pointer
 ** (staged through persistent device scratch, uploaded/downloaded around the
@@ -178,6 +205,12 @@ int	gpu_unpack_seq_rows(ann_real *dst, const ann_real *src, int B, int T,
 /* S8: x += bias then ReLU in one launch (rows x cols). */
 int	gpu_bias_relu_forward(ann_real *x, const ann_real *bias, int rows,
 		int cols);
+/*
+** FFN W1 finish: optional bias into pre, hidden = ReLU(pre), publish BF16
+** twin of hidden for the W2 GEMM. bias NULL means pre already includes bias.
+*/
+int	gpu_ffn_w1_finish(ann_real *hidden, ann_real *pre,
+		const ann_real *bias, int rows, int cols);
 /* E8: optional host seqlens[B] in [1,T]; NULL clears. Active for next fused attn. */
 void	gpu_attn_set_seqlens(const int *seqlens);
 
@@ -188,6 +221,8 @@ void	gpu_attn_set_seqlens(const int *seqlens);
 int	gpu_mat_copy(mat *dst, const mat *src);
 /* dst += src (elementwise). */
 int	gpu_mat_add(mat *dst, const mat *src);
+/* dst = a + b (elementwise); skips a prior copy+add pair. */
+int	gpu_mat_add2(mat *dst, const mat *a, const mat *b);
 /* y += a * x (elementwise). */
 int	gpu_mat_axpy(mat *y, double a, const mat *x);
 
@@ -215,5 +250,42 @@ int	gpu_graph_begin(void);
 int	gpu_graph_end(void);
 int	gpu_graph_replay(void);
 void	gpu_graph_destroy(void);
+
+/*
+** Single-stream decode. Weight mats are device twins (row-major Din x Dout);
+** LN / bias vectors are host and copied once. The K/V cache is n_layers x
+** max_T x d_model on the device. gpu_dec_step embeds id at pos, runs every
+** layer (appending K/V at row pos) and copies vocab logits to the host.
+** All return 0 / non-NULL on success; NULL / -1 on the CPU stub.
+*/
+typedef struct	gpu_dec_layer_w {
+	const ann_real	*wq;
+	const ann_real	*wk;
+	const ann_real	*wv;
+	const ann_real	*wo;
+	const ann_real	*w1;
+	const ann_real	*w2;
+	const ann_real	*ln1_g;
+	const ann_real	*ln1_b;
+	const ann_real	*ln2_g;
+	const ann_real	*ln2_b;
+	const ann_real	*b1;
+	const ann_real	*b2;
+	double		eps1;
+	double		eps2;
+} gpu_dec_layer_w;
+
+typedef struct gpu_dec	gpu_dec;
+
+gpu_dec	*gpu_dec_create(int n_layers, int d_model, int d_ff, int vocab,
+		int max_T, int n_heads);
+int	gpu_dec_set_layer(gpu_dec *g, int i, const gpu_dec_layer_w *w);
+int	gpu_dec_set_io(gpu_dec *g, const ann_real *embed_dev,
+		const ann_real *w_head_dev, const ann_real *b_head_host);
+/* Rows [0, n) of layer's K/V from host buffers (n x d_model). */
+int	gpu_dec_kv_load(gpu_dec *g, int layer, const ann_real *k_host,
+		const ann_real *v_host, int n);
+int	gpu_dec_step(gpu_dec *g, int id, int pos, ann_real *logits);
+void	gpu_dec_free(gpu_dec **g);
 
 #endif
