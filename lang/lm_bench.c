@@ -3,8 +3,12 @@
 */
 #include <stdio.h>
 #include <stdlib.h>
-#include <sys/time.h>
 #include <time.h>
+#ifdef _WIN32
+#include "ann_posix.h"
+#else
+#include <sys/time.h>
+#endif
 #include "gpu.h"
 #include "gradutil.h"
 #include "lm_adam.h"

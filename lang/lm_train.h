@@ -39,6 +39,8 @@ void	lm_train_set_varlen(int on);
 void	lm_train_set_cuda_graphs(int on);
 /* S5a/S5b: GPU_PREC_*; FP16 enables dynamic loss scaling. */
 void	lm_train_set_compute_prec(int prec);
+void	lm_train_set_fp8(int on);
+void	lm_train_set_fp8_dgrad(int on);
 double	lm_train_loss_scale(void);	/* current scale (1.0 if not FP16) */
 /* S7: Flash-style attn (no persistent B·H·T·T weights). */
 void	lm_train_set_flash_attn(int on);

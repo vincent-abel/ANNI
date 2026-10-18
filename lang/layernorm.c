@@ -6,6 +6,7 @@
 #include "gpu.h"
 #include "gradutil.h"
 #include "layernorm.h"
+#include "resid.h"
 
 layernorm *layernorm_create(void)
 {
@@ -60,7 +61,7 @@ ln_cache *ln_cache_create(int T)
 	if (!c)
 		return NULL;
 	c->T = T;
-	c->x_hat = mat_create(T, LM_D_MODEL);
+	c->x_hat = mat_create_dev(T, LM_D_MODEL);
 	c->mean = vec_create(T);
 	c->inv_std = vec_create(T);
 	if (!c->x_hat || !c->mean || !c->inv_std) {
@@ -97,6 +98,39 @@ int layernorm_forward(mat *x, const layernorm *ln)
 	return rc;
 }
 
+int layernorm_forward_into(mat *out, const mat *in, layernorm *ln, ln_cache *c)
+{
+	int T;
+	int d;
+	ann_real *yp;
+	ann_real *xp;
+	ann_real *xh;
+
+	if (!out || !in || !ln || !c)
+		return -1;
+	if (out->rows != in->rows || out->cols != in->cols
+	    || in->cols != LM_D_MODEL || c->T != in->rows)
+		return -1;
+	T = in->rows;
+	d = in->cols;
+	mat_try_pin((mat *)in);
+	mat_try_pin(out);
+	mat_try_pin(c->x_hat);
+	xp = mat_compute_ptr((mat *)in);
+	yp = mat_compute_ptr(out);
+	xh = mat_compute_ptr(c->x_hat);
+	if (xp && yp && xh && gpu_layernorm_forward_ex(yp, xp, ln->gamma->data,
+		ln->beta->data, xh, c->mean->data, c->inv_std->data, T, d,
+		ln->eps) == 0) {
+		mat_mark_device(out);
+		mat_mark_device(c->x_hat);
+		return 0;
+	}
+	if (out != in && resid_copy(out, in) != 0)
+		return -1;
+	return layernorm_forward_cache(out, ln, c);
+}
+
 int layernorm_forward_cache(mat *x, layernorm *ln, ln_cache *c)
 {
 	int t;
@@ -110,7 +144,7 @@ int layernorm_forward_cache(mat *x, layernorm *ln, ln_cache *c)
 	ann_real *xp;
 	ann_real *xh;
 
-	if (!x || !ln || !c || !x->data)
+	if (!x || !ln || !c)
 		return -1;
 	if (x->cols != LM_D_MODEL || c->T != x->rows)
 		return -1;

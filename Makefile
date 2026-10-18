@@ -1,6 +1,6 @@
 CC=gcc -g
 # Include roots: net/ (neural network), num/ (numerical engine), lang/ (language model), cli/.
-INCLUDES=-I. -Inet -Inum -Ilang -Icli
+INCLUDES=-I. -Inet -Inum -Ilang -Icli -Icompat
 # OPT=-O2 enables auto-vectorization on contiguous ann_dot / mat_mul loops.
 OPT ?= -O2
 OPENMP ?= -fopenmp
@@ -25,7 +25,7 @@ NET_SRC=net/neuron.c net/layer.c net/dataset.c net/optim.c net/serialize.c
 NUM_SRC=num/vec.c num/mat.c num/tensor.c num/ops.c num/arena.c num/simd.c num/gpu_stub.c
 NVCC ?= nvcc
 CUDA_OBJ=$(OBJDIR)/gpu_cuda.o
-LANG_SRC=lang/tokenize.c lang/vocab.c lang/bpe.c lang/embed.c lang/posenc.c lang/attn.c lang/ffn.c lang/layernorm.c lang/resid.c lang/block.c lang/lm.c lang/generate.c lang/gradutil.c lang/lm_adam.c lang/dataset_text.c lang/dataset_stream.c lang/lm_serialize.c lang/lm_train.c lang/lm_bench.c lang/lm_info.c lang/quant.c lang/kv.c
+LANG_SRC=lang/tokenize.c lang/vocab.c lang/bpe.c lang/embed.c lang/posenc.c lang/attn.c lang/ffn.c lang/layernorm.c lang/resid.c lang/block.c lang/lm.c lang/generate.c lang/gradutil.c lang/lm_adam.c lang/dataset_text.c lang/dataset_stream.c lang/lm_serialize.c lang/lm_train.c lang/lm_bench.c lang/lm_info.c lang/quant.c lang/decode.c
 CLI_SRC=cli/tower.c cli/chat_session.c cli/chat_ui.c
 LIB_SRC=$(NET_SRC) $(NUM_SRC) $(LANG_SRC)
 LIB_OBJ=$(patsubst %.c,$(OBJDIR)/%.o,$(notdir $(LIB_SRC)))
@@ -69,7 +69,8 @@ $(OBJDIR)/lm_serialize.o: lang/lm_serialize.c
 $(OBJDIR)/lm_bench.o: lang/lm_bench.c
 $(OBJDIR)/lm_info.o: lang/lm_info.c
 $(OBJDIR)/quant.o: lang/quant.c
-$(OBJDIR)/kv.o: lang/kv.c
+$(OBJDIR)/kv.o:
+$(OBJDIR)/decode.o: lang/decode.c
 $(OBJDIR)/tower.o: cli/tower.c
 $(OBJDIR)/chat_session.o: cli/chat_session.c
 $(OBJDIR)/chat_ui.o: cli/chat_ui.c
@@ -131,20 +132,38 @@ cuda-autotrain: $(filter-out $(OBJDIR)/gpu_stub.o,$(LIB_OBJ)) $(CUDA_OBJ) autotr
 
 # Optional CUDA build: replaces gpu_stub.o with gpu_cuda.o (requires nvcc).
 # ANN_CUBLAS=1 (default) links cuBLAS for GEMM; set ANN_CUBLAS=0 for teaching kernels only.
+# Prefer CUDA 13.x then 12.8 so Blackwell gets sm_120 + Lt/FP8.
 ANN_CUBLAS ?= 1
-CUDA_NVCC_FLAGS=-O2 -I. -Inum -Ilang
-CUDA_LIBS=-lcudart
+CUDA_HOME ?= $(firstword \
+	$(wildcard $(HOME)/cuda13/usr/local/cuda-13*) \
+	$(wildcard $(HOME)/cuda13/usr/local/cuda) \
+	$(wildcard $(HOME)/cuda12/usr/local/cuda-12.8) \
+	$(wildcard /usr/local/cuda-13*) \
+	$(wildcard /usr/local/cuda))
+ifneq ($(wildcard $(CUDA_HOME)/bin/nvcc),)
+NVCC := $(CUDA_HOME)/bin/nvcc
+CUDA_INC := -I$(CUDA_HOME)/include
+CUDA_LDFLAGS := -L$(CUDA_HOME)/lib64 -Wl,-rpath,$(CUDA_HOME)/lib64
+# RTX 50-class (sm_120) when the toolkit lists it; else let nvcc pick.
+CUDA_ARCH_FLAG := $(shell $(NVCC) --list-gpu-arch 2>/dev/null | grep -q compute_120 && echo -arch=sm_120)
+else
+CUDA_INC :=
+CUDA_LDFLAGS :=
+CUDA_ARCH_FLAG :=
+endif
+CUDA_NVCC_FLAGS=-O2 -I. -Inum -Ilang -Icompat $(CUDA_INC) $(CUDA_ARCH_FLAG) --use_fast_math
+CUDA_LIBS=$(CUDA_LDFLAGS) -lcudart
 ifeq ($(ANN_CUBLAS),1)
 CUDA_NVCC_FLAGS+=-DANN_CUBLAS
-CUDA_LIBS+=-lcublas
+CUDA_LIBS+=-lcublas -lcublasLt
 endif
 
 cuda: $(filter-out $(OBJDIR)/gpu_stub.o,$(OBJ)) $(CUDA_OBJ)
-	@if ! command -v $(NVCC) >/dev/null 2>&1; then \
+	@if ! command -v $(NVCC) >/dev/null 2>&1 && [ ! -x "$(NVCC)" ]; then \
 		echo "nvcc not found; keeping CPU stub (make / make test still work)"; \
 		exit 1; \
 	fi
-	$(CC) -o $(EXEC) $(filter-out $(OBJDIR)/gpu_stub.o,$^) $(LDFLAGS) $(CUDA_LIBS)
+	$(CC) -o $(EXEC) $(filter-out $(OBJDIR)/gpu_stub.o,$^) $(LDFLAGS) $(CUDA_LIBS) -lstdc++
 	ln -sfn anni ann
 
 $(CUDA_OBJ): num/gpu_cuda.cu | $(OBJDIR)

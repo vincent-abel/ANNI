@@ -9,6 +9,7 @@
 #include "gpu.h"
 #include "gradutil.h"
 #include "ops.h"
+#include "resid.h"
 #include "vec.h"
 
 static double rand_w(void)
@@ -33,7 +34,10 @@ static void fill_rand(mat *m)
 
 static void copy_mat(mat *dst, const mat *src)
 {
-	mat_ensure_host((mat *)src);
+	if (resid_copy(dst, src) == 0)
+		return;
+	if (mat_ensure_host((mat *)src) != 0 || mat_ensure_host(dst) != 0)
+		return;
 	memcpy(dst->data, src->data,
 	    (size_t)dst->rows * (size_t)dst->cols * sizeof(ann_real));
 	mat_host_dirty(dst);
@@ -428,11 +432,15 @@ int attn_mha_forward_cache(mat *out, attn *a, const mat *x, int causal,
 			c->v_h[h], causal, c->attn_w[h],
 			&c->softmax_tmp[h * c->T]) != 0)
 			fail = 1;
-		else
-			write_head(c->concat, c->o_h[h], h, a->d_head);
 	}
 	if (fail)
 		return -1;
+	/* BATCH leaves o_h on the device; D2H outside the OpenMP region. */
+	for (h = 0; h < a->n_heads; h++) {
+		if (mat_ensure_host(c->o_h[h]) != 0)
+			return -1;
+		write_head(c->concat, c->o_h[h], h, a->d_head);
+	}
 	if (mat_mul(out, c->concat, a->wo) != 0)
 		return -1;
 	return 0;
@@ -630,11 +638,11 @@ attn_pcache *attn_pcache_create(int B, int T, int n_heads, int d_head)
 	c->n = n;
 	c->n_heads = n_heads;
 	c->d_head = d_head;
-	c->x_in = mat_create(n, LM_D_MODEL);
-	c->q = mat_create(n, LM_D_MODEL);
-	c->k = mat_create(n, LM_D_MODEL);
-	c->v = mat_create(n, LM_D_MODEL);
-	c->concat = mat_create(n, LM_D_MODEL);
+	c->x_in = mat_create_dev(n, LM_D_MODEL);
+	c->q = mat_create_dev(n, LM_D_MODEL);
+	c->k = mat_create_dev(n, LM_D_MODEL);
+	c->v = mat_create_dev(n, LM_D_MODEL);
+	c->concat = mat_create_dev(n, LM_D_MODEL);
 	c->seq = calloc((size_t)B, sizeof(attn_cache *));
 	if (!c->x_in || !c->q || !c->k || !c->v || !c->concat || !c->seq) {
 		attn_pcache_free(&c);
@@ -646,22 +654,22 @@ attn_pcache *attn_pcache_create(int B, int T, int n_heads, int d_head)
 	mat_try_pin(c->v);
 	mat_try_pin(c->concat);
 	/*
-	** Score buffer (B·H·T)×T for TC/fused. Cap at 256 MiB so large-B
-	** --flash-attn can omit it and use the no-w_all flash kernel.
+	** Score buffer (B·H·T)×T for TC GemmEx when it fits (≤256 MiB).
+	** Prefer TC even under --flash-attn at moderate T (e.g. 64): tiled FA
+	** saves VRAM for huge T but is slower than strided GemmEx here.
+	** When scores do not fit, leave w_all NULL and use tiled FA.
 	*/
 	if (gpu_available() && T <= 256) {
 		size_t sb = (size_t)B * (size_t)n_heads * (size_t)T
 		    * (size_t)T * sizeof(ann_real);
 
-		if (!g_flash_attn || sb <= (size_t)256 * 1024 * 1024) {
-			c->w_all = mat_create(B * n_heads * T, T);
-			if (c->w_all)
-				mat_try_pin(c->w_all);
+		if (sb <= (size_t)256 * 1024 * 1024) {
+			c->w_all = mat_create_dev(B * n_heads * T, T);
 			if (c->w_all && !c->w_all->d_data)
 				mat_free(&c->w_all);
 		}
 	}
-	/* Host per-sequence caches only when no GPU score buffer. */
+	/* Host per-sequence caches only when no GPU score buffer / flash. */
 	if (!c->w_all && !g_flash_attn) {
 		for (b = 0; b < B; b++) {
 			c->seq[b] = attn_cache_alloc(T, n_heads, d_head, 1);
@@ -694,11 +702,11 @@ static int pcache_ensure_seq(attn_pcache *c)
 static int pcache_ensure_scratch(attn_pcache *c)
 {
 	if (!c->dq) {
-		c->dq = mat_create(c->n, LM_D_MODEL);
-		c->dk = mat_create(c->n, LM_D_MODEL);
-		c->dv = mat_create(c->n, LM_D_MODEL);
-		c->dconcat = mat_create(c->n, LM_D_MODEL);
-		c->dtmp = mat_create(c->n, LM_D_MODEL);
+		c->dq = mat_create_dev(c->n, LM_D_MODEL);
+		c->dk = mat_create_dev(c->n, LM_D_MODEL);
+		c->dv = mat_create_dev(c->n, LM_D_MODEL);
+		c->dconcat = mat_create_dev(c->n, LM_D_MODEL);
+		c->dtmp = mat_create_dev(c->n, LM_D_MODEL);
 		if (c->dq && c->dk && c->dv && c->dconcat && c->dtmp) {
 			mat_try_pin(c->dq);
 			mat_try_pin(c->dk);
@@ -777,10 +785,24 @@ int attn_mha_forward_packed(mat *out, attn *a, const mat *x, attn_pcache *c)
 	if (attn_qkv_project(c->q, c->k, c->v, a, x) != 0)
 		return -1;
 	/*
-	** --flash-attn: tiled FA (fused==4, no T×T HBM) first for VRAM;
-	** then TC GemmEx (3) if w_all fits; else legacy flash (2) / fused (1).
+	** Prefer TC GemmEx when w_all fits (faster at T=64 meter; FA ~3×
+	** slower here). Else tiled FA under --flash-attn (no T×T HBM). Then
+	** legacy / host.
 	*/
 	c->fused = 0;
+	if (c->w_all
+	    && gpu_attn_tc_fwd(c->concat, c->w_all, c->q, c->k, c->v, c->B, T,
+	    nh, a->d_head) == 0) {
+		static int s_tc_once;
+
+		c->fused = 3;
+		if (!s_tc_once) {
+			s_tc_once = 1;
+			fprintf(stderr, "[attn] Tensor-Core strided QK/AV path\n");
+			fflush(stderr);
+		}
+		return mat_mul(out, c->concat, a->wo);
+	}
 	if (g_flash_attn
 	    && gpu_attn_flash_fwd(c->concat, c->q, c->k, c->v, c->B, T, nh,
 	    a->d_head) == 0) {
@@ -791,19 +813,6 @@ int attn_mha_forward_packed(mat *out, attn *a, const mat *x, attn_pcache *c)
 			s_fa_once = 1;
 			fprintf(stderr,
 			    "[attn] tiled flash (logsumexp, no T×T HBM)\n");
-			fflush(stderr);
-		}
-		return mat_mul(out, c->concat, a->wo);
-	}
-	if (g_flash_attn && c->w_all
-	    && gpu_attn_tc_fwd(c->concat, c->w_all, c->q, c->k, c->v, c->B, T,
-	    nh, a->d_head) == 0) {
-		static int s_tc_once;
-
-		c->fused = 3;
-		if (!s_tc_once) {
-			s_tc_once = 1;
-			fprintf(stderr, "[attn] Tensor-Core strided QK/AV path\n");
 			fflush(stderr);
 		}
 		return mat_mul(out, c->concat, a->wo);

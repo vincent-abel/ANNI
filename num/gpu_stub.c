@@ -66,12 +66,37 @@ int gpu_memcpy_d2h(void *dst, const void *src, size_t nbytes)
 	return -1;
 }
 
+int gpu_host_pin(void *p, size_t nbytes)
+{
+	(void)p;
+	(void)nbytes;
+	return -1;
+}
+
+int gpu_memcpy_d2h_async(void *dst, const void *src, size_t nbytes)
+{
+	(void)dst;
+	(void)src;
+	(void)nbytes;
+	return -1;
+}
+
+int gpu_stream_sync(void)
+{
+	return -1;
+}
+
 int gpu_memcpy_d2d(void *dst, const void *src, size_t nbytes)
 {
 	(void)dst;
 	(void)src;
 	(void)nbytes;
 	return -1;
+}
+
+void gpu_half_wt_invalidate(const ann_real *fp32_dev)
+{
+	(void)fp32_dev;
 }
 
 int gpu_memset(void *dst, int value, size_t nbytes)
@@ -199,6 +224,26 @@ void gpu_set_compute_prec(int prec)
 int gpu_compute_prec(void)
 {
 	return GPU_PREC_FP32;
+}
+
+void gpu_set_fp8(int on)
+{
+	(void)on;
+}
+
+int gpu_fp8(void)
+{
+	return 0;
+}
+
+void gpu_set_fp8_dgrad(int on)
+{
+	(void)on;
+}
+
+int gpu_fp8_dgrad(void)
+{
+	return 0;
 }
 
 int gpu_bias_row_add(ann_real *x, const ann_real *bias, int rows, int cols)
@@ -332,6 +377,71 @@ int gpu_bias_relu_forward(ann_real *x, const ann_real *bias, int rows, int cols)
 	return -1;
 }
 
+int gpu_ffn_w1_finish(ann_real *hidden, ann_real *pre, const ann_real *bias,
+	int rows, int cols)
+{
+	(void)hidden;
+	(void)pre;
+	(void)bias;
+	(void)rows;
+	(void)cols;
+	return -1;
+}
+
+int gpu_mat_mul_bias(mat *c, const mat *a, const mat *b, const ann_real *bias)
+{
+	(void)c;
+	(void)a;
+	(void)b;
+	(void)bias;
+	return -1;
+}
+
+int gpu_mat_mul_bias_relu(mat *c, const mat *a, const mat *b,
+	const ann_real *bias)
+{
+	(void)c;
+	(void)a;
+	(void)b;
+	(void)bias;
+	return -1;
+}
+
+void gpu_half_wt_refresh_all(void)
+{
+}
+
+void gpu_adam_set_bf16_flat(void *bf16, const ann_real *fp32, int n)
+{
+	(void)bf16;
+	(void)fp32;
+	(void)n;
+}
+
+int gpu_adam_seed_bf16_flat(void *bf16, const ann_real *fp32, int n)
+{
+	(void)bf16;
+	(void)fp32;
+	(void)n;
+	return -1;
+}
+
+int gpu_adam_step_dev_bf16(ann_real *d_param, void *d_param_bf16,
+	ann_real *d_grad, ann_real *d_m, ann_real *d_v, int n, double lr,
+	double beta1, double beta2, double eps, int t, double grad_scale)
+{
+	(void)d_param_bf16;
+	return gpu_adam_step_dev(d_param, d_grad, d_m, d_v, n, lr, beta1, beta2,
+	    eps, t, grad_scale);
+}
+
+int gpu_ce_fetch_mean(double *mean_ce, int rows)
+{
+	(void)mean_ce;
+	(void)rows;
+	return -1;
+}
+
 int gpu_ce_delta_from_softmax(ann_real *probs, const int *tgt, int rows, int V,
 	ann_real *db_host, double *mean_ce)
 {
@@ -412,26 +522,6 @@ int gpu_adam_step_dev(ann_real *d_param, ann_real *d_grad, ann_real *d_m,
 	return -1;
 }
 
-int gpu_kv_attn_decode(ann_real *out, const ann_real *x,
-	const ann_real *wq, const ann_real *wk, const ann_real *wv,
-	const ann_real *wo, ann_real *k_cache, ann_real *v_cache,
-	int len, int max_T, int d_model, int n_heads, int d_head)
-{
-	(void)out;
-	(void)x;
-	(void)wq;
-	(void)wk;
-	(void)wv;
-	(void)wo;
-	(void)k_cache;
-	(void)v_cache;
-	(void)len;
-	(void)max_T;
-	(void)d_model;
-	(void)n_heads;
-	(void)d_head;
-	return -1;
-}
 
 void gpu_attn_set_seqlens(const int *seqlens)
 {
@@ -483,6 +573,14 @@ int gpu_mat_add(mat *dst, const mat *src)
 {
 	(void)dst;
 	(void)src;
+	return -1;
+}
+
+int gpu_mat_add2(mat *dst, const mat *a, const mat *b)
+{
+	(void)dst;
+	(void)a;
+	(void)b;
 	return -1;
 }
 
@@ -549,4 +647,59 @@ int gpu_graph_replay(void)
 
 void gpu_graph_destroy(void)
 {
+}
+
+gpu_dec *gpu_dec_create(int n_layers, int d_model, int d_ff, int vocab,
+	int max_T, int n_heads)
+{
+	(void)n_layers;
+	(void)d_model;
+	(void)d_ff;
+	(void)vocab;
+	(void)max_T;
+	(void)n_heads;
+	return NULL;
+}
+
+int gpu_dec_set_layer(gpu_dec *g, int i, const gpu_dec_layer_w *w)
+{
+	(void)g;
+	(void)i;
+	(void)w;
+	return -1;
+}
+
+int gpu_dec_set_io(gpu_dec *g, const ann_real *embed_dev,
+	const ann_real *w_head_dev, const ann_real *b_head_host)
+{
+	(void)g;
+	(void)embed_dev;
+	(void)w_head_dev;
+	(void)b_head_host;
+	return -1;
+}
+
+int gpu_dec_kv_load(gpu_dec *g, int layer, const ann_real *k_host,
+	const ann_real *v_host, int n)
+{
+	(void)g;
+	(void)layer;
+	(void)k_host;
+	(void)v_host;
+	(void)n;
+	return -1;
+}
+
+int gpu_dec_step(gpu_dec *g, int id, int pos, ann_real *logits)
+{
+	(void)g;
+	(void)id;
+	(void)pos;
+	(void)logits;
+	return -1;
+}
+
+void gpu_dec_free(gpu_dec **g)
+{
+	(void)g;
 }

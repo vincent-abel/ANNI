@@ -80,7 +80,9 @@ int embed_lookup(mat *out, const embed *e, const int *ids, int n)
 	mat_try_pin(out);
 	if (gpu_embed_lookup(out, e->table, ids, n) == 0)
 		return 0;
-	(void)mat_ensure_host((mat *)e->table);
+	/* Device-only mats have NULL host data — allocate before CPU gather. */
+	if (mat_ensure_host(out) != 0 || mat_ensure_host((mat *)e->table) != 0)
+		return -1;
 	for (i = 0; i < n; i++) {
 		id = ids[i];
 		if (id < 0 || id >= e->table->rows)

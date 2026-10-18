@@ -24,9 +24,19 @@ typedef struct	mat {
 #define MAT_DEV_HOST	0
 #define MAT_DEV_DEVICE	1
 #define MAT_DEV_SYNCED	2
+/* d_data is a view into an external buffer (Adam flat); do not cudaFree. */
+#define MAT_DEV_ALIASED	3
 
 mat	*mat_create(int rows, int cols);
+/*
+** Device-resident mat: no host calloc when CUDA is up (packed act caches).
+** Falls back to mat_create on CPU stub. Host buffer is allocated lazily on
+** mat_ensure_host if a CPU path needs it.
+*/
+mat	*mat_create_dev(int rows, int cols);
 void	mat_free(mat **m);
+/* Free host mirror only (keep d_data). No-op if data is NULL. */
+void	mat_release_host(mat *m);
 ann_real	mat_get(const mat *m, int row, int col);
 void	mat_set(mat *m, int row, int col, ann_real value);
 void	mat_fill(mat *m, ann_real value);

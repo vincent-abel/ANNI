@@ -8,6 +8,8 @@
 #include "resid.h"
 
 static int g_act_checkpoint;
+/* When set, drop/recompute every stride-th block (2 = keep ~half VRAM, half recompute). */
+static int g_act_ckpt_stride = 2;
 
 void block_set_act_checkpoint(int on)
 {
@@ -17,6 +19,15 @@ void block_set_act_checkpoint(int on)
 int block_act_checkpoint_enabled(void)
 {
 	return g_act_checkpoint;
+}
+
+static int block_ckpt_layer(int i)
+{
+	if (!g_act_checkpoint)
+		return 0;
+	if (g_act_ckpt_stride <= 1)
+		return 1;
+	return (i % g_act_ckpt_stride) == (g_act_ckpt_stride - 1);
 }
 
 /* S11: free device twins of recomputable activations; keep x_in. */
@@ -55,7 +66,8 @@ static void copy_mat(mat *dst, const mat *src)
 {
 	if (resid_copy(dst, src) == 0)
 		return;
-	mat_ensure_host((mat *)src);
+	if (mat_ensure_host((mat *)src) != 0 || mat_ensure_host(dst) != 0)
+		return;
 	memcpy(dst->data, src->data,
 	    (size_t)dst->rows * (size_t)dst->cols * sizeof(ann_real));
 	mat_host_dirty(dst);
@@ -114,12 +126,13 @@ static block_cache *block_cache_alloc(int B, int T, int n_heads, int d_head)
 		return NULL;
 	memset(c, 0, sizeof(*c));
 	c->T = n;
-	c->x_in = mat_create(n, LM_D_MODEL);
-	c->ln1_out = mat_create(n, LM_D_MODEL);
-	c->attn_out = mat_create(n, LM_D_MODEL);
-	c->x_mid = mat_create(n, LM_D_MODEL);
-	c->ln2_out = mat_create(n, LM_D_MODEL);
-	c->ffn_out = mat_create(n, LM_D_MODEL);
+	/* Device-only when CUDA is up — host mirrors of all layers blew WSL RAM. */
+	c->x_in = mat_create_dev(n, LM_D_MODEL);
+	c->ln1_out = mat_create_dev(n, LM_D_MODEL);
+	c->attn_out = mat_create_dev(n, LM_D_MODEL);
+	c->x_mid = mat_create_dev(n, LM_D_MODEL);
+	c->ln2_out = mat_create_dev(n, LM_D_MODEL);
+	c->ffn_out = mat_create_dev(n, LM_D_MODEL);
 	c->ln1c = ln_cache_create(n);
 	if (B == 1)
 		c->attnc = attn_cache_create(T, n_heads, d_head);
@@ -175,13 +188,43 @@ void block_cache_free(block_cache **c)
 	*c = NULL;
 }
 
+static void block_cache_repin(block_cache *bc)
+{
+	if (!bc)
+		return;
+	mat_try_pin(bc->x_in);
+	mat_try_pin(bc->ln1_out);
+	mat_try_pin(bc->attn_out);
+	mat_try_pin(bc->x_mid);
+	mat_try_pin(bc->ln2_out);
+	mat_try_pin(bc->ffn_out);
+	if (bc->ffnc) {
+		mat_try_pin(bc->ffnc->x_in);
+		mat_try_pin(bc->ffnc->pre_act);
+		mat_try_pin(bc->ffnc->hidden);
+	}
+	if (bc->attnpc) {
+		mat_try_pin(bc->attnpc->x_in);
+		mat_try_pin(bc->attnpc->q);
+		mat_try_pin(bc->attnpc->k);
+		mat_try_pin(bc->attnpc->v);
+		mat_try_pin(bc->attnpc->concat);
+	}
+	if (bc->ln1c)
+		mat_try_pin(bc->ln1c->x_hat);
+	if (bc->ln2c)
+		mat_try_pin(bc->ln2c->x_hat);
+}
+
 int tblock_forward_cache(mat *x, tblock *b, block_cache *c)
 {
 	if (!x || !b || !c)
 		return -1;
+	/* After act-checkpoint drop_device, reattach twins before GEMMs. */
+	block_cache_repin(c);
 	copy_mat(c->x_in, x);
-	copy_mat(c->ln1_out, x);
-	if (layernorm_forward_cache(c->ln1_out, b->ln1, c->ln1c) != 0)
+	/* LN(in→out) and resid sum skip a full D2D copy each. */
+	if (layernorm_forward_into(c->ln1_out, c->x_in, b->ln1, c->ln1c) != 0)
 		return -1;
 	if (c->attnpc) {
 		if (attn_mha_forward_packed(c->attn_out, b->attn, c->ln1_out,
@@ -190,16 +233,13 @@ int tblock_forward_cache(mat *x, tblock *b, block_cache *c)
 	} else if (attn_mha_forward_cache(c->attn_out, b->attn, c->ln1_out, 1,
 	    c->attnc) != 0)
 		return -1;
-	copy_mat(c->x_mid, c->x_in);
-	if (resid_add(c->x_mid, c->attn_out) != 0)
+	if (resid_sum(c->x_mid, c->x_in, c->attn_out) != 0)
 		return -1;
-	copy_mat(c->ln2_out, c->x_mid);
-	if (layernorm_forward_cache(c->ln2_out, b->ln2, c->ln2c) != 0)
+	if (layernorm_forward_into(c->ln2_out, c->x_mid, b->ln2, c->ln2c) != 0)
 		return -1;
 	if (ffn_forward_cache(c->ffn_out, c->ln2_out, b->ffn, c->ffnc) != 0)
 		return -1;
-	copy_mat(x, c->x_mid);
-	if (resid_add(x, c->ffn_out) != 0)
+	if (resid_sum(x, c->x_mid, c->ffn_out) != 0)
 		return -1;
 	return 0;
 }
@@ -221,35 +261,55 @@ int tblock_forward(mat *x, tblock *b)
 
 int tblock_backward(mat *dx, const mat *dout, tblock *b, const block_cache *c)
 {
+	/* One shared pool for all blocks (backward is serial). */
+	static mat *s_d_ffn_in;
+	static mat *s_d_mid;
+	static mat *s_d_attn_out;
+	static mat *s_tmp;
+	static int s_T;
 	mat *d_ffn_in;
 	mat *d_mid;
 	mat *d_attn_out;
-	mat *d_ln1_out;
 	mat *tmp;
 
 	if (!dx || !dout || !b || !c)
 		return -1;
 
-	d_ffn_in = mat_create(c->T, LM_D_MODEL);
-	d_mid = mat_create(c->T, LM_D_MODEL);
-	d_attn_out = mat_create(c->T, LM_D_MODEL);
-	d_ln1_out = mat_create(c->T, LM_D_MODEL);
-	tmp = mat_create(c->T, LM_D_MODEL);
-	if (!d_ffn_in || !d_mid || !d_attn_out || !d_ln1_out || !tmp)
-		goto fail;
-	mat_try_pin(d_ffn_in);
-	mat_try_pin(d_mid);
-	mat_try_pin(d_attn_out);
-	mat_try_pin(d_ln1_out);
-	mat_try_pin(tmp);
+	if (s_T != c->T || !s_d_ffn_in || !s_d_mid || !s_d_attn_out || !s_tmp) {
+		mat_free(&s_d_ffn_in);
+		mat_free(&s_d_mid);
+		mat_free(&s_d_attn_out);
+		mat_free(&s_tmp);
+		s_T = 0;
+		s_d_ffn_in = mat_create_dev(c->T, LM_D_MODEL);
+		s_d_mid = mat_create_dev(c->T, LM_D_MODEL);
+		s_d_attn_out = mat_create_dev(c->T, LM_D_MODEL);
+		s_tmp = mat_create_dev(c->T, LM_D_MODEL);
+		if (!s_d_ffn_in || !s_d_mid || !s_d_attn_out || !s_tmp) {
+			mat_free(&s_d_ffn_in);
+			mat_free(&s_d_mid);
+			mat_free(&s_d_attn_out);
+			mat_free(&s_tmp);
+			return -1;
+		}
+		mat_try_pin(s_d_ffn_in);
+		mat_try_pin(s_d_mid);
+		mat_try_pin(s_d_attn_out);
+		mat_try_pin(s_tmp);
+		s_T = c->T;
+	}
+	d_ffn_in = s_d_ffn_in;
+	d_mid = s_d_mid;
+	d_attn_out = s_d_attn_out;
+	tmp = s_tmp;
 	mat_try_pin(dx);
 
 	/* y = x_mid + ffn_out; dy splits to both */
 	copy_mat(d_mid, dout);
 	if (ffn_backward(d_ffn_in, dout, b->ffn, c->ffnc) != 0)
-		goto fail;
+		return -1;
 	if (layernorm_backward(tmp, d_ffn_in, b->ln2, c->ln2c) != 0)
-		goto fail;
+		return -1;
 	mat_axpy(d_mid, 1.0, tmp);
 
 	/* x_mid = x_in + attn_out */
@@ -257,26 +317,13 @@ int tblock_backward(mat *dx, const mat *dout, tblock *b, const block_cache *c)
 	if (c->attnpc) {
 		if (attn_mha_backward_packed(d_attn_out, d_mid, b->attn,
 		    c->attnpc) != 0)
-			goto fail;
+			return -1;
 	} else if (attn_mha_backward(d_attn_out, d_mid, b->attn, c->attnc) != 0)
-		goto fail;
+		return -1;
 	if (layernorm_backward(tmp, d_attn_out, b->ln1, c->ln1c) != 0)
-		goto fail;
+		return -1;
 	mat_axpy(dx, 1.0, tmp);
-
-	mat_free(&d_ffn_in);
-	mat_free(&d_mid);
-	mat_free(&d_attn_out);
-	mat_free(&d_ln1_out);
-	mat_free(&tmp);
 	return 0;
-fail:
-	mat_free(&d_ffn_in);
-	mat_free(&d_mid);
-	mat_free(&d_attn_out);
-	mat_free(&d_ln1_out);
-	mat_free(&tmp);
-	return -1;
 }
 
 transformer *transformer_create(void)
@@ -424,8 +471,8 @@ int transformer_forward_cache(mat *x, transformer *t, transformer_cache *c)
 	for (i = 0; i < t->n_blocks; i++) {
 		if (tblock_forward_cache(x, &t->blocks[i], &c->bc[i]) != 0)
 			return -1;
-		/* S11: release per-block device acts; x_in stays for recompute. */
-		if (g_act_checkpoint)
+		/* S11: drop selected layers; x_in stays for recompute. */
+		if (block_ckpt_layer(i))
 			block_cache_drop_device(&c->bc[i]);
 	}
 	return 0;
@@ -449,53 +496,65 @@ int transformer_forward(mat *x, transformer *t)
 int transformer_backward(mat *dx, const mat *dout, transformer *t,
 	transformer_cache *c)
 {
+	static mat *s_cur;
+	static mat *s_prev;
+	static mat *s_scratch;
+	static int s_T;
+	static int s_have_scratch;
 	mat *cur;
 	mat *prev;
 	mat *swap;
 	mat *scratch;
 	int i;
+	int want_scratch;
 
 	if (!dx || !dout || !t || !c)
 		return -1;
-	cur = mat_create(c->T, LM_D_MODEL);
-	prev = mat_create(c->T, LM_D_MODEL);
-	scratch = g_act_checkpoint ? mat_create(c->T, LM_D_MODEL) : NULL;
-	if (!cur || !prev || (g_act_checkpoint && !scratch)) {
-		mat_free(&cur);
-		mat_free(&prev);
-		mat_free(&scratch);
-		return -1;
-	}
-	if (scratch)
-		mat_try_pin(scratch);
-	copy_mat(cur, dout);
-	for (i = t->n_blocks - 1; i >= 0; i--) {
-		if (g_act_checkpoint) {
-			/* Recompute block activations from saved x_in. */
-			copy_mat(scratch, c->bc[i].x_in);
-			if (tblock_forward_cache(scratch, &t->blocks[i],
-			    &c->bc[i]) != 0) {
-				mat_free(&cur);
-				mat_free(&prev);
-				mat_free(&scratch);
-				return -1;
-			}
-		}
-		if (tblock_backward(prev, cur, &t->blocks[i], &c->bc[i]) != 0) {
-			mat_free(&cur);
-			mat_free(&prev);
-			mat_free(&scratch);
+	want_scratch = g_act_checkpoint ? 1 : 0;
+	if (s_T != c->T || !s_cur || !s_prev
+	    || want_scratch != s_have_scratch) {
+		mat_free(&s_cur);
+		mat_free(&s_prev);
+		mat_free(&s_scratch);
+		s_T = 0;
+		s_have_scratch = 0;
+		s_cur = mat_create_dev(c->T, LM_D_MODEL);
+		s_prev = mat_create_dev(c->T, LM_D_MODEL);
+		s_scratch = want_scratch
+		    ? mat_create_dev(c->T, LM_D_MODEL) : NULL;
+		if (!s_cur || !s_prev || (want_scratch && !s_scratch)) {
+			mat_free(&s_cur);
+			mat_free(&s_prev);
+			mat_free(&s_scratch);
 			return -1;
 		}
-		if (g_act_checkpoint)
+		mat_try_pin(s_cur);
+		mat_try_pin(s_prev);
+		if (s_scratch)
+			mat_try_pin(s_scratch);
+		s_T = c->T;
+		s_have_scratch = want_scratch;
+	}
+	cur = s_cur;
+	prev = s_prev;
+	scratch = s_scratch;
+	copy_mat(cur, dout);
+	for (i = t->n_blocks - 1; i >= 0; i--) {
+		if (block_ckpt_layer(i)) {
+			/* Recompute dropped-layer activations from saved x_in. */
+			copy_mat(scratch, c->bc[i].x_in);
+			if (tblock_forward_cache(scratch, &t->blocks[i],
+			    &c->bc[i]) != 0)
+				return -1;
+		}
+		if (tblock_backward(prev, cur, &t->blocks[i], &c->bc[i]) != 0)
+			return -1;
+		if (block_ckpt_layer(i))
 			block_cache_drop_device(&c->bc[i]);
 		swap = cur;
 		cur = prev;
 		prev = swap;
 	}
 	copy_mat(dx, cur);
-	mat_free(&cur);
-	mat_free(&prev);
-	mat_free(&scratch);
 	return 0;
 }
