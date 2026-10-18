@@ -1,6 +1,12 @@
 #include "main.h"
 #include "gpu.h"
+#ifdef _WIN32
+#include "ann_posix.h"
+#else
 #include <unistd.h>
+#include <sys/time.h>
+#include <sys/ioctl.h>
+#endif
 
 static int arg_eq(const char *a, const char *b)
 {
@@ -232,6 +238,15 @@ static int run_lm_train_core(int argc, char **argv, int use_tower)
 				lm_train_set_compute_prec(GPU_PREC_BF16);
 			else if (fp16)
 				lm_train_set_compute_prec(GPU_PREC_FP16);
+			/*
+			** --fp8: E4M3 forward + E5M2 dgrad GEMMs; wgrad stays
+			** BF16; FP32 Adam masters. Implies --fp8-dgrad.
+			*/
+			if (arg_flag(argc, argv, NULL, "--fp8"))
+				lm_train_set_fp8(1);
+			/* --fp8-dgrad alone: E5M2 dX only (no forward FP8). */
+			if (arg_flag(argc, argv, NULL, "--fp8-dgrad"))
+				lm_train_set_fp8_dgrad(1);
 		}
 		if (arg_flag(argc, argv, NULL, "--flash-attn"))
 			lm_train_set_flash_attn(1);
@@ -425,6 +440,9 @@ static int run_lm_train_core(int argc, char **argv, int use_tower)
 	} else if (model && opt) {
 		ds = text_dataset_load_tok(data, window, model->bpe);
 	}
+	/* Non-stream: --stride N (e.g. =window) for one pass over ids. */
+	if (ds && !stream && stride > 0)
+		text_dataset_set_stride(ds, stride);
 	if (!model || !opt || (stream ? !tstream : !ds)) {
 		lm_free(&model);
 		text_dataset_free(&ds);
@@ -685,14 +703,161 @@ static int apply_vocab_arg(lm *model, int argc, char **argv, const char *who)
 	return 0;
 }
 
+struct gen_view {
+	int		nnew;
+	int		vocab;
+	int		tty;
+	double		t0;
+	double		t_first;	/* wall time of the first new piece */
+	int		cols;		/* terminal size */
+	int		lines;
+	int		row;		/* cursor row below the meter, 0-based */
+	int		col;
+};
+
+static double gen_wall(void)
+{
+	struct timeval tv;
+
+	gettimeofday(&tv, NULL);
+	return (double)tv.tv_sec + 1e-6 * (double)tv.tv_usec;
+}
+
+static void gen_term_size(struct gen_view *v)
+{
+	v->cols = 80;
+	v->lines = 24;
+#ifdef TIOCGWINSZ
+	{
+		struct winsize ws;
+
+		if (ioctl(fileno(stderr), TIOCGWINSZ, &ws) == 0) {
+			if (ws.ws_col > 0)
+				v->cols = ws.ws_col;
+			if (ws.ws_row > 0)
+				v->lines = ws.ws_row;
+		}
+	}
+#endif
+}
+
+/* Follow the cursor through text written below the meter (with autowrap). */
+static void gen_track(struct gen_view *v, const char *s, int n)
+{
+	int i;
+
+	for (i = 0; i < n; i++) {
+		unsigned char c = (unsigned char)s[i];
+
+		if (c == '\n') {
+			v->row++;
+			v->col = 0;
+		} else if (c == '\r')
+			v->col = 0;
+		else if (c == '\t') {
+			if (v->col >= v->cols) {
+				v->row++;
+				v->col = 0;
+			}
+			v->col += 8 - v->col % 8;
+			if (v->col > v->cols)
+				v->col = v->cols;
+		} else if (c >= 0x20 && c != 0x7f && (c & 0xc0) != 0x80) {
+			if (v->col >= v->cols) {
+				v->row++;
+				v->col = 0;
+			}
+			v->col++;
+		}
+	}
+}
+
+/* Forward GEMMs: 2 flops per stored weight (blocks + vocab head). */
+static double gen_tflops(double tok_sec, int vocab)
+{
+	double params;
+
+	params = (double)LM_N_BLOCKS * (4.0 * LM_D_MODEL * LM_D_MODEL
+	    + 2.0 * LM_D_MODEL * LM_D_FF)
+	    + (double)LM_D_MODEL * (double)vocab;
+	return 2.0 * params * tok_sec / 1e12;
+}
+
+static void gen_meter(struct gen_view *v, int final)
+{
+	double dt;
+	double ts;
+	double tf;
+	double steady;
+	char buf[96];
+
+	dt = gen_wall() - v->t0;
+	if (v->nnew <= 0 || dt <= 0.0) {
+		ts = 0.0;
+		tf = 0.0;
+	} else {
+		ts = (double)v->nnew / dt;
+		tf = gen_tflops(ts, v->vocab);
+	}
+	/* Steady excludes load, prefill and the first token. */
+	steady = 0.0;
+	if (v->nnew > 1 && gen_wall() > v->t_first)
+		steady = (double)(v->nnew - 1) / (gen_wall() - v->t_first);
+	if (v->tty) {
+		/* Once the meter scrolls off the top, cursor-up would clamp
+		** onto a text line; print the summary below instead. */
+		if (v->row + 1 > v->lines - 1) {
+			if (final)
+				fprintf(stderr, "%.0f t/s  %.3f TF  steady %.1f "
+				    "t/s\n", ts, tf, steady);
+			fflush(stderr);
+			return;
+		}
+		/* At the last column the wrap is pending; save/restore drops
+		** it on some terminals, so wait for the next piece. */
+		if (v->col >= v->cols)
+			return;
+		if (final)
+			snprintf(buf, sizeof(buf), "%7.0f t/s  %7.3f TF  steady "
+			    "%.1f t/s", ts, tf, steady);
+		else
+			snprintf(buf, sizeof(buf), "%7.0f t/s  %7.3f TF", ts, tf);
+		fprintf(stderr, "\0337\033[%dA\r%.*s\033[K\0338", v->row + 1,
+		    v->cols - 1, buf);
+		fflush(stderr);
+		return;
+	}
+	if (!final)
+		return;
+	fprintf(stderr, "%.0f t/s  %.3f TF  steady %.1f t/s\n", ts, tf, steady);
+	fflush(stderr);
+}
+
+static void gen_emit(const char *s, int n, void *ud)
+{
+	struct gen_view *v;
+
+	v = ud;
+	if (s && n > 0) {
+		fwrite(s, 1, (size_t)n, stdout);
+		fflush(stdout);
+		gen_track(v, s, n);
+	}
+	if (v->nnew == 0)
+		v->t_first = gen_wall();
+	v->nnew++;
+	gen_meter(v, 0);
+}
+
 static int run_lm_generate(int argc, char **argv)
 {
 	lm *model;
-	char out[512];
+	struct gen_view view;
 	const char *path;
 	const char *prompt;
 	int nnew;
 	int top_k;
+	int sync_was;
 	double temperature;
 	double top_p;
 
@@ -707,23 +872,46 @@ static int run_lm_generate(int argc, char **argv)
 	if (top_k < 0)
 		top_k = 0;
 
+	memset(&view, 0, sizeof(view));
+	view.tty = isatty(fileno(stdout)) && isatty(fileno(stderr));
+	setvbuf(stdout, NULL, _IONBF, 0);
+	/* Prompt is already known. Show it before the checkpoint load. */
+	if (view.tty) {
+		gen_term_size(&view);
+		fprintf(stderr, "%7.0f t/s  %7.3f TF\n", 0.0, 0.0);
+		fflush(stderr);
+	}
+	fputs(prompt, stdout);
+	fflush(stdout);
+	gen_track(&view, prompt, (int)strlen(prompt));
+
 	model = lm_load(path);
 	if (!model)
 		model = lm_load_checkpoint(path, NULL, NULL, NULL);
 	if (!model) {
-		fprintf(stderr, "lm generate: cannot load %s\n", path);
+		fprintf(stderr, "\nlm generate: cannot load %s\n", path);
 		return 1;
 	}
 	if (apply_vocab_arg(model, argc, argv, "lm generate") != 0) {
 		lm_free(&model);
 		return 1;
 	}
-	if (lm_generate(model, prompt, out, (int)sizeof(out), nnew,
-		temperature, top_k, top_p) < 0) {
+	view.vocab = model->vocab_size;
+	view.t0 = gen_wall();
+	sync_was = gpu_sync_mode();
+	gpu_set_sync_mode(GPU_SYNC_BATCH);
+	if (lm_generate_stream(model, prompt, nnew, temperature, top_k, top_p,
+		gen_emit, &view) < 0) {
+		gpu_set_sync_mode(sync_was);
+		fprintf(stderr, "\nlm generate: failed\n");
 		lm_free(&model);
 		return 1;
 	}
-	printf("%s\n", out);
+	gpu_set_sync_mode(sync_was);
+	fputc('\n', stdout);
+	fflush(stdout);
+	gen_track(&view, "\n", 1);
+	gen_meter(&view, 1);
 	lm_free(&model);
 	return 0;
 }
@@ -769,7 +957,7 @@ static int run_anni_chat(int argc, char **argv)
 
 	path = arg_value(argc, argv, "--model", "wiki_bpe.bin");
 	nnew = atoi(arg_value(argc, argv, "--tokens", "64"));
-	temperature = atof(arg_value(argc, argv, "--temperature", "0.8"));
+	temperature = atof(arg_value(argc, argv, "--temperature", "0.2"));
 	top_k = atoi(arg_value(argc, argv, "--top-k", "0"));
 	top_p = atof(arg_value(argc, argv, "--top-p", "0.9"));
 
