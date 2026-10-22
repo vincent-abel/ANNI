@@ -1,4 +1,6 @@
 CC=gcc -g
+# `make` with no target builds ./anni (the per-object rules below come first).
+.DEFAULT_GOAL := all
 # Include roots: net/ (neural network), num/ (numerical engine), lang/ (language model), cli/.
 INCLUDES=-I. -Inet -Inum -Ilang -Icli -Icompat
 # OPT=-O2 enables auto-vectorization on contiguous ann_dot / mat_mul loops.
@@ -16,10 +18,12 @@ else ifneq ($(wildcard /usr/include/ncurses/curses.h),)
 NCURSES_CFLAGS=-DANN_NCURSES -I/usr/include/ncurses
 NCURSES_LIBS=-lncurses
 endif
-CFLAGS=-W -Wall -ansi -pedantic -std=c99 $(OPT) $(OPENMP) $(ARCH) $(INCLUDES) $(NCURSES_CFLAGS)
+# LMCFG overrides lang/lm_config.h sizes (e.g. -DLM_D_MODEL=128); `make test` uses a small model.
+LMCFG ?=
+CFLAGS=-W -Wall -ansi -pedantic -std=c99 $(OPT) $(OPENMP) $(ARCH) $(INCLUDES) $(NCURSES_CFLAGS) $(LMCFG)
 LDFLAGS=-lm $(OPENMP) $(NCURSES_LIBS)
 EXEC=anni
-OBJDIR=objects
+OBJDIR ?= objects
 
 NET_SRC=net/neuron.c net/layer.c net/dataset.c net/optim.c net/serialize.c
 NUM_SRC=num/vec.c num/mat.c num/tensor.c num/ops.c num/arena.c num/simd.c num/gpu_stub.c
@@ -94,7 +98,11 @@ ann: anni
 $(TEST): tests/test_ann.c $(LIB_OBJ)
 	$(CC) $(CFLAGS) -o $@ tests/test_ann.c $(LIB_OBJ) $(LDFLAGS)
 
-test: $(TEST)
+# Unit tests build a small LM (D=128, 2 blocks) in their own object dir so they
+# finish in seconds; the full D=1024 x 12 config made the CPU suite run >15 min.
+TEST_LMCFG=-DLM_D_MODEL=128 -DLM_N_HEADS=4 -DLM_D_FF=512 -DLM_N_BLOCKS=2
+test:
+	$(MAKE) OBJDIR=objects-test LMCFG="$(TEST_LMCFG)" $(TEST)
 	./$(TEST)
 
 gui: $(GUI)
@@ -151,7 +159,7 @@ CUDA_INC :=
 CUDA_LDFLAGS :=
 CUDA_ARCH_FLAG :=
 endif
-CUDA_NVCC_FLAGS=-O2 -I. -Inum -Ilang -Icompat $(CUDA_INC) $(CUDA_ARCH_FLAG) --use_fast_math
+CUDA_NVCC_FLAGS=-O2 -I. -Inum -Ilang -Icompat $(LMCFG) $(CUDA_INC) $(CUDA_ARCH_FLAG) --use_fast_math
 CUDA_LIBS=$(CUDA_LDFLAGS) -lcudart
 ifeq ($(ANN_CUBLAS),1)
 CUDA_NVCC_FLAGS+=-DANN_CUBLAS
@@ -170,7 +178,7 @@ $(CUDA_OBJ): num/gpu_cuda.cu | $(OBJDIR)
 	$(NVCC) $(CUDA_NVCC_FLAGS) -c num/gpu_cuda.cu -o $@
 
 clean:
-	rm -rf $(OBJDIR)
+	rm -rf $(OBJDIR) objects-test
 
 mrproper: clean
 	rm -rf $(EXEC) ann

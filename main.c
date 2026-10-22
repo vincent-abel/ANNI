@@ -1032,6 +1032,66 @@ static int run_lm_load(int argc, char **argv)
 	return 0;
 }
 
+/* lm bench step|gemm|decode|sweep: see docs/bench-harness.md. */
+static int run_lm_bench_mode(int argc, char **argv, const char *mode)
+{
+	lm_bench_cfg cfg;
+	const char *prec;
+	const char *json;
+	int i;
+
+	lm_bench_cfg_defaults(&cfg);
+	cfg.B = atoi(arg_value(argc, argv, "--batch", "32"));
+	cfg.T = atoi(arg_value(argc, argv, "--window",
+	    LM_MAX_CTX < 256 ? "64" : "256"));
+	cfg.vocab = atoi(arg_value(argc, argv, "--vocab-size", "16384"));
+	cfg.warmup = atoi(arg_value(argc, argv, "--warmup", "5"));
+	cfg.steps = atoi(arg_value(argc, argv, "--steps", "30"));
+	cfg.seed = atoi(arg_value(argc, argv, "--seed", "1"));
+	cfg.lr = atof(arg_value(argc, argv, "--lr", "3e-4"));
+	cfg.profile = arg_flag(argc, argv, NULL, "--profile");
+	cfg.ckpt = arg_flag(argc, argv, NULL, "--act-checkpoint");
+	cfg.offload = arg_flag(argc, argv, NULL, "--adam-offload");
+	cfg.ceiling = !arg_flag(argc, argv, NULL, "--no-ceiling");
+	cfg.allow_busy = arg_flag(argc, argv, NULL, "--allow-busy");
+	cfg.model_path = arg_value(argc, argv, "--model", NULL);
+	cfg.prompt = arg_value(argc, argv, "--prompt", "The ");
+	cfg.tokens = atoi(arg_value(argc, argv, "--tokens", "128"));
+	cfg.runs = atoi(arg_value(argc, argv, "--runs", "3"));
+	json = arg_value(argc, argv, "--json", "bench/results.jsonl");
+	cfg.json = arg_eq(json, "none") ? NULL : json;
+	prec = arg_value(argc, argv, "--prec", "bf16");
+	cfg.prec = -1;
+	for (i = 0; i < 3; i++) {
+		static const char *const names[] = { "fp32", "bf16", "fp8" };
+
+		if (arg_eq(prec, names[i]))
+			cfg.prec = i;
+	}
+	if (cfg.prec < 0 && !arg_eq(mode, "sweep")) {
+		fprintf(stderr, "lm bench: --prec must be fp32, bf16 or fp8\n");
+		return 1;
+	}
+	if (cfg.prec < 0)
+		cfg.prec = LM_BENCH_BF16;
+	if (arg_eq(mode, "step")) {
+		cfg.graphs = atoi(arg_value(argc, argv, "--graphs", "1")) != 0;
+		return lm_bench_step(&cfg);
+	}
+	if (arg_eq(mode, "gemm")) {
+		cfg.B = atoi(arg_value(argc, argv, "--batch", "64"));
+		return lm_bench_gemm(&cfg);
+	}
+	if (arg_eq(mode, "decode"))
+		return lm_bench_decode(&cfg);
+	/* Cartesian product of the lists; see docs/bench-harness.md. */
+	return lm_bench_sweep(&cfg,
+	    arg_value(argc, argv, "--windows", "64,256"),
+	    arg_value(argc, argv, "--batches", "32,64,128"),
+	    arg_value(argc, argv, "--precs", "fp32,bf16,fp8"),
+	    arg_value(argc, argv, "--graphs", "0,1"));
+}
+
 static int run_lm_bench(int argc, char **argv)
 {
 	lm *model;
@@ -1040,6 +1100,9 @@ static int run_lm_bench(int argc, char **argv)
 	int iters;
 	double ms;
 
+	if (argc >= 4 && (arg_eq(argv[3], "step") || arg_eq(argv[3], "gemm")
+	    || arg_eq(argv[3], "decode") || arg_eq(argv[3], "sweep")))
+		return run_lm_bench_mode(argc, argv, argv[3]);
 	n = atoi(arg_value(argc, argv, "--tokens", "32"));
 	iters = atoi(arg_value(argc, argv, "--iters", "20"));
 	if (n <= 0)
@@ -1282,7 +1345,15 @@ int main(int argc, char *argv[])
 		printf("                 [--vocab PATH]\n");
 		printf("       ./anni lm chat --model wiki_bpe.bin   (alias of ./anni chat)\n");
 		printf("       ./anni lm load --model model.bin [--vocab PATH] [--prompt TEXT]\n");
-		printf("       ./anni lm bench [--tokens N] [--iters N] [--train]\n");
+		printf("       ./anni lm bench step [--batch B] [--window T] [--prec fp32|bf16|fp8]\n");
+		printf("                 [--graphs 0|1] [--act-checkpoint] [--adam-offload] [--profile]\n");
+		printf("                 [--warmup N] [--steps N] [--vocab-size V] [--json PATH|none]\n");
+		printf("                 [--no-ceiling] [--allow-busy]\n");
+		printf("       ./anni lm bench gemm [--batch B] [--window T] [--prec P]\n");
+		printf("       ./anni lm bench decode --model PATH [--prompt TEXT] [--tokens N] [--runs N]\n");
+		printf("       ./anni lm bench sweep [--windows 64,256] [--batches 32,64,128]\n");
+		printf("                 [--precs fp32,bf16,fp8] [--graphs 0,1] [step flags]\n");
+		printf("       ./anni lm bench [--tokens N] [--iters N] [--train]   (legacy B=1)\n");
 		return 1;
 	}
 
