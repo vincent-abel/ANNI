@@ -339,6 +339,12 @@ static void bench_env_probe(bench_env *e)
 
 static int bench_env_ok(const lm_bench_cfg *cfg, const bench_env *e)
 {
+	/* CPU stub timings say nothing about the GPU path: refuse. */
+	if (!gpu_available()) {
+		fprintf(stderr, "lm bench: needs a CUDA device (backend=%s); "
+		    "build with make cuda\n", gpu_backend_name());
+		return 0;
+	}
 	if (!e->busy)
 		return 1;
 	fprintf(stderr, "lm bench: GPU busy (%.0f MB of %.0f MB already used "
