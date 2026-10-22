@@ -173,15 +173,25 @@ int	gpu_relu_backward(ann_real *dx, const ann_real *x_pre_relu_or_mask, int n);
 */
 int	gpu_attn_causal_fwd(mat *concat, mat *w, const mat *q, const mat *k,
 		const mat *v, int B, int T, int H, int dh);
-/* S7: like fwd but does not materialize w (Flash-style); recompute w in bwd. */
+/*
+** S7: causal flash forward. Writes per-row logsumexp into lse ((B*H*T) x 1)
+** and does not materialize T×T scores. lse must already be device-resident.
+** Same causal softmax as the tiled backward (j > i masked, plus seqlens).
+*/
 int	gpu_attn_flash_fwd(mat *concat, const mat *q, const mat *k,
-		const mat *v, int B, int T, int H, int dh);
-/* FA-2 tiled bwd: uses logsumexp from flash_fwd; no B·H·T·T scores buffer. */
+		const mat *v, int B, int T, int H, int dh, mat *lse);
+/* FA-2 tiled bwd: P = exp(S - L) from this forward's lse. No T×T buffer. */
 int	gpu_attn_tiled_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat,
 		const mat *concat, const mat *q, const mat *k, const mat *v,
-		int B, int T, int H, int dh);
-int	gpu_attn_recompute_w(mat *w, const mat *q, const mat *k, int B, int T,
+		const mat *lse, int B, int T, int H, int dh);
+/* Recompute that causal logsumexp into lse. Does not write a score tensor. */
+int	gpu_attn_recompute_w(mat *lse, const mat *q, const mat *k, int B, int T,
 		int H, int dh);
+/*
+** Milliseconds of one tiled flash backward, or -1 if not measured yet.
+** Timed once, outside CUDA graph capture. This is not a cuDNN SDPA launch.
+*/
+float	gpu_attn_flash_bwd_ms(void);
 int	gpu_attn_causal_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat,
 		const mat *w, const mat *q, const mat *k, const mat *v,
 		int B, int T, int H, int dh);
