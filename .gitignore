@@ -54,3 +54,5 @@ tests/*.ann
 
 # real corpora fetched by scripts/fetch_wiki.sh (CC BY-SA, never vendored)
 data/wiki_*
+objects-test/
+bench/

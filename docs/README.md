@@ -110,6 +110,7 @@
 - [GPU bias grad reduce (S3)](gpu-bias-grad-reduce.md)
 - [FP16 loss scaling (S5b)](fp16-loss-scaling.md)
 - [Speed stack bench (S6/S10/S15)](speed-stack-bench.md)
+- [Bench harness (`lm bench step|gemm|decode|sweep`)](bench-harness.md)
 - [Fused epilogues (S8)](fused-epilogues.md)
 - [Multi-stream train (S9)](multi-stream-train.md)
 - [Activation buffer reuse (S12)](activation-buffer-reuse.md)
@@ -387,7 +388,7 @@ make cuda defaults to ANN_CUBLAS=1 so gpu_mat_mul prefers cublasDgemm then falls
 GPU_SYNC_BATCH skips per-GEMM D2H when outputs are pinned. The train loop syncs at Adam and epoch NLL boundaries instead.
 
 ### [nvidia-smi / train util proof](gpu-train-util-proof.md)
-lm train --bench-gpu and lm bench --train time full train steps and print the GPU backend. Use nvidia-smi dmon alongside make cuda builds to confirm util.
+lm train --bench-gpu and lm bench --train time full train steps and print the GPU backend. Use nvidia-smi dmon alongside make cuda builds to confirm util. They time an unpacked B=1 step; for the packed train path use [lm bench step](bench-harness.md).
 
 # From toy LM → small LLM docs
 
