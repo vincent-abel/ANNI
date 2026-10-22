@@ -62,7 +62,7 @@ F_{recompute}(T) = 2\,L\,(4D^2 + 2\,D\,D_{ff}) + 2\,L\,T\,D
 - **Attention path is "auto".** `--flash-attn` is set: the TC score path runs when `B·H·T·T` floats fit in 256 MiB, otherwise tiled flash. The once-per-process `[attn]` log line says which one ran. The tiled backward on master shares one logsumexp across layers (fixed on the local `phase2-flash-bwd` branch); step timings are valid either way, but trust training only on the fixed build.
 - **`--prec fp8`** sets BF16 compute plus `lm_train_set_fp8(1)` (E4M3 forward, E5M2 dgrad, BF16 wgrad), matching what `lm train --fp8 --bf16` does.
 - **The train meter is not changed here.** `lm train` still prints the old TF estimate; switching it to `lm_bench_flops_per_token` changes every logged number and the TF gate scripts, so it lands with the CLI trim.
-- **CPU stub.** Every mode runs on the CPU build. `make test` exercises `lm_train_bench_packed` and the FLOP formula with a D=128, 2-block model.
+- **GPU only.** Every mode refuses to run on the CPU stub: CPU timings say nothing about the CUDA path. `make test` still checks `lm_train_bench_packed` for correctness (timings recorded, phases filled, CE falls) and the FLOP formula, on a D=128, 2-block model, without reporting speed.
 
 ## How it shows up in this repo
 
@@ -92,11 +92,11 @@ scripts/bench_gate.sh
 python3 scripts/bench_compare.py bench/baseline-NVIDIA_GeForce_RTX_5070_Ti.jsonl bench/run-*.jsonl
 ```
 
-Stdout row (CPU stub, D=128 test config):
+Stdout row format:
 
 ```text
-step fp32 B=4 T=32 graphs=1 ckpt=0 off=0  p50 116.31 ms (p10 104.08 p90 127.55 cv 7.1%)  1101 tok/s  0.004 TF  MFU 45.3%  loss 7.519->6.696 ok
-     phases p50: fwd 18.84  loss 38.33  bwd 49.41  adam 6.06 ms
+step bf16 B=64 T=256 graphs=1 ckpt=0 off=0  p50 <ms> (p10 <ms> p90 <ms> cv <%>)  <tok/s>  <TF>  MFU <%>  VRAM <MB>  loss <a>-><b> ok
+     phases p50: fwd <ms>  loss <ms>  bwd <ms>  adam <ms>
 ```
 
 The matching JSON line carries the same numbers plus `git`, `dirty`, `gpu`, `driver`, `vram_mb`, `busy`, model dims and the full config.

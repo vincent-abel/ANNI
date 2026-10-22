@@ -21,9 +21,12 @@ for a in "$@"; do
 	esac
 done
 
-mkdir -p bench
 gpu=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 | tr ' /' '__')
-gpu=${gpu:-cpu}
+if [[ -z $gpu ]]; then
+	echo "bench_gate: no NVIDIA GPU (nvidia-smi); the bench is GPU-only" >&2
+	exit 2
+fi
+mkdir -p bench
 sha=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)
 RUN="bench/run-$sha-$(date +%Y%m%d-%H%M%S).jsonl"
 BASE="bench/baseline-$gpu.jsonl"
