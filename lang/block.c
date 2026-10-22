@@ -51,7 +51,10 @@ static void block_cache_drop_device(block_cache *bc)
 		mat_device_free(bc->attnpc->k);
 		mat_device_free(bc->attnpc->v);
 		mat_device_free(bc->attnpc->concat);
-		/* Keep w_all: TC/flash bwd recomputes scores into it. */
+		/*
+		** Keep w_all and lse. lse is the forward causal logsumexp;
+		** the tiled backward reads that same softmax. Do not drop it.
+		*/
 	}
 	if (bc->attnc) {
 		mat_device_free(bc->attnc->x_in);

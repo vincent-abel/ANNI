@@ -3234,8 +3234,12 @@ __global__ static void attn_fwd_kernel(ann_real *concat, ann_real *w,
 	}
 }
 
-/* S7: write softmax weights only (for bwd recompute after flash fwd). */
-__global__ static void attn_recompute_w_kernel(ann_real *w, const ann_real *q,
+/*
+** Same causal softmax as attn_fwd_kernel: S_ij = -inf when j > i or the
+** position is outside seqlens. Writes L = m + log(sum exp(S-m)) only.
+** The row lives in SRAM. No T×T score tensor in HBM.
+*/
+__global__ static void attn_lse_kernel(ann_real *Lstat, const ann_real *q,
 	const ann_real *k, int T, int H, int dh, ann_real scale,
 	const int *seqlens)
 {
@@ -3255,7 +3259,6 @@ __global__ static void attn_recompute_w_kernel(ann_real *w, const ann_real *q,
 	ann_real mx;
 	ann_real sum;
 	ann_real acc;
-	ann_real *wr = w + (size_t)blockIdx.x * T;
 
 	if (L < 1)
 		L = 1;
@@ -3288,8 +3291,8 @@ __global__ static void attn_recompute_w_kernel(ann_real *w, const ann_real *q,
 	sum = att_sum(sum, red);
 	if (sum < 1e-20f)
 		sum = 1.0f;
-	for (j = threadIdx.x; j < T; j += blockDim.x)
-		wr[j] = sc[j] / sum;
+	if (threadIdx.x == 0)
+		Lstat[blockIdx.x] = mx + __logf(sum);
 }
 
 /*
@@ -3381,10 +3384,61 @@ __global__ static void attn_bwd_cols_kernel(ann_real *dk, ann_real *dv,
 static pthread_mutex_t g_att_mu = PTHREAD_MUTEX_INITIALIZER;
 static ann_real *g_att_ds;
 static size_t g_att_ds_cap;
-/* Flash/tiled: per-row logsumexp (B·H·T), not T×T scores. */
-static ann_real *g_fa_L;
-static size_t g_fa_L_cap;
-static int g_fa_L_n;
+/*
+** One-shot wall clock of the tiled flash backward. -1 until measured.
+** Not recorded inside CUDA graph capture (a sync there is illegal, and
+** autotune stays outside the timed window).
+*/
+static float g_fa_bwd_ms = -1.f;
+static int g_fa_time_done;
+static cudaEvent_t g_fa_ev0;
+static cudaEvent_t g_fa_ev1;
+static int g_fa_ev_ok;
+
+static int fa_time_begin(void)
+{
+	cudaStreamCaptureStatus cap;
+
+	if (g_fa_time_done)
+		return 0;
+	cap = cudaStreamCaptureStatusNone;
+	if (cudaStreamIsCapturing(0, &cap) != cudaSuccess
+	    || cap != cudaStreamCaptureStatusNone)
+		return 0;
+	if (!g_fa_ev_ok) {
+		if (cudaEventCreate(&g_fa_ev0) != cudaSuccess
+		    || cudaEventCreate(&g_fa_ev1) != cudaSuccess) {
+			g_fa_time_done = 1;
+			return 0;
+		}
+		g_fa_ev_ok = 1;
+	}
+	if (cudaEventRecord(g_fa_ev0, 0) != cudaSuccess)
+		return 0;
+	return 1;
+}
+
+static void fa_time_end(int timing)
+{
+	if (!timing)
+		return;
+	g_fa_time_done = 1;
+	if (cudaEventRecord(g_fa_ev1, 0) != cudaSuccess)
+		return;
+	if (cudaEventSynchronize(g_fa_ev1) != cudaSuccess)
+		return;
+	if (cudaEventElapsedTime(&g_fa_bwd_ms, g_fa_ev0, g_fa_ev1)
+	    != cudaSuccess) {
+		g_fa_bwd_ms = -1.f;
+		return;
+	}
+	fprintf(stderr, "[attn] flash bwd %.3f ms\n", g_fa_bwd_ms);
+}
+
+extern "C" float gpu_attn_flash_bwd_ms(void)
+{
+	return g_fa_bwd_ms;
+}
 
 #define FA_BC	32	/* KV tile width for tiled bwd */
 
@@ -3465,29 +3519,33 @@ out:
 }
 
 extern "C" int gpu_attn_flash_fwd(mat *concat, const mat *q, const mat *k,
-	const mat *v, int B, int T, int H, int dh)
+	const mat *v, int B, int T, int H, int dh, mat *lse)
 {
 	ann_real *dq;
 	ann_real *dk;
 	ann_real *dv;
 	ann_real *dc;
+	ann_real *dL;
 	int oq;
 	int ok;
 	int ov;
 	int oc;
+	int oL;
 	int rc;
 	size_t smem;
 
-	if (!concat || !q || !k || !v || !att_args_ok(B, T, H, dh))
+	if (!concat || !q || !k || !v || !lse || !att_args_ok(B, T, H, dh)
+	    || !lse->d_data)
 		return -1;
 	if (q->rows != B * T || q->cols != H * dh || k->rows != q->rows
 	    || v->rows != q->rows || concat->rows != q->rows
-	    || concat->cols != q->cols)
+	    || concat->cols != q->cols || lse->rows != B * H * T
+	    || lse->cols != 1)
 		return -1;
 	pthread_mutex_lock(&g_att_mu);
 	rc = -1;
-	oq = ok = ov = oc = 0;
-	dq = dk = dv = dc = NULL;
+	oq = ok = ov = oc = oL = 0;
+	dq = dk = dv = dc = dL = NULL;
 	if (ensure_dev(q, &dq, &oq) != 0)
 		goto flash_out;
 	if (ensure_dev(k, &dk, &ok) != 0)
@@ -3495,6 +3553,8 @@ extern "C" int gpu_attn_flash_fwd(mat *concat, const mat *q, const mat *k,
 	if (ensure_dev(v, &dv, &ov) != 0)
 		goto flash_out;
 	if (ensure_dev_out(concat, &dc, &oc) != 0)
+		goto flash_out;
+	if (ensure_dev_out(lse, &dL, &oL) != 0)
 		goto flash_out;
 	smem = (size_t)(dh + T) * sizeof(ann_real);
 	if (g_att_seqlens_host) {
@@ -3510,29 +3570,12 @@ extern "C" int gpu_attn_flash_fwd(mat *concat, const mat *q, const mat *k,
 		    (size_t)B * sizeof(int)) != 0)
 			goto flash_out;
 	}
-	{
-		size_t need_L = (size_t)B * (size_t)H * (size_t)T
-		    * sizeof(ann_real);
-
-		if (g_fa_L_cap < need_L) {
-			if (g_fa_L)
-				cudaFree(g_fa_L);
-			g_fa_L = NULL;
-			g_fa_L_cap = 0;
-			g_fa_L_n = 0;
-			if (cudaMalloc((void **)&g_fa_L, need_L) != cudaSuccess)
-				goto flash_out;
-			g_fa_L_cap = need_L;
-		}
-		g_fa_L_n = B * H * T;
-	}
 	attn_fwd_kernel<<<B * H * T, ATT_BLOCK, smem>>>(dc, NULL, dq, dk, dv,
 	    T, H, dh, (ann_real)(1.0 / sqrt((double)dh)),
-	    g_att_seqlens_host ? g_att_seqlens_dev : NULL, g_fa_L);
-	if (launch_done() == 0 && finish_out(concat, dc, oc) == 0)
+	    g_att_seqlens_host ? g_att_seqlens_dev : NULL, dL);
+	if (launch_done() == 0 && finish_out(concat, dc, oc) == 0
+	    && finish_out(lse, dL, oL) == 0)
 		rc = 0;
-	else
-		g_fa_L_n = 0;
 flash_out:
 	if (oq && dq)
 		gpu_free(dq);
@@ -3542,13 +3585,25 @@ flash_out:
 		gpu_free(dv);
 	if (oc && dc)
 		gpu_free(dc);
+	if (oL && dL)
+		gpu_free(dL);
 	pthread_mutex_unlock(&g_att_mu);
 	return rc;
 }
 
 /*
-** Tiled FA-2 style bwd: recompute P from Q,K and Lstat in FA_BC tiles.
-** Never materializes B·H·T·T in HBM (no g_att_ds / w). dK/dV via atomics.
+** FlashAttention-2 backward (Dao, 2023, Alg. 2). Recompute
+** P_ij = exp(S_ij - L_i) in KV tiles of width FA_BC. L_i is the forward
+** row logsumexp of this same causal softmax (S_ij = -inf for j > i,
+** and outside seqlens). No B·H·T·T scores and no dS tensor in HBM.
+**
+** A cuDNN SDPA forward is a different softmax unless it uses this mask,
+** this scale, and this L. Pairing it with this backward would make
+** dQ/dK/dV the gradient of another function than the O the forward
+** wrote. gpu_attn_flash_bwd_ms() records this kernel's wall clock once,
+** outside graph capture; consult that before any SDPA port. Attention
+** is about 1% of FLOPs at T=64, which only orders the work. T is not
+** shortened and causal masking stays.
 */
 __global__ static void attn_tiled_bwd_kernel(ann_real *dq, ann_real *dk,
 	ann_real *dv, const ann_real *dO, const ann_real *O, const ann_real *q,
@@ -3600,6 +3655,9 @@ __global__ static void attn_tiled_bwd_kernel(ann_real *dq, ann_real *dk,
 	for (j0 = 0; j0 < T; j0 += FA_BC) {
 		int j1 = j0 + FA_BC;
 
+		/* Tile is entirely in the future of this causal softmax. */
+		if (j0 > i)
+			break;
 		if (j1 > T)
 			j1 = T;
 		for (j = j0 + (int)threadIdx.x; j < j1; j += (int)blockDim.x) {
@@ -3653,7 +3711,7 @@ __global__ static void attn_tiled_bwd_kernel(ann_real *dq, ann_real *dk,
 
 extern "C" int gpu_attn_tiled_bwd(mat *dq, mat *dk, mat *dv,
 	const mat *dconcat, const mat *concat, const mat *q, const mat *k,
-	const mat *v, int B, int T, int H, int dh)
+	const mat *v, const mat *lse, int B, int T, int H, int dh)
 {
 	ann_real *a_dq;
 	ann_real *a_dk;
@@ -3663,22 +3721,29 @@ extern "C" int gpu_attn_tiled_bwd(mat *dq, mat *dk, mat *dv,
 	ann_real *a_q;
 	ann_real *a_k;
 	ann_real *a_v;
+	ann_real *a_L;
 	size_t smem;
 	size_t nbytes;
 	int o[8];
 	ann_real *ptr[8];
+	int oL;
+	int timing;
 	int i;
 	int rc;
 
 	if (!dq || !dk || !dv || !dconcat || !concat || !q || !k || !v
-	    || !att_args_ok(B, T, H, dh) || !g_fa_L || g_fa_L_n != B * H * T)
+	    || !lse || !att_args_ok(B, T, H, dh) || !lse->d_data)
 		return -1;
 	if (q->rows != B * T || q->cols != H * dh || dq->rows != q->rows
 	    || dk->rows != q->rows || dv->rows != q->rows
-	    || dconcat->rows != q->rows || concat->rows != q->rows)
+	    || dconcat->rows != q->rows || concat->rows != q->rows
+	    || lse->rows != B * H * T || lse->cols != 1)
 		return -1;
 	pthread_mutex_lock(&g_att_mu);
 	rc = -1;
+	oL = 0;
+	a_L = NULL;
+	timing = 0;
 	for (i = 0; i < 8; i++) {
 		o[i] = 0;
 		ptr[i] = NULL;
@@ -3688,6 +3753,7 @@ extern "C" int gpu_attn_tiled_bwd(mat *dq, mat *dk, mat *dv,
 	    || ensure_dev(q, &ptr[2], &o[2]) != 0
 	    || ensure_dev(k, &ptr[3], &o[3]) != 0
 	    || ensure_dev(v, &ptr[4], &o[4]) != 0
+	    || ensure_dev(lse, &a_L, &oL) != 0
 	    || ensure_dev_out(dq, &ptr[5], &o[5]) != 0
 	    || ensure_dev_out(dk, &ptr[6], &o[6]) != 0
 	    || ensure_dev_out(dv, &ptr[7], &o[7]) != 0)
@@ -3705,10 +3771,12 @@ extern "C" int gpu_attn_tiled_bwd(mat *dq, mat *dk, mat *dv,
 	    || cudaMemset(a_dv, 0, nbytes) != cudaSuccess)
 		goto tiled_bwd_out;
 	smem = (size_t)(4 * dh + 2 * FA_BC * dh) * sizeof(ann_real);
+	timing = fa_time_begin();
 	attn_tiled_bwd_kernel<<<B * H * T, ATT_BLOCK, smem>>>(a_dq, a_dk, a_dv,
-	    a_dc, a_o, a_q, a_k, a_v, g_fa_L, T, H, dh,
+	    a_dc, a_o, a_q, a_k, a_v, a_L, T, H, dh,
 	    (ann_real)(1.0 / sqrt((double)dh)),
 	    g_att_seqlens_host ? g_att_seqlens_dev : NULL);
+	fa_time_end(timing);
 	if (launch_done() == 0 && finish_out(dq, a_dq, o[5]) == 0
 	    && finish_out(dk, a_dk, o[6]) == 0
 	    && finish_out(dv, a_dv, o[7]) == 0)
@@ -3717,46 +3785,51 @@ tiled_bwd_out:
 	for (i = 0; i < 8; i++)
 		if (o[i] && ptr[i])
 			gpu_free(ptr[i]);
+	if (oL && a_L)
+		gpu_free(a_L);
 	pthread_mutex_unlock(&g_att_mu);
 	return rc;
 }
 
-extern "C" int gpu_attn_recompute_w(mat *w, const mat *q, const mat *k, int B,
-	int T, int H, int dh)
+extern "C" int gpu_attn_recompute_w(mat *lse, const mat *q, const mat *k,
+	int B, int T, int H, int dh)
 {
 	ann_real *dq;
 	ann_real *dk;
-	ann_real *dw;
+	ann_real *dL;
 	int oq;
 	int ok;
+	int oL;
 	int rc;
 	size_t smem;
 
-	if (!w || !q || !k || !att_args_ok(B, T, H, dh) || !w->d_data)
+	if (!lse || !q || !k || !att_args_ok(B, T, H, dh) || !lse->d_data)
 		return -1;
-	if (q->rows != B * T || w->rows != B * H * T || w->cols != T)
+	if (q->rows != B * T || lse->rows != B * H * T || lse->cols != 1)
 		return -1;
 	pthread_mutex_lock(&g_att_mu);
 	rc = -1;
-	oq = ok = 0;
+	oq = ok = oL = 0;
+	dq = dk = dL = NULL;
 	if (ensure_dev(q, &dq, &oq) != 0)
 		goto rec_out;
 	if (ensure_dev(k, &dk, &ok) != 0)
 		goto rec_out;
-	dw = w->d_data;
+	if (ensure_dev_out(lse, &dL, &oL) != 0)
+		goto rec_out;
 	smem = (size_t)(dh + T) * sizeof(ann_real);
-	attn_recompute_w_kernel<<<B * H * T, ATT_BLOCK, smem>>>(dw, dq, dk, T,
-	    H, dh, (ann_real)(1.0 / sqrt((double)dh)),
+	attn_lse_kernel<<<B * H * T, ATT_BLOCK, smem>>>(dL, dq, dk, T, H, dh,
+	    (ann_real)(1.0 / sqrt((double)dh)),
 	    g_att_seqlens_host ? g_att_seqlens_dev : NULL);
-	if (launch_done() == 0) {
-		w->on_device = MAT_DEV_DEVICE;
+	if (launch_done() == 0 && finish_out(lse, dL, oL) == 0)
 		rc = 0;
-	}
 rec_out:
 	if (oq && dq)
 		gpu_free(dq);
 	if (ok && dk)
 		gpu_free(dk);
+	if (oL && dL)
+		gpu_free(dL);
 	pthread_mutex_unlock(&g_att_mu);
 	return rc;
 }
