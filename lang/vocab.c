@@ -57,6 +57,45 @@ vocab *vocab_byte_create(void)
 	return v;
 }
 
+/*
+** Placeholder vocab of `size` ids (byte vocab first, then "<tN>"), so a model
+** can have a BPE-sized head without a trained tokenizer (lm bench).
+*/
+vocab *vocab_sized_create(int size)
+{
+	vocab *v;
+	char buf[16];
+	int i;
+	int nb;
+
+	v = vocab_byte_create();
+	if (!v || size <= v->size)
+		return v;
+	nb = v->size;
+	{
+		char **grown = realloc(v->id_to_token,
+		    (size_t)size * sizeof(char *));
+
+		if (!grown) {
+			vocab_free(&v);
+			return NULL;
+		}
+		v->id_to_token = grown;
+	}
+	for (i = nb; i < size; i++)
+		v->id_to_token[i] = NULL;
+	v->size = size;
+	for (i = nb; i < size; i++) {
+		snprintf(buf, sizeof(buf), "<t%d>", i);
+		v->id_to_token[i] = xstrdup(buf);
+		if (!v->id_to_token[i]) {
+			vocab_free(&v);
+			return NULL;
+		}
+	}
+	return v;
+}
+
 void vocab_free(vocab **v)
 {
 	int i;
