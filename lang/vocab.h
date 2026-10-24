@@ -18,6 +18,8 @@ typedef struct	vocab {
 } vocab;
 
 vocab	*vocab_byte_create(void);
+/* Byte vocab padded with placeholder ids up to `size` (lm bench). */
+vocab	*vocab_sized_create(int size);
 void	vocab_free(vocab **v);
 int	vocab_size(const vocab *v);
 const char	*vocab_token(const vocab *v, int id);

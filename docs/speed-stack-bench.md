@@ -4,6 +4,8 @@
 
 Record util / VRAM / ms/step (and packed ms/tok) after each speed-stack wave.
 
+> **Correction (2026-10-22).** `lm train --bench-gpu` returns before any precision, attention or memory flag is parsed, and it times an unpacked B=1 step. The Wave 2 and Wave 3 rows below therefore ran with identical settings; their differences are run-to-run noise. Use `anni lm bench step|sweep` ([bench-harness.md](bench-harness.md)) for new numbers.
+
 ## Wave 1 (S6)
 
 | Mode | Result |
