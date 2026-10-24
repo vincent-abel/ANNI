@@ -376,7 +376,7 @@ static text_dataset *accum_finish(accum *a, int window)
 		return NULL;
 	}
 	ds->ids = a->ids;
-	ds->n_ids = (int)a->n;
+	ds->n_ids = (long)a->n;
 	ds->window = window;
 	ds->starts = a->starts;
 	ds->n_starts = (int)a->ns;

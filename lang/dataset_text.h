@@ -14,7 +14,7 @@
 */
 typedef struct	text_dataset {
 	int	*ids;
-	int	n_ids;
+	long	n_ids;	/* long: pretokenized mixes exceed 2^31 ids */
 	int	window;
 	int	stride;	/* start step; 1 = every offset, window = non-overlap */
 	int	*starts;

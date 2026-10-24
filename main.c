@@ -502,7 +502,7 @@ static int run_lm_train_core(int argc, char **argv, int use_tower)
 	} else {
 		nw = text_dataset_n_windows(ds);
 		snprintf(msg, sizeof(msg),
-		    "dataset ready: %d token ids, %d windows (len %d)",
+		    "dataset ready: %ld token ids, %d windows (len %d)",
 		    ds->n_ids, nw, window);
 		train_dbg(debug, msg);
 		if (nw <= 0) {

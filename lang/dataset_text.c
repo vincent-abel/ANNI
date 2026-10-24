@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 #include "dataset_text.h"
 #include "tokenize.h"
 
@@ -72,7 +73,7 @@ text_dataset *text_dataset_load_ids(const char *path, int window)
 		text_dataset_free(&ds);
 		return NULL;
 	}
-	ds->n_ids = (int)n;
+	ds->n_ids = (long)n;
 	return ds;
 }
 
@@ -168,8 +169,8 @@ void text_dataset_set_stride(text_dataset *ds, int stride)
 
 int text_dataset_n_windows(const text_dataset *ds)
 {
-	int stride;
-	int span;
+	long stride;
+	long span;
 
 	if (ds && ds->starts)
 		return ds->n_starts;
@@ -177,14 +178,17 @@ int text_dataset_n_windows(const text_dataset *ds)
 		return 0;
 	stride = ds->stride > 0 ? ds->stride : 1;
 	span = ds->n_ids - ds->window;
-	return span / stride + 1;
+	/* Window indices are int: clamp; use --stride window on huge id files. */
+	if (span / stride >= INT_MAX)
+		return INT_MAX;
+	return (int)(span / stride + 1);
 }
 
 int text_dataset_window(const text_dataset *ds, int index, int *ids_out, int *n_out)
 {
 	int i;
-	int start;
-	int stride;
+	long start;
+	long stride;
 
 	if (!ds || !ids_out || !n_out || index < 0)
 		return -1;
@@ -194,7 +198,7 @@ int text_dataset_window(const text_dataset *ds, int index, int *ids_out, int *n_
 		start = ds->starts[index];
 	else {
 		stride = ds->stride > 0 ? ds->stride : 1;
-		start = index * stride;
+		start = (long)index * stride;
 	}
 	for (i = 0; i < ds->window; i++)
 		ids_out[i] = ds->ids[start + i];

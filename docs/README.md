@@ -156,6 +156,10 @@ Full code checklists live in the root [`../README.md`](../README.md): **Capable 
 
 ---
 
+### Talking model (talk-170m)
+
+- [Talking model plan](talk-170m-plan.md)
+
 # How this neural network works
 
 Short notes on each piece that is already built. Each note explains the idea in ordinary language, then the arithmetic this C program actually runs.
@@ -431,3 +435,8 @@ Shards are read from disk, tokenized once, and yielded as shuffled window batche
 
 ### [Autotrain executable](autotrain.md)
 A second binary, `./autotrain`, picks Target-oriented defaults (BPE, stream, batch auto, safe LR), ensures data, trains, and smoke-generates. `./ann lm train` stays the explicit teaching CLI; phase 2 adds a light LR sweep.
+
+# Talking model docs
+
+### [Talking model plan](talk-170m-plan.md)
+Train the D=1024, 12-block shape (about 185M parameters) on about 3B tokens of FineWeb-Edu and permissive code, then fine-tune on chat. The note sizes the data, the tokenizer and the GPU time.

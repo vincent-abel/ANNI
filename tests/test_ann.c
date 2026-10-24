@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
+#include <limits.h>
 #include <time.h>
 #include "../main.h"
 
@@ -893,6 +894,20 @@ static void test_text_dataset(void)
 	text_dataset_free(&ds);
 }
 
+/* Pretokenized mixes pass 2^31 ids: window count must not overflow. */
+static void test_text_dataset_huge_ids(void)
+{
+	text_dataset ds;
+
+	memset(&ds, 0, sizeof(ds));
+	ds.n_ids = 3000000000L;
+	ds.window = 256;
+	ds.stride = 256;
+	assert(text_dataset_n_windows(&ds) == 11718750);
+	ds.stride = 1;
+	assert(text_dataset_n_windows(&ds) == INT_MAX);
+}
+
 static const char bpe_sample[] =
 	"the cat sat on the mat. the cat saw the other cat on the mat.\n"
 	"the hat and the bat sat on the mat too. caf\xc3\xa9 au lait!\n";
@@ -1391,6 +1406,7 @@ int main(void)
 	test_lm_generate_smoke();
 	test_lm_backprop_head();
 	test_text_dataset();
+	test_text_dataset_huge_ids();
 	test_bpe_roundtrip();
 	test_bpe_lm_checkpoint();
 	test_split_and_stream();
