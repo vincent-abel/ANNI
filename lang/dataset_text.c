@@ -5,6 +5,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <limits.h>
+#ifndef _WIN32
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 #include "dataset_text.h"
 #include "tokenize.h"
 
@@ -25,6 +31,45 @@ static int path_ends_with(const char *path, const char *suf)
 	return np >= ns && strcmp(path + np - ns, suf) == 0;
 }
 
+#ifndef _WIN32
+/*
+** Map the id file instead of copying it: a multi-GB mix then lives once in
+** the page cache, not twice (cache + heap). Returns NULL to use fread.
+*/
+static text_dataset *load_ids_mmap(const char *path, int window)
+{
+	int fd;
+	struct stat st;
+	void *map;
+	text_dataset *ds;
+
+	fd = open(path, O_RDONLY);
+	if (fd < 0)
+		return NULL;
+	if (fstat(fd, &st) != 0 || st.st_size < 2 * (off_t)sizeof(int)
+	    || (st.st_size % (off_t)sizeof(int)) != 0) {
+		close(fd);
+		return NULL;
+	}
+	map = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+	close(fd);
+	if (map == MAP_FAILED)
+		return NULL;
+	ds = calloc(1, sizeof(text_dataset));
+	if (!ds) {
+		munmap(map, (size_t)st.st_size);
+		return NULL;
+	}
+	ds->ids = (int *)map;
+	ds->map = map;
+	ds->map_len = (size_t)st.st_size;
+	ds->n_ids = (long)((size_t)st.st_size / sizeof(int));
+	ds->window = window;
+	ds->stride = 1;
+	return ds;
+}
+#endif
+
 text_dataset *text_dataset_load_ids(const char *path, int window)
 {
 	FILE *fp;
@@ -34,6 +79,11 @@ text_dataset *text_dataset_load_ids(const char *path, int window)
 
 	if (!path || window < 2 || window > LM_MAX_CTX)
 		return NULL;
+#ifndef _WIN32
+	ds = load_ids_mmap(path, window);
+	if (ds)
+		return ds;
+#endif
 	fp = fopen(path, "rb");
 	if (!fp)
 		return NULL;
@@ -48,7 +98,7 @@ text_dataset *text_dataset_load_ids(const char *path, int window)
 	}
 	rewind(fp);
 	n = (size_t)sz / sizeof(int);
-	ds = malloc(sizeof(text_dataset));
+	ds = calloc(1, sizeof(text_dataset));
 	if (!ds) {
 		fclose(fp);
 		return NULL;
@@ -117,7 +167,7 @@ text_dataset *text_dataset_load_tok(const char *path, int window, const bpe *tok
 	fclose(fp);
 	buf[sz] = '\0';
 
-	ds = malloc(sizeof(text_dataset));
+	ds = calloc(1, sizeof(text_dataset));
 	if (!ds) {
 		free(buf);
 		return NULL;
@@ -149,7 +199,12 @@ void text_dataset_free(text_dataset **ds)
 {
 	if (!ds || !*ds)
 		return;
-	free((*ds)->ids);
+#ifndef _WIN32
+	if ((*ds)->map)
+		munmap((*ds)->map, (*ds)->map_len);
+	else
+#endif
+		free((*ds)->ids);
 	free((*ds)->starts);
 	free(*ds);
 	*ds = NULL;
