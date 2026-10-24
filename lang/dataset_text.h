@@ -19,6 +19,8 @@ typedef struct	text_dataset {
 	int	stride;	/* start step; 1 = every offset, window = non-overlap */
 	int	*starts;
 	int	n_starts;
+	void	*map;	/* ids mapped read-only from an id file, or NULL */
+	size_t	map_len;
 } text_dataset;
 
 /* Byte tokenizer. */

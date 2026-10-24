@@ -999,6 +999,32 @@ static void test_text_dataset(void)
 	text_dataset_free(&ds);
 }
 
+/* Pretokenized id files load (mapped on POSIX) and slice into windows. */
+static void test_text_dataset_ids_file(void)
+{
+	text_dataset *ds;
+	FILE *fp;
+	int vals[40];
+	int ids[LM_MAX_CTX];
+	int n;
+	int i;
+
+	for (i = 0; i < 40; i++)
+		vals[i] = 300 + i;
+	fp = fopen("objects/test_ids.bin", "wb");
+	assert(fp && fwrite(vals, sizeof(int), 40, fp) == 40);
+	fclose(fp);
+	ds = text_dataset_load_ids("objects/test_ids.bin", 8);
+	assert(ds && ds->n_ids == 40);
+	text_dataset_set_stride(ds, 8);
+	assert(text_dataset_n_windows(ds) == 5);
+	assert(text_dataset_window(ds, 4, ids, &n) == 0);
+	assert(n == 8 && ids[0] == 332 && ids[7] == 339);
+	text_dataset_free(&ds);
+	assert(!ds);
+	remove("objects/test_ids.bin");
+}
+
 /* Pretokenized mixes pass 2^31 ids: window count must not overflow. */
 static void test_text_dataset_huge_ids(void)
 {
@@ -1525,6 +1551,7 @@ int main(void)
 	test_lm_generate_smoke();
 	test_lm_backprop_head();
 	test_text_dataset();
+	test_text_dataset_ids_file();
 	test_text_dataset_huge_ids();
 	test_chat_reply_cut();
 	test_bpe_roundtrip();
