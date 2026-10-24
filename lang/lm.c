@@ -111,6 +111,11 @@ lm *lm_create(void)
 	return lm_create_with(vocab_byte_create(), NULL);
 }
 
+lm *lm_create_vocab(int vocab_size)
+{
+	return lm_create_with(vocab_sized_create(vocab_size), NULL);
+}
+
 lm *lm_create_bpe(bpe *tok)
 {
 	lm *model;
