@@ -908,6 +908,20 @@ static void test_text_dataset_huge_ids(void)
 	assert(text_dataset_n_windows(&ds) == INT_MAX);
 }
 
+static void test_chat_reply_cut(void)
+{
+	char a[] = " Paris is the capital.\nUser: and Spain?\nAssistant: Madrid";
+	char b[] = "def f(x):\n    return x\n\nAssistant: more";
+	char c[] = "plain answer \n\n";
+
+	chat_reply_cut(a);
+	assert(strcmp(a, " Paris is the capital.") == 0);
+	chat_reply_cut(b);
+	assert(strcmp(b, "def f(x):\n    return x") == 0);
+	chat_reply_cut(c);
+	assert(strcmp(c, "plain answer") == 0);
+}
+
 static const char bpe_sample[] =
 	"the cat sat on the mat. the cat saw the other cat on the mat.\n"
 	"the hat and the bat sat on the mat too. caf\xc3\xa9 au lait!\n";
@@ -1407,6 +1421,7 @@ int main(void)
 	test_lm_backprop_head();
 	test_text_dataset();
 	test_text_dataset_huge_ids();
+	test_chat_reply_cut();
 	test_bpe_roundtrip();
 	test_bpe_lm_checkpoint();
 	test_split_and_stream();

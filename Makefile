@@ -95,7 +95,7 @@ ann: anni
 TEST_LM_FLAGS=-DLM_D_MODEL=64 -DLM_N_HEADS=4 -DLM_D_FF=256 -DLM_N_BLOCKS=2
 TEST_OBJDIR=$(OBJDIR)/test
 TEST_LIB_OBJ=$(patsubst $(OBJDIR)/%,$(TEST_OBJDIR)/%,$(LIB_OBJ))
-vpath %.c net num lang
+vpath %.c net num lang cli
 
 $(TEST_OBJDIR):
 	mkdir -p $(TEST_OBJDIR)
@@ -103,8 +103,9 @@ $(TEST_OBJDIR):
 $(TEST_OBJDIR)/%.o: %.c | $(TEST_OBJDIR)
 	$(CC) -o $@ -c $< $(CFLAGS) $(TEST_LM_FLAGS)
 
-$(TEST): tests/test_ann.c $(TEST_LIB_OBJ)
-	$(CC) $(CFLAGS) $(TEST_LM_FLAGS) -o $@ tests/test_ann.c $(TEST_LIB_OBJ) $(LDFLAGS)
+$(TEST): tests/test_ann.c $(TEST_LIB_OBJ) $(TEST_OBJDIR)/chat_session.o
+	$(CC) $(CFLAGS) $(TEST_LM_FLAGS) -o $@ tests/test_ann.c $(TEST_LIB_OBJ) \
+	    $(TEST_OBJDIR)/chat_session.o $(LDFLAGS)
 
 test: $(TEST)
 	./$(TEST)
