@@ -203,7 +203,7 @@ static void tower_draw(void)
 	draw_bar(y++, 0, 28, ep_frac, "epoch");
 	draw_bar(y++, 0, 28, win_frac, "window");
 	mvprintw(y++, 0,
-	    "ep %d/%d  windows %d/%d  steps %d/%d  tokens %d",
+	    "ep %d/%d  windows %d/%d  steps %d/%d  tokens %ld",
 	    p->epoch + 1, p->epochs > 0 ? p->epochs : 0,
 	    p->epoch_done, p->nw, p->done_steps, p->total_steps,
 	    p->tokens_done);

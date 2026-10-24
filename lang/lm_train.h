@@ -31,6 +31,17 @@ void	lm_train_set_tokens_per_step(int n);
 void	lm_train_set_early_stop(int patience);
 /* E16: abort if train/val NLL rises by more than delta vs best, or non-finite. */
 void	lm_train_set_diverge_delta(double delta);
+/*
+** Corpus training only: save the checkpoint every `minutes` of wall time
+** mid-epoch (0 = epoch ends only). The file stores the epoch and window
+** reached; lm_train_set_resume_pos(step) makes the next run continue there.
+*/
+void	lm_train_set_ckpt_minutes(int minutes);
+void	lm_train_set_resume_pos(int window_pos);
+/* Seed for the per-epoch window shuffle (from --seed). */
+void	lm_train_set_shuffle_seed(unsigned int seed);
+/* Fill order[0..nw) with the window order of absolute epoch epoch_num. */
+void	lm_train_epoch_order(int *order, int nw, int epoch_num);
 /* R9/S11: block activation checkpointing (recompute in bwd). */
 void	lm_train_set_act_checkpoint(int on);
 /* E8: emit/pad short EOF windows and mask pad positions in CE (+ fused attn). */

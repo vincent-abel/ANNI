@@ -223,6 +223,8 @@ static int run_lm_train_core(int argc, char **argv, int use_tower)
 		    "--early-stop-patience", "0")));
 		lm_train_set_diverge_delta(atof(arg_value(argc, argv,
 		    "--diverge-delta", "0")));
+		lm_train_set_ckpt_minutes(atoi(arg_value(argc, argv,
+		    "--ckpt-minutes", "0")));
 		if (arg_flag(argc, argv, NULL, "--varlen"))
 			lm_train_set_varlen(1);
 		if (arg_flag(argc, argv, NULL, "--cuda-graphs"))
@@ -532,6 +534,9 @@ static int run_lm_train_core(int argc, char **argv, int use_tower)
 		}
 		train_dbg(debug, "running mini-batch corpus training");
 		total_epochs = prev_epoch + epochs;
+		lm_train_set_shuffle_seed((unsigned int)seed);
+		/* A mid-epoch checkpoint stores the window it reached. */
+		lm_train_set_resume_pos(prev_step);
 		loss = lm_train_corpus_val(model, ds, opt, epochs, batch, lr,
 		    debug, out, prev_epoch, eval_every, eval_windows, val_ds);
 	}
@@ -1276,7 +1281,8 @@ int main(int argc, char *argv[])
 		printf("                 [--vocab PATH]\n");
 		printf("       ./anni lm [phrase]\n");
 		printf("       ./anni lm train [--data PATH] [--epochs N] [--out PATH]\n");
-		printf("                 [--resume PATH] [--val-data PATH] [--lr RATE] [--window N]\n");
+		printf("                 [--resume PATH] [--val-data PATH] [--ckpt-minutes M]\n");
+		printf("                 [--lr RATE] [--window N]\n");
 		printf("                 [--batch N|auto] [--grad-accum K] [--vram-frac F]\n");
 		printf("                 [--seed N] [--eval-every N]\n");
 		printf("                 [--eval-windows M] [-y|--force] [-d|--debug]\n");
