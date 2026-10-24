@@ -1,4 +1,6 @@
 CC=gcc -g
+# `make` with no target builds ./anni (the per-object rules below come first).
+.DEFAULT_GOAL := all
 # Include roots: net/ (neural network), num/ (numerical engine), lang/ (language model), cli/.
 INCLUDES=-I. -Inet -Inum -Ilang -Icli -Icompat
 # OPT=-O2 enables auto-vectorization on contiguous ann_dot / mat_mul loops.
