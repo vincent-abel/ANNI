@@ -37,7 +37,9 @@ autotrain
 tests/test_ann
 gui/ann-gui
 gui/__pycache__/
+scripts/__pycache__/
 scripts/pretok_ids
+scripts/bpe_train
 
 # models, vocabs, local train artifacts (never vendored)
 models/
@@ -57,6 +59,7 @@ data/wiki_*
 # talk-170m mix fetched by scripts/fetch_mix.py (licensed sources, never vendored)
 data/raw/
 data/mix*
+data/chat*
 
 # local run logs
 logs/

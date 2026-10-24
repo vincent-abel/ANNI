@@ -138,6 +138,7 @@ static int run_lm_train_core(int argc, char **argv, int use_tower)
 	bpe *chk;
 	text_split sp;
 	text_dataset *val_ds;
+	const char *val_data;
 	text_stream *tstream;
 	text_stream *vstream;
 	double val_nll;
@@ -191,6 +192,7 @@ static int run_lm_train_core(int argc, char **argv, int use_tower)
 	split_arg = arg_value(argc, argv, "--split", "doc");
 	split_seed = atoi(arg_value(argc, argv, "--split-seed", "1"));
 	stream = arg_flag(argc, argv, NULL, "--stream");
+	val_data = arg_value(argc, argv, "--val-data", NULL);
 	shuffle_buf = atoi(arg_value(argc, argv, "--shuffle-buf", "1024"));
 	stride = atoi(arg_value(argc, argv, "--stride", "0"));
 	if (epochs <= 0)
@@ -443,6 +445,16 @@ static int run_lm_train_core(int argc, char **argv, int use_tower)
 	/* Non-stream: --stride N (e.g. =window) for one pass over ids. */
 	if (ds && !stream && stride > 0)
 		text_dataset_set_stride(ds, stride);
+	/* --val-data: held-out file kept apart from --data (e.g. *_val_ids.bin). */
+	if (ds && !stream && !use_split && val_data) {
+		val_ds = text_dataset_load_tok(val_data, window, model->bpe);
+		if (!val_ds) {
+			fprintf(stderr, "lm train: cannot load --val-data %s\n",
+			    val_data);
+			text_dataset_free(&ds);
+		} else
+			text_dataset_set_stride(val_ds, window);
+	}
 	if (!model || !opt || (stream ? !tstream : !ds)) {
 		lm_free(&model);
 		text_dataset_free(&ds);
@@ -1264,7 +1276,7 @@ int main(int argc, char *argv[])
 		printf("                 [--vocab PATH]\n");
 		printf("       ./anni lm [phrase]\n");
 		printf("       ./anni lm train [--data PATH] [--epochs N] [--out PATH]\n");
-		printf("                 [--resume PATH] [--lr RATE] [--window N]\n");
+		printf("                 [--resume PATH] [--val-data PATH] [--lr RATE] [--window N]\n");
 		printf("                 [--batch N|auto] [--grad-accum K] [--vram-frac F]\n");
 		printf("                 [--seed N] [--eval-every N]\n");
 		printf("                 [--eval-windows M] [-y|--force] [-d|--debug]\n");
