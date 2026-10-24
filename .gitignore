@@ -54,3 +54,9 @@ tests/*.ann
 
 # real corpora fetched by scripts/fetch_wiki.sh (CC BY-SA, never vendored)
 data/wiki_*
+# talk-170m mix fetched by scripts/fetch_mix.py (licensed sources, never vendored)
+data/raw/
+data/mix*
+
+# local run logs
+logs/
