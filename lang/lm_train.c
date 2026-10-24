@@ -21,7 +21,7 @@
 #include "mat.h"
 
 /* E10: tokens/sec, rough TFLOP/s, VRAM used (MB). */
-static void fill_throughput(train_progress *tp, int tokens_done, double elapsed)
+static void fill_throughput(train_progress *tp, long tokens_done, double elapsed)
 {
 	size_t fr;
 	size_t tot;
@@ -72,6 +72,10 @@ static int g_grad_accum = 1;
 static double g_vram_frac = 0.85;
 static int g_early_stop_patience;
 static double g_diverge_delta;
+/* Mid-epoch checkpoints: minutes between saves, window to resume at. */
+static int g_ckpt_minutes;
+static int g_resume_pos;
+static unsigned int g_shuffle_seed = 1;
 static int g_act_checkpoint;
 static int g_varlen;
 static int g_cuda_graphs;
@@ -240,7 +244,7 @@ static void dbg_fmt_eta(char *out, size_t out_n, double sec)
 /* Single in-place progress line (\\r). Close it before any stamp/log line. */
 static void dbg_progress(int ep, int epochs, int done, int total,
 	int epoch_done, int nw, double nll, double win_nll, double t0,
-	int tokens_done, int force)
+	long tokens_done, int force)
 {
 	int width;
 	int filled;
@@ -260,9 +264,9 @@ static void dbg_progress(int ep, int epochs, int done, int total,
 	size_t tot;
 	static double last_print;
 	static double last_tok_t;
-	static int last_tok_n;
+	static long last_tok_n;
 	double interval_ts;
-	int dtok;
+	long dtok;
 	double dt;
 
 	now = wall_sec();
@@ -424,6 +428,49 @@ void lm_train_set_early_stop(int patience)
 void lm_train_set_diverge_delta(double delta)
 {
 	g_diverge_delta = delta > 0.0 ? delta : 0.0;
+}
+
+void lm_train_set_ckpt_minutes(int minutes)
+{
+	g_ckpt_minutes = minutes > 0 ? minutes : 0;
+}
+
+void lm_train_set_resume_pos(int window_pos)
+{
+	g_resume_pos = window_pos > 0 ? window_pos : 0;
+}
+
+void lm_train_set_shuffle_seed(unsigned int seed)
+{
+	g_shuffle_seed = seed ? seed : 1;
+}
+
+/*
+** Epoch shuffle from its own xorshift32 stream, seeded by --seed and the
+** absolute epoch number, so a mid-epoch resume rebuilds the same order.
+*/
+void lm_train_epoch_order(int *order, int nw, int epoch_num)
+{
+	unsigned int s;
+	int j;
+	int r;
+	int tmp;
+
+	for (j = 0; j < nw; j++)
+		order[j] = j;
+	s = g_shuffle_seed * 2654435761u ^ (unsigned int)(epoch_num + 1)
+	    * 40503u;
+	if (!s)
+		s = 1;
+	for (j = nw - 1; j > 0; j--) {
+		s ^= s << 13;
+		s ^= s >> 17;
+		s ^= s << 5;
+		r = (int)(s % (unsigned int)(j + 1));
+		tmp = order[j];
+		order[j] = order[r];
+		order[r] = tmp;
+	}
 }
 
 void lm_train_set_act_checkpoint(int on)
@@ -933,12 +980,10 @@ double lm_train_corpus_val(lm *model, text_dataset *ds, lm_adam *opt,
 	int n;
 	int total_steps;
 	int done_steps;
-	int tokens_done;
+	long tokens_done;
 	int epoch_num;
 	int *order;
-	int tmp;
 	int j;
-	int r;
 	int k;
 	int bb;
 	int win_tot;
@@ -947,6 +992,7 @@ double lm_train_corpus_val(lm *model, text_dataset *ds, lm_adam *opt,
 	double last;
 	double win;
 	double t0;
+	double last_ckpt;
 	char msg[192];
 
 	if (!model || !ds || !opt || epochs <= 0 || lr <= 0.0)
@@ -993,6 +1039,7 @@ double lm_train_corpus_val(lm *model, text_dataset *ds, lm_adam *opt,
 		win = lm_nll_windows(model, val ? val : ds, eval_windows);
 	}
 	t0 = wall_sec();
+	last_ckpt = t0;
 	{
 		train_progress tp;
 		double best_val = -1.0;
@@ -1041,14 +1088,19 @@ double lm_train_corpus_val(lm *model, text_dataset *ds, lm_adam *opt,
 				    ep + 1, epochs);
 				dbg_stamp(msg);
 			}
-			/* Seeded shuffle so parallel --seed runs diverge after resume. */
-			for (j = nw - 1; j > 0; j--) {
-				r = rand() % (j + 1);
-				tmp = order[j];
-				order[j] = order[r];
-				order[r] = tmp;
-			}
+			lm_train_epoch_order(order, nw, epoch_base + ep);
 			idx = 0;
+			/* Mid-epoch resume: skip windows the checkpoint covered. */
+			if (ep == 0 && g_resume_pos > 0 && g_resume_pos < nw) {
+				idx = g_resume_pos;
+				if (debug && !g_progress_fn) {
+					snprintf(msg, sizeof(msg),
+					    "resuming epoch %d at window %d/%d",
+					    epoch_base + 1, idx, nw);
+					dbg_stamp(msg);
+				}
+			}
+			g_resume_pos = 0;
 			while (idx < nw) {
 				double step_lr;
 				double elapsed;
@@ -1258,6 +1310,24 @@ double lm_train_corpus_val(lm *model, text_dataset *ds, lm_adam *opt,
 					dbg_progress(ep, epochs, done_steps,
 					    total_steps, idx, nw, last, win, t0,
 					    tokens_done, 0);
+				if (ckpt_path && g_ckpt_minutes > 0
+				    && wall_sec() - last_ckpt
+				    >= 60.0 * (double)g_ckpt_minutes) {
+					/* Epoch not finished: store it with its window. */
+					last_ckpt = wall_sec();
+					if (lm_save_checkpoint(model, opt,
+					    epoch_base + ep, idx, ckpt_path) == 0)
+						snprintf(msg, sizeof(msg),
+						    "saved checkpoint %s (epoch %d, "
+						    "window %d/%d)", ckpt_path,
+						    epoch_base + ep + 1, idx, nw);
+					else
+						snprintf(msg, sizeof(msg),
+						    "mid-epoch checkpoint save failed "
+						    "(%s)", ckpt_path);
+					if (debug && !g_progress_fn)
+						dbg_stamp(msg);
+				}
 				if (g_train_ctl && g_train_ctl->quit_save) {
 					quit = 1;
 					break;
@@ -1534,7 +1604,7 @@ double lm_train_stream(lm *model, text_stream *train, lm_adam *opt,
 						tp.nw = tp.epoch_done;
 				}
 				tp.done_steps = (int)steps;
-				tp.tokens_done = (int)tokens;
+				tp.tokens_done = (long)tokens;
 				tp.nll = last;
 				tp.win_nll = win;
 				tp.val_nll = val ? win : -1.0;
@@ -1732,7 +1802,7 @@ double lm_train_stream(lm *model, text_stream *train, lm_adam *opt,
 						tp.nw = tp.epoch_done;
 				}
 				tp.done_steps = (int)steps;
-				tp.tokens_done = (int)tokens;
+				tp.tokens_done = (long)tokens;
 				/*
 				** Mid-epoch val subsample every ~5% (cheap vs train;
 				** ~1–2% wall with M=32). Skip 100% — epoch-end does it.
@@ -1810,7 +1880,7 @@ double lm_train_stream(lm *model, text_stream *train, lm_adam *opt,
 			tp.nll = last;
 			tp.win_nll = win;
 			tp.val_nll = val ? win : -1.0;
-			tp.tokens_done = (int)tokens;
+			tp.tokens_done = (long)tokens;
 			tp.done_steps = (int)steps;
 			tp.epoch_done = (int)text_stream_count(train);
 			{

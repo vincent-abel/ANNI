@@ -833,6 +833,111 @@ static void test_lm_checkpoint_resume(void)
 	lm_free(&b);
 }
 
+/* Mid-epoch checkpoint: same window order on resume, position kept. */
+static void test_lm_mid_epoch_resume(void)
+{
+	int a[64];
+	int b[64];
+	int seen[64];
+	int i;
+	int same;
+	lm *m;
+	lm *m2;
+	lm_adam *o;
+	lm_adam *o2;
+	text_dataset *ds;
+	int epoch;
+	int step;
+	FILE *fp;
+
+	lm_train_set_shuffle_seed(7);
+	lm_train_epoch_order(a, 64, 3);
+	lm_train_epoch_order(b, 64, 3);
+	assert(memcmp(a, b, sizeof(a)) == 0);
+	memset(seen, 0, sizeof(seen));
+	for (i = 0; i < 64; i++) {
+		assert(a[i] >= 0 && a[i] < 64 && !seen[a[i]]);
+		seen[a[i]] = 1;
+	}
+	lm_train_epoch_order(b, 64, 4);
+	same = memcmp(a, b, sizeof(a)) == 0;
+	assert(!same);
+
+	srand(15);
+	m = lm_create();
+	o = m ? lm_adam_create(m) : NULL;
+	ds = text_dataset_load("data/toy_micro.txt", 8);
+	assert(m && o && ds);
+	assert(lm_save_checkpoint(m, o, 2, 5, "objects/test_mid.bin") == 0);
+	fp = fopen("objects/test_mid.bin.tmp", "rb");
+	assert(!fp);
+	m2 = lm_load_checkpoint("objects/test_mid.bin", &o2, &epoch, &step);
+	assert(m2 && o2 && epoch == 2 && step == 5);
+	/* Resume near the end: only the last windows of the epoch run. */
+	lm_train_set_resume_pos(text_dataset_n_windows(ds) - 2);
+	assert(lm_train_corpus(m2, ds, o2, 1, 2, 0.01, 0, NULL, epoch, 0, 0)
+	    > 0.0);
+	lm_adam_free(&o);
+	lm_adam_free(&o2);
+	text_dataset_free(&ds);
+	lm_free(&m);
+	lm_free(&m2);
+	remove("objects/test_mid.bin");
+}
+
+/* Mid-epoch resume rebuilds the same window order from seed and epoch. */
+static void test_lm_epoch_order(void)
+{
+	int a[100];
+	int b[100];
+	int seen[100];
+	int i;
+	int same;
+
+	lm_train_set_shuffle_seed(7);
+	lm_train_epoch_order(a, 100, 3);
+	lm_train_epoch_order(b, 100, 3);
+	memset(seen, 0, sizeof(seen));
+	for (i = 0; i < 100; i++) {
+		assert(a[i] == b[i]);
+		assert(a[i] >= 0 && a[i] < 100 && !seen[a[i]]);
+		seen[a[i]] = 1;
+	}
+	lm_train_epoch_order(b, 100, 4);
+	same = 0;
+	for (i = 0; i < 100; i++)
+		same += a[i] == b[i];
+	assert(same < 100);
+	lm_train_set_shuffle_seed(1);
+}
+
+/* A checkpoint keeps the epoch and window it reached; no .tmp is left. */
+static void test_lm_checkpoint_mid_epoch(void)
+{
+	lm *a;
+	lm *b;
+	lm_adam *oa;
+	lm_adam *ob;
+	FILE *fp;
+	int epoch;
+	int step;
+
+	srand(15);
+	a = lm_create();
+	oa = lm_adam_create(a);
+	assert(a && oa);
+	assert(lm_save_checkpoint(a, oa, 2, 1234, "objects/test_mid.bin") == 0);
+	fp = fopen("objects/test_mid.bin.tmp", "rb");
+	assert(!fp);
+	b = lm_load_checkpoint("objects/test_mid.bin", &ob, &epoch, &step);
+	assert(b && ob && epoch == 2 && step == 1234);
+	remove("objects/test_mid.bin");
+	lm_adam_free(&oa);
+	lm_adam_free(&ob);
+	lm_free(&a);
+	lm_free(&b);
+}
+
 static void test_lm_perplexity(void)
 {
 	lm *model;
@@ -1430,6 +1535,9 @@ int main(void)
 	test_lm_serialize_roundtrip();
 	test_lm_merge_average();
 	test_lm_checkpoint_resume();
+	test_lm_epoch_order();
+	test_lm_checkpoint_mid_epoch();
+	test_lm_mid_epoch_resume();
 	test_lm_rejects_double_magic();
 	test_lm_perplexity();
 	test_lm_generate_from_checkpoint();

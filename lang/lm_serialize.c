@@ -245,34 +245,42 @@ lm *lm_load(const char *path)
 	return model;
 }
 
+/*
+** Written to PATH.tmp and renamed over PATH, so a crash mid-save leaves the
+** previous checkpoint intact.
+*/
 int lm_save_checkpoint(const lm *model, const lm_adam *opt, int epoch, int step,
 	const char *path)
 {
 	FILE *fp;
 	int i;
+	int bad;
+	char tmp[1024];
 
 	if (!model || !opt || !path)
 		return -1;
-	fp = fopen(path, "wb");
+	if (snprintf(tmp, sizeof(tmp), "%s.tmp", path) >= (int)sizeof(tmp))
+		return -1;
+	fp = fopen(tmp, "wb");
 	if (!fp)
 		return -1;
-	if (write_weights(fp, model) != 0) {
-		fclose(fp);
+	bad = write_weights(fp, model) != 0
+	    || write_i32(fp, 1) != 0 || write_i32(fp, epoch) != 0
+	    || write_i32(fp, step) != 0 || write_i32(fp, opt->t) != 0
+	    || write_i32(fp, opt->n) != 0;
+	if (!bad)
+		lm_adam_sync_host((lm_adam *)opt);
+	for (i = 0; !bad && i < opt->n; i++) {
+		if (write_real(fp, opt->slots[i].m) != 0
+		    || write_real(fp, opt->slots[i].v) != 0)
+			bad = 1;
+	}
+	if (fclose(fp) != 0)
+		bad = 1;
+	if (bad || rename(tmp, path) != 0) {
+		remove(tmp);
 		return -1;
 	}
-	if (write_i32(fp, 1) != 0 || write_i32(fp, epoch) != 0 || write_i32(fp, step) != 0
-	    || write_i32(fp, opt->t) != 0 || write_i32(fp, opt->n) != 0) {
-		fclose(fp);
-		return -1;
-	}
-	lm_adam_sync_host((lm_adam *)opt);
-	for (i = 0; i < opt->n; i++) {
-		if (write_real(fp, opt->slots[i].m) != 0 || write_real(fp, opt->slots[i].v) != 0) {
-			fclose(fp);
-			return -1;
-		}
-	}
-	fclose(fp);
 	return 0;
 }
 
