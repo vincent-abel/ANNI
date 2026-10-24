@@ -10,7 +10,7 @@ The old benches measured something else than training:
 
 - `lm bench --train` and `lm train --bench-gpu` timed an **unpacked B=1, 32-token** step through `lm_forward_cache`. That code path is not `pack_run`, so CUDA Graphs, fused CE, packed attention and auto-B were never exercised.
 - `lm train --bench-gpu` returns at the top of `run_lm_train_core`, **before** `--flash-attn`, `--bf16`, `--act-checkpoint` or `--adam-offload` are parsed. The Wave 2 and Wave 3 tables in [speed-stack-bench.md](speed-stack-bench.md) therefore compare runs with identical settings; the gaps are run-to-run noise (Wave 1 already saw 257–540 ms for one config).
-- `scripts/bench_tf_gate.sh` scored the cumulative train meter (eval probes and warmup included) and ran `pkill -x anni`.
+- `scripts/bench_tf_gate.sh` first scored the cumulative train meter (eval probes and warmup included); it now scores interval tok/s, but it still reads the train meter's TF (below) and runs `pkill -x anni`, which kills any other AnnI job on the machine.
 - The train meter's parameter count is `L·(12D² + 2·D·FF)`, which counts attention three times. The real block has `4D² + 2·D·FF` matmul weights, so the meter's P is 251.7M where the matmul P is 151.0M (+16.8M for the head). Every TF/s figure printed by `lm train` is about **1.5× too high**. The README's old "~280M params" had the same error: `lm_param_count` gives **184.7M** at V=16384.
 
 ## How it works for a human (intuition, analogy)
@@ -59,7 +59,7 @@ F_{recompute}(T) = 2\,L\,(4D^2 + 2\,D\,D_{ff}) + 2\,L\,T\,D
 
 - **Wall clock bracketed by device syncs, not CUDA events.** One step is one stream-ordered unit ending in a full sync anyway; events would add a `gpu.h` API for no extra accuracy at the 10–1000 ms scale.
 - **Fresh model per sweep point.** Each point builds its own model and Adam state, so a precision or graph change cannot inherit the previous point's caches. Cost: model init (~1–2 s at D=1024) per point.
-- **Attention path is "auto".** `--flash-attn` is set: the TC score path runs when `B·H·T·T` floats fit in 256 MiB, otherwise tiled flash. The once-per-process `[attn]` log line says which one ran. The tiled backward on master shares one logsumexp across layers (fixed on the local `phase2-flash-bwd` branch); step timings are valid either way, but trust training only on the fixed build.
+- **Attention path is "auto".** `--flash-attn` is set: the TC score path runs when `B·H·T·T` floats fit in 256 MiB, otherwise tiled flash. The once-per-process `[attn]` log line says which one ran. Each layer keeps its own logsumexp for the tiled backward (the shared-buffer bug was fixed in `6c786ec`).
 - **`--prec fp8`** sets BF16 compute plus `lm_train_set_fp8(1)` (E4M3 forward, E5M2 dgrad, BF16 wgrad), matching what `lm train --fp8 --bf16` does.
 - **The train meter is not changed here.** `lm train` still prints the old TF estimate; switching it to `lm_bench_flops_per_token` changes every logged number and the TF gate scripts, so it lands with the CLI trim.
 - **GPU only.** Every mode refuses to run on the CPU stub: CPU timings say nothing about the CUDA path. `make test` still checks `lm_train_bench_packed` for correctness (timings recorded, phases filled, CE falls) and the FLOP formula, on the small test model (D=64, 2 blocks), without reporting speed.
