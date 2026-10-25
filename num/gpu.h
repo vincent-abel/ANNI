@@ -206,6 +206,8 @@ int	gpu_attn_flash_fwd(mat *concat, const mat *q, const mat *k,
 */
 int	gpu_attn_fa_fwd(mat *concat, const mat *q, const mat *k,
 		const mat *v, int B, int T, int H, int dh, mat *lse);
+/* 1 when gpu_attn_fa_fwd will take this shape (so no T x T scores are needed). */
+int	gpu_attn_fa_usable(int T, int dh);
 int	gpu_attn_fa_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat,
 		const mat *concat, const mat *q, const mat *k, const mat *v,
 		const mat *lse, int B, int T, int H, int dh);

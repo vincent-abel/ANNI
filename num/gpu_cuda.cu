@@ -5502,6 +5502,13 @@ static int fa_wmma_ok(int T, int dh)
 	    && !g_att_seqlens_host;
 }
 
+/* 1 when the fused tensor-core attention will take this shape in BF16 mode. */
+extern "C" int gpu_attn_fa_usable(int T, int dh)
+{
+	return gpu_available() && g_compute_prec == GPU_PREC_BF16
+	    && (T % FA_BQ) == 0 && dh >= 16 && dh <= 64 && (dh % 16) == 0;
+}
+
 /*
 ** Fused tensor-core causal attention forward (BF16 mode). Writes concat and
 ** lse; -1 = caller uses another path.

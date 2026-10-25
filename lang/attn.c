@@ -671,7 +671,9 @@ attn_pcache *attn_pcache_create(int B, int T, int n_heads, int d_head)
 	** saves VRAM for huge T but is slower than strided GemmEx here.
 	** When scores do not fit, leave w_all NULL and use tiled FA.
 	*/
-	if (gpu_available() && T <= 256) {
+	/* The fused WMMA path needs no score buffer: 67 MB per layer saved. */
+	if (gpu_available() && T <= 256
+	    && !(g_flash_attn && gpu_attn_fa_usable(T, d_head))) {
 		size_t sb = (size_t)B * (size_t)n_heads * (size_t)T
 		    * (size_t)T * sizeof(ann_real);
 
