@@ -1435,7 +1435,7 @@ extern "C" void gpu_adam_set_bf16_flat(void *bf16, const ann_real *fp32, int n)
 ** FFN hidden→W2). Two slots so LN and FFN hidden do not clobber each other
 ** inside one block. Not a full per-layer residency (that doubles act VRAM).
 */
-#define ACT_BF16_SLOTS	2
+#define ACT_BF16_SLOTS	48	/* ln1, ln2, hidden of every layer */
 typedef struct {
 	const ann_real	*fp32;
 	void		*half;
