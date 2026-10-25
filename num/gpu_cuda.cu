@@ -1471,6 +1471,12 @@ static void *grad_twin_put(const ann_real *src, size_t n)
 {
 	grad_twin_slot *e = &g_grad_twin[g_grad_twin_rr % GRAD_TWIN_SLOTS];
 
+	/*
+	** The head's delta (rows x vocab, 134 MB in BF16) would size every
+	** slot to it: converting it twice costs less than 0.5 GB of VRAM.
+	*/
+	if (n > (size_t)16 * 1024 * 1024)
+		return NULL;
 	g_grad_twin_rr++;
 	if (ensure_half_buf(&e->half, &e->cap, n * 2) != 0
 	    || half_wt_convert(e->half, src, (int)n, 1) != 0) {
