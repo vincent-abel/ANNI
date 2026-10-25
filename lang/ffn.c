@@ -128,7 +128,8 @@ void ffn_cache_free(ffn_cache **c)
 {
 	if (!c || !*c)
 		return;
-	mat_free(&(*c)->x_in);
+	if (!(*c)->x_in_alias)
+		mat_free(&(*c)->x_in);
 	mat_free(&(*c)->pre_act);
 	mat_free(&(*c)->hidden);
 	free(*c);
@@ -149,7 +150,11 @@ int ffn_forward_cache(mat *out, const mat *x, ffn *f, ffn_cache *c)
 	if (x->cols != LM_D_MODEL || c->T != x->rows)
 		return -1;
 	T = x->rows;
-	copy_mat(c->x_in, x);
+	/* Alias the block's LN output (see attn_mha_forward_packed). */
+	if (!c->x_in_alias)
+		mat_free(&c->x_in);
+	c->x_in = (mat *)x;
+	c->x_in_alias = 1;
 	mat_try_pin(c->pre_act);
 	mat_try_pin(c->hidden);
 	mat_try_pin(out);

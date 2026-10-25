@@ -736,7 +736,8 @@ void attn_pcache_free(attn_pcache **c)
 
 	if (!c || !*c)
 		return;
-	mat_free(&(*c)->x_in);
+	if (!(*c)->x_in_alias)
+		mat_free(&(*c)->x_in);
 	mat_free(&(*c)->q);
 	mat_free(&(*c)->k);
 	mat_free(&(*c)->v);
@@ -793,7 +794,15 @@ int attn_mha_forward_packed(mat *out, attn *a, const mat *x, attn_pcache *c)
 		return -1;
 	T = c->T;
 	nh = a->n_heads;
-	copy_mat(c->x_in, x);
+	/*
+	** x is the block's LayerNorm output, which lives in the block cache
+	** until the backward: keep a pointer instead of a 16 MB copy, so the
+	** weight gradients also reuse the BF16 twin the LayerNorm published.
+	*/
+	if (!c->x_in_alias)
+		mat_free(&c->x_in);
+	c->x_in = (mat *)x;
+	c->x_in_alias = 1;
 	/* Fat projections: one (B*T) x D GEMM each. */
 	if (attn_qkv_project(c->q, c->k, c->v, a, x) != 0)
 		return -1;

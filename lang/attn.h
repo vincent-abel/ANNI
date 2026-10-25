@@ -75,6 +75,7 @@ typedef struct	attn_pcache {
 	mat		*dconcat;
 	mat		*dtmp;
 	int		fused;		/* last forward used gpu_attn_causal_fwd */
+	int		x_in_alias;	/* x_in points at the caller's input, not owned */
 	int		B;
 	int		T;		/* per-sequence length */
 	int		n;		/* B*T */

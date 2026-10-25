@@ -21,6 +21,7 @@ typedef struct	ffn {
 
 typedef struct	ffn_cache {
 	mat	*x_in;
+	int	x_in_alias;	/* x_in points at the caller's input, not owned */
 	mat	*pre_act;
 	mat	*hidden;
 	int	T;

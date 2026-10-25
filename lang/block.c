@@ -41,12 +41,14 @@ static void block_cache_drop_device(block_cache *bc)
 	mat_device_free(bc->ln2_out);
 	mat_device_free(bc->ffn_out);
 	if (bc->ffnc) {
-		mat_device_free(bc->ffnc->x_in);
+		if (!bc->ffnc->x_in_alias)
+			mat_device_free(bc->ffnc->x_in);
 		mat_device_free(bc->ffnc->pre_act);
 		mat_device_free(bc->ffnc->hidden);
 	}
 	if (bc->attnpc) {
-		mat_device_free(bc->attnpc->x_in);
+		if (!bc->attnpc->x_in_alias)
+			mat_device_free(bc->attnpc->x_in);
 		mat_device_free(bc->attnpc->q);
 		mat_device_free(bc->attnpc->k);
 		mat_device_free(bc->attnpc->v);
