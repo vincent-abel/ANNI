@@ -27,7 +27,7 @@ if [ "${1:-}" = "--boot" ]; then
 	shift
 fi
 if [ "${1:-}" != "--inside" ]; then
-	if tmux has-session -t "$SESSION" 2>/dev/null; then
+	if tmux has-session -t "=$SESSION" 2>/dev/null; then
 		echo "talk170m: already running in tmux session $SESSION"
 		exit 0
 	fi
@@ -116,7 +116,7 @@ pretrain() {
 	    --data data/mix_train_ids.bin --val-data data/mix_val_ids.bin \
 	    --tokenizer bpe --vocab data/mix.vocab \
 	    --window 256 --stride 256 --batch 16 --grad-accum 32 --epochs 1 \
-	    --lr 3e-4 --lr-warmup 500 --lr-decay cosine --lr-decay-steps 28600 \
+	    --lr 1.5e-4 --lr-warmup 1500 --lr-decay cosine --lr-decay-steps 27600 --adam-beta2 0.95 \
 	    --grad-clip 1.0 --weight-decay 0.1 \
 	    --flash-attn --bf16 \
 	    --eval-every 1 --eval-windows 256 --ckpt-minutes 30 --seed 1 -d
