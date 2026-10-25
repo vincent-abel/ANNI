@@ -37,6 +37,18 @@ Before the fixes, two identical runs in one process gave different step-1 losses
 
 With the per-tensor scales, FP8 training on the test model stays within 1e-2 of the FP32 loss over four steps and every weight gradient within 23% relative error and 3% in norm on a clean process, up to 43% on dW1 after other GPU work has shuffled the allocations (BF16: 13% and 1%). `make test-gpu` checks BF16 at 20%/10% and FP8 at 60%/30%.
 
+## Precision A/B at the real scale
+
+`scripts/ab_precision.sh 150`: the first 19.7M tokens of the mix, the pretraining flags (batch 16, 32 accumulated microbatches, LR 3e-4 with 1000 warmup steps), seed 1, 150 Adam steps per precision on the RTX 5070 Ti.
+
+| GEMMs | Train NLL | Val NLL (256 windows) | Steady tok/s | Meter TFLOP/s | VRAM |
+|---|---|---|---|---|---|
+| FP32 | 7.5893 | 7.5048 | 19.9k | 30.0 | 11.25 GB |
+| BF16 | 7.5896 | 7.5047 | 38.3k | 57.9 | 11.52 GB |
+| FP8 (E4M3 fwd, E5M2 dgrad, BF16 wgrad) | 7.5916 | 7.5092 | 28.3k | 42.8 | 11.70 GB |
+
+BF16 and FP32 agree to four digits at every 5% validation probe; FP8 trails by 0.004 nats at the end. FP8 is slower than BF16 here: the extra quantization and transpose passes (and the E4M3 weight re-quantization after each step) cost more than the FP8 tensor-core GEMMs save at D=1024 on sm_120. The run restarts in BF16.
+
 ## Consequence for the talk-170m run
 
 Every checkpoint written before this note trained on fixed targets with frozen LayerNorm vectors and untrained FFN biases, in FP32 as well as BF16; the FP32-vs-BF16 comparison that motivated the FP32 restart measured the bugs, not the precision. The run has to restart from scratch with the fixed binary. BF16 is believed correct again, but a short FP32-vs-BF16 A/B on the fixed code is the cheap way to confirm it at the real scale before committing 30 hours.
