@@ -99,6 +99,16 @@ void gpu_half_wt_invalidate(const ann_real *fp32_dev)
 	(void)fp32_dev;
 }
 
+void gpu_host_forget(const void *host)
+{
+	(void)host;
+}
+
+const char *gpu_debug_last_error(void)
+{
+	return "";
+}
+
 int gpu_memset(void *dst, int value, size_t nbytes)
 {
 	(void)dst;
