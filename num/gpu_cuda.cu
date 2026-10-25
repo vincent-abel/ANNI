@@ -1637,8 +1637,37 @@ static void act_bf16_publish(const ann_real *fp32, int n)
 		}
 	}
 	if (!e) {
-		e = &g_act_bf16[g_act_bf16_rr % ACT_BF16_SLOTS];
-		g_act_bf16_rr++;
+		/*
+		** New tensor: a free slot (its buffer freed by gpu_free) whose
+		** buffer fits, else any free slot, else round robin. Pointer
+		** keys keep each training tensor in its own slot, so this
+		** only runs for eval caches; slots over twice the size shrink
+		** so eval-sized buffers do not pin 32 MB each forever.
+		*/
+		int best = -1;
+
+		for (i = 0; i < ACT_BF16_SLOTS; i++) {
+			if (g_act_bf16[i].fp32)
+				continue;
+			if (g_act_bf16[i].cap >= (size_t)n * 2
+			    && (best < 0 || g_act_bf16[i].cap
+			    < g_act_bf16[best].cap))
+				best = i;
+			else if (best < 0 || (g_act_bf16[best].cap < (size_t)n * 2
+			    && g_act_bf16[i].cap > g_act_bf16[best].cap))
+				best = i;
+		}
+		if (best >= 0)
+			e = &g_act_bf16[best];
+		else {
+			e = &g_act_bf16[g_act_bf16_rr % ACT_BF16_SLOTS];
+			g_act_bf16_rr++;
+		}
+		if (e->half && e->cap > (size_t)n * 4) {
+			cudaFree(e->half);
+			e->half = NULL;
+			e->cap = 0;
+		}
 	}
 	if (ensure_half_buf(&e->half, &e->cap, (size_t)n * 2) != 0) {
 		e->live = 0;
