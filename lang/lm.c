@@ -441,7 +441,7 @@ static int ce_rows_backward(lm *model, const mat *hv, const int *tgt, int rows,
 			goto fail;
 		dp = mat_compute_ptr(delta);
 		if (dp && gpu_bias_row_add(dp, model->b_head->data, rows, V) == 0)
-			mat_mark_device(delta);
+			mat_mark_written(delta, dp);
 		else {
 			(void)mat_ensure_host(delta);
 			for (t = 0; t < rows; t++) {
@@ -458,7 +458,7 @@ static int ce_rows_backward(lm *model, const mat *hv, const int *tgt, int rows,
 		ann_real *dp = mat_compute_ptr(delta);
 
 		if (dp && gpu_softmax_rows(dp, rows, V) == 0)
-			mat_mark_device(delta);
+			mat_mark_written(delta, dp);
 		else {
 			(void)mat_ensure_host(delta);
 			if (gpu_softmax_rows(delta->data, rows, V) != 0) {
@@ -485,7 +485,7 @@ static int ce_rows_backward(lm *model, const mat *hv, const int *tgt, int rows,
 		if (dp
 		    && gpu_ce_delta_from_softmax(dp, tgt, rows, V,
 		    model->db_head->data, mean_ce_out ? &ce_sum : NULL) == 0) {
-			mat_mark_device(delta);
+			mat_mark_written(delta, dp);
 			/* Device mean is over all rows; rescale to target rows. */
 			if (mean_ce_out)
 				*mean_ce_out = n_valid > 0 && ce_sum >= 0.0
@@ -657,7 +657,7 @@ int lm_forward_cache_packed(lm *model, const int *ids, int B, int T,
 					    t);
 			mat_host_dirty(c->hidden);
 		} else
-			mat_mark_device(c->hidden);
+			mat_mark_written(c->hidden, hp);
 	}
 	return transformer_forward_cache(c->hidden, model->tr, c->trc);
 }

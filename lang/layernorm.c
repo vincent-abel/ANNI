@@ -122,8 +122,8 @@ int layernorm_forward_into(mat *out, const mat *in, layernorm *ln, ln_cache *c)
 	if (xp && yp && xh && gpu_layernorm_forward_ex(yp, xp, ln->gamma->data,
 		ln->beta->data, xh, c->mean->data, c->inv_std->data, T, d,
 		ln->eps) == 0) {
-		mat_mark_device(out);
-		mat_mark_device(c->x_hat);
+		mat_mark_written(out, yp);
+		mat_mark_written(c->x_hat, xh);
 		return 0;
 	}
 	if (out != in && resid_copy(out, in) != 0)
@@ -158,8 +158,8 @@ int layernorm_forward_cache(mat *x, layernorm *ln, ln_cache *c)
 	if (xp && xh && gpu_layernorm_forward_ex(xp, xp, ln->gamma->data,
 		ln->beta->data, xh, c->mean->data, c->inv_std->data, T, d,
 		ln->eps) == 0) {
-		mat_mark_device(x);
-		mat_mark_device(c->x_hat);
+		mat_mark_written(x, xp);
+		mat_mark_written(c->x_hat, xh);
 		return 0;
 	}
 	(void)mat_ensure_host(x);

@@ -2374,13 +2374,19 @@ extern "C" void gpu_device_sync(void)
 */
 static int finish_out(mat *m, ann_real *dptr, int owned)
 {
+	/*
+	** A dW aliased into the Adam flat stays MAT_DEV_ALIASED: turning it
+	** into a plain DEVICE mat made mat_free cudaFree a slice of the flat
+	** (sticky "invalid argument" that fails the next launch check).
+	*/
 	if (g_sync_mode == GPU_SYNC_BATCH && m->d_data && !owned) {
-		m->on_device = MAT_DEV_DEVICE;
+		if (m->on_device != MAT_DEV_ALIASED)
+			m->on_device = MAT_DEV_DEVICE;
 		return 0;
 	}
 	if (m->data && gpu_memcpy_d2h(m->data, dptr, mat_bytes(m)) != 0)
 		return -1;
-	if (m->d_data && !owned)
+	if (m->d_data && !owned && m->on_device != MAT_DEV_ALIASED)
 		m->on_device = MAT_DEV_HOST;
 	return 0;
 }
