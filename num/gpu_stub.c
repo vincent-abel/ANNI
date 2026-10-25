@@ -25,6 +25,12 @@ int gpu_mem_info(size_t *free_bytes, size_t *total_bytes)
 	return -1;
 }
 
+int gpu_attn_fa_usable(int T, int dh)
+{
+	(void)T; (void)dh;
+	return 0;
+}
+
 int gpu_attn_fa_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat,
 	const mat *concat, const mat *q, const mat *k, const mat *v,
 	const mat *lse, int B, int T, int H, int dh)
