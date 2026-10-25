@@ -18,6 +18,7 @@
 #include "gradutil.h"
 #include "lm.h"
 #include "lm_adam.h"
+#include "lm_serialize.h"
 
 #define B 4
 #define T 32
@@ -336,6 +337,73 @@ static void check_tracks_fp32(const char *tag, int prec, double loss_tol,
 	assert(!bad);
 }
 
+/*
+** 6. Save / load round trip: a checkpoint written after training must
+** evaluate to the same loss once loaded into a fresh model, on the packed
+** path and on the single-window lm_nll path (the resume "start NLL").
+*/
+static void test_checkpoint_round_trip(void)
+{
+	rig r;
+	lm *m2;
+	lm_adam *opt2;
+	lm_cache *c2;
+	mat *dh2;
+	int ids[B * T];
+	double l_before;
+	double l_after;
+	double n_before;
+	double n_after;
+	double n_after2;
+	const char *path = "/tmp/test_gpu_ckpt.bin";
+	int ep = 0;
+	int st = 0;
+
+	rig_open(&r, GPU_PREC_BF16);
+	lm_adam_zero_grad(r.m);
+	microbatch(&r, 777u, 1);
+	lm_adam_step_scaled(r.opt, 1e-3, 1.0 / (double)(B * (T - 1)));
+	lm_adam_zero_grad(r.m);
+	microbatch(&r, 787u, 1);
+	lm_adam_step_scaled(r.opt, 1e-3, 1.0 / (double)(B * (T - 1)));
+	lm_adam_zero_grad(r.m);
+	l_before = microbatch(&r, 999u, 0);
+	fill_ids(ids, 999u);
+	n_before = lm_nll(r.m, ids, T);
+	lm_weights_ensure_host(r.m);
+	assert(lm_save_checkpoint(r.m, r.opt, 1, 2, path) == 0);
+	rig_close(&r);
+	m2 = lm_load_checkpoint(path, &opt2, &ep, &st);
+	assert(m2 && opt2);
+	/* Evaluate exactly as a resumed run does: before any device upload. */
+	n_after = lm_nll(m2, ids, T);
+	c2 = lm_cache_create_packed(B, T);
+	dh2 = mat_create(B * T, LM_D_MODEL);
+	assert(c2 && dh2);
+	lm_weights_to_device(m2);
+	gpu_set_sync_mode(GPU_SYNC_BATCH);
+	{
+		double ce = -1.0;
+
+		assert(lm_forward_cache_packed(m2, ids, B, T, c2) == 0);
+		assert(lm_loss_backward_packed(m2, c2, ids, B, T, dh2, &ce) == 0);
+		gpu_device_sync();
+		l_after = ce;
+	}
+	gpu_set_sync_mode(GPU_SYNC_EAGER);
+	n_after2 = lm_nll(m2, ids, T);
+	printf("  round trip: packed %.6f -> %.6f, lm_nll %.6f -> %.6f (after upload %.6f)\n",
+	    l_before, l_after, n_before, n_after, n_after2);
+	assert(fabs(l_before - l_after) < 1e-4);
+	assert(fabs(n_before - n_after) < 1e-4);
+	assert(fabs(n_before - n_after2) < 1e-4);
+	lm_adam_free(&opt2);
+	lm_cache_free(&c2);
+	mat_free(&dh2);
+	lm_free(&m2);
+	remove(path);
+}
+
 int main(void)
 {
 	if (!gpu_available()) {
@@ -352,6 +420,7 @@ int main(void)
 	test_forward_no_cross_batch_state();
 	test_first_step_updates_everything();
 	test_free_leaves_no_cuda_error();
+	test_checkpoint_round_trip();
 	printf("bf16 vs fp32\n");
 	check_tracks_fp32("bf16", GPU_PREC_BF16, 2e-3, 0.2, 0.1);
 	printf("fp8 (E4M3 fwd, E5M2 dgrad) vs fp32\n");

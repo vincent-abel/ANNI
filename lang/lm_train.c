@@ -1246,6 +1246,8 @@ double lm_train_corpus_val(lm *model, text_dataset *ds, lm_adam *opt,
 					pack_ctx_free(&pk);
 					tp.event = TRAIN_EV_FAIL;
 					tp.msg = "train step failed";
+					fprintf(stderr, "train step failed: CUDA '%s'\n",
+					    gpu_debug_last_error());
 					emit_progress(&tp);
 					return -1.0;
 				}
