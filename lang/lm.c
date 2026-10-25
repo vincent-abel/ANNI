@@ -234,6 +234,8 @@ static void lm_each_wgrad(lm *model, int mode)
 void lm_weights_to_device(lm *model)
 {
 	lm_each_wgrad(model, 0);
+	/* Bias / LN vectors: drop device copies cached from an older model. */
+	gpu_half_wt_invalidate(NULL);
 }
 
 void lm_weights_host_dirty(lm *model)
@@ -241,6 +243,7 @@ void lm_weights_host_dirty(lm *model)
 	lm_each_wgrad(model, 1);
 	if (model && model->embed)
 		mat_host_dirty(model->embed->table);
+	gpu_half_wt_invalidate(NULL);
 }
 
 void lm_weights_ensure_host(lm *model)
