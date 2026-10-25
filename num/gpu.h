@@ -50,8 +50,21 @@ int	gpu_memcpy_d2h_async(void *dst, const void *src, size_t nbytes);
 int	gpu_stream_sync(void);
 int	gpu_memcpy_d2d(void *dst, const void *src, size_t nbytes);
 int	gpu_memset(void *dst, int value, size_t nbytes);
-/* Drop cached BF16/FP16 twin after an in-place FP32 weight write (Adam). */
+/*
+** Drop cached BF16/FP16 twin after an in-place FP32 weight write (Adam).
+** NULL drops every twin and also marks the cached device copies of host
+** bias / LayerNorm vectors stale, so the next launch re-uploads them: call
+** it after every optimizer step and whenever host code rewrites weights.
+*/
 void	gpu_half_wt_invalidate(const ann_real *fp32_dev);
+/*
+** A host vector (bias, LN gamma/beta, their grads) is being freed: drop its
+** cached device copy and any pending column-sum accumulator so a later
+** allocation at the same address never inherits them. No-op on the stub.
+*/
+void	gpu_host_forget(const void *host);
+/* Debug: pending CUDA error string (cleared by the call); "" when none. */
+const char	*gpu_debug_last_error(void);
 /* Reconvert all cached weight twins in place (stable addresses; after Adam). */
 void	gpu_half_wt_refresh_all(void);
 /*

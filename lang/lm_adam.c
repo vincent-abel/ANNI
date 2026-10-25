@@ -504,8 +504,21 @@ void lm_adam_step_scaled(lm_adam *opt, double lr, double grad_scale)
 	if (!opt || lr <= 0.0)
 		return;
 	opt->t++;
-	if (gpu_available() && adam_step_gpu(opt, lr, grad_scale) == 0)
+	/*
+	** Batch mode leaves the FFN bias column sums (db1/db2) in device
+	** accumulators; the sync flushes them into the host grads that
+	** seg_gather uploads. Without it those grads are never applied.
+	*/
+	gpu_device_sync();
+	if (gpu_available() && adam_step_gpu(opt, lr, grad_scale) == 0) {
+		/*
+		** Host bias / LN vectors were rewritten by the D2H scatter:
+		** drop their cached device copies so the next forward uploads
+		** the updated values instead of the ones cached at step 1.
+		*/
+		gpu_half_wt_invalidate(NULL);
 		return;
+	}
 	/* Host fallback: bring resident m/v, weights and grads back first. */
 	lm_adam_sync_host(opt);
 	for (i = 0; i < opt->n_segs; i++) {
@@ -553,4 +566,5 @@ void lm_adam_step_scaled(lm_adam *opt, double lr, double grad_scale)
 		if (opt->segs[i].dw)
 			mat_host_dirty(opt->segs[i].dw);
 	}
+	gpu_half_wt_invalidate(NULL);
 }

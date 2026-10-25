@@ -2768,27 +2768,9 @@ static int ew_acquire(ew_ref *r, int slot, const void *host, size_t bytes,
 	r->down = 0;
 	if (!host || bytes == 0)
 		return -1;
-	/* Tiny host vectors: bias cache (also during capture after warm). */
-	if (up && !down && bytes <= 64 * 1024) {
-		void *cached = bias_cache_get(host, bytes);
-
-		if (cached) {
-			r->dev = (ann_real *)cached;
-			return 0;
-		}
-	}
 	if (ew_is_dev(host)) {
 		r->dev = (ann_real *)host;
 		return 0;
-	}
-	/* Prefer persistent bias/LN cache for host→device uploads. */
-	if (up && !down) {
-		void *cached = bias_cache_get(host, bytes);
-
-		if (cached) {
-			r->dev = (ann_real *)cached;
-			return 0;
-		}
 	}
 	if (g_ew_cap[slot] < bytes) {
 		if (g_ew_buf[slot])
@@ -2807,6 +2789,31 @@ static int ew_acquire(ew_ref *r, int slot, const void *host, size_t bytes,
 		return -1;
 	r->down = down;
 	return 0;
+}
+
+/*
+** Read-only parameter vector (bias, LN gamma/beta): served from the
+** persistent device cache, re-uploaded after gpu_half_wt_invalidate(NULL)
+** (every optimizer step). Falls back to the staged path.
+*/
+static int ew_acquire_param(ew_ref *r, int slot, const void *host,
+	size_t bytes)
+{
+	r->dev = NULL;
+	r->host = (void *)host;
+	r->bytes = bytes;
+	r->down = 0;
+	if (!host || bytes == 0)
+		return -1;
+	if (bytes <= 64 * 1024) {
+		void *cached = bias_cache_get(host, bytes);
+
+		if (cached) {
+			r->dev = (ann_real *)cached;
+			return 0;
+		}
+	}
+	return ew_acquire(r, slot, host, bytes, 1, 0);
 }
 
 /* Mark an aliased ref as needing D2H (only meaningful when staged). */
@@ -3892,7 +3899,7 @@ extern "C" int gpu_bias_relu_forward(ann_real *x, const ann_real *bias,
 		pthread_mutex_unlock(&g_ew_mu);
 		return -1;
 	}
-	if (ew_acquire(&rb, 1, bias, (size_t)cols * sizeof(ann_real), 1, 0)
+	if (ew_acquire_param(&rb, 1, bias, (size_t)cols * sizeof(ann_real))
 	    != 0) {
 		pthread_mutex_unlock(&g_ew_mu);
 		return -1;
@@ -3952,7 +3959,7 @@ extern "C" int gpu_ffn_w1_finish(ann_real *hidden, ann_real *pre,
 		return -1;
 	}
 	if (have_bias
-	    && ew_acquire(&rb, 2, bias, (size_t)cols * sizeof(ann_real), 1, 0)
+	    && ew_acquire_param(&rb, 2, bias, (size_t)cols * sizeof(ann_real))
 	    != 0) {
 		pthread_mutex_unlock(&g_ew_mu);
 		return -1;
@@ -5194,8 +5201,8 @@ static int gpu_layernorm_forward_ex_locked(ann_real *y, const ann_real *x,
 	} else if (ew_acquire(&ry, 1, y, mb, 0, 1) != 0) {
 		return -1;
 	}
-	if (ew_acquire(&rg, 2, gamma, gb, 1, 0) != 0
-	    || ew_acquire(&rb, 3, beta, gb, 1, 0) != 0)
+	if (ew_acquire_param(&rg, 2, gamma, gb) != 0
+	    || ew_acquire_param(&rb, 3, beta, gb) != 0)
 		return -1;
 	memset(&rh, 0, sizeof(rh));
 	memset(&rm, 0, sizeof(rm));
@@ -5308,7 +5315,7 @@ static int gpu_layernorm_backward_locked(mat *dx, const mat *dy, const ann_real 
 	} else if (ew_acquire(&rdx, 0, dx->data, mb, 0, 1) != 0)
 		return -1;
 	if (ew_acquire(&rdy, 1, dyp, mb, 1, 0) != 0
-	    || ew_acquire(&rg, 2, gamma, gb, 1, 0) != 0
+	    || ew_acquire_param(&rg, 2, gamma, gb) != 0
 	    || ew_acquire(&rh, 3, x_hat, mb, 1, 0) != 0
 	    || ew_acquire(&ri, 4, inv_std, vb, 1, 0) != 0
 	    || ew_acquire(&rdg, 5, dgamma, gb, 1, 1) != 0
@@ -5360,7 +5367,7 @@ static int gpu_bias_row_add_locked(ann_real *x, const ann_real *bias, int rows,
 	if (n > 0x7fffffffL)
 		return -1;
 	if (ew_acquire(&rx, 0, x, (size_t)n * sizeof(ann_real), 1, 1) != 0
-	    || ew_acquire(&rb, 1, bias, (size_t)cols * sizeof(ann_real), 1, 0) != 0)
+	    || ew_acquire_param(&rb, 1, bias, (size_t)cols * sizeof(ann_real)) != 0)
 		return -1;
 	bias_add_kernel<<<(int)((n + 255) / 256), 256>>>(rx.dev, rb.dev, (int)n,
 	    cols);
