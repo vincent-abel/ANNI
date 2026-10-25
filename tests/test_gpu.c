@@ -26,6 +26,8 @@
 #define NT 64
 /* Pseudo precision for rig_open: BF16 GEMMs with the FP8 fwd/dgrad stack. */
 #define PREC_FP8 99
+/* Attention path used by rig_open: 1 = tiled flash, 0 = Tensor-Core scores. */
+static int g_flash = 1;
 
 static void fill_ids(int *ids, unsigned x)
 {
@@ -65,7 +67,7 @@ static void rig_open(rig *r, int prec)
 	r->opt->weight_decay = 0.1;
 	gpu_set_fp8(prec == PREC_FP8);
 	gpu_set_compute_prec(prec == PREC_FP8 ? GPU_PREC_BF16 : prec);
-	attn_set_flash(1);
+	attn_set_flash(g_flash);
 	lm_weights_to_device(r->m);
 	r->c = lm_cache_create_packed(B, T);
 	r->dh = mat_create(B * T, LM_D_MODEL);
@@ -155,7 +157,11 @@ static void train(int prec, float **snaps, double *loss, int *nt, int *sizes,
 			snaps[s * NT + i] = malloc(nb);
 			assert(snaps[s * NT + i]);
 			/* dtable is device-authoritative too: pull every tensor. */
-			assert(mat_pull_host(g[i]) == 0);
+			if (mat_pull_host(g[i]) != 0) {
+				printf("  pull %s failed: CUDA '%s'\n", names[i],
+				    gpu_debug_last_error());
+				assert(0);
+			}
 			memcpy(snaps[s * NT + i], g[i]->data, nb);
 		}
 		lm_adam_step_scaled(r.opt, 1e-3, 1.0 / (double)(B * (T - 1)));
@@ -338,6 +344,8 @@ int main(void)
 		return 0;
 	}
 	setvbuf(stdout, NULL, _IONBF, 0);
+	if (getenv("ANN_TEST_FLASH"))
+		g_flash = atoi(getenv("ANN_TEST_FLASH"));
 	/* Load-independent cuBLASLt algo choice: BF16 rounding then repeats. */
 	setenv("ANN_LT_HEURISTIC", "1", 1);
 	printf("test_gpu on %s\n", gpu_backend_name());
@@ -348,6 +356,10 @@ int main(void)
 	check_tracks_fp32("bf16", GPU_PREC_BF16, 2e-3, 0.2, 0.1);
 	printf("fp8 (E4M3 fwd, E5M2 dgrad) vs fp32\n");
 	check_tracks_fp32("fp8", PREC_FP8, 3e-2, 0.6, 0.3);
+	g_flash = 0;
+	printf("Tensor-Core attention path: bf16 vs fp32\n");
+	check_tracks_fp32("bf16-tc", GPU_PREC_BF16, 2e-3, 0.2, 0.1);
+	g_flash = 1;
 	printf("test_gpu: all passed\n");
 	return 0;
 }
