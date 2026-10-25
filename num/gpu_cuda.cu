@@ -5639,8 +5639,9 @@ __global__ static void attn_fa_wmma_bwd_kernel(ann_real *dq, ann_real *dk,
 	__nv_bfloat16 *Pt = dOs + FA_BBQ * dh;				/* BK keys x BQ queries */
 	__nv_bfloat16 *dSt = Pt + FA_BK * FA_BBQ;			/* BK x BQ */
 	float *Ss = (float *)(dSt + FA_BK * FA_BBQ);			/* BK x (BQ+pad) */
-	float *ls = Ss + FA_BK * (64 + FA_BPAD);			/* BQ */
+	float *ls = Ss + FA_BK * (FA_BBQ + FA_BPAD);			/* BQ */
 	float *dvs = ls + FA_BBQ;					/* BQ */
+	float *dqs = dvs + FA_BBQ;					/* 4 warps x 16 x 16 */
 	const int bh = blockIdx.x;
 	const int b = bh / H;
 	const int h = bh % H;
@@ -5648,7 +5649,7 @@ __global__ static void attn_fa_wmma_bwd_kernel(ann_real *dq, ann_real *dk,
 	const int warp = threadIdx.x >> 5;
 	const int lane = threadIdx.x & 31;
 	const int D = H * dh;
-	const int SLD = 64 + FA_BPAD;		/* rows also stage 16 x dh (dh <= 64) of dQ */
+	const int SLD = FA_BBQ + FA_BPAD;
 	const int HC = FA_BBQ / 2;		/* queries per lane in the row loops */
 	const size_t row0 = (size_t)b * T;
 	const int k0 = kt * FA_BK;
@@ -5771,6 +5772,8 @@ __global__ static void attn_fa_wmma_bwd_kernel(ann_real *dq, ann_real *dk,
 		** atomically added to the global FP32 dQ (several key tiles).
 		*/
 		if (warp * 16 < FA_BBQ) {	/* BQ/16 warps own 16 query rows each */
+			float *wq = dqs + warp * 256;	/* 16 x 16 per warp */
+
 			for (nt = 0; nt < ndt; nt++) {
 				wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
 				wmma::fill_fragment(acc, 0.0f);
@@ -5781,14 +5784,14 @@ __global__ static void attn_fa_wmma_bwd_kernel(ann_real *dq, ann_real *dk,
 					wmma::load_matrix_sync(bfr, Ks + kk * dh + nt * 16, dh);
 					wmma::mma_sync(acc, a, bfr, acc);
 				}
-				wmma::store_matrix_sync(Ss + warp * 16 * SLD + nt * 16, acc,
-				    SLD, wmma::mem_row_major);
-			}
-			__syncwarp();
-			for (i = lane; i < 16 * dh; i += 32) {
-				int r = i / dh, cc = i % dh;
-				atomicAdd(&dq[(row0 + q0 + warp * 16 + r) * D + h * dh + cc],
-				    Ss[(warp * 16 + r) * SLD + cc] * scale);
+				wmma::store_matrix_sync(wq, acc, 16, wmma::mem_row_major);
+				__syncwarp();
+				for (i = lane; i < 256; i += 32) {
+					int r = i >> 4, cc = i & 15;
+					atomicAdd(&dq[(row0 + q0 + warp * 16 + r) * D + h * dh
+					    + nt * 16 + cc], wq[i] * scale);
+				}
+				__syncwarp();
 			}
 		}
 		__syncthreads();	/* Qs / dOs / Ss reused by the next tile */
@@ -5806,7 +5809,8 @@ __global__ static void attn_fa_wmma_bwd_kernel(ann_real *dq, ann_real *dk,
 static size_t fa_wmma_bwd_smem(int dh)
 {
 	return (size_t)(2 * FA_BK * dh + 2 * FA_BBQ * dh + 2 * FA_BK * FA_BBQ) * 2
-	    + (size_t)(FA_BK * (64 + FA_BPAD) + 2 * FA_BBQ) * sizeof(float);
+	    + (size_t)(FA_BK * (FA_BBQ + FA_BPAD) + 2 * FA_BBQ + FA_WARPS * 256)
+	    * sizeof(float);
 }
 
 static float *g_fa_dvec;
