@@ -1432,6 +1432,21 @@ static void test_gpu_gemm_bwd_stub(void)
 	mat_free(&db);
 }
 
+/* mat_mark_written: host pointer means the host wrote; no twin on CPU. */
+static void test_mat_mark_written_cpu(void)
+{
+	mat *m = mat_create(2, 2);
+
+	assert(m);
+	mat_mark_written(m, m->data);
+	assert(m->on_device == MAT_DEV_HOST);
+	mat_mark_written(m, NULL);
+	assert(m->on_device == MAT_DEV_HOST);
+	mat_mark_device(m);			/* no d_data: stays host */
+	assert(m->on_device == MAT_DEV_HOST);
+	mat_free(&m);
+}
+
 static void test_mat_device_pin_cpu(void)
 {
 	mat *m;
@@ -1655,6 +1670,7 @@ int main(void)
 	test_qmat_roundtrip();
 	test_lm_decoder_cpu();
 	test_gpu_stub();
+	test_mat_mark_written_cpu();
 	test_mat_device_pin_cpu();
 	test_gpu_gemm_bwd_stub();
 	{

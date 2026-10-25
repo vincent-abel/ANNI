@@ -137,8 +137,35 @@ lm_adam *lm_adam_create(lm *model)
 	return opt;
 }
 
+/*
+** Weights / grads aliased into the flats must not keep pointing into them
+** once the flats are freed: pull the weights to host and detach the views,
+** so a later mat_free never cudaFree's a slice of the flat.
+*/
+static void unalias_segs(lm_adam *opt)
+{
+	int i;
+
+	for (i = 0; i < opt->n_segs; i++) {
+		lm_adam_seg *s = &opt->segs[i];
+
+		if (s->w && s->w->d_data && opt->d_param
+		    && s->w->d_data == opt->d_param + s->off) {
+			(void)mat_pull_host(s->w);
+			s->w->d_data = NULL;
+			s->w->on_device = MAT_DEV_HOST;
+		}
+		if (s->dw && s->dw->d_data && opt->d_grad
+		    && s->dw->d_data == opt->d_grad + s->off) {
+			s->dw->d_data = NULL;
+			s->dw->on_device = MAT_DEV_HOST;
+		}
+	}
+}
+
 static void release_gpu(lm_adam *opt)
 {
+	unalias_segs(opt);
 	gpu_adam_set_bf16_flat(NULL, NULL, 0);
 	gpu_free(opt->d_param);
 	gpu_free(opt->d_param_bf16);

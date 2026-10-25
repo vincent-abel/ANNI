@@ -172,25 +172,25 @@ int ffn_forward_cache(mat *out, const mat *x, ffn *f, ffn_cache *c)
 		if (pre && hid
 		    && gpu_ffn_w1_finish(hid, pre,
 		    bias_fused ? NULL : f->b1->data, T, LM_D_FF) == 0) {
-			mat_mark_device(c->pre_act);
-			mat_mark_device(c->hidden);
+			mat_mark_written(c->pre_act, pre);
+			mat_mark_written(c->hidden, hid);
 		} else if (!bias_fused && pre
 		    && resid_copy(c->hidden, c->pre_act) == 0
 		    && (hid = mat_compute_ptr(c->hidden))
 		    && gpu_bias_relu_forward(hid, f->b1->data, T, LM_D_FF)
 		    == 0) {
-			mat_mark_device(c->hidden);
+			mat_mark_written(c->hidden, hid);
 			if (gpu_bias_row_add(pre, f->b1->data, T, LM_D_FF)
 			    == 0)
-				mat_mark_device(c->pre_act);
+				mat_mark_written(c->pre_act, pre);
 		} else if (!bias_fused && pre
 		    && gpu_bias_row_add(pre, f->b1->data, T, LM_D_FF) == 0) {
-			mat_mark_device(c->pre_act);
+			mat_mark_written(c->pre_act, pre);
 			if (resid_copy(c->hidden, c->pre_act) != 0)
 				copy_mat(c->hidden, c->pre_act);
 			hid = mat_compute_ptr(c->hidden);
 			if (hid && gpu_relu_forward(hid, T * LM_D_FF) == 0)
-				mat_mark_device(c->hidden);
+				mat_mark_written(c->hidden, hid);
 			else {
 				(void)mat_ensure_host(c->hidden);
 				for (t = 0; t < T; t++)
@@ -221,7 +221,7 @@ int ffn_forward_cache(mat *out, const mat *x, ffn *f, ffn_cache *c)
 		return -1;
 	op = mat_compute_ptr(out);
 	if (op && gpu_bias_row_add(op, f->b2->data, T, LM_D_MODEL) == 0)
-		mat_mark_device(out);
+		mat_mark_written(out, op);
 	else {
 		(void)mat_ensure_host(out);
 		for (t = 0; t < T; t++) {
@@ -322,7 +322,7 @@ int ffn_backward(mat *dx, const mat *dout, ffn *f, const ffn_cache *c)
 		}
 		mat_host_dirty(dh);
 	} else
-		mat_mark_device(dh);
+		mat_mark_written(dh, dhp);
 	if (mat_outer_add(f->dw1, c->x_in, dh) != 0)
 		return -1;
 	{
