@@ -41,6 +41,7 @@ SMI=/usr/lib/wsl/lib/nvidia-smi
 command -v nvidia-smi >/dev/null && SMI=nvidia-smi
 NVCC="$HOME/cuda13/usr/local/cuda-13.0/bin/nvcc"
 OUT=models/talk170m.bin
+CHAT=models/talk170m-chat.bin
 
 log() { echo "[$(date '+%F %T')] talk170m: $*"; }
 
@@ -83,7 +84,28 @@ step() {	# step NAME MARKER CMD...
 }
 
 build_cuda() {
+	# No header dependencies in the Makefile: always rebuild from clean.
+	make clean
 	make -j6 cuda NVCC="$NVCC -Xcompiler -U_GNU_SOURCE"
+}
+
+chat_ids() {
+	gcc -O2 -std=c99 -I. -Ilang -Inum -Icompat scripts/pretok_chat.c \
+	    lang/bpe.c lang/vocab.c lang/tokenize.c -o scripts/pretok_chat -lm
+	scripts/pretok_chat data/mix.vocab data/chat_train.txt data/chat_train_mids.bin
+	scripts/pretok_chat data/mix.vocab data/chat_val.txt data/chat_val_mids.bin
+}
+
+# Chat fine-tune from the pretrained weights and Adam state. Short, so a
+# crash restarts it from the pretrained file. Constant LR: the schedule
+# follows Adam's step count, which is already past the pretraining decay.
+finetune() {
+	./anni lm train --resume "$OUT" --out "$CHAT" --force \
+	    --data data/chat_train_mids.bin --val-data data/chat_val_mids.bin \
+	    --tokenizer bpe --vocab data/mix.vocab \
+	    --window 256 --stride 256 --batch 16 --grad-accum 8 --epochs 2 \
+	    --lr 5e-5 --lr-decay none --grad-clip 1.0 --weight-decay 0.1 \
+	    --flash-attn --bf16 --eval-every 1 --eval-windows 256 --seed 2 -d
 }
 
 pretrain() {
@@ -101,7 +123,7 @@ pretrain() {
 }
 
 # Finished: leave llama-server alone.
-if [ -e models/.talk170m_pretrained ]; then
+if [ -e models/.talk170m_chat ]; then
 	log "pipeline finished; nothing to do"
 	exit 0
 fi
@@ -109,8 +131,14 @@ stop_llama
 step fetch_mix data/mix.SOURCE "$PY" -I scripts/fetch_mix.py
 step build_mix data/.mix_built scripts/build_mix.sh
 step fetch_chat data/chat.SOURCE "$PY" scripts/fetch_chat.py
-step build_cuda objects/.cuda_built build_cuda
+step build_cuda models/.cuda_built build_cuda
 stop_llama
 wait_free
 step pretrain models/.talk170m_pretrained pretrain
-log "all steps done"
+step build_cuda_mask models/.cuda_built_mask build_cuda
+step chat_ids data/.chat_ids chat_ids
+stop_llama
+wait_free
+step finetune models/.talk170m_chat finetune
+log "all steps done; restarting janni-llama-server"
+systemctl --user start janni-llama-server || log "llama-server start failed"
