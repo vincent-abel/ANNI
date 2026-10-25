@@ -159,6 +159,8 @@ Full code checklists live in the root [`../README.md`](../README.md): **Capable 
 ### Talking model (talk-170m)
 
 - [Talking model plan](talk-170m-plan.md)
+- [Talking model data](talk-170m-data.md)
+- [Talking model pretraining run](talk-170m-pretrain.md)
 
 # How this neural network works
 
@@ -440,3 +442,9 @@ A second binary, `./autotrain`, picks Target-oriented defaults (BPE, stream, bat
 
 ### [Talking model plan](talk-170m-plan.md)
 Train the D=1024, 12-block shape (about 185M parameters) on about 3B tokens of FineWeb-Edu and permissive code, then fine-tune on chat. The note sizes the data, the tokenizer and the GPU time.
+
+### [Talking model data](talk-170m-data.md)
+3.81B training tokens (3.21B FineWeb-Edu, 0.60B permissive code) encoded with a 16k BPE retrained on the mix, a held-out split, and 150k chat conversations in User:/Assistant: form. Id files are memory-mapped and counted in a long.
+
+### [Talking model pretraining run](talk-170m-pretrain.md)
+Batch 16 × 32 accumulation at window 256, BF16 flash attention, 11.7 GB peak VRAM and about 34k tok/s, about 33 h. Checkpoints every 30 minutes resume at the window they reached; a tmux driver restarts the run after a crash.
