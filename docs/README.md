@@ -126,6 +126,7 @@
 - [Variable-length packing (E8)](variable-length-packing.md)
 - [Compile profile (E12)](compile-profile.md)
 - [GPU training audit: stale caches and BF16](gpu-training-audit.md)
+- [Plan: proper 8-bit and 4-bit training](low-precision-plan.md)
 
 ### From toy LM → small LLM
 
