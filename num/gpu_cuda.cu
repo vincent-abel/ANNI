@@ -2969,6 +2969,18 @@ extern "C" void gpu_host_forget(const void *host)
 
 	if (!host || !gpu_available())
 		return;
+	/*
+	** A pinned (cudaHostRegister) vector must be unregistered before the
+	** heap hands its pages to another allocation: a later vector at an
+	** overlapping address would look "already pinned" or fail to register.
+	*/
+	for (i = 0; i < g_host_pin_n; i++) {
+		if (g_host_pin[i] == host) {
+			(void)cudaHostUnregister((void *)host);
+			g_host_pin[i] = g_host_pin[--g_host_pin_n];
+			break;
+		}
+	}
 	pthread_mutex_lock(&g_ew_mu);
 	for (i = 0; i < BIAS_CACHE_SLOTS; i++) {
 		if (g_bias_cache[i].host == host) {
