@@ -87,6 +87,9 @@ int	gpu_mat_mul(mat *c, const mat *a, const mat *b);
 /* c = a b + bias (bias length = c->cols); cuBLASLt BIAS epilogue when BF16. */
 int	gpu_mat_mul_bias(mat *c, const mat *a, const mat *b,
 		const ann_real *bias);
+/* d = a b (+ bias, may be NULL) + res, one cuBLASLt call (BF16 mode); -1 = do it in steps. */
+int	gpu_mat_mul_res(mat *d, const mat *a, const mat *b, const ann_real *bias,
+		const mat *res);
 /* c = ReLU(a b + bias); cuBLASLt RELU_BIAS. Publishes BF16 twin of c. */
 int	gpu_mat_mul_bias_relu(mat *c, const mat *a, const mat *b,
 		const ann_real *bias);

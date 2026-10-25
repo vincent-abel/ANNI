@@ -32,6 +32,9 @@ void	ffn_free(ffn **f);
 void	ffn_zero_grad(ffn *f);
 int	ffn_forward(mat *x, const ffn *f);
 int	ffn_forward_cache(mat *out, const mat *x, ffn *f, ffn_cache *c);
+/* Same with the block residual fused into the W2 GEMM (res may be NULL). */
+int	ffn_forward_cache_res(mat *out, const mat *x, ffn *f, ffn_cache *c,
+		const mat *res);
 int	ffn_backward(mat *dx, const mat *dout, ffn *f, const ffn_cache *c);
 
 ffn_cache	*ffn_cache_create(int T);
