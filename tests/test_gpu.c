@@ -24,6 +24,8 @@
 #define ACC 2
 #define STEPS 4
 #define NT 64
+/* Pseudo precision for rig_open: BF16 GEMMs with the FP8 fwd/dgrad stack. */
+#define PREC_FP8 99
 
 static void fill_ids(int *ids, unsigned x)
 {
@@ -61,7 +63,8 @@ static void rig_open(rig *r, int prec)
 	r->opt->beta2 = 0.95;
 	r->opt->grad_clip = 1.0;
 	r->opt->weight_decay = 0.1;
-	gpu_set_compute_prec(prec);
+	gpu_set_fp8(prec == PREC_FP8);
+	gpu_set_compute_prec(prec == PREC_FP8 ? GPU_PREC_BF16 : prec);
 	attn_set_flash(1);
 	lm_weights_to_device(r->m);
 	r->c = lm_cache_create_packed(B, T);
@@ -73,6 +76,7 @@ static void rig_open(rig *r, int prec)
 static void rig_close(rig *r)
 {
 	gpu_set_sync_mode(GPU_SYNC_EAGER);
+	gpu_set_fp8(0);
 	lm_weights_ensure_host(r->m);
 	lm_adam_free(&r->opt);
 	lm_cache_free(&r->c);
@@ -269,9 +273,14 @@ static void test_free_leaves_no_cuda_error(void)
 	assert(err[0] == '\0');
 }
 
-/* 5. BF16 training tracks FP32: same loss trajectory (to 1e-3) and every
-** weight gradient within 20%% relative error / 10%% norm from step 1 on. */
-static void test_bf16_tracks_fp32(void)
+/*
+** 5. Reduced-precision training tracks FP32: loss trajectory within
+** loss_tol and every weight gradient within rel_tol relative error and
+** ratio_tol in norm, from step 1 on (step 1 catches the GEMM-level bugs:
+** timing loop, scale saturation; later steps the trajectory).
+*/
+static void check_tracks_fp32(const char *tag, int prec, double loss_tol,
+	double rel_tol, double ratio_tol)
 {
 	static float *s32[STEPS * NT];
 	static float *s16[STEPS * NT];
@@ -286,10 +295,11 @@ static void test_bf16_tracks_fp32(void)
 	int bad = 0;
 
 	train(GPU_PREC_FP32, s32, l32, &nt, sizes, names);
-	train(GPU_PREC_BF16, s16, l16, &nt, sizes, names);
+	train(prec, s16, l16, &nt, sizes, names);
 	for (s = 0; s < STEPS; s++) {
-		printf("  step %d loss fp32 %.5f bf16 %.5f\n", s + 1, l32[s], l16[s]);
-		if (fabs(l32[s] - l16[s]) > 2e-3)
+		printf("  step %d loss fp32 %.5f %s %.5f\n", s + 1, l32[s], tag,
+		    l16[s]);
+		if (fabs(l32[s] - l16[s]) > loss_tol)
 			bad = 1;
 		for (i = 0; i < nt; i++) {
 			double num = 0.0;
@@ -307,7 +317,8 @@ static void test_bf16_tracks_fp32(void)
 			}
 			rel = sqrt(num / (den + 1e-30));
 			ratio = sqrt(n16 / (den + 1e-30));
-			if (rel > 0.2 || ratio > 1.1 || ratio < 0.9) {
+			if (rel > rel_tol || ratio > 1.0 + ratio_tol
+			    || ratio < 1.0 - ratio_tol) {
 				printf("    %s: rel_err %.3f ratio %.3f\n", names[i], rel,
 				    ratio);
 				bad = 1;
@@ -333,7 +344,10 @@ int main(void)
 	test_forward_no_cross_batch_state();
 	test_first_step_updates_everything();
 	test_free_leaves_no_cuda_error();
-	test_bf16_tracks_fp32();
+	printf("bf16 vs fp32\n");
+	check_tracks_fp32("bf16", GPU_PREC_BF16, 2e-3, 0.2, 0.1);
+	printf("fp8 (E4M3 fwd, E5M2 dgrad) vs fp32\n");
+	check_tracks_fp32("fp8", PREC_FP8, 1e-2, 0.4, 0.2);
 	printf("test_gpu: all passed\n");
 	return 0;
 }
