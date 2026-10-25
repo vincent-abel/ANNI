@@ -5,6 +5,7 @@
 #include <cuda_fp16.h>
 #if CUDART_VERSION >= 11000
 #include <cuda_bf16.h>
+#include <mma.h>
 #endif
 #if CUDART_VERSION >= 12000
 #include <cuda_fp8.h>
@@ -5307,6 +5308,556 @@ static int tc_upload_seqlens(int B)
 		return -1;
 	return gpu_memcpy_h2d(g_att_seqlens_dev, g_att_seqlens_host,
 	    (size_t)B * sizeof(int));
+}
+
+
+/*
+** ---- Fused causal attention on tensor cores (BF16 WMMA, FP32 accumulate) --
+**
+** FlashAttention-style: one block per (b, h, 64-query tile), four warps of
+** 16 query rows each. Keys stream through shared memory in 64-wide tiles up
+** to the causal diagonal; the score matrix is never written to HBM. Two
+** passes over the keys (row max / sum first, then P V) keep the output in
+** WMMA accumulators without per-row rescaling; QK^T is recomputed (cheap on
+** tensor cores). Writes lse[b,h,i] = m_i + log l_i for the backward.
+** Requirements: dh in {16,32,48,64}, T % 64 == 0, no seqlens.
+*/
+#define FA_BQ	64
+#define FA_BK	64
+#define FA_WARPS	4
+#define FA_SPAD	8		/* fp32 score row pad (bank spread) */
+
+__global__ static void attn_fa_wmma_fwd_kernel(ann_real *out, ann_real *lse,
+	const ann_real *q, const ann_real *k, const ann_real *v, int T, int H,
+	int dh, float scale)
+{
+	using namespace nvcuda;
+	extern __shared__ unsigned char fa_sm[];
+	__nv_bfloat16 *Qs = (__nv_bfloat16 *)fa_sm;			/* 64 x dh */
+	__nv_bfloat16 *Ks = Qs + FA_BQ * dh;				/* 64 x dh */
+	__nv_bfloat16 *Vs = Ks + FA_BK * dh;				/* 64 x dh */
+	__nv_bfloat16 *Ps = Vs + FA_BK * dh;				/* 64 x 64 */
+	float *Ss = (float *)(Ps + FA_BQ * FA_BK);			/* 64 x (64+pad) */
+	float *rm = Ss + FA_BQ * (FA_BK + FA_SPAD);			/* 64 */
+	float *rl = rm + FA_BQ;						/* 64 */
+	const int bh = blockIdx.x;
+	const int b = bh / H;
+	const int h = bh % H;
+	const int qt = blockIdx.y;
+	const int warp = threadIdx.x >> 5;
+	const int lane = threadIdx.x & 31;
+	const int D = H * dh;
+	const int SLD = FA_BK + FA_SPAD;
+	const size_t row0 = (size_t)b * T;
+	const int q0 = qt * FA_BQ;
+	const int nkt = qt + 1;				/* causal: key tiles 0..qt */
+	int i, kt, kk, nt, c;
+
+	/* Q tile -> BF16 shared (rows q0..q0+63). */
+	for (i = threadIdx.x; i < FA_BQ * dh; i += blockDim.x) {
+		int r = i / dh, cc = i % dh;
+		Qs[r * dh + cc] = __float2bfloat16(
+		    q[(row0 + q0 + r) * D + h * dh + cc]);
+	}
+	if (threadIdx.x < FA_BQ) {
+		rm[threadIdx.x] = -1e30f;
+		rl[threadIdx.x] = 0.0f;
+	}
+	__syncthreads();
+
+	/* Pass 1: row max and sum over all causal keys. */
+	for (kt = 0; kt < nkt; kt++) {
+		const int k0 = kt * FA_BK;
+
+		for (i = threadIdx.x; i < FA_BK * dh; i += blockDim.x) {
+			int r = i / dh, cc = i % dh;
+			Ks[r * dh + cc] = __float2bfloat16(
+			    k[(row0 + k0 + r) * D + h * dh + cc]);
+		}
+		__syncthreads();
+		/* S_w = Q_w K^T: 16 x 64 per warp. */
+		for (nt = 0; nt < FA_BK / 16; nt++) {
+			wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+			wmma::fill_fragment(acc, 0.0f);
+			for (kk = 0; kk < dh; kk += 16) {
+				wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a;
+				wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> bfr;
+				wmma::load_matrix_sync(a, Qs + warp * 16 * dh + kk, dh);
+				wmma::load_matrix_sync(bfr, Ks + nt * 16 * dh + kk, dh);
+				wmma::mma_sync(acc, a, bfr, acc);
+			}
+			wmma::store_matrix_sync(Ss + warp * 16 * SLD + nt * 16, acc,
+			    SLD, wmma::mem_row_major);
+		}
+		__syncwarp();
+		/* Online stats: lane -> row lane/2, half lane&1 of the 64 keys. */
+		{
+			const int r = warp * 16 + (lane >> 1);
+			const int qi = q0 + r;
+			const float *srow = Ss + r * SLD + (lane & 1) * 32;
+			float tmax = -1e30f, tsum, mold, mnew;
+
+			for (c = 0; c < 32; c++) {
+				int kj = k0 + (lane & 1) * 32 + c;
+				float sv = kj <= qi ? srow[c] * scale : -1e30f;
+				tmax = fmaxf(tmax, sv);
+			}
+			tmax = fmaxf(tmax, __shfl_xor_sync(0xffffffffu, tmax, 1));
+			mold = rm[r];
+			mnew = fmaxf(mold, tmax);
+			tsum = 0.0f;
+			for (c = 0; c < 32; c++) {
+				int kj = k0 + (lane & 1) * 32 + c;
+				if (kj <= qi)
+					tsum += __expf(srow[c] * scale - mnew);
+			}
+			tsum += __shfl_xor_sync(0xffffffffu, tsum, 1);
+			if ((lane & 1) == 0) {
+				rl[r] = rl[r] * __expf(mold - mnew) + tsum;
+				rm[r] = mnew;
+			}
+		}
+		__syncthreads();
+	}
+
+	/* Pass 2: O_w = sum_kt P_w V in WMMA accumulators. */
+	{
+		wmma::fragment<wmma::accumulator, 16, 16, 16, float> oacc[4];
+		const int ndt = dh / 16;
+
+		for (nt = 0; nt < ndt; nt++)
+			wmma::fill_fragment(oacc[nt], 0.0f);
+		for (kt = 0; kt < nkt; kt++) {
+			const int k0 = kt * FA_BK;
+
+			for (i = threadIdx.x; i < FA_BK * dh; i += blockDim.x) {
+				int r = i / dh, cc = i % dh;
+				Ks[r * dh + cc] = __float2bfloat16(
+				    k[(row0 + k0 + r) * D + h * dh + cc]);
+				Vs[r * dh + cc] = __float2bfloat16(
+				    v[(row0 + k0 + r) * D + h * dh + cc]);
+			}
+			__syncthreads();
+			for (nt = 0; nt < FA_BK / 16; nt++) {
+				wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+				wmma::fill_fragment(acc, 0.0f);
+				for (kk = 0; kk < dh; kk += 16) {
+					wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a;
+					wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> bfr;
+					wmma::load_matrix_sync(a, Qs + warp * 16 * dh + kk, dh);
+					wmma::load_matrix_sync(bfr, Ks + nt * 16 * dh + kk, dh);
+					wmma::mma_sync(acc, a, bfr, acc);
+				}
+				wmma::store_matrix_sync(Ss + warp * 16 * SLD + nt * 16, acc,
+				    SLD, wmma::mem_row_major);
+			}
+			__syncwarp();
+			/* P = exp(S*scale - m) / l, masked, as BF16. */
+			{
+				const int r = warp * 16 + (lane >> 1);
+				const int qi = q0 + r;
+				const float *srow = Ss + r * SLD + (lane & 1) * 32;
+				__nv_bfloat16 *prow = Ps + r * FA_BK + (lane & 1) * 32;
+				const float m = rm[r];
+				const float inv = 1.0f / rl[r];
+
+				for (c = 0; c < 32; c++) {
+					int kj = k0 + (lane & 1) * 32 + c;
+					float pv = kj <= qi
+					    ? __expf(srow[c] * scale - m) * inv : 0.0f;
+					prow[c] = __float2bfloat16(pv);
+				}
+			}
+			__syncwarp();
+			/* O_w += P_w (16 x 64) V (64 x dh). */
+			for (kk = 0; kk < FA_BK; kk += 16) {
+				wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a;
+				wmma::load_matrix_sync(a, Ps + warp * 16 * FA_BK + kk, FA_BK);
+				for (nt = 0; nt < ndt; nt++) {
+					wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> bfr;
+					wmma::load_matrix_sync(bfr, Vs + kk * dh + nt * 16, dh);
+					wmma::mma_sync(oacc[nt], a, bfr, oacc[nt]);
+				}
+			}
+			__syncthreads();
+		}
+		for (nt = 0; nt < ndt; nt++)
+			wmma::store_matrix_sync(out + (row0 + q0 + warp * 16) * D
+			    + h * dh + nt * 16, oacc[nt], D, wmma::mem_row_major);
+	}
+	if (threadIdx.x < FA_BQ)
+		lse[(size_t)bh * T + q0 + threadIdx.x] =
+		    rm[threadIdx.x] + __logf(rl[threadIdx.x]);
+}
+
+static size_t fa_wmma_smem(int dh)
+{
+	return (size_t)(3 * FA_BQ * dh + FA_BQ * FA_BK) * 2
+	    + (size_t)(FA_BQ * (FA_BK + FA_SPAD) + 2 * FA_BQ) * sizeof(float);
+}
+
+static int fa_wmma_ok(int T, int dh)
+{
+	return (T % FA_BQ) == 0 && dh >= 16 && dh <= 64 && (dh % 16) == 0
+	    && !g_att_seqlens_host;
+}
+
+/*
+** Fused tensor-core causal attention forward (BF16 mode). Writes concat and
+** lse; -1 = caller uses another path.
+*/
+extern "C" int gpu_attn_fa_fwd(mat *concat, const mat *q, const mat *k,
+	const mat *v, int B, int T, int H, int dh, mat *lse)
+{
+	OpScope _op(OP_ATTN_FWD);
+	ann_real *dq, *dk, *dv, *dc;
+	int oq, ok, ov, oc, rc = -1;
+	size_t smem;
+
+	if (!concat || !q || !k || !v || !lse || !lse->d_data
+	    || !att_args_ok(B, T, H, dh) || !fa_wmma_ok(T, dh)
+	    || g_compute_prec != GPU_PREC_BF16)
+		return -1;
+	if (q->rows != B * T || q->cols != H * dh || lse->rows != B * H * T)
+		return -1;
+	smem = fa_wmma_smem(dh);
+	{
+		static int attr_done;
+
+		if (!attr_done) {
+			/* Once, for the largest head size (dh = 64: 51 KB). */
+			if (cudaFuncSetAttribute(attn_fa_wmma_fwd_kernel,
+			    cudaFuncAttributeMaxDynamicSharedMemorySize,
+			    (int)fa_wmma_smem(64)) != cudaSuccess) {
+				(void)cudaGetLastError();
+				return -1;
+			}
+			attr_done = 1;
+		}
+	}
+	pthread_mutex_lock(&g_att_mu);
+	oq = ok = ov = oc = 0;
+	if (ensure_dev(q, &dq, &oq) != 0 || ensure_dev(k, &dk, &ok) != 0
+	    || ensure_dev(v, &dv, &ov) != 0
+	    || ensure_dev_out(concat, &dc, &oc) != 0)
+		goto fa_out;
+	{
+		dim3 grid(B * H, T / FA_BQ);
+
+		attn_fa_wmma_fwd_kernel<<<grid, 32 * FA_WARPS, smem>>>(dc,
+		    lse->d_data, dq, dk, dv, T, H, dh,
+		    (float)(1.0 / sqrt((double)dh)));
+	}
+	if (launch_done() == 0 && finish_out(concat, dc, oc) == 0) {
+		lse->on_device = MAT_DEV_DEVICE;
+		rc = 0;
+	}
+fa_out:
+	if (oq && dq)
+		gpu_free(dq);
+	if (ok && dk)
+		gpu_free(dk);
+	if (ov && dv)
+		gpu_free(dv);
+	if (oc && dc)
+		gpu_free(dc);
+	pthread_mutex_unlock(&g_att_mu);
+	return rc;
+}
+
+/* D_i = sum_c dO[i,c] O[i,c] per (b,h,i), one thread per row. */
+__global__ static void attn_fa_dvec_kernel(float *dvec, const ann_real *dO,
+	const ann_real *O, int nrows, int T, int H, int dh)
+{
+	int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	int bh = idx / T;
+	int i = idx % T;
+	int b = bh / H;
+	int h = bh % H;
+	int D = H * dh;
+	size_t off;
+	float acc = 0.0f;
+	int c;
+
+	if (idx >= nrows)
+		return;
+	off = ((size_t)b * T + i) * D + h * dh;
+	for (c = 0; c < dh; c++)
+		acc += dO[off + c] * O[off + c];
+	dvec[idx] = acc;
+}
+
+/*
+** Fused causal attention backward (FA-2 order): one block per (b, h,
+** 64-key tile), four warps of 16 key rows. Query tiles from the diagonal
+** on stream through shared memory; P^T is recomputed from lse, dV and dK
+** accumulate in WMMA fragments, dQ contributions are atomically added
+** (FP32) per query tile. No score matrix in HBM.
+*/
+__global__ static void attn_fa_wmma_bwd_kernel(ann_real *dq, ann_real *dk,
+	ann_real *dv, const ann_real *q, const ann_real *k, const ann_real *v,
+	const ann_real *dO, const float *lse, const float *dvec, int T, int H,
+	int dh, float scale)
+{
+	using namespace nvcuda;
+	extern __shared__ unsigned char fa_sm[];
+	__nv_bfloat16 *Ks = (__nv_bfloat16 *)fa_sm;			/* 64 x dh */
+	__nv_bfloat16 *Vs = Ks + FA_BK * dh;				/* 64 x dh */
+	__nv_bfloat16 *Qs = Vs + FA_BK * dh;				/* 64 x dh */
+	__nv_bfloat16 *dOs = Qs + FA_BQ * dh;				/* 64 x dh */
+	__nv_bfloat16 *Pt = dOs + FA_BQ * dh;				/* 64k x 64q */
+	__nv_bfloat16 *dSt = Pt + FA_BK * FA_BQ;			/* 64k x 64q */
+	float *Ss = (float *)(dSt + FA_BK * FA_BQ);			/* 64 x (64+pad) */
+	float *ls = Ss + FA_BK * (FA_BQ + FA_SPAD);			/* 64 */
+	float *dvs = ls + FA_BQ;					/* 64 */
+	const int bh = blockIdx.x;
+	const int b = bh / H;
+	const int h = bh % H;
+	const int kt = blockIdx.y;
+	const int warp = threadIdx.x >> 5;
+	const int lane = threadIdx.x & 31;
+	const int D = H * dh;
+	const int SLD = FA_BQ + FA_SPAD;
+	const size_t row0 = (size_t)b * T;
+	const int k0 = kt * FA_BK;
+	const int ndt = dh / 16;
+	wmma::fragment<wmma::accumulator, 16, 16, 16, float> dkacc[4];
+	wmma::fragment<wmma::accumulator, 16, 16, 16, float> dvacc[4];
+	int i, qt, kk, nt, c;
+
+	for (nt = 0; nt < ndt; nt++) {
+		wmma::fill_fragment(dkacc[nt], 0.0f);
+		wmma::fill_fragment(dvacc[nt], 0.0f);
+	}
+	for (i = threadIdx.x; i < FA_BK * dh; i += blockDim.x) {
+		int r = i / dh, cc = i % dh;
+		size_t off = (row0 + k0 + r) * D + h * dh + cc;
+		Ks[r * dh + cc] = __float2bfloat16(k[off]);
+		Vs[r * dh + cc] = __float2bfloat16(v[off]);
+	}
+	__syncthreads();
+	for (qt = kt; qt < T / FA_BQ; qt++) {
+		const int q0 = qt * FA_BQ;
+
+		for (i = threadIdx.x; i < FA_BQ * dh; i += blockDim.x) {
+			int r = i / dh, cc = i % dh;
+			size_t off = (row0 + q0 + r) * D + h * dh + cc;
+			Qs[r * dh + cc] = __float2bfloat16(q[off]);
+			dOs[r * dh + cc] = __float2bfloat16(dO[off]);
+		}
+		if (threadIdx.x < FA_BQ) {
+			ls[threadIdx.x] = lse[(size_t)bh * T + q0 + threadIdx.x];
+			dvs[threadIdx.x] = dvec[(size_t)bh * T + q0 + threadIdx.x];
+		}
+		__syncthreads();
+		/* S^T_w = K_w Q^T: 16 keys x 64 queries. */
+		for (nt = 0; nt < FA_BQ / 16; nt++) {
+			wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+			wmma::fill_fragment(acc, 0.0f);
+			for (kk = 0; kk < dh; kk += 16) {
+				wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a;
+				wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> bfr;
+				wmma::load_matrix_sync(a, Ks + warp * 16 * dh + kk, dh);
+				wmma::load_matrix_sync(bfr, Qs + nt * 16 * dh + kk, dh);
+				wmma::mma_sync(acc, a, bfr, acc);
+			}
+			wmma::store_matrix_sync(Ss + warp * 16 * SLD + nt * 16, acc,
+			    SLD, wmma::mem_row_major);
+		}
+		__syncwarp();
+		/* P^T[kj, qi] = exp(scale S - lse_qi), causal mask kj <= qi. */
+		{
+			const int r = warp * 16 + (lane >> 1);
+			const int kj = k0 + r;
+			const float *srow = Ss + r * SLD + (lane & 1) * 32;
+			__nv_bfloat16 *prow = Pt + r * FA_BQ + (lane & 1) * 32;
+
+			for (c = 0; c < 32; c++) {
+				int qc = (lane & 1) * 32 + c;
+				int qi = q0 + qc;
+				float pv = kj <= qi
+				    ? __expf(srow[c] * scale - ls[qc]) : 0.0f;
+				prow[c] = __float2bfloat16(pv);
+			}
+		}
+		__syncwarp();
+		/* dV_w += P^T_w (16 x 64) dO (64 x dh). */
+		for (kk = 0; kk < FA_BQ; kk += 16) {
+			wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a;
+			wmma::load_matrix_sync(a, Pt + warp * 16 * FA_BQ + kk, FA_BQ);
+			for (nt = 0; nt < ndt; nt++) {
+				wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> bfr;
+				wmma::load_matrix_sync(bfr, dOs + kk * dh + nt * 16, dh);
+				wmma::mma_sync(dvacc[nt], a, bfr, dvacc[nt]);
+			}
+		}
+		/* dP^T_w = V_w dO^T: 16 keys x 64 queries, into Ss. */
+		for (nt = 0; nt < FA_BQ / 16; nt++) {
+			wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+			wmma::fill_fragment(acc, 0.0f);
+			for (kk = 0; kk < dh; kk += 16) {
+				wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a;
+				wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> bfr;
+				wmma::load_matrix_sync(a, Vs + warp * 16 * dh + kk, dh);
+				wmma::load_matrix_sync(bfr, dOs + nt * 16 * dh + kk, dh);
+				wmma::mma_sync(acc, a, bfr, acc);
+			}
+			wmma::store_matrix_sync(Ss + warp * 16 * SLD + nt * 16, acc,
+			    SLD, wmma::mem_row_major);
+		}
+		__syncwarp();
+		/* dS^T = P^T (dP^T - D_qi) as BF16. */
+		{
+			const int r = warp * 16 + (lane >> 1);
+			const float *drow = Ss + r * SLD + (lane & 1) * 32;
+			const __nv_bfloat16 *prow = Pt + r * FA_BQ + (lane & 1) * 32;
+			__nv_bfloat16 *dsrow = dSt + r * FA_BQ + (lane & 1) * 32;
+
+			for (c = 0; c < 32; c++) {
+				int qc = (lane & 1) * 32 + c;
+				float pv = __bfloat162float(prow[c]);
+				dsrow[c] = __float2bfloat16(pv * (drow[c] - dvs[qc]));
+			}
+		}
+		__syncthreads();	/* all warps' dS^T rows complete */
+		/* dK_w += scale dS^T_w (16 x 64 queries) Q (64 x dh). */
+		for (kk = 0; kk < FA_BQ; kk += 16) {
+			wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a;
+			wmma::load_matrix_sync(a, dSt + warp * 16 * FA_BQ + kk, FA_BQ);
+			for (nt = 0; nt < ndt; nt++) {
+				wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> bfr;
+				wmma::load_matrix_sync(bfr, Qs + kk * dh + nt * 16, dh);
+				wmma::mma_sync(dkacc[nt], a, bfr, dkacc[nt]);
+			}
+		}
+		/*
+		** dQ (16 queries per warp x dh) = scale dS (queries x keys) K:
+		** dS is the column-major view of dS^T; staged through Ss and
+		** atomically added to the global FP32 dQ (several key tiles).
+		*/
+		for (nt = 0; nt < ndt; nt++) {
+			wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+			wmma::fill_fragment(acc, 0.0f);
+			for (kk = 0; kk < FA_BK; kk += 16) {
+				wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::col_major> a;
+				wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> bfr;
+				wmma::load_matrix_sync(a, dSt + kk * FA_BQ + warp * 16, FA_BQ);
+				wmma::load_matrix_sync(bfr, Ks + kk * dh + nt * 16, dh);
+				wmma::mma_sync(acc, a, bfr, acc);
+			}
+			wmma::store_matrix_sync(Ss + warp * 16 * SLD + nt * 16, acc,
+			    SLD, wmma::mem_row_major);
+		}
+		__syncwarp();
+		for (i = lane; i < 16 * dh; i += 32) {
+			int r = i / dh, cc = i % dh;
+			atomicAdd(&dq[(row0 + q0 + warp * 16 + r) * D + h * dh + cc],
+			    Ss[(warp * 16 + r) * SLD + cc] * scale);
+		}
+		__syncthreads();	/* Qs / dOs / Ss reused by the next tile */
+	}
+	for (nt = 0; nt < ndt; nt++) {
+		for (i = 0; i < dkacc[nt].num_elements; i++)
+			dkacc[nt].x[i] *= scale;
+		wmma::store_matrix_sync(dk + (row0 + k0 + warp * 16) * D + h * dh
+		    + nt * 16, dkacc[nt], D, wmma::mem_row_major);
+		wmma::store_matrix_sync(dv + (row0 + k0 + warp * 16) * D + h * dh
+		    + nt * 16, dvacc[nt], D, wmma::mem_row_major);
+	}
+}
+
+static size_t fa_wmma_bwd_smem(int dh)
+{
+	return (size_t)(4 * FA_BK * dh + 2 * FA_BK * FA_BQ) * 2
+	    + (size_t)(FA_BK * (FA_BQ + FA_SPAD) + 2 * FA_BQ) * sizeof(float);
+}
+
+static float *g_fa_dvec;
+static size_t g_fa_dvec_cap;
+
+/* Fused tensor-core causal attention backward (BF16 mode); dq/dk/dv written. */
+extern "C" int gpu_attn_fa_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat,
+	const mat *concat, const mat *q, const mat *k, const mat *v,
+	const mat *lse, int B, int T, int H, int dh)
+{
+	OpScope _op(OP_ATTN_BWD);
+	ann_real *ptr[7];
+	int o[7];
+	int i, rc = -1;
+	size_t smem, nrows;
+
+	if (!dq || !dk || !dv || !dconcat || !concat || !q || !k || !v || !lse
+	    || !lse->d_data || !att_args_ok(B, T, H, dh) || !fa_wmma_ok(T, dh)
+	    || g_compute_prec != GPU_PREC_BF16)
+		return -1;
+	smem = fa_wmma_bwd_smem(dh);
+	{
+		static int attr_done;
+
+		if (!attr_done) {
+			if (cudaFuncSetAttribute(attn_fa_wmma_bwd_kernel,
+			    cudaFuncAttributeMaxDynamicSharedMemorySize,
+			    (int)fa_wmma_bwd_smem(64)) != cudaSuccess) {
+				(void)cudaGetLastError();
+				return -1;
+			}
+			attr_done = 1;
+		}
+	}
+	nrows = (size_t)B * H * T;
+	if (g_fa_dvec_cap < nrows) {
+		if (g_fa_dvec)
+			cudaFree(g_fa_dvec);
+		g_fa_dvec = NULL;
+		g_fa_dvec_cap = 0;
+		if (cudaMalloc((void **)&g_fa_dvec, nrows * sizeof(float))
+		    != cudaSuccess) {
+			g_fa_dvec = NULL;
+			return -1;
+		}
+		g_fa_dvec_cap = nrows;
+	}
+	pthread_mutex_lock(&g_att_mu);
+	for (i = 0; i < 7; i++) {
+		o[i] = 0;
+		ptr[i] = NULL;
+	}
+	if (ensure_dev(dconcat, &ptr[0], &o[0]) != 0
+	    || ensure_dev(concat, &ptr[1], &o[1]) != 0
+	    || ensure_dev(q, &ptr[2], &o[2]) != 0
+	    || ensure_dev(k, &ptr[3], &o[3]) != 0
+	    || ensure_dev(v, &ptr[4], &o[4]) != 0
+	    || ensure_dev_out(dq, &ptr[5], &o[5]) != 0
+	    || ensure_dev_out(dk, &ptr[6], &o[6]) != 0)
+		goto fa_bwd_out;
+	{
+		ann_real *a_dv;
+		int odv = 0;
+		dim3 grid(B * H, T / FA_BK);
+
+		if (ensure_dev_out(dv, &a_dv, &odv) != 0)
+			goto fa_bwd_out;
+		if (cudaMemsetAsync(ptr[5], 0, (size_t)B * T * H * dh
+		    * sizeof(ann_real), 0) != cudaSuccess)
+			goto fa_bwd_out;
+		attn_fa_dvec_kernel<<<(unsigned)((nrows + 255) / 256), 256>>>(
+		    g_fa_dvec, ptr[0], ptr[1], (int)nrows, T, H, dh);
+		attn_fa_wmma_bwd_kernel<<<grid, 32 * FA_WARPS, smem>>>(ptr[5],
+		    ptr[6], a_dv, ptr[2], ptr[3], ptr[4], ptr[0], lse->d_data,
+		    g_fa_dvec, T, H, dh, (float)(1.0 / sqrt((double)dh)));
+		if (launch_done() == 0 && finish_out(dq, ptr[5], o[5]) == 0
+		    && finish_out(dk, ptr[6], o[6]) == 0
+		    && finish_out(dv, a_dv, odv) == 0)
+			rc = 0;
+		if (odv && a_dv)
+			gpu_free(a_dv);
+	}
+fa_bwd_out:
+	for (i = 0; i < 7; i++)
+		if (o[i] && ptr[i])
+			gpu_free(ptr[i]);
+	pthread_mutex_unlock(&g_att_mu);
+	return rc;
 }
 
 extern "C" int gpu_attn_tc_fwd(mat *concat, mat *w, const mat *q, const mat *k,

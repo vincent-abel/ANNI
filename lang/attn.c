@@ -812,6 +812,23 @@ int attn_mha_forward_packed(mat *out, attn *a, const mat *x, attn_pcache *c)
 	** legacy / host.
 	*/
 	c->fused = 0;
+	/*
+	** Fused tensor-core attention (no T x T scores in HBM): BF16 mode,
+	** T % 64 == 0, no seqlens; the lse it writes feeds its backward.
+	*/
+	if (g_flash_attn && c->lse
+	    && gpu_attn_fa_fwd(c->concat, c->q, c->k, c->v, c->B, T, nh,
+	    a->d_head, c->lse) == 0) {
+		static int s_fa_wmma_once;
+
+		c->fused = 5;
+		if (!s_fa_wmma_once) {
+			s_fa_wmma_once = 1;
+			fprintf(stderr, "[attn] fused tensor-core attention (WMMA)\n");
+			fflush(stderr);
+		}
+		return mat_mul(out, c->concat, a->wo);
+	}
 	if (c->w_all
 	    && gpu_attn_tc_fwd(c->concat, c->w_all, c->q, c->k, c->v, c->B, T,
 	    nh, a->d_head) == 0) {
@@ -913,6 +930,12 @@ int attn_mha_backward_packed(mat *dx, const mat *dout, attn *a,
 		return -1;
 	if (mat_mul_wt(dconcat, dout, a->wo) != 0)
 		return -1;
+	if (c->fused == 5) {
+		if (gpu_attn_fa_bwd(dq, dk, dv, dconcat, c->concat, c->q, c->k,
+		    c->v, c->lse, c->B, T, nh, a->d_head) != 0)
+			return -1;
+		goto proj;
+	}
 	if (c->fused == 4) {
 		if (gpu_attn_tiled_bwd(dq, dk, dv, dconcat, c->concat, c->q,
 		    c->k, c->v, c->lse, c->B, T, nh, a->d_head) != 0)

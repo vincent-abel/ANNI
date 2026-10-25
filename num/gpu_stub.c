@@ -25,6 +25,14 @@ int gpu_mem_info(size_t *free_bytes, size_t *total_bytes)
 	return -1;
 }
 
+int gpu_attn_fa_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat,
+	const mat *concat, const mat *q, const mat *k, const mat *v,
+	const mat *lse, int B, int T, int H, int dh)
+{
+	(void)dq; (void)dk; (void)dv; (void)dconcat; (void)concat; (void)q; (void)k; (void)v; (void)lse; (void)B; (void)T; (void)H; (void)dh;
+	return -1;
+}
+
 void gpu_set_sync_mode(int mode)
 {
 	g_sync_mode = mode;
@@ -111,6 +119,13 @@ const char *gpu_debug_last_error(void)
 
 void gpu_op_prof_dump(void)
 {
+}
+
+int gpu_attn_fa_fwd(mat *concat, const mat *q, const mat *k, const mat *v,
+	int B, int T, int H, int dh, mat *lse)
+{
+	(void)concat; (void)q; (void)k; (void)v; (void)B; (void)T; (void)H; (void)dh; (void)lse;
+	return -1;
 }
 
 int gpu_memset(void *dst, int value, size_t nbytes)

@@ -21,7 +21,7 @@
 #include "lm_serialize.h"
 
 #define B 4
-#define T 32
+#define T 64	/* multiple of 64: exercises the fused WMMA attention */
 #define ACC 2
 #define STEPS 4
 #define NT 64
