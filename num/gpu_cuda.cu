@@ -51,15 +51,10 @@ extern "C" int gpu_compute_prec(void)
 
 extern "C" void gpu_set_fp8(int on)
 {
+	/* On implies dgrad; off switches both (an FP8 dgrad left on after an
+	** FP8 run silently quantized the gradients of the next BF16 run). */
 	g_fp8_fwd = on ? 1 : 0;
-	/*
-	** --fp8: E4M3 forward and hot LayerNorm, E4M3×E5M2 dgrad,
-	** E4M3 softmax probabilities, group-128 E4M3 Adam moments.
-	** Wgrad stays BF16 unless ANN_FP8_WGRAD=1 (two transposes lose).
-	** NVFP4 GEMM is not in this cuBLAS (probe status 7).
-	*/
-	if (on)
-		g_fp8_dgrad = 1;
+	g_fp8_dgrad = on ? 1 : 0;
 }
 
 extern "C" int gpu_fp8(void)
@@ -1450,6 +1445,69 @@ typedef struct {
 } act_bf16_slot;
 static act_bf16_slot g_act_bf16[ACT_BF16_SLOTS];
 static int g_act_bf16_rr;
+/*
+** One-shot BF16 twin of the last gradient converted by a weight-gradient
+** GEMM (dW += A^T G): the data-gradient GEMM that follows (dX = G W^T)
+** converts the same G again. The slot is consumed by that one call and
+** cleared, so it can never outlive a rewrite of G.
+*/
+static int ensure_half_buf(void **buf, size_t *cap, size_t bytes);
+static int half_wt_convert(void *dst, const ann_real *src, int n, int bf16);
+
+#define GRAD_TWIN_SLOTS	4	/* dq, dk, dv are converted before any is consumed */
+typedef struct {
+	void		*half;
+	size_t		cap;
+	const ann_real	*src;
+	size_t		n;
+} grad_twin_slot;
+static grad_twin_slot g_grad_twin[GRAD_TWIN_SLOTS];
+static int g_grad_twin_rr;
+static long g_grad_twin_hit;
+static long g_grad_twin_miss;
+
+/* Convert G into a one-shot twin slot (round robin); NULL on failure. */
+static void *grad_twin_put(const ann_real *src, size_t n)
+{
+	grad_twin_slot *e = &g_grad_twin[g_grad_twin_rr % GRAD_TWIN_SLOTS];
+
+	g_grad_twin_rr++;
+	if (ensure_half_buf(&e->half, &e->cap, n * 2) != 0
+	    || half_wt_convert(e->half, src, (int)n, 1) != 0) {
+		e->src = NULL;
+		e->n = 0;
+		return NULL;
+	}
+	e->src = src;
+	e->n = n;
+	return e->half;
+}
+
+/* Take (and clear) the twin of src if one is pending. */
+static void *grad_twin_take(const ann_real *src, size_t n)
+{
+	int i;
+
+	for (i = 0; i < GRAD_TWIN_SLOTS; i++) {
+		if (g_grad_twin[i].src == src && g_grad_twin[i].n == n) {
+			g_grad_twin[i].src = NULL;
+			g_grad_twin[i].n = 0;
+			return g_grad_twin[i].half;
+		}
+	}
+	return NULL;
+}
+
+static void grad_twin_forget(const void *p)
+{
+	int i;
+
+	for (i = 0; i < GRAD_TWIN_SLOTS; i++)
+		if (g_grad_twin[i].src == (const ann_real *)p) {
+			g_grad_twin[i].src = NULL;
+			g_grad_twin[i].n = 0;
+		}
+}
 
 static int ensure_half_buf(void **buf, size_t *cap, size_t bytes)
 {
@@ -2100,12 +2158,22 @@ static int cublas_gemm_rm_bt(ann_real *dC, const ann_real *dA,
 		}
 #if CUDART_VERSION >= 11000
 		if (use_bf16) {
-			if (half_wt_convert(g_half_A, dA, (int)nA, 1) != 0) {
+			const void *hA_use = NULL;
+
+			hA_use = grad_twin_take(dA, nA);	/* converted by the wgrad */
+			if (hA_use)
+				g_grad_twin_hit++;
+			else {
+				g_grad_twin_miss++;
+				if (half_wt_convert(g_half_A, dA, (int)nA, 1) == 0)
+					hA_use = g_half_A;
+			}
+			if (!hA_use) {
 				pthread_mutex_unlock(&g_gemm_mu);
 				return -1;
 			}
 			rc = cublas_gemm_ex_bf16(CUBLAS_OP_T, CUBLAS_OP_N, N,
-			    M, K, &alpha, hB_use, K, g_half_A, K, &beta, dC, N);
+			    M, K, &alpha, hB_use, K, hA_use, K, &beta, dC, N);
 			pthread_mutex_unlock(&g_gemm_mu);
 			return rc;
 		}
@@ -2211,11 +2279,15 @@ fp8_wgrad_skip:
 			hA_use = g_half_A;
 		}
 		if (!hB_use) {
-			if (half_wt_convert(g_half_B, dB, (int)nB, 1) != 0) {
-				pthread_mutex_unlock(&g_gemm_mu);
-				return -1;
+			/* Convert G once, into the one-shot twin the dgrad reuses. */
+			hB_use = grad_twin_put(dB, nB);
+			if (!hB_use) {
+				if (half_wt_convert(g_half_B, dB, (int)nB, 1) != 0) {
+					pthread_mutex_unlock(&g_gemm_mu);
+					return -1;
+				}
+				hB_use = g_half_B;
 			}
-			hB_use = g_half_B;
 		}
 		rc = cublas_gemm_ex_bf16(CUBLAS_OP_N, CUBLAS_OP_T, N, M, T,
 		    &alpha, hB_use, N, hA_use, M, &beta, dC, N);
@@ -2322,6 +2394,7 @@ static void twins_forget_dev(const void *p)
 			g_act_bf16[i].live = 0;
 		}
 	}
+	grad_twin_forget(p);
 #if CUDART_VERSION >= 12000 && defined(ANN_CUBLAS)
 	fp8_wt_invalidate((const ann_real *)p);
 	fp8_act_forget(p);
@@ -2731,8 +2804,9 @@ extern "C" void gpu_op_prof_dump(void)
 	mb = g_op_calls[OP_CE] > 0 ? g_op_calls[OP_CE] : 1;
 	/* convert is also inside the gemm_* rows: the total excludes it. */
 	tot -= g_op_ms[OP_CONVERT];
-	fprintf(stderr, "[opprof] %ld microbatches, %.1f ms/microbatch of GPU op time (convert counted inside gemm rows)\n",
-	    mb, tot / (double)mb);
+	fprintf(stderr, "[opprof] %ld microbatches, %.1f ms/microbatch of GPU op time (convert counted inside gemm rows); grad twin hits %ld misses %ld\n",
+	    mb, tot / (double)mb, g_grad_twin_hit, g_grad_twin_miss);
+	g_grad_twin_hit = g_grad_twin_miss = 0;
 	for (i = 0; i < OP_N; i++) {
 		if (g_op_calls[i] == 0)
 			continue;
