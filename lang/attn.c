@@ -784,7 +784,27 @@ static void write_head_rows(mat *dst, const mat *src, int row0, int head,
 		    (size_t)d_head * sizeof(ann_real));
 }
 
+/* Output projection: out = concat Wo (+ res when given, fused on BF16). */
+static int attn_project_out(mat *out, attn *a, attn_pcache *c, const mat *res)
+{
+	if (res && gpu_mat_mul_res(out, c->concat, a->wo, NULL, res) == 0)
+		return 0;
+	if (mat_mul(out, c->concat, a->wo) != 0)
+		return -1;
+	return res ? resid_add(out, res) : 0;
+}
+
 int attn_mha_forward_packed(mat *out, attn *a, const mat *x, attn_pcache *c)
+{
+	return attn_mha_forward_packed_res(out, a, x, c, NULL);
+}
+
+/*
+** Packed forward with the block's residual folded into the output
+** projection: out = res + Attn(x) Wo (res may be NULL).
+*/
+int attn_mha_forward_packed_res(mat *out, attn *a, const mat *x,
+	attn_pcache *c, const mat *res)
 {
 	int i;
 	int T;
@@ -829,7 +849,7 @@ int attn_mha_forward_packed(mat *out, attn *a, const mat *x, attn_pcache *c)
 			fprintf(stderr, "[attn] fused tensor-core attention (WMMA)\n");
 			fflush(stderr);
 		}
-		return mat_mul(out, c->concat, a->wo);
+		return attn_project_out(out, a, c, res);
 	}
 	if (c->w_all
 	    && gpu_attn_tc_fwd(c->concat, c->w_all, c->q, c->k, c->v, c->B, T,
@@ -842,7 +862,7 @@ int attn_mha_forward_packed(mat *out, attn *a, const mat *x, attn_pcache *c)
 			fprintf(stderr, "[attn] Tensor-Core strided QK/AV path\n");
 			fflush(stderr);
 		}
-		return mat_mul(out, c->concat, a->wo);
+		return attn_project_out(out, a, c, res);
 	}
 	if (g_flash_attn
 	    && gpu_attn_flash_fwd(c->concat, c->q, c->k, c->v, c->B, T, nh,
@@ -856,12 +876,12 @@ int attn_mha_forward_packed(mat *out, attn *a, const mat *x, attn_pcache *c)
 			    "[attn] tiled flash (logsumexp, no T×T HBM)\n");
 			fflush(stderr);
 		}
-		return mat_mul(out, c->concat, a->wo);
+		return attn_project_out(out, a, c, res);
 	}
 	if (c->w_all && gpu_attn_causal_fwd(c->concat, c->w_all, c->q, c->k,
 	    c->v, c->B, T, nh, a->d_head) == 0) {
 		c->fused = 1;
-		return mat_mul(out, c->concat, a->wo);
+		return attn_project_out(out, a, c, res);
 	}
 	if (pcache_ensure_seq(c) != 0)
 		return -1;
@@ -894,9 +914,7 @@ int attn_mha_forward_packed(mat *out, attn *a, const mat *x, attn_pcache *c)
 	if (fail)
 		return -1;
 	mat_host_dirty(c->concat);
-	if (mat_mul(out, c->concat, a->wo) != 0)
-		return -1;
-	return 0;
+	return attn_project_out(out, a, c, res);
 }
 
 int attn_mha_backward_packed(mat *dx, const mat *dout, attn *a,

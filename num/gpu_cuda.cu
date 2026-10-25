@@ -205,8 +205,9 @@ static int lt_heuristic_only(void)
 static int cublas_lt_gemm_half(cublasOperation_t opa, cublasOperation_t opb,
 	int N, int M, int K, const float *alpha, const void *B, int ldb,
 	const void *A, int lda, const float *beta, float *C, int ldc, int bf16,
-	cublasLtEpilogue_t epi, const float *bias_dev)
+	cublasLtEpilogue_t epi, const float *bias_dev, float *Dout)
 {
+	float *D = Dout ? Dout : C;	/* D = alpha A B + beta C, out of place when Dout */
 	cublasLtMatmulDesc_t op;
 	cublasLtMatrixLayout_t layoutA, layoutB, layoutC;
 	cublasLtMatmulPreference_t pref;
@@ -254,7 +255,7 @@ static int cublas_lt_gemm_half(cublasOperation_t opa, cublasOperation_t opb,
 			e->bias = bias_dev;
 		}
 		st = cublasLtMatmul(g_cublaslt, e->desc, alpha, B, e->layoutA,
-		    A, e->layoutB, beta, C, e->layoutC, C, e->layoutC,
+		    A, e->layoutB, beta, C, e->layoutC, D, e->layoutC,
 		    &e->algo, g_lt_workspace,
 		    e->ws > 0 ? e->ws : g_lt_workspace_bytes, 0);
 		return st == CUBLAS_STATUS_SUCCESS ? 0 : -1;
@@ -376,9 +377,9 @@ static int cublas_lt_gemm_half(cublasOperation_t opa, cublasOperation_t opb,
 		*/
 		best_i = -1;
 		best_ms = 1e30f;
-		time_D = C;
+		time_D = D;
 		time_D_owned = 0;
-		if (*beta != 0.0f) {
+		if (*beta != 0.0f && D == C) {
 			size_t d_bytes = (size_t)M * (size_t)N * sizeof(float);
 
 			if (cudaMalloc(&time_D, d_bytes) == cudaSuccess)
@@ -465,7 +466,7 @@ static int cublas_lt_gemm_half(cublasOperation_t opa, cublasOperation_t opb,
 		e->valid = 1;
 	}
 	st = cublasLtMatmul(g_cublaslt, op, alpha, B, layoutA, A, layoutB, beta,
-	    C, layoutC, C, layoutC, &e->algo,
+	    C, layoutC, D, layoutC, &e->algo,
 	    g_lt_workspace, e->ws > 0 ? e->ws : g_lt_workspace_bytes, 0);
 	cublasLtMatmulPreferenceDestroy(pref);
 	return st == CUBLAS_STATUS_SUCCESS ? 0 : -1;
@@ -1867,7 +1868,7 @@ static int cublas_gemm_ex_f16(cublasOperation_t opa, cublasOperation_t opb,
 	const void *A, int lda, const float *beta, float *C, int ldc)
 {
 	if (cublas_lt_gemm_half(opa, opb, N, M, K, alpha, B, ldb, A, lda, beta,
-	    C, ldc, 0, CUBLASLT_EPILOGUE_DEFAULT, NULL) == 0)
+	    C, ldc, 0, CUBLASLT_EPILOGUE_DEFAULT, NULL, NULL) == 0)
 		return 0;
 #if CUDART_VERSION >= 11000
 	return cublasGemmEx(g_cublas, opa, opb, N, M, K, alpha, B, CUDA_R_16F,
@@ -1887,7 +1888,7 @@ static int cublas_gemm_ex_bf16(cublasOperation_t opa, cublasOperation_t opb,
 	const void *A, int lda, const float *beta, float *C, int ldc)
 {
 	if (cublas_lt_gemm_half(opa, opb, N, M, K, alpha, B, ldb, A, lda, beta,
-	    C, ldc, 1, CUBLASLT_EPILOGUE_DEFAULT, NULL) == 0)
+	    C, ldc, 1, CUBLASLT_EPILOGUE_DEFAULT, NULL, NULL) == 0)
 		return 0;
 	/* FAST_16BF: plain COMPUTE_32F can pick SIMT on Blackwell. */
 	return cublasGemmEx(g_cublas, opa, opb, N, M, K, alpha, B, CUDA_R_16BF,
@@ -2040,12 +2041,16 @@ static int lt_bias_upload(const ann_real *bias_host, int N)
 /*
 ** Row-major C = epi(A B + bias). epi is BIAS or RELU_BIAS. Bias length N.
 */
-static int cublas_gemm_rm_epi(ann_real *dC, const ann_real *dA,
+/*
+** Row-major D = epi(A B + bias) (+ res when res is given: beta = 1 with
+** C = res and D = dC out of place, which fuses a residual add).
+*/
+static int cublas_gemm_rm_epi_res(ann_real *dC, const ann_real *dA,
 	const ann_real *dB, int M, int N, int K, const ann_real *bias_host,
-	cublasLtEpilogue_t epi)
+	cublasLtEpilogue_t epi, const ann_real *res)
 {
 	const ann_real alpha = 1.0f;
-	const ann_real beta = 0.0f;
+	const ann_real beta = res ? 1.0f : 0.0f;
 	size_t nA;
 	size_t nB;
 	int use_bf16;
@@ -2053,9 +2058,11 @@ static int cublas_gemm_rm_epi(ann_real *dC, const ann_real *dA,
 	void *hB_use;
 	int rc;
 
-	if (!bias_host || cublas_ensure() != 0)
+	if (cublas_ensure() != 0)
 		return -1;
-	if (lt_bias_upload(bias_host, N) != 0)
+	if (bias_host && lt_bias_upload(bias_host, N) != 0)
+		return -1;
+	if (!bias_host && epi != CUBLASLT_EPILOGUE_DEFAULT)
 		return -1;
 	pthread_mutex_lock(&g_gemm_mu);
 	half_scratch_warm();
@@ -2094,9 +2101,17 @@ static int cublas_gemm_rm_epi(ann_real *dC, const ann_real *dA,
 		hB_use = g_half_B;
 	}
 	rc = cublas_lt_gemm_half(CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha,
-	    hB_use, N, hA_use, K, &beta, dC, N, 1, epi, g_lt_bias_dev);
+	    hB_use, N, hA_use, K, &beta, res ? (ann_real *)res : dC, N, 1, epi,
+	    bias_host ? g_lt_bias_dev : NULL, res ? dC : NULL);
 	pthread_mutex_unlock(&g_gemm_mu);
 	return rc;
+}
+
+static int cublas_gemm_rm_epi(ann_real *dC, const ann_real *dA,
+	const ann_real *dB, int M, int N, int K, const ann_real *bias_host,
+	cublasLtEpilogue_t epi)
+{
+	return cublas_gemm_rm_epi_res(dC, dA, dB, M, N, K, bias_host, epi, NULL);
 }
 
 static int cublas_gemm_rm_bias(ann_real *dC, const ann_real *dA,
@@ -4745,6 +4760,67 @@ extern "C" int gpu_mat_mul_bias(mat *c, const mat *a, const mat *b,
 	const ann_real *bias)
 {
 	return gpu_mat_mul_epi(c, a, b, bias, 0);
+}
+
+/*
+** d = a b (+ bias) + res in one cuBLASLt call (BF16 mode): the residual
+** add of a projection fused into its GEMM. -1 = caller does it in steps.
+*/
+extern "C" int gpu_mat_mul_res(mat *d, const mat *a, const mat *b,
+	const ann_real *bias, const mat *res)
+{
+	OpScope _op(OP_GEMM_FWD);
+#ifdef ANN_CUBLAS
+	ann_real *dA, *dB, *dD, *dR;
+	int ownA, ownB, ownD, ownR, rc;
+
+	if (!d || !a || !b || !res || d == res)
+		return -1;
+	if (a->cols != b->rows || d->rows != a->rows || d->cols != b->cols
+	    || res->rows != d->rows || res->cols != d->cols)
+		return -1;
+	if (!gpu_available() || g_compute_prec != GPU_PREC_BF16)
+		return -1;
+	if (ensure_dev(a, &dA, &ownA) != 0)
+		return -1;
+	if (ensure_dev(b, &dB, &ownB) != 0) {
+		if (ownA)
+			gpu_free(dA);
+		return -1;
+	}
+	if (ensure_dev(res, &dR, &ownR) != 0) {
+		if (ownA)
+			gpu_free(dA);
+		if (ownB)
+			gpu_free(dB);
+		return -1;
+	}
+	if (ensure_dev_out(d, &dD, &ownD) != 0) {
+		if (ownA)
+			gpu_free(dA);
+		if (ownB)
+			gpu_free(dB);
+		if (ownR)
+			gpu_free(dR);
+		return -1;
+	}
+	rc = cublas_gemm_rm_epi_res(dD, dA, dB, a->rows, b->cols, a->cols, bias,
+	    bias ? CUBLASLT_EPILOGUE_BIAS : CUBLASLT_EPILOGUE_DEFAULT, dR);
+	if (rc == 0)
+		rc = (launch_done() == 0 && finish_out(d, dD, ownD) == 0) ? 0 : -1;
+	if (ownA)
+		gpu_free(dA);
+	if (ownB)
+		gpu_free(dB);
+	if (ownR)
+		gpu_free(dR);
+	if (ownD)
+		gpu_free(dD);
+	return rc;
+#else
+	(void)d; (void)a; (void)b; (void)bias; (void)res;
+	return -1;
+#endif
 }
 
 extern "C" int gpu_mat_mul_bias_relu(mat *c, const mat *a, const mat *b,

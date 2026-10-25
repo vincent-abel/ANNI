@@ -232,19 +232,21 @@ int tblock_forward_cache(mat *x, tblock *b, block_cache *c)
 	if (layernorm_forward_into(c->ln1_out, c->x_in, b->ln1, c->ln1c) != 0)
 		return -1;
 	if (c->attnpc) {
-		if (attn_mha_forward_packed(c->attn_out, b->attn, c->ln1_out,
-		    c->attnpc) != 0)
+		/* x_mid = x_in + Attn(ln1) Wo: residual fused into the GEMM. */
+		if (attn_mha_forward_packed_res(c->x_mid, b->attn, c->ln1_out,
+		    c->attnpc, c->x_in) != 0)
 			return -1;
-	} else if (attn_mha_forward_cache(c->attn_out, b->attn, c->ln1_out, 1,
-	    c->attnc) != 0)
-		return -1;
-	if (resid_sum(c->x_mid, c->x_in, c->attn_out) != 0)
-		return -1;
+	} else {
+		if (attn_mha_forward_cache(c->attn_out, b->attn, c->ln1_out, 1,
+		    c->attnc) != 0)
+			return -1;
+		if (resid_sum(c->x_mid, c->x_in, c->attn_out) != 0)
+			return -1;
+	}
 	if (layernorm_forward_into(c->ln2_out, c->x_mid, b->ln2, c->ln2c) != 0)
 		return -1;
-	if (ffn_forward_cache(c->ffn_out, c->ln2_out, b->ffn, c->ffnc) != 0)
-		return -1;
-	if (resid_sum(x, c->x_mid, c->ffn_out) != 0)
+	/* x = x_mid + FFN(ln2): residual fused into the W2 GEMM. */
+	if (ffn_forward_cache_res(x, c->ln2_out, b->ffn, c->ffnc, c->x_mid) != 0)
 		return -1;
 	return 0;
 }

@@ -25,6 +25,13 @@ int gpu_mem_info(size_t *free_bytes, size_t *total_bytes)
 	return -1;
 }
 
+int gpu_mat_mul_res(mat *d, const mat *a, const mat *b, const ann_real *bias,
+	const mat *res)
+{
+	(void)d; (void)a; (void)b; (void)bias; (void)res;
+	return -1;
+}
+
 int gpu_attn_fa_usable(int T, int dh)
 {
 	(void)T; (void)dh;

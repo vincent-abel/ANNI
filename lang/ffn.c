@@ -138,6 +138,13 @@ void ffn_cache_free(ffn_cache **c)
 
 int ffn_forward_cache(mat *out, const mat *x, ffn *f, ffn_cache *c)
 {
+	return ffn_forward_cache_res(out, x, f, c, NULL);
+}
+
+/* out = res + FFN(x) with the residual fused into the W2 GEMM (res may be NULL). */
+int ffn_forward_cache_res(mat *out, const mat *x, ffn *f, ffn_cache *c,
+	const mat *res)
+{
 	int t;
 	int j;
 	int T;
@@ -219,9 +226,12 @@ int ffn_forward_cache(mat *out, const mat *x, ffn *f, ffn_cache *c)
 		} else
 			return -1;
 	}
+	if (res && !gpu_fp8()
+	    && gpu_mat_mul_res(out, c->hidden, f->w2, f->b2->data, res) == 0)
+		return 0;
 	if (!gpu_fp8()
 	    && gpu_mat_mul_bias(out, c->hidden, f->w2, f->b2->data) == 0)
-		return 0;
+		return res ? resid_add(out, res) : 0;
 	if (mat_mul(out, c->hidden, f->w2) != 0)
 		return -1;
 	op = mat_compute_ptr(out);
@@ -235,7 +245,7 @@ int ffn_forward_cache(mat *out, const mat *x, ffn *f, ffn_cache *c)
 				    mat_get(out, t, j) + f->b2->data[j]);
 		}
 	}
-	return 0;
+	return res ? resid_add(out, res) : 0;
 }
 
 int ffn_forward(mat *x, const ffn *f)
