@@ -125,6 +125,7 @@
 - [Fused QKV + CE (40TF T3)](fused-qkv-ce-40tf.md)
 - [Variable-length packing (E8)](variable-length-packing.md)
 - [Compile profile (E12)](compile-profile.md)
+- [GPU training audit: stale caches and BF16](gpu-training-audit.md)
 
 ### From toy LM → small LLM
 
