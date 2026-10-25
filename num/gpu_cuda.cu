@@ -3252,11 +3252,12 @@ __global__ static void ln_bwd_kernel(ann_real *dx, const ann_real *dy,
 	ann_real xh;
 	int j;
 
+	/* dgamma / dbeta are column sums done by col_sum_tiled_kernel. */
+	(void)dgamma;
+	(void)dbeta;
 	for (j = threadIdx.x; j < d; j += blockDim.x) {
 		g = dy[off + j];
 		xh = x_hat[off + j];
-		atomicAdd(&dbeta[j], g);
-		atomicAdd(&dgamma[j], g * xh);
 		g *= gamma[j];
 		sum_dy += g;
 		sum_dyx += g * xh;
@@ -3268,6 +3269,38 @@ __global__ static void ln_bwd_kernel(ann_real *dx, const ann_real *dy,
 		dx[off + j] = (g - (sum_dy + x_hat[off + j] * sum_dyx) / (ann_real)d)
 		    * inv;
 	}
+}
+
+/*
+** db[c] += sum over rows of x[r,c] (* x2[r,c] when x2 is given). One thread
+** per column and a 64-row slab per block: the slabs run in parallel and each
+** column gets rows/64 atomics instead of one serial 4096-row walk per thread
+** (col_sum_kernel) or 4096 atomics per column (the old LN backward).
+*/
+#define COLSUM_SLAB	64
+__global__ static void col_sum_tiled_kernel(ann_real *db, const ann_real *x,
+	const ann_real *x2, int rows, int cols)
+{
+	int c = blockIdx.x * blockDim.x + threadIdx.x;
+	int r0 = blockIdx.y * COLSUM_SLAB;
+	int r1 = r0 + COLSUM_SLAB;
+	int r;
+	float s;
+
+	if (c >= cols)
+		return;
+	if (r1 > rows)
+		r1 = rows;
+	s = 0.0f;
+	if (x2) {
+		for (r = r0; r < r1; r++)
+			s += x[(size_t)r * (size_t)cols + (size_t)c]
+			    * x2[(size_t)r * (size_t)cols + (size_t)c];
+	} else {
+		for (r = r0; r < r1; r++)
+			s += x[(size_t)r * (size_t)cols + (size_t)c];
+	}
+	atomicAdd(&db[c], s);
 }
 
 __global__ static void bias_add_kernel(ann_real *x, const ann_real *bias,
@@ -5538,8 +5571,8 @@ static int gpu_layernorm_backward_locked(mat *dx, const mat *dy, const ann_real 
 	ew_ref rg;
 	ew_ref rh;
 	ew_ref ri;
-	ew_ref rdg;
-	ew_ref rdb;
+	colsum_acc *acc_g;
+	colsum_acc *acc_b;
 	const ann_real *dyp;
 	size_t mb;
 	size_t vb;
@@ -5564,28 +5597,46 @@ static int gpu_layernorm_backward_locked(mat *dx, const mat *dy, const ann_real 
 	if (ew_acquire(&rdy, 1, dyp, mb, 1, 0) != 0
 	    || ew_acquire_param(&rg, 2, gamma, gb) != 0
 	    || ew_acquire(&rh, 3, x_hat, mb, 1, 0) != 0
-	    || ew_acquire(&ri, 4, inv_std, vb, 1, 0) != 0
-	    || ew_acquire(&rdg, 5, dgamma, gb, 1, 1) != 0
-	    || ew_acquire(&rdb, 6, dbeta, gb, 1, 1) != 0)
+	    || ew_acquire(&ri, 4, inv_std, vb, 1, 0) != 0)
+		return -1;
+	/*
+	** dgamma / dbeta accumulate on the device (same accumulators as the
+	** FFN bias grads) and reach the host at gpu_device_sync: staging them
+	** through host copies cost two full-pipeline syncs per layer.
+	*/
+	acc_g = colsum_acc_get(dgamma, d);
+	acc_b = colsum_acc_get(dbeta, d);
+	if (!acc_g || !acc_b)
 		return -1;
 	ln_bwd_kernel<<<T, ew_block_for(d)>>>(rdx.dev, rdy.dev, rg.dev, rh.dev,
-	    ri.dev, rdg.dev, rdb.dev, d);
+	    ri.dev, NULL, NULL, d);
 	if (ew_launch_ok() != 0)
 		return -1;
-	/* Accumulators first: dx last so a late failure can still fall back. */
+	{
+		dim3 grid((d + EW_BLOCK - 1) / EW_BLOCK,
+		    (T + COLSUM_SLAB - 1) / COLSUM_SLAB);
+
+		col_sum_tiled_kernel<<<grid, EW_BLOCK>>>(acc_b->dev, rdy.dev,
+		    NULL, T, d);
+		col_sum_tiled_kernel<<<grid, EW_BLOCK>>>(acc_g->dev, rdy.dev,
+		    rh.dev, T, d);
+	}
+	if (ew_launch_ok() != 0)
+		return -1;
+	acc_g->dirty = 1;
+	acc_b->dirty = 1;
 	did = 0;
-	if ((rc = ew_release(&rdg)) < 0)
-		return -1;
-	did |= rc;
-	if ((rc = ew_release(&rdb)) < 0)
-		return -1;
-	did |= rc;
 	if ((rc = ew_release(&rdx)) < 0)
 		return -1;
 	did |= rc;
 	if (dx->d_data)
 		dx->on_device = MAT_DEV_DEVICE;
-	return ew_finish_sync(did) == 0 ? 0 : -1;
+	if (ew_finish_sync(did) != 0)
+		return -1;
+	/* Eager mode: callers read host dgamma right away. */
+	if (g_sync_mode == GPU_SYNC_EAGER && !stream_is_capturing())
+		colsum_flush_all();
+	return 0;
 }
 
 extern "C" int gpu_layernorm_backward(mat *dx, const mat *dy, const ann_real *gamma,
@@ -6483,8 +6534,13 @@ extern "C" int gpu_ce_delta_from_softmax(ann_real *probs, const int *tgt,
 	    rp.dev, (const int *)rt.dev, rows, V, g_ce_dev);
 	if (ew_launch_ok() != 0)
 		goto ce_fail;
-	col_sum_kernel<<<(V + EW_BLOCK - 1) / EW_BLOCK, EW_BLOCK>>>(s_db_dev,
-	    rp.dev, rows, V);
+	{
+		dim3 grid((V + EW_BLOCK - 1) / EW_BLOCK,
+		    (rows + COLSUM_SLAB - 1) / COLSUM_SLAB);
+
+		col_sum_tiled_kernel<<<grid, EW_BLOCK>>>(s_db_dev, rp.dev, NULL,
+		    rows, V);
+	}
 	if (ew_launch_ok() != 0)
 		goto ce_fail;
 	/* Always mirror CE to pinned host so graph replay can report NLL. */
@@ -6585,8 +6641,13 @@ extern "C" int gpu_mat_col_sum_add(ann_real *db_host, const ann_real *x,
 		pthread_mutex_unlock(&g_ew_mu);
 		return -1;
 	}
-	col_sum_kernel<<<(cols + EW_BLOCK - 1) / EW_BLOCK, EW_BLOCK>>>(acc->dev,
-	    rx.dev, rows, cols);
+	{
+		dim3 grid((cols + EW_BLOCK - 1) / EW_BLOCK,
+		    (rows + COLSUM_SLAB - 1) / COLSUM_SLAB);
+
+		col_sum_tiled_kernel<<<grid, EW_BLOCK>>>(acc->dev, rx.dev, NULL,
+		    rows, cols);
+	}
 	if (ew_launch_ok() != 0) {
 		pthread_mutex_unlock(&g_ew_mu);
 		return -1;
