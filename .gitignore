@@ -35,6 +35,7 @@ ann
 anni
 autotrain
 tests/test_ann
+tests/test_gpu
 gui/ann-gui
 gui/__pycache__/
 scripts/__pycache__/
