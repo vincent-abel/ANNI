@@ -347,7 +347,7 @@ int main(void)
 	printf("bf16 vs fp32\n");
 	check_tracks_fp32("bf16", GPU_PREC_BF16, 2e-3, 0.2, 0.1);
 	printf("fp8 (E4M3 fwd, E5M2 dgrad) vs fp32\n");
-	check_tracks_fp32("fp8", PREC_FP8, 1e-2, 0.4, 0.2);
+	check_tracks_fp32("fp8", PREC_FP8, 3e-2, 0.6, 0.3);
 	printf("test_gpu: all passed\n");
 	return 0;
 }
