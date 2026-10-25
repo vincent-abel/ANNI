@@ -161,6 +161,7 @@ Full code checklists live in the root [`../README.md`](../README.md): **Capable 
 - [Talking model plan](talk-170m-plan.md)
 - [Talking model data](talk-170m-data.md)
 - [Talking model pretraining run](talk-170m-pretrain.md)
+- [Talking model chat fine-tune](talk-170m-chat.md)
 
 # How this neural network works
 
@@ -448,3 +449,6 @@ Train the D=1024, 12-block shape (about 185M parameters) on about 3B tokens of F
 
 ### [Talking model pretraining run](talk-170m-pretrain.md)
 Batch 16 × 32 accumulation at window 256, BF16 flash attention, 11.7 GB peak VRAM and about 34k tok/s, about 33 h. Checkpoints every 30 minutes resume at the window they reached; a tmux driver restarts the run after a crash.
+
+### [Talking model chat fine-tune](talk-170m-chat.md)
+Two epochs on 24M tokens of User:/Assistant: conversations from the pretrained checkpoint. User turns are stored as -(id+1) and masked out of the loss on the host and the GPU, so the model is trained only on its answers.
