@@ -262,10 +262,22 @@ static int gpu_buffers_init(lm_adam *opt)
 				continue;
 			s->w->d_data = dp;
 			s->w->on_device = MAT_DEV_ALIASED;
+			/*
+			** The first step's gradient already sits in the dW twin
+			** (or host): carry it into the flat. Zeroing here made
+			** step 1 a pure weight-decay step for every matrix.
+			*/
+			if (s->dw->d_data && s->dw->on_device != MAT_DEV_HOST) {
+				if (gpu_memcpy_d2d(dg, s->dw->d_data, nb) != 0)
+					return -1;
+			} else if (s->dw->data) {
+				if (gpu_memcpy_h2d(dg, s->dw->data, nb) != 0)
+					return -1;
+			} else
+				(void)gpu_memset(dg, 0, nb);
 			mat_device_free(s->dw);
 			s->dw->d_data = dg;
 			s->dw->on_device = MAT_DEV_ALIASED;
-			(void)gpu_memset(dg, 0, nb);
 		}
 		opt->params_valid = 1;
 		gpu_half_wt_invalidate(NULL);	/* old twin addrs are gone */
