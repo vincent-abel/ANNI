@@ -4730,6 +4730,15 @@ static void *g_tc_half_q;
 static void *g_tc_half_k;
 static size_t g_tc_half_q_cap;
 static size_t g_tc_half_k_cap;
+/* BF16 attention products: V, dO (packed heads), P and dS (T x T rows). */
+static void *g_tc_half_v;
+static void *g_tc_half_do;
+static void *g_tc_half_p;
+static void *g_tc_half_ds;
+static size_t g_tc_half_v_cap;
+static size_t g_tc_half_do_cap;
+static size_t g_tc_half_p_cap;
+static size_t g_tc_half_ds_cap;
 
 __global__ static void attn_pack_heads_kernel(ann_real *out, const ann_real *in,
 	int B, int T, int H, int dh)
@@ -5243,17 +5252,27 @@ extern "C" int gpu_attn_tc_fwd(mat *concat, mat *w, const mat *q, const mat *k,
 	*/
 #if CUDART_VERSION >= 11000
 	if (g_compute_prec == GPU_PREC_BF16) {
+		/*
+		** All attention products on tensor cores: Q, K, V packed as
+		** BF16, P written as BF16 by the softmax, O = P V in BF16 with
+		** FP32 accumulation (the FP32 Sgemm products were 29% of the
+		** microbatch for 1% of its FLOPs).
+		*/
 		if (ensure_half_buf(&g_tc_half_q, &g_tc_half_q_cap,
 		    (size_t)npack * 2) != 0
 		    || ensure_half_buf(&g_tc_half_k, &g_tc_half_k_cap,
-		    (size_t)npack * 2) != 0)
+		    (size_t)npack * 2) != 0
+		    || ensure_half_buf(&g_tc_half_v, &g_tc_half_v_cap,
+		    (size_t)npack * 2) != 0
+		    || ensure_half_buf(&g_tc_half_p, &g_tc_half_p_cap,
+		    (size_t)batch * T * T * 2) != 0)
 			goto tc_fwd_out;
 		{ OpNest _n(OP_ATT_PACK_ID); attn_pack_heads_bf16_kernel<<<(npack + threads - 1) / threads,
 		    threads>>>((__nv_bfloat16 *)g_tc_half_q, dq, B, T, H, dh); }
 		{ OpNest _n(OP_ATT_PACK_ID); attn_pack_heads_bf16_kernel<<<(npack + threads - 1) / threads,
 		    threads>>>((__nv_bfloat16 *)g_tc_half_k, dk, B, T, H, dh); }
-		{ OpNest _n(OP_ATT_PACK_ID); attn_pack_heads_kernel<<<(npack + threads - 1) / threads,
-		    threads>>>(g_tc_v, dv, B, T, H, dh); }
+		{ OpNest _n(OP_ATT_PACK_ID); attn_pack_heads_bf16_kernel<<<(npack + threads - 1) / threads,
+		    threads>>>((__nv_bfloat16 *)g_tc_half_v, dv, B, T, H, dh); }
 		if (OpNest(OP_ATT_GEMM_ID), tc_gemm_qk_half(dw, T, dh, batch, 1) != 0)
 			goto tc_fwd_out;
 	} else
@@ -5275,10 +5294,22 @@ extern "C" int gpu_attn_tc_fwd(mat *concat, mat *w, const mat *q, const mat *k,
 
 		while (nth < T && nth < ATT_BLOCK)
 			nth <<= 1;
-		{ OpNest _n(OP_ATT_SMX_ID); attn_tc_softmax_kernel<<<sgrid, nth>>>(dw, NULL, T, H, scale,
+		{ OpNest _n(OP_ATT_SMX_ID); attn_tc_softmax_kernel<<<sgrid, nth>>>(dw,
+		    g_compute_prec == GPU_PREC_BF16
+		    ? (__nv_bfloat16 *)g_tc_half_p : NULL, T, H, scale,
 		    g_att_seqlens_host ? g_att_seqlens_dev : NULL,
 		    tc_fp8_softmax_buf(batch, T)); }
 	}
+#if CUDART_VERSION >= 11000
+	if (g_compute_prec == GPU_PREC_BF16) {
+		/* O = P V: col-major O^T[dh,T] = V^T[dh,T] P^T[T,T]. */
+		if (OpNest(OP_ATT_GEMM_ID), tc_gemm_bf16_strided(CUBLAS_OP_N,
+		    CUBLAS_OP_N, dh, T, T, 1.0f, g_tc_half_v, dh,
+		    (long long)T * dh, g_tc_half_p, T, (long long)T * T,
+		    g_tc_o, dh, (long long)T * dh, batch) != 0)
+			goto tc_fwd_out;
+	} else
+#endif
 	if (OpNest(OP_ATT_GEMM_ID), tc_gemm_pv_batched(g_tc_o, dw, g_tc_v, T, dh, batch) != 0)
 		goto tc_fwd_out;
 	{ OpNest _n(OP_ATT_PACK_ID); attn_unpack_heads_kernel<<<(npack + threads - 1) / threads, threads>>>(
@@ -5376,6 +5407,67 @@ extern "C" int gpu_attn_tc_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat,
 		goto tc_bwd_out;
 	scale = (float)(1.0 / sqrt((double)dh));
 	sgrid = dim3(batch, T, 1);
+#if CUDART_VERSION >= 11000
+	if (g_compute_prec == GPU_PREC_BF16) {
+		int nth = 32;
+		long long sv = (long long)T * dh;
+		long long ss = (long long)T * T;
+
+		while (nth < T && nth < ATT_BLOCK)
+			nth <<= 1;
+		if (ensure_half_buf(&g_tc_half_q, &g_tc_half_q_cap,
+		    (size_t)npack * 2) != 0
+		    || ensure_half_buf(&g_tc_half_k, &g_tc_half_k_cap,
+		    (size_t)npack * 2) != 0
+		    || ensure_half_buf(&g_tc_half_v, &g_tc_half_v_cap,
+		    (size_t)npack * 2) != 0
+		    || ensure_half_buf(&g_tc_half_do, &g_tc_half_do_cap,
+		    (size_t)npack * 2) != 0
+		    || ensure_half_buf(&g_tc_half_p, &g_tc_half_p_cap,
+		    (size_t)batch * ss * 2) != 0
+		    || ensure_half_buf(&g_tc_half_ds, &g_tc_half_ds_cap,
+		    (size_t)batch * ss * 2) != 0)
+			goto tc_bwd_out;
+		{ OpNest _n(OP_ATT_PACK_ID); attn_pack_heads_bf16_kernel<<<(npack + threads - 1) / threads,
+		    threads>>>((__nv_bfloat16 *)g_tc_half_q, a_q, B, T, H, dh); }
+		{ OpNest _n(OP_ATT_PACK_ID); attn_pack_heads_bf16_kernel<<<(npack + threads - 1) / threads,
+		    threads>>>((__nv_bfloat16 *)g_tc_half_k, a_k, B, T, H, dh); }
+		{ OpNest _n(OP_ATT_PACK_ID); attn_pack_heads_bf16_kernel<<<(npack + threads - 1) / threads,
+		    threads>>>((__nv_bfloat16 *)g_tc_half_v, a_v, B, T, H, dh); }
+		{ OpNest _n(OP_ATT_PACK_ID); attn_pack_heads_bf16_kernel<<<(npack + threads - 1) / threads,
+		    threads>>>((__nv_bfloat16 *)g_tc_half_do, a_dc, B, T, H, dh); }
+		/* S = Q K^T (recomputed), P = softmax(S) in FP32 + BF16. */
+		if (OpNest(OP_ATT_GEMM_ID), tc_gemm_qk_half(dw, T, dh, batch, 1) != 0)
+			goto tc_bwd_out;
+		{ OpNest _n(OP_ATT_SMX_ID); attn_tc_softmax_kernel<<<sgrid, nth>>>(dw,
+		    (__nv_bfloat16 *)g_tc_half_p, T, H, (ann_real)scale,
+		    g_att_seqlens_host ? g_att_seqlens_dev : NULL, NULL); }
+		/* dP = dO V^T: col-major dP^T[T,T] = V[dh,T]^T dO^T[dh,T]. */
+		if (OpNest(OP_ATT_GEMM_ID), tc_gemm_bf16_strided(CUBLAS_OP_T,
+		    CUBLAS_OP_N, T, T, dh, 1.0f, g_tc_half_v, dh, sv,
+		    g_tc_half_do, dh, sv, g_tc_dp, T, ss, batch) != 0)
+			goto tc_bwd_out;
+		/* dV = P^T dO: col-major dV^T[dh,T] = dO^T[dh,T] P[T,T]. */
+		if (OpNest(OP_ATT_GEMM_ID), tc_gemm_bf16_strided(CUBLAS_OP_N,
+		    CUBLAS_OP_T, dh, T, T, 1.0f, g_tc_half_do, dh, sv,
+		    g_tc_half_p, T, ss, g_tc_v, dh, sv, batch) != 0)
+			goto tc_bwd_out;
+		/* dS = P (dP - rowsum(P dP)) in FP32 + BF16. */
+		{ OpNest _n(OP_ATT_SMX_ID); attn_tc_softmax_bwd_kernel<<<sgrid, nth>>>(g_tc_dp,
+		    (__nv_bfloat16 *)g_tc_half_ds, dw, T, H,
+		    g_att_seqlens_host ? g_att_seqlens_dev : NULL); }
+		/* dQ = scale dS K: col-major dQ^T[dh,T] = K^T[dh,T] dS^T[T,T]. */
+		if (OpNest(OP_ATT_GEMM_ID), tc_gemm_bf16_strided(CUBLAS_OP_N,
+		    CUBLAS_OP_N, dh, T, T, scale, g_tc_half_k, dh, sv,
+		    g_tc_half_ds, T, ss, g_tc_o, dh, sv, batch) != 0)
+			goto tc_bwd_out;
+		/* dK = scale dS^T Q: col-major dK^T[dh,T] = Q^T[dh,T] dS[T,T]. */
+		if (OpNest(OP_ATT_GEMM_ID), tc_gemm_bf16_strided(CUBLAS_OP_N,
+		    CUBLAS_OP_T, dh, T, T, scale, g_tc_half_q, dh, sv,
+		    g_tc_half_ds, T, ss, g_tc_k, dh, sv, batch) != 0)
+			goto tc_bwd_out;
+	} else
+#endif
 	{
 		int nth = 32;
 
