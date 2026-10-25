@@ -5405,9 +5405,56 @@ extern "C" int gpu_relu_backward(ann_real *dx, const ann_real *x_pre_relu_or_mas
 	return rc;
 }
 
+/* Decoupled weight decay for the device Adam kernels (host path: lm_adam.c). */
+static float g_adam_wd;
+
+extern "C" void gpu_adam_set_weight_decay(double wd)
+{
+	g_adam_wd = wd > 0.0 ? (float)wd : 0.0f;
+}
+
+/* Sum of squares of x[0..n) into *acc (double atomics, sm_60+). */
+__global__ static void sumsq_kernel(const ann_real *x, int n, double *acc)
+{
+	__shared__ double s[256];
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	int m;
+	double v;
+
+	v = i < n ? (double)x[i] * (double)x[i] : 0.0;
+	s[threadIdx.x] = v;
+	__syncthreads();
+	for (m = blockDim.x >> 1; m > 0; m >>= 1) {
+		if ((int)threadIdx.x < m)
+			s[threadIdx.x] += s[threadIdx.x + m];
+		__syncthreads();
+	}
+	if (threadIdx.x == 0)
+		atomicAdd(acc, s[0]);
+}
+
+extern "C" int gpu_grad_sumsq(const ann_real *d_x, int n, double *out)
+{
+	static double *s_acc;
+
+	if (!d_x || n <= 0 || !out || !gpu_available())
+		return -1;
+	if (!s_acc && cudaMalloc((void **)&s_acc, sizeof(double)) != cudaSuccess) {
+		s_acc = NULL;
+		return -1;
+	}
+	if (cudaMemset(s_acc, 0, sizeof(double)) != cudaSuccess)
+		return -1;
+	sumsq_kernel<<<(n + 255) / 256, 256>>>(d_x, n, s_acc);
+	if (cudaGetLastError() != cudaSuccess)
+		return -1;
+	return cudaMemcpy(out, s_acc, sizeof(double), cudaMemcpyDeviceToHost)
+	    == cudaSuccess ? 0 : -1;
+}
+
 __global__ static void adam_kernel(ann_real *param, ann_real *grad, ann_real *m,
 	ann_real *v, int n, ann_real lr, ann_real beta1, ann_real beta2, ann_real eps,
-	ann_real bc1, ann_real bc2, ann_real gscale)
+	ann_real bc1, ann_real bc2, ann_real gscale, ann_real wd)
 {
 	int i = blockIdx.x * blockDim.x + threadIdx.x;
 	ann_real g;
@@ -5422,6 +5469,7 @@ __global__ static void adam_kernel(ann_real *param, ann_real *grad, ann_real *m,
 	mhat = m[i] / bc1;
 	vhat = v[i] / bc2;
 	param[i] -= lr * mhat / (sqrtf(vhat) + eps);
+	param[i] -= lr * wd * param[i];
 	grad[i] = 0.0f;
 }
 
@@ -5429,7 +5477,7 @@ __global__ static void adam_kernel(ann_real *param, ann_real *grad, ann_real *m,
 __global__ static void adam_kernel_bf16(ann_real *param, __nv_bfloat16 *param_bf16,
 	ann_real *grad, ann_real *m, ann_real *v, int n, ann_real lr,
 	ann_real beta1, ann_real beta2, ann_real eps, ann_real bc1, ann_real bc2,
-	ann_real gscale)
+	ann_real gscale, ann_real wd)
 {
 	int i = blockIdx.x * blockDim.x + threadIdx.x;
 	ann_real g;
@@ -5445,6 +5493,7 @@ __global__ static void adam_kernel_bf16(ann_real *param, __nv_bfloat16 *param_bf
 	mhat = m[i] / bc1;
 	vhat = v[i] / bc2;
 	p = param[i] - lr * mhat / (sqrtf(vhat) + eps);
+	p -= lr * wd * p;
 	param[i] = p;
 	param_bf16[i] = __float2bfloat16(p);
 	grad[i] = 0.0f;
@@ -5647,11 +5696,11 @@ extern "C" int gpu_adam_step_dev_bf16(ann_real *d_p, void *d_p_bf16,
 	if (d_p_bf16 && g_compute_prec == GPU_PREC_BF16) {
 		adam_kernel_bf16<<<(n + 255) / 256, 256>>>(d_p,
 		    (__nv_bfloat16 *)d_p_bf16, d_g, d_m, d_v, n, lr, beta1,
-		    beta2, eps, bc1, bc2, (ann_real)grad_scale);
+		    beta2, eps, bc1, bc2, (ann_real)grad_scale, g_adam_wd);
 	} else
 #endif
 		adam_kernel<<<(n + 255) / 256, 256>>>(d_p, d_g, d_m, d_v, n, lr,
-		    beta1, beta2, eps, bc1, bc2, (ann_real)grad_scale);
+		    beta1, beta2, eps, bc1, bc2, (ann_real)grad_scale, g_adam_wd);
 	return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }
 

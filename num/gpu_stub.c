@@ -433,6 +433,19 @@ int gpu_adam_seed_bf16_flat(void *bf16, const ann_real *fp32, int n)
 	return -1;
 }
 
+void gpu_adam_set_weight_decay(double wd)
+{
+	(void)wd;
+}
+
+int gpu_grad_sumsq(const ann_real *d_x, int n, double *out)
+{
+	(void)d_x;
+	(void)n;
+	(void)out;
+	return -1;
+}
+
 int gpu_adam_step_dev_bf16(ann_real *d_param, void *d_param_bf16,
 	ann_real *d_grad, ann_real *d_m, ann_real *d_v, int n, double lr,
 	double beta1, double beta2, double eps, int t, double grad_scale)

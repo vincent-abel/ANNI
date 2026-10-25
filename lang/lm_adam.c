@@ -2,6 +2,7 @@
 **	Adam optimizer over flat LM param/grad slots
 */
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include "gpu.h"
 #include "gradutil.h"
@@ -111,6 +112,7 @@ lm_adam *lm_adam_create(lm *model)
 	opt->eps = 1e-8;
 	opt->weight_decay = 0.0;
 	opt->grad_clip = 0.0;
+	opt->last_grad_norm = 0.0;
 	i = 0;
 	add_mat(opt, &i, model->w_head, model->dw_head, 0);
 	add_vec(opt, &i, model->b_head, model->db_head);
@@ -405,6 +407,21 @@ static int seg_scatter(lm_adam *opt, const lm_adam_seg *s)
 ** scattered D2D into each weight's d_data (no host pack/unpack, no D2H). Only
 ** host-consumed segments (embedding table, bias/LN vecs) cross PCIe.
 */
+/* ANN_GNORM_EVERY=N prints the grad norm every N steps (0 = never). */
+static int adam_gnorm_every(void)
+{
+	static int every = -1;
+	const char *e;
+
+	if (every < 0) {
+		e = getenv("ANN_GNORM_EVERY");
+		every = e ? atoi(e) : 0;
+		if (every < 0)
+			every = 0;
+	}
+	return every;
+}
+
 static int adam_step_gpu(lm_adam *opt, double lr, double grad_scale)
 {
 	int i;
@@ -418,6 +435,33 @@ static int adam_step_gpu(lm_adam *opt, double lr, double grad_scale)
 	for (i = 0; i < opt->n_segs; i++)
 		if (seg_gather(opt, &opt->segs[i]) != 0)
 			goto fail;
+	/* Same clip and decay as the host path below, on the device grads. */
+	if (opt->grad_clip > 0.0 || adam_gnorm_every() > 0) {
+		double ss;
+		double norm;
+
+		if (gpu_grad_sumsq(opt->d_grad, opt->n, &ss) != 0)
+			goto fail;
+		norm = sqrt(ss) * fabs(grad_scale);
+		opt->last_grad_norm = norm;
+		if (!isfinite(norm)) {
+			/* Skip a non-finite step instead of poisoning m/v. */
+			if (gpu_memset(opt->d_grad, 0, (size_t)opt->n
+			    * sizeof(ann_real)) != 0)
+				goto fail;
+			fprintf(stderr, "[adam] step %d skipped: grad norm %g\n",
+			    opt->t, norm);
+			opt->params_valid = 1;
+			return 0;
+		}
+		if (adam_gnorm_every() > 0 && opt->t % adam_gnorm_every() == 0)
+			fprintf(stderr, "[adam] step %d grad norm %.4g%s\n", opt->t,
+			    norm, opt->grad_clip > 0.0 && norm > opt->grad_clip
+			    ? " (clipped)" : "");
+		if (opt->grad_clip > 0.0 && norm > opt->grad_clip)
+			grad_scale *= opt->grad_clip / norm;
+	}
+	gpu_adam_set_weight_decay(opt->weight_decay);
 	if (gpu_adam_step_dev_bf16(opt->d_param, opt->d_param_bf16,
 	    opt->d_grad, opt->d_m, opt->d_v, opt->n, lr, opt->beta1, opt->beta2,
 	    opt->eps, opt->t, grad_scale) != 0)

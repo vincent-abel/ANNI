@@ -102,6 +102,10 @@ int	gpu_adam_step(ann_real *param, ann_real *grad, ann_real *m, ann_real *v, int
 int	gpu_adam_step_dev(ann_real *d_param, ann_real *d_grad, ann_real *d_m,
 		ann_real *d_v, int n, double lr, double beta1, double beta2,
 		double eps, int t, double grad_scale);
+/* Decoupled weight decay applied by the device Adam kernels (0 = off). */
+void	gpu_adam_set_weight_decay(double wd);
+/* *out = sum of d_x[i]^2 over n device floats (grad-norm clipping). */
+int	gpu_grad_sumsq(const ann_real *d_x, int n, double *out);
 /* Like gpu_adam_step_dev; when d_param_bf16 non-NULL and BF16 prec, writes twins. */
 int	gpu_adam_step_dev_bf16(ann_real *d_param, void *d_param_bf16,
 		ann_real *d_grad, ann_real *d_m, ann_real *d_v, int n,
