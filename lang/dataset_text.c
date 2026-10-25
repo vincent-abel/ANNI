@@ -138,6 +138,12 @@ text_dataset *text_dataset_load_tok(const char *path, int window, const bpe *tok
 	if (!path || window < 2 || window > LM_MAX_CTX)
 		return NULL;
 	/* Pretokenized BPE id dumps skip encode on the train thread. */
+	if (path_ends_with(path, "_mids.bin")) {
+		ds = text_dataset_load_ids(path, window);
+		if (ds)
+			ds->masked = 1;
+		return ds;
+	}
 	if (path_ends_with(path, "_ids.bin") || path_ends_with(path, "ids.bin")
 	    || path_ends_with(path, "wiki_ids.bin"))
 		return text_dataset_load_ids(path, window);
@@ -241,7 +247,14 @@ int text_dataset_n_windows(const text_dataset *ds)
 
 int text_dataset_window(const text_dataset *ds, int index, int *ids_out, int *n_out)
 {
+	return text_dataset_window_mask(ds, index, ids_out, NULL, n_out);
+}
+
+int text_dataset_window_mask(const text_dataset *ds, int index, int *ids_out,
+	unsigned char *loss_out, int *n_out)
+{
 	int i;
+	int v;
 	long start;
 	long stride;
 
@@ -255,8 +268,32 @@ int text_dataset_window(const text_dataset *ds, int index, int *ids_out, int *n_
 		stride = ds->stride > 0 ? ds->stride : 1;
 		start = (long)index * stride;
 	}
-	for (i = 0; i < ds->window; i++)
-		ids_out[i] = ds->ids[start + i];
+	for (i = 0; i < ds->window; i++) {
+		v = ds->ids[start + i];
+		/* Masked files store no-loss tokens as -(id + 1). */
+		if (ds->masked && v < 0)
+			ids_out[i] = -v - 1;
+		else
+			ids_out[i] = v;
+		if (loss_out)
+			loss_out[i] = !(ds->masked && v < 0);
+	}
 	*n_out = ds->window;
 	return 0;
+}
+
+long text_dataset_head(const text_dataset *ds, int *ids_out, long max_ids)
+{
+	long n;
+	long i;
+	int v;
+
+	if (!ds || !ids_out || max_ids <= 0)
+		return 0;
+	n = ds->n_ids < max_ids ? ds->n_ids : max_ids;
+	for (i = 0; i < n; i++) {
+		v = ds->ids[i];
+		ids_out[i] = ds->masked && v < 0 ? -v - 1 : v;
+	}
+	return n;
 }

@@ -104,6 +104,12 @@ int	lm_loss_backward_packed_lens(lm *model, const lm_cache *c,
 		const int *ids, int B, int T, const int *lens, mat *dhidden,
 		double *mean_ce);
 int	lm_backward_packed(lm *model, const mat *dhidden, const lm_cache *c);
+/*
+** Loss mask for the packed loss: mask[b*T+t] = 0 drops the loss of
+** predicting token t of sequence b (chat fine-tune: user turns). The
+** pointer is kept until the next call; NULL restores loss on every token.
+*/
+void	lm_loss_set_mask(const unsigned char *mask);
 
 /*
 ** Estimated working-set bytes of one packed step (activation caches, backward

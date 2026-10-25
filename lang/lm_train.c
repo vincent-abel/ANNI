@@ -595,6 +595,7 @@ typedef struct	pack_ctx {
 	int		ids_pinned;	/* E5: cudaHostAlloc */
 	int		next_bb;	/* E3: windows waiting in ids_next */
 	int		next_done;	/* E3: stream exhausted while prefetching */
+	unsigned char	*mask;		/* Bmax * T loss mask (masked data only) */
 	pack_slot	slot[2];	/* [0] = Bmax, [1] = tail */
 } pack_ctx;
 
@@ -623,6 +624,8 @@ static void pack_ctx_free(pack_ctx *p)
 	}
 	free(p->lens);
 	free(p->lens_next);
+	free(p->mask);
+	p->mask = NULL;
 	p->ids = NULL;
 	p->ids_next = NULL;
 	p->lens = NULL;
@@ -753,6 +756,7 @@ static int pack_run_body(lm *model, pack_ctx *p, int b, double *mean_ce,
 	}
 	/* Keep seqlens through transformer bwd (TC/FA masks). */
 	gpu_attn_set_seqlens(lens);
+	lm_loss_set_mask(p->mask);
 	if (s_prof_left > 0)
 		gettimeofday(&tv0, NULL);
 	if (lm_forward_cache_packed(model, p->ids, b, p->T, s->c) != 0) {
@@ -763,8 +767,10 @@ static int pack_run_body(lm *model, pack_ctx *p, int b, double *mean_ce,
 		gpu_device_sync();
 		gettimeofday(&tv1, NULL);
 	}
-	if (lm_loss_backward_packed_lens(model, s->c, p->ids, b, p->T, lens,
-	    s->dh, mean_ce) != 0) {
+	rc = lm_loss_backward_packed_lens(model, s->c, p->ids, b, p->T, lens,
+	    s->dh, mean_ce);
+	lm_loss_set_mask(NULL);
+	if (rc != 0) {
 		gpu_attn_set_seqlens(NULL);
 		return -1;
 	}
@@ -830,7 +836,8 @@ static int pack_run(lm *model, pack_ctx *p, int b, double *mean_ce)
 	** Skip when varlen seqlens change the mask, or B/T changes.
 	*/
 	/* Graph capture includes CE→pinned D2H; fetch mean after replay. */
-	if (g_cuda_graphs && gpu_available() && !lens) {
+	/* A loss mask is host data read while building targets: no graphs. */
+	if (g_cuda_graphs && gpu_available() && !lens && !p->mask) {
 		if (g_graph_ready && g_graph_B == b && g_graph_T == p->T) {
 			if (gpu_graph_replay() == 0) {
 				if (mean_ce) {
@@ -1011,6 +1018,14 @@ double lm_train_corpus_val(lm *model, text_dataset *ds, lm_adam *opt,
 		free(order);
 		return -1.0;
 	}
+	if (ds->masked) {
+		pk.mask = calloc((size_t)batch_size * (size_t)ds->window, 1);
+		if (!pk.mask) {
+			free(order);
+			pack_ctx_free(&pk);
+			return -1.0;
+		}
+	}
 	for (j = 0; j < nw; j++)
 		order[j] = j;
 	mat_try_pin(model->dw_head);
@@ -1026,8 +1041,12 @@ double lm_train_corpus_val(lm *model, text_dataset *ds, lm_adam *opt,
 		eval_windows = 0;
 	if (debug && !g_progress_fn)
 		dbg_stamp("computing start NLL");
-	last = lm_nll(model, ds->ids,
-	    ds->n_ids < LM_MAX_CTX ? ds->n_ids : LM_MAX_CTX);
+	{
+		int head[LM_MAX_CTX];
+		int nh = (int)text_dataset_head(ds, head, LM_MAX_CTX);
+
+		last = lm_nll(model, head, nh);
+	}
 	win = -1.0;
 	if (eval_every > 0) {
 		if (debug && !g_progress_fn) {
@@ -1162,9 +1181,11 @@ double lm_train_corpus_val(lm *model, text_dataset *ds, lm_adam *opt,
 						    ? nw - idx : batch_size;
 						ts = wall_sec();
 						for (j = 0; j < bb; j++) {
-							if (text_dataset_window(ds,
+							if (text_dataset_window_mask(ds,
 							    order[idx + j],
 							    &pk.ids[j * ds->window],
+							    pk.mask ? &pk.mask[j
+							    * ds->window] : NULL,
 							    &n) != 0
 							    || n != ds->window) {
 								ok = 0;
@@ -1338,9 +1359,10 @@ double lm_train_corpus_val(lm *model, text_dataset *ds, lm_adam *opt,
 			** long-ctx lm_nll is a separate probe (do not clobber).
 			*/
 			{
-				double ctx_nll = lm_nll(model, ds->ids,
-				    ds->n_ids < LM_MAX_CTX ? ds->n_ids
-				    : LM_MAX_CTX);
+				int head[LM_MAX_CTX];
+				int nh = (int)text_dataset_head(ds, head,
+				    LM_MAX_CTX);
+				double ctx_nll = lm_nll(model, head, nh);
 
 				if (debug && !g_progress_fn && ctx_nll >= 0.0) {
 					snprintf(msg, sizeof(msg),

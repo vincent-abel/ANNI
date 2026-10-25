@@ -6014,8 +6014,12 @@ __global__ static void ce_onehot_ce_kernel(ann_real *probs, const int *tgt,
 	if (r >= rows)
 		return;
 	t = tgt[r];
-	if (t < 0 || t >= V)
+	if (t < 0 || t >= V) {
+		/* Masked row (tgt -1): no loss and no gradient. */
+		for (t = 0; t < V; t++)
+			probs[(size_t)r * (size_t)V + (size_t)t] = 0.0f;
 		return;
+	}
 	p = probs[(size_t)r * (size_t)V + (size_t)t];
 	if (p < 1e-12f)
 		p = 1e-12f;

@@ -408,11 +408,15 @@ static int ce_rows_backward(lm *model, const mat *hv, const int *tgt, int rows,
 	int V;
 	int t;
 	int v;
+	int n_valid;	/* rows with a target; tgt -1 = masked (no loss) */
 
 	V = model->vocab_size;
-	for (t = 0; t < rows; t++)
-		if (tgt[t] < 0 || tgt[t] >= V)
+	n_valid = 0;
+	for (t = 0; t < rows; t++) {
+		if (tgt[t] < -1 || tgt[t] >= V)
 			return -1;
+		n_valid += tgt[t] >= 0;
+	}
 	delta = reuse_mat(&g_ce_delta, rows, V);
 	if (!delta)
 		return -1;
@@ -479,13 +483,20 @@ static int ce_rows_backward(lm *model, const mat *hv, const int *tgt, int rows,
 		    && gpu_ce_delta_from_softmax(dp, tgt, rows, V,
 		    model->db_head->data, mean_ce_out ? &ce_sum : NULL) == 0) {
 			mat_mark_device(delta);
+			/* Device mean is over all rows; rescale to target rows. */
 			if (mean_ce_out)
-				*mean_ce_out = ce_sum;
+				*mean_ce_out = n_valid > 0 && ce_sum >= 0.0
+				    ? ce_sum * (double)rows / (double)n_valid
+				    : -1.0;
 		} else {
 			(void)mat_ensure_host(delta);
 			ce_sum = 0.0;
 			for (t = 0; t < rows; t++) {
 				row = &delta->data[(size_t)t * V];
+				if (tgt[t] < 0) {
+					memset(row, 0, (size_t)V * sizeof(ann_real));
+					continue;
+				}
 				p = (double)row[tgt[t]];
 				if (p < 1e-12)
 					p = 1e-12;
@@ -495,8 +506,8 @@ static int ce_rows_backward(lm *model, const mat *hv, const int *tgt, int rows,
 					model->db_head->data[v] += row[v];
 			}
 			if (mean_ce_out)
-				*mean_ce_out = rows > 0
-				    ? ce_sum / (double)rows : -1.0;
+				*mean_ce_out = n_valid > 0
+				    ? ce_sum / (double)n_valid : -1.0;
 			mat_host_dirty(delta);
 		}
 	}
@@ -660,6 +671,22 @@ int lm_loss_backward_packed(lm *model, const lm_cache *c, const int *ids,
 	    mean_ce);
 }
 
+/* Chat fine-tune: per-position loss mask (B*T bytes), NULL = every token. */
+static const unsigned char *g_loss_mask;
+
+void lm_loss_set_mask(const unsigned char *mask)
+{
+	g_loss_mask = mask;
+}
+
+/* Target of input position i: -1 when the next token is masked. */
+static int packed_target(const int *ids, int i)
+{
+	if (g_loss_mask && !g_loss_mask[i + 1])
+		return -1;
+	return ids[i + 1];
+}
+
 int lm_loss_backward_packed_lens(lm *model, const lm_cache *c, const int *ids,
 	int B, int T, const int *lens, mat *dhidden, double *mean_ce)
 {
@@ -677,7 +704,7 @@ int lm_loss_backward_packed_lens(lm *model, const lm_cache *c, const int *ids,
 	    || c->T != T || !c->hidden || dhidden->rows < B * T
 	    || dhidden->cols != LM_D_MODEL)
 		return -1;
-	if (B == 1 && (!lens || lens[0] >= T))
+	if (B == 1 && (!lens || lens[0] >= T) && !g_loss_mask)
 		return lm_loss_backward(model, c, ids, T, dhidden, mean_ce);
 	rows = B * (T - 1);
 	rb = (size_t)LM_D_MODEL * sizeof(ann_real);
@@ -696,7 +723,7 @@ int lm_loss_backward_packed_lens(lm *model, const lm_cache *c, const int *ids,
 	    LM_D_MODEL) == 0) {
 		for (b = 0; b < B; b++)
 			for (t = 0; t < T - 1; t++)
-				tgt[b * (T - 1) + t] = ids[b * T + t + 1];
+				tgt[b * (T - 1) + t] = packed_target(ids, b * T + t);
 		hc->on_device = MAT_DEV_DEVICE;
 		goto gather_done;
 	}
@@ -709,7 +736,7 @@ int lm_loss_backward_packed_lens(lm *model, const lm_cache *c, const int *ids,
 			    (size_t)(T - 1) * rb) != 0)
 				goto gather_host;
 			for (t = 0; t < T - 1; t++)
-				tgt[b * (T - 1) + t] = ids[b * T + t + 1];
+				tgt[b * (T - 1) + t] = packed_target(ids, b * T + t);
 		}
 		hc->on_device = MAT_DEV_DEVICE;
 		goto gather_done;
@@ -721,7 +748,7 @@ gather_host:
 		    &c->hidden->data[(size_t)b * T * LM_D_MODEL],
 		    (size_t)(T - 1) * rb);
 		for (t = 0; t < T - 1; t++)
-			tgt[b * (T - 1) + t] = ids[b * T + t + 1];
+			tgt[b * (T - 1) + t] = packed_target(ids, b * T + t);
 	}
 	mat_host_dirty(hc);
 gather_done:
