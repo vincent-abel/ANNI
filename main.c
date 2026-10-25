@@ -428,6 +428,9 @@ static int run_lm_train_core(int argc, char **argv, int use_tower)
 		model = lm_create();
 		opt = model ? lm_adam_create(model) : NULL;
 	}
+	/* LM pretraining is steadier with beta2 0.95 than Adam's 0.999. */
+	if (opt && arg_value(argc, argv, "--adam-beta2", NULL))
+		opt->beta2 = atof(arg_value(argc, argv, "--adam-beta2", "0.999"));
 	train_dbg(debug, "loading dataset / tokenizing");
 	if (model && opt && stream) {
 		tstream = text_stream_open(data, window, model->bpe,
@@ -1282,6 +1285,7 @@ int main(int argc, char *argv[])
 		printf("       ./anni lm [phrase]\n");
 		printf("       ./anni lm train [--data PATH] [--epochs N] [--out PATH]\n");
 		printf("                 [--resume PATH] [--val-data PATH] [--ckpt-minutes M]\n");
+		printf("                 [--adam-beta2 B]\n");
 		printf("                 [--lr RATE] [--window N]\n");
 		printf("                 [--batch N|auto] [--grad-accum K] [--vram-frac F]\n");
 		printf("                 [--seed N] [--eval-every N]\n");
