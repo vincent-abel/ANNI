@@ -199,6 +199,16 @@ int	gpu_attn_causal_fwd(mat *concat, mat *w, const mat *q, const mat *k,
 */
 int	gpu_attn_flash_fwd(mat *concat, const mat *q, const mat *k,
 		const mat *v, int B, int T, int H, int dh, mat *lse);
+/*
+** Fused tensor-core causal attention (BF16 WMMA, FP32 accumulate): same
+** outputs as gpu_attn_flash_fwd (concat + lse). -1 = use another path
+** (needs T % 64 == 0, dh in {16,32,48,64}, BF16 mode, no seqlens).
+*/
+int	gpu_attn_fa_fwd(mat *concat, const mat *q, const mat *k,
+		const mat *v, int B, int T, int H, int dh, mat *lse);
+int	gpu_attn_fa_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat,
+		const mat *concat, const mat *q, const mat *k, const mat *v,
+		const mat *lse, int B, int T, int H, int dh);
 /* FA-2 tiled bwd: P = exp(S - L) from this forward's lse. No T×T buffer. */
 int	gpu_attn_tiled_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat,
 		const mat *concat, const mat *q, const mat *k, const mat *v,
