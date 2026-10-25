@@ -1509,10 +1509,16 @@ extern "C" void gpu_half_wt_invalidate(const ann_real *fp32)
 	half_wt_invalidate(fp32);
 }
 
+static int op_begin_nested(int op);
+static void op_end(int i);
+#define OP_CONVERT_ID	17	/* == OP_CONVERT; enum is defined further down */
+
 static int half_wt_convert(void *dst, const ann_real *src, int n, int bf16)
 {
 	int threads = 256;
 	int blocks;
+	int prof = op_begin_nested(OP_CONVERT_ID);
+	int rc;
 
 #if CUDART_VERSION >= 11000
 	if (bf16) {
@@ -1522,14 +1528,18 @@ static int half_wt_convert(void *dst, const ann_real *src, int n, int bf16)
 			blocks = 1;
 		f32_to_bf16_kernel<<<blocks, threads>>>(
 		    (__nv_bfloat16 *)dst, src, n);
-		return cudaGetLastError() == cudaSuccess ? 0 : -1;
+		rc = cudaGetLastError() == cudaSuccess ? 0 : -1;
+		op_end(prof);
+		return rc;
 	}
 #else
 	(void)bf16;
 #endif
 	f32_to_f16_kernel<<<(n + threads - 1) / threads, threads>>>(
 	    (half *)dst, src, n);
-	return cudaGetLastError() == cudaSuccess ? 0 : -1;
+	rc = cudaGetLastError() == cudaSuccess ? 0 : -1;
+	op_end(prof);
+	return rc;
 }
 
 extern "C" int gpu_adam_seed_bf16_flat(void *bf16, const ann_real *fp32, int n)
@@ -2081,14 +2091,9 @@ static int cublas_gemm_rm_bt(ann_real *dC, const ann_real *dA,
 		}
 #if CUDART_VERSION >= 11000
 		if (use_bf16) {
-			{
-				int blocks = (int)((nA + (size_t)threads * 4 - 1)
-				    / ((size_t)threads * 4));
-
-				if (blocks < 1)
-					blocks = 1;
-				f32_to_bf16_kernel<<<blocks, threads>>>(
-				    (__nv_bfloat16 *)g_half_A, dA, (int)nA);
+			if (half_wt_convert(g_half_A, dA, (int)nA, 1) != 0) {
+				pthread_mutex_unlock(&g_gemm_mu);
+				return -1;
 			}
 			rc = cublas_gemm_ex_bf16(CUBLAS_OP_T, CUBLAS_OP_N, N,
 			    M, K, &alpha, hB_use, K, g_half_A, K, &beta, dC, N);
@@ -2189,26 +2194,19 @@ fp8_wgrad_skip:
 		const void *hA_use = act_bf16_get(dA, (int)nA);
 		const void *hB_use = act_bf16_get(dB, (int)nB);
 
-		if (!hA_use || !hB_use) {
-			int ba = (int)((nA + (size_t)threads * 4 - 1)
-			    / ((size_t)threads * 4));
-			int bb = (int)((nB + (size_t)threads * 4 - 1)
-			    / ((size_t)threads * 4));
-
-			if (ba < 1)
-				ba = 1;
-			if (bb < 1)
-				bb = 1;
-			if (!hA_use) {
-				f32_to_bf16_kernel<<<ba, threads>>>(
-				    (__nv_bfloat16 *)g_half_A, dA, (int)nA);
-				hA_use = g_half_A;
+		if (!hA_use) {
+			if (half_wt_convert(g_half_A, dA, (int)nA, 1) != 0) {
+				pthread_mutex_unlock(&g_gemm_mu);
+				return -1;
 			}
-			if (!hB_use) {
-				f32_to_bf16_kernel<<<bb, threads>>>(
-				    (__nv_bfloat16 *)g_half_B, dB, (int)nB);
-				hB_use = g_half_B;
+			hA_use = g_half_A;
+		}
+		if (!hB_use) {
+			if (half_wt_convert(g_half_B, dB, (int)nB, 1) != 0) {
+				pthread_mutex_unlock(&g_gemm_mu);
+				return -1;
 			}
+			hB_use = g_half_B;
 		}
 		rc = cublas_gemm_ex_bf16(CUBLAS_OP_N, CUBLAS_OP_T, N, M, T,
 		    &alpha, hB_use, N, hA_use, M, &beta, dC, N);
@@ -2555,12 +2553,13 @@ extern "C" const char *gpu_debug_last_error(void)
 enum {
 	OP_GEMM_FWD, OP_GEMM_DGRAD, OP_GEMM_WGRAD, OP_QKV, OP_ATTN_FWD,
 	OP_ATTN_BWD, OP_LN_FWD, OP_LN_BWD, OP_SOFTMAX, OP_CE, OP_COLSUM,
-	OP_ELEMWISE, OP_RESID, OP_EMBED, OP_POSENC, OP_PACK, OP_ADAM, OP_N
+	OP_ELEMWISE, OP_RESID, OP_EMBED, OP_POSENC, OP_PACK, OP_ADAM,
+	OP_CONVERT, OP_N
 };
 static const char *g_op_name[OP_N] = {
 	"gemm_fwd", "gemm_dgrad", "gemm_wgrad", "qkv_fused", "attn_fwd",
 	"attn_bwd", "ln_fwd", "ln_bwd", "softmax", "ce", "colsum", "elemwise",
-	"resid", "embed", "posenc", "pack", "adam"
+	"resid", "embed", "posenc", "pack", "adam", "convert"
 };
 #define OP_EV_SLOTS	16384
 typedef struct {
@@ -2628,6 +2627,41 @@ static int op_begin(int op)
 	return i;
 }
 
+/* Operand conversions run inside a GEMM scope: record them without the depth guard. */
+static int op_begin_nested(int op)
+{
+	op_ev *e;
+	int i;
+
+	if (!op_prof_on() || stream_is_capturing())
+		return -1;
+	pthread_mutex_lock(&g_op_mu);
+	if (g_op_ev_n >= OP_EV_SLOTS) {
+		pthread_mutex_unlock(&g_op_mu);
+		return -1;
+	}
+	e = &g_op_ev[g_op_ev_n];
+	if (g_op_ev_n >= g_op_ev_made) {
+		if (cudaEventCreate(&e->e0) != cudaSuccess
+		    || cudaEventCreate(&e->e1) != cudaSuccess) {
+			(void)cudaGetLastError();
+			pthread_mutex_unlock(&g_op_mu);
+			return -1;
+		}
+		g_op_ev_made++;
+	}
+	e->op = op;
+	if (cudaEventRecord(e->e0, 0) != cudaSuccess) {
+		(void)cudaGetLastError();
+		pthread_mutex_unlock(&g_op_mu);
+		return -1;
+	}
+	g_op_depth++;	/* op_end decrements */
+	i = g_op_ev_n++;
+	pthread_mutex_unlock(&g_op_mu);
+	return i;
+}
+
 static void op_end(int i)
 {
 	if (i < 0)
@@ -2685,7 +2719,9 @@ extern "C" void gpu_op_prof_dump(void)
 	for (i = 0; i < OP_N; i++)
 		tot += g_op_ms[i];
 	mb = g_op_calls[OP_CE] > 0 ? g_op_calls[OP_CE] : 1;
-	fprintf(stderr, "[opprof] %ld microbatches, %.1f ms/microbatch of GPU op time\n",
+	/* convert is also inside the gemm_* rows: the total excludes it. */
+	tot -= g_op_ms[OP_CONVERT];
+	fprintf(stderr, "[opprof] %ld microbatches, %.1f ms/microbatch of GPU op time (convert counted inside gemm rows)\n",
 	    mb, tot / (double)mb);
 	for (i = 0; i < OP_N; i++) {
 		if (g_op_calls[i] == 0)
