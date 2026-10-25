@@ -2574,6 +2574,8 @@ static int g_op_ev_made;
 static double g_op_ms[OP_N];
 static long g_op_calls[OP_N];
 static int g_op_depth;
+/* OpenMP threads call gpu_* concurrently (per-head attention): one slot table. */
+static pthread_mutex_t g_op_mu = PTHREAD_MUTEX_INITIALIZER;
 
 static int op_prof_on(void)
 {
@@ -2590,29 +2592,51 @@ static int op_prof_on(void)
 static int op_begin(int op)
 {
 	op_ev *e;
+	int i;
 
-	if (!op_prof_on() || g_op_depth > 0 || g_op_ev_n >= OP_EV_SLOTS
-	    || stream_is_capturing())
+	if (!op_prof_on() || stream_is_capturing())
 		return -1;
+	pthread_mutex_lock(&g_op_mu);
+	if (g_op_depth > 0 || g_op_ev_n >= OP_EV_SLOTS) {
+		pthread_mutex_unlock(&g_op_mu);
+		return -1;
+	}
 	e = &g_op_ev[g_op_ev_n];
 	if (g_op_ev_n >= g_op_ev_made) {
 		if (cudaEventCreate(&e->e0) != cudaSuccess
-		    || cudaEventCreate(&e->e1) != cudaSuccess)
+		    || cudaEventCreate(&e->e1) != cudaSuccess) {
+			(void)cudaGetLastError();
+			pthread_mutex_unlock(&g_op_mu);
 			return -1;
+		}
 		g_op_ev_made++;
 	}
 	e->op = op;
-	(void)cudaEventRecord(e->e0, 0);
+	if (cudaEventRecord(e->e0, 0) != cudaSuccess) {
+		static int warned;
+
+		if (!warned++)
+			fprintf(stderr, "[opprof] event record failed: %s\n",
+			    cudaGetErrorString(cudaGetLastError()));
+		(void)cudaGetLastError();	/* never poison launch checks */
+		pthread_mutex_unlock(&g_op_mu);
+		return -1;
+	}
 	g_op_depth++;
-	return g_op_ev_n++;
+	i = g_op_ev_n++;
+	pthread_mutex_unlock(&g_op_mu);
+	return i;
 }
 
 static void op_end(int i)
 {
 	if (i < 0)
 		return;
-	(void)cudaEventRecord(g_op_ev[i].e1, 0);
+	pthread_mutex_lock(&g_op_mu);
+	if (cudaEventRecord(g_op_ev[i].e1, 0) != cudaSuccess)
+		(void)cudaGetLastError();
 	g_op_depth--;
+	pthread_mutex_unlock(&g_op_mu);
 }
 
 struct OpScope {
@@ -2627,14 +2651,25 @@ static void op_prof_resolve(void)
 	int i;
 	float ms;
 
+	pthread_mutex_lock(&g_op_mu);
 	for (i = 0; i < g_op_ev_n; i++) {
-		if (cudaEventElapsedTime(&ms, g_op_ev[i].e0, g_op_ev[i].e1)
-		    == cudaSuccess) {
+		cudaError_t err = cudaEventElapsedTime(&ms, g_op_ev[i].e0,
+		    g_op_ev[i].e1);
+
+		if (err == cudaSuccess) {
 			g_op_ms[g_op_ev[i].op] += ms;
 			g_op_calls[g_op_ev[i].op]++;
+		} else {
+			static int warned;
+
+			if (!warned++)
+				fprintf(stderr, "[opprof] elapsed failed on %s: %s\n",
+				    g_op_name[g_op_ev[i].op], cudaGetErrorString(err));
+			(void)cudaGetLastError();
 		}
 	}
 	g_op_ev_n = 0;
+	pthread_mutex_unlock(&g_op_mu);
 }
 
 extern "C" void gpu_op_prof_dump(void)
