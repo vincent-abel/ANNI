@@ -109,6 +109,7 @@ finetune() {
 }
 
 pretrain() {
+	export ANN_GNORM_EVERY=50
 	local start=--force
 	[ -s "$OUT" ] && start="--resume $OUT"
 	log "pretrain start flag: $start"

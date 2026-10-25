@@ -1278,8 +1278,14 @@ double lm_train_corpus_val(lm *model, text_dataset *ds, lm_adam *opt,
 						const char *pe = getenv(
 						    "ANN_STEP_PROF");
 
+						/*
+						** Mean over predicted tokens, so
+						** --grad-clip bounds the usual
+						** per-token gradient norm.
+						*/
 						lm_adam_step_scaled(opt, step_lr,
-						    us / (double)b);
+						    us / ((double)b
+						    * (double)(ds->window - 1)));
 						if (s_adam_log > 0 && pe
 						    && pe[0] == '1') {
 							fprintf(stderr,
@@ -1800,8 +1806,9 @@ double lm_train_stream(lm *model, text_stream *train, lm_adam *opt,
 						static int s_adam_log = 6;
 						const char *pe = getenv("ANN_STEP_PROF");
 
+						/* Mean over predicted tokens (see corpus path). */
 						lm_adam_step_scaled(opt, step_lr,
-						    us / (double)b);
+						    us / ((double)b * (double)(T - 1)));
 						if (s_adam_log > 0 && pe && pe[0] == '1') {
 							fprintf(stderr,
 							    "[adam] %.1fms\n",

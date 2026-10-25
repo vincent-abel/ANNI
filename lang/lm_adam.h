@@ -51,6 +51,7 @@ typedef struct	lm_adam {
 	int	offload_mv;	/* S13: keep m/v on host between steps */
 	double	weight_decay;	/* E2 AdamW-style; 0 = off */
 	double	grad_clip;	/* E2 global L2 clip; 0 = off */
+	double	last_grad_norm;	/* device path: L2 norm before clipping */
 } lm_adam;
 
 lm_adam	*lm_adam_create(lm *model);
