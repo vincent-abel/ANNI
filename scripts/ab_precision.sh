@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Short FP32 / BF16 / FP8 A/B on the fixed training path (docs/gpu-training-audit.md).
 #
-#   scripts/ab_precision.sh [STEPS]      # default 150 Adam steps per precision
+#   scripts/ab_precision.sh [STEPS] [fp32|bf16|fp8 ...]   # default 150 steps, all three
 #
 # Same seed, same data slice (the first STEPS*16*256*32 tokens of the mix),
 # same flags as scripts/talk170m_run.sh pretrain(). Needs the GPU to itself
@@ -10,6 +10,8 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 STEPS=${1:-150}
+shift || true
+PRECS=${*:-fp32 bf16 fp8}
 TOK_PER_STEP=$((16 * 256 * 32))
 BYTES=$((STEPS * TOK_PER_STEP * 4 + 4096 * 4))
 SLICE=data/ab_train_ids.bin
@@ -30,11 +32,15 @@ run() {	# run NAME [extra flags...]
 	    --flash-attn --eval-every 1 --eval-windows 256 --seed 1 -d "$@" \
 	    2>&1 | tee "logs/ab_$name.log" | tr '\r' '\n' | grep -a --line-buffered '\[adam\]\|NLL' | tail -3
 }
-run fp32
-run bf16 --bf16
-run fp8 --bf16 --fp8
+for p in $PRECS; do
+	case $p in
+	fp32) run fp32 ;;
+	bf16) run bf16 --bf16 ;;
+	fp8) run fp8 --bf16 --fp8 ;;
+	esac
+done
 echo "== summary (last progress line of each)"
-for p in fp32 bf16 fp8; do
+for p in $PRECS; do
 	printf '%-5s ' "$p"
 	tr '\r' '\n' < "logs/ab_$p.log" | grep -a 'NLL' | tail -1 | sed 's/^ *//'
 done

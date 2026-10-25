@@ -108,6 +108,10 @@ finetune() {
 	    --flash-attn --eval-every 1 --eval-windows 256 --seed 2 -d
 }
 
+# GEMM precision of the pretraining run; chosen by scripts/ab_precision.sh
+# after the GPU audit (docs/gpu-training-audit.md). Empty = FP32.
+PREC_FLAGS=${PREC_FLAGS:-"--bf16"}
+
 pretrain() {
 	export ANN_GNORM_EVERY=50
 	local start=--force
@@ -119,7 +123,7 @@ pretrain() {
 	    --window 256 --stride 256 --batch 16 --grad-accum 32 --epochs 1 \
 	    --lr 3e-4 --lr-warmup 1000 --lr-decay cosine --lr-decay-steps 28100 --adam-beta2 0.95 \
 	    --grad-clip 1.0 --weight-decay 0.1 \
-	    --flash-attn \
+	    --flash-attn $PREC_FLAGS \
 	    --eval-every 1 --eval-windows 256 --ckpt-minutes 30 --seed 1 -d
 }
 

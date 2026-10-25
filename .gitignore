@@ -66,3 +66,5 @@ data/chat*
 # local run logs
 logs/
 data/.*
+data/ab_train_ids.bin
+data/prof_ids.bin
