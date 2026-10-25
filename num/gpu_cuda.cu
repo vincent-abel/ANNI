@@ -5341,8 +5341,9 @@ __global__ static void attn_fa_wmma_fwd_kernel(ann_real *out, ann_real *lse,
 	__nv_bfloat16 *Vs = Ks + FA_FBK * dh;				/* BK x dh */
 	__nv_bfloat16 *Ps = Vs + FA_FBK * dh;				/* BQ x BK */
 	float *Ss = (float *)(Ps + FA_BQ * FA_FBK);			/* BQ x (BK+pad) */
-	float *rm = Ss + FA_BQ * (FA_FBK + FA_SPAD);			/* BQ */
-	float *rl = rm + FA_BQ;						/* 64 */
+	float *rm = Ss + FA_BQ * (FA_FBK + FA_SPAD);			/* BQ: running max */
+	float *rl = rm + FA_BQ;						/* BQ: running sum */
+	float *ra = rl + FA_BQ;						/* BQ: rescale of this tile */
 	const int bh = blockIdx.x;
 	const int b = bh / H;
 	const int h = bh % H;
@@ -5355,9 +5356,18 @@ __global__ static void attn_fa_wmma_fwd_kernel(ann_real *out, ann_real *lse,
 	const size_t row0 = (size_t)b * T;
 	const int q0 = qt * FA_BQ;
 	const int nkt = (q0 + FA_BQ) / FA_FBK;	/* causal: tiles up to the diagonal */
+	const int ndt = dh / 16;
+	/*
+	** Accumulator element -> row map of the 16x16 FP32 WMMA fragment on
+	** sm_80+ (two 8-row halves, element pairs): element i of lane l sits
+	** in row (l >> 2) + 8 * ((i >> 1) & 1). Verified against the CPU
+	** reference by tests/test_gpu and the probe; used only for the
+	** per-row rescale of the online softmax.
+	*/
+	const int frow0 = warp * 16 + (lane >> 2);
+	wmma::fragment<wmma::accumulator, 16, 16, 16, float> oacc[4];
 	int i, kt, kk, nt, c;
 
-	/* Q tile (head-major BF16, contiguous 64 x dh) -> shared. */
 	{
 		const __nv_bfloat16 *qsrc = q + ((size_t)bh * T + q0) * dh;
 
@@ -5367,21 +5377,26 @@ __global__ static void attn_fa_wmma_fwd_kernel(ann_real *out, ann_real *lse,
 	if (threadIdx.x < FA_BQ) {
 		rm[threadIdx.x] = -1e30f;
 		rl[threadIdx.x] = 0.0f;
+		ra[threadIdx.x] = 1.0f;
 	}
+	for (nt = 0; nt < ndt; nt++)
+		wmma::fill_fragment(oacc[nt], 0.0f);
 	__syncthreads();
 
-	/* Pass 1: row max and sum over all causal keys. */
+	/* One pass: S tile, online max/sum, rescale O, O += P V. */
 	for (kt = 0; kt < nkt; kt++) {
 		const int k0 = kt * FA_FBK;
 
 		{
 			const __nv_bfloat16 *ksrc = k + ((size_t)bh * T + k0) * dh;
+			const __nv_bfloat16 *vsrc = v + ((size_t)bh * T + k0) * dh;
 
-			for (i = threadIdx.x; i < FA_FBK * dh; i += blockDim.x)
+			for (i = threadIdx.x; i < FA_FBK * dh; i += blockDim.x) {
 				Ks[i] = ksrc[i];
+				Vs[i] = vsrc[i];
+			}
 		}
 		__syncthreads();
-		/* S_w = Q_w K^T: 16 x 64 per warp. */
 		for (nt = 0; nt < FA_FBK / 16; nt++) {
 			wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
 			wmma::fill_fragment(acc, 0.0f);
@@ -5396,11 +5411,12 @@ __global__ static void attn_fa_wmma_fwd_kernel(ann_real *out, ann_real *lse,
 			    SLD, wmma::mem_row_major);
 		}
 		__syncwarp();
-		/* Online stats: lane -> row lane/2, half lane&1 of the 64 keys. */
+		/* Row stats: lane -> row lane/2, half lane&1 of the BK keys. */
 		{
 			const int r = warp * 16 + (lane >> 1);
 			const int qi = q0 + r;
 			const float *srow = Ss + r * SLD + (lane & 1) * HC;
+			__nv_bfloat16 *prow = Ps + r * FA_FBK + (lane & 1) * HC;
 			float tmax = -1e30f, tsum, mold, mnew;
 
 			for (c = 0; c < HC; c++) {
@@ -5414,84 +5430,51 @@ __global__ static void attn_fa_wmma_fwd_kernel(ann_real *out, ann_real *lse,
 			tsum = 0.0f;
 			for (c = 0; c < HC; c++) {
 				int kj = k0 + (lane & 1) * HC + c;
-				if (kj <= qi)
-					tsum += __expf(srow[c] * scale - mnew);
+				float pv = kj <= qi ? __expf(srow[c] * scale - mnew) : 0.0f;
+				prow[c] = __float2bfloat16(pv);
+				tsum += pv;
 			}
 			tsum += __shfl_xor_sync(0xffffffffu, tsum, 1);
 			if ((lane & 1) == 0) {
-				rl[r] = rl[r] * __expf(mold - mnew) + tsum;
+				float alpha = __expf(mold - mnew);
+
+				rl[r] = rl[r] * alpha + tsum;
 				rm[r] = mnew;
+				ra[r] = alpha;
+			}
+		}
+		__syncwarp();
+		/* Rescale O_w rows by alpha, then O_w += P_w V. */
+		{
+			const float a0 = ra[frow0];
+			const float a1 = ra[frow0 + 8];
+
+			for (nt = 0; nt < ndt; nt++)
+				for (i = 0; i < oacc[nt].num_elements; i++)
+					oacc[nt].x[i] *= ((i >> 1) & 1) ? a1 : a0;
+		}
+		for (kk = 0; kk < FA_FBK; kk += 16) {
+			wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a;
+			wmma::load_matrix_sync(a, Ps + warp * 16 * FA_FBK + kk, FA_FBK);
+			for (nt = 0; nt < ndt; nt++) {
+				wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> bfr;
+				wmma::load_matrix_sync(bfr, Vs + kk * dh + nt * 16, dh);
+				wmma::mma_sync(oacc[nt], a, bfr, oacc[nt]);
 			}
 		}
 		__syncthreads();
 	}
-
-	/* Pass 2: O_w = sum_kt P_w V in WMMA accumulators. */
+	/* O = O / l per row, written straight from the fragments. */
 	{
-		wmma::fragment<wmma::accumulator, 16, 16, 16, float> oacc[4];
-		const int ndt = dh / 16;
+		const float i0 = 1.0f / rl[frow0];
+		const float i1 = 1.0f / rl[frow0 + 8];
 
-		for (nt = 0; nt < ndt; nt++)
-			wmma::fill_fragment(oacc[nt], 0.0f);
-		for (kt = 0; kt < nkt; kt++) {
-			const int k0 = kt * FA_FBK;
-
-			{
-				const __nv_bfloat16 *ksrc = k + ((size_t)bh * T + k0) * dh;
-				const __nv_bfloat16 *vsrc = v + ((size_t)bh * T + k0) * dh;
-
-				for (i = threadIdx.x; i < FA_FBK * dh; i += blockDim.x) {
-					Ks[i] = ksrc[i];
-					Vs[i] = vsrc[i];
-				}
-			}
-			__syncthreads();
-			for (nt = 0; nt < FA_FBK / 16; nt++) {
-				wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
-				wmma::fill_fragment(acc, 0.0f);
-				for (kk = 0; kk < dh; kk += 16) {
-					wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a;
-					wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> bfr;
-					wmma::load_matrix_sync(a, Qs + warp * 16 * dh + kk, dh);
-					wmma::load_matrix_sync(bfr, Ks + nt * 16 * dh + kk, dh);
-					wmma::mma_sync(acc, a, bfr, acc);
-				}
-				wmma::store_matrix_sync(Ss + warp * 16 * SLD + nt * 16, acc,
-				    SLD, wmma::mem_row_major);
-			}
-			__syncwarp();
-			/* P = exp(S*scale - m) / l, masked, as BF16. */
-			{
-				const int r = warp * 16 + (lane >> 1);
-				const int qi = q0 + r;
-				const float *srow = Ss + r * SLD + (lane & 1) * HC;
-				__nv_bfloat16 *prow = Ps + r * FA_FBK + (lane & 1) * HC;
-				const float m = rm[r];
-				const float inv = 1.0f / rl[r];
-
-				for (c = 0; c < HC; c++) {
-					int kj = k0 + (lane & 1) * HC + c;
-					float pv = kj <= qi
-					    ? __expf(srow[c] * scale - m) * inv : 0.0f;
-					prow[c] = __float2bfloat16(pv);
-				}
-			}
-			__syncwarp();
-			/* O_w += P_w (16 x 64) V (64 x dh). */
-			for (kk = 0; kk < FA_FBK; kk += 16) {
-				wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a;
-				wmma::load_matrix_sync(a, Ps + warp * 16 * FA_FBK + kk, FA_FBK);
-				for (nt = 0; nt < ndt; nt++) {
-					wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> bfr;
-					wmma::load_matrix_sync(bfr, Vs + kk * dh + nt * 16, dh);
-					wmma::mma_sync(oacc[nt], a, bfr, oacc[nt]);
-				}
-			}
-			__syncthreads();
-		}
-		for (nt = 0; nt < ndt; nt++)
+		for (nt = 0; nt < ndt; nt++) {
+			for (i = 0; i < oacc[nt].num_elements; i++)
+				oacc[nt].x[i] *= ((i >> 1) & 1) ? i1 : i0;
 			wmma::store_matrix_sync(out + (row0 + q0 + warp * 16) * D
 			    + h * dh + nt * 16, oacc[nt], D, wmma::mem_row_major);
+		}
 	}
 	if (threadIdx.x < FA_BQ)
 		lse[(size_t)bh * T + q0 + threadIdx.x] =
@@ -5501,7 +5484,7 @@ __global__ static void attn_fa_wmma_fwd_kernel(ann_real *out, ann_real *lse,
 static size_t fa_wmma_smem(int dh)
 {
 	return (size_t)(FA_BQ * dh + 2 * FA_FBK * dh + FA_BQ * FA_FBK) * 2
-	    + (size_t)(FA_BQ * (FA_FBK + FA_SPAD) + 2 * FA_BQ) * sizeof(float);
+	    + (size_t)(FA_BQ * (FA_FBK + FA_SPAD) + 3 * FA_BQ) * sizeof(float);
 }
 
 static int fa_wmma_ok(int T, int dh)
