@@ -28,6 +28,7 @@ extern "C" {
 }
 
 static int g_sync_mode;
+static void devvec_forget(const void *host);
 static int g_compute_prec;
 static int g_fp8_fwd;
 static int g_fp8_dgrad;
@@ -3107,6 +3108,7 @@ extern "C" void gpu_host_forget(const void *host)
 		}
 	}
 	pthread_mutex_lock(&g_ew_mu);
+	devvec_forget(host);
 	for (i = 0; i < BIAS_CACHE_SLOTS; i++) {
 		if (g_bias_cache[i].host == host) {
 			if (g_bias_cache[i].dev)
@@ -3127,6 +3129,74 @@ extern "C" void gpu_host_forget(const void *host)
 		}
 	}
 	pthread_mutex_unlock(&g_ew_mu);
+}
+
+/*
+** Device-resident twins of small host vectors that only kernels read and
+** write (LayerNorm per-row mean / inv_std). Keyed on the host address;
+** the host copy is refreshed only in eager mode (CPU fallbacks, tests).
+** Staging them per call cost a synchronous D2H in every LN forward.
+*/
+#define DEVVEC_SLOTS	512
+typedef struct {
+	const void	*host;
+	void		*dev;
+	size_t		bytes;
+} devvec_ent;
+static devvec_ent g_devvec[DEVVEC_SLOTS];
+
+static void *devvec_get(const void *host, size_t bytes)
+{
+	int i;
+	int free_slot = -1;
+	devvec_ent *e;
+
+	if (!host || bytes == 0)
+		return NULL;
+	for (i = 0; i < DEVVEC_SLOTS; i++) {
+		e = &g_devvec[i];
+		if (e->host == host) {
+			if (e->bytes < bytes) {
+				cudaFree(e->dev);
+				e->dev = NULL;
+				e->bytes = 0;
+				if (cudaMalloc(&e->dev, bytes) != cudaSuccess) {
+					e->host = NULL;
+					return NULL;
+				}
+				e->bytes = bytes;
+			}
+			return e->dev;
+		}
+		if (free_slot < 0 && !e->host)
+			free_slot = i;
+	}
+	if (free_slot < 0)
+		return NULL;
+	e = &g_devvec[free_slot];
+	if (cudaMalloc(&e->dev, bytes) != cudaSuccess) {
+		e->dev = NULL;
+		return NULL;
+	}
+	(void)cudaMemset(e->dev, 0, bytes);
+	e->host = host;
+	e->bytes = bytes;
+	return e->dev;
+}
+
+static void devvec_forget(const void *host)
+{
+	int i;
+
+	for (i = 0; i < DEVVEC_SLOTS; i++) {
+		if (g_devvec[i].host == host) {
+			if (g_devvec[i].dev)
+				cudaFree(g_devvec[i].dev);
+			g_devvec[i].dev = NULL;
+			g_devvec[i].host = NULL;
+			g_devvec[i].bytes = 0;
+		}
+	}
 }
 
 /*
@@ -5636,10 +5706,19 @@ static int gpu_layernorm_forward_ex_locked(ann_real *y, const ann_real *x,
 	memset(&ri, 0, sizeof(ri));
 	if (x_hat && ew_acquire(&rh, 4, x_hat, mb, 0, 1) != 0)
 		return -1;
-	if (mean && ew_acquire(&rm, 5, mean, vb, 0, 1) != 0)
-		return -1;
-	if (inv_std && ew_acquire(&ri, 6, inv_std, vb, 0, 1) != 0)
-		return -1;
+	/* mean / inv_std: device resident (only kernels use them). */
+	if (mean) {
+		rm.dev = (ann_real *)(ew_is_dev(mean) ? (void *)mean
+		    : devvec_get(mean, vb));
+		if (!rm.dev)
+			return -1;
+	}
+	if (inv_std) {
+		ri.dev = (ann_real *)(ew_is_dev(inv_std) ? (void *)inv_std
+		    : devvec_get(inv_std, vb));
+		if (!ri.dev)
+			return -1;
+	}
 	{
 		__nv_fp8_storage_t *y8 = NULL;
 		float *sc8 = NULL;
@@ -5671,15 +5750,17 @@ static int gpu_layernorm_forward_ex_locked(ann_real *y, const ann_real *x,
 			return -1;
 		did |= rc;
 	}
-	if (mean) {
-		if ((rc = ew_release(&rm)) < 0)
+	/* Eager mode keeps the host stats valid for CPU fallbacks / tests. */
+	if (g_sync_mode == GPU_SYNC_EAGER && !stream_is_capturing()) {
+		if (mean && (void *)rm.dev != (void *)mean
+		    && cudaMemcpy(mean, rm.dev, vb, cudaMemcpyDeviceToHost)
+		    != cudaSuccess)
 			return -1;
-		did |= rc;
-	}
-	if (inv_std) {
-		if ((rc = ew_release(&ri)) < 0)
+		if (inv_std && (void *)ri.dev != (void *)inv_std
+		    && cudaMemcpy(inv_std, ri.dev, vb, cudaMemcpyDeviceToHost)
+		    != cudaSuccess)
 			return -1;
-		did |= rc;
+		did = 1;
 	}
 	if ((rc = ew_release(&ry)) < 0)
 		return -1;
@@ -5745,8 +5826,11 @@ static int gpu_layernorm_backward_locked(mat *dx, const mat *dy, const ann_real 
 		return -1;
 	if (ew_acquire(&rdy, 1, dyp, mb, 1, 0) != 0
 	    || ew_acquire_param(&rg, 2, gamma, gb) != 0
-	    || ew_acquire(&rh, 3, x_hat, mb, 1, 0) != 0
-	    || ew_acquire(&ri, 4, inv_std, vb, 1, 0) != 0)
+	    || ew_acquire(&rh, 3, x_hat, mb, 1, 0) != 0)
+		return -1;
+	ri.dev = (ann_real *)(ew_is_dev(inv_std) ? (void *)inv_std
+	    : devvec_get(inv_std, vb));
+	if (!ri.dev)
 		return -1;
 	/*
 	** dgamma / dbeta accumulate on the device (same accumulators as the
