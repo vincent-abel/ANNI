@@ -64,4 +64,4 @@ data/chat*
 
 # local run logs
 logs/
-data/.mix_built
+data/.*
