@@ -1487,6 +1487,57 @@ static void act_bf16_publish(const ann_real *fp32, int n)
 	e->live = 1;
 }
 
+/*
+** ANN_TWIN_CHECK=1: reconvert a cached twin and compare it with the cache
+** before serving it (debug only; synchronises). Reports stale twins.
+*/
+static int twin_check_on(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		const char *e = getenv("ANN_TWIN_CHECK");
+
+		on = (e && e[0] == '1') ? 1 : 0;
+	}
+	return on;
+}
+
+static void twin_check(const char *what, const void *twin,
+	const ann_real *fp32, size_t n, int bf16)
+{
+	void *fresh = NULL;
+	unsigned char *a;
+	unsigned char *b;
+	size_t bytes = n * 2;
+	size_t i;
+	size_t bad = 0;
+
+	if (!twin_check_on() || !twin || !fp32 || n == 0)
+		return;
+	if (cudaMalloc(&fresh, bytes) != cudaSuccess)
+		return;
+	if (half_wt_convert(fresh, fp32, (int)n, bf16) != 0) {
+		cudaFree(fresh);
+		return;
+	}
+	a = (unsigned char *)malloc(bytes);
+	b = (unsigned char *)malloc(bytes);
+	if (a && b && cudaMemcpy(a, twin, bytes, cudaMemcpyDeviceToHost)
+	    == cudaSuccess
+	    && cudaMemcpy(b, fresh, bytes, cudaMemcpyDeviceToHost)
+	    == cudaSuccess) {
+		for (i = 0; i < bytes; i++)
+			bad += a[i] != b[i];
+		if (bad)
+			fprintf(stderr, "[twin] STALE %s fp32=%p n=%zu bytes_diff=%zu\n",
+			    what, (const void *)fp32, n, bad);
+	}
+	free(a);
+	free(b);
+	cudaFree(fresh);
+}
+
 static const void *act_bf16_get(const ann_real *fp32, int n)
 {
 	int i;
@@ -1495,8 +1546,10 @@ static const void *act_bf16_get(const ann_real *fp32, int n)
 		return NULL;
 	for (i = 0; i < ACT_BF16_SLOTS; i++) {
 		if (g_act_bf16[i].live && g_act_bf16[i].fp32 == fp32
-		    && g_act_bf16[i].n == n)
+		    && g_act_bf16[i].n == n) {
+			twin_check("act", g_act_bf16[i].half, fp32, (size_t)n, 1);
 			return g_act_bf16[i].half;
+		}
 	}
 	return NULL;
 }
@@ -1545,9 +1598,19 @@ static void *half_wt_get(const ann_real *fp32, size_t n, int bf16)
 	/* Flat Adam twin: no per-mat convert after the fused Adam write. */
 	if (bf16 && g_adam_bf16 && g_adam_fp32 && g_adam_flat_n > 0
 	    && fp32 >= g_adam_fp32
-	    && fp32 + n <= g_adam_fp32 + g_adam_flat_n)
+	    && fp32 + n <= g_adam_fp32 + g_adam_flat_n) {
+		twin_check("flat", (char *)g_adam_bf16
+		    + (size_t)(fp32 - g_adam_fp32) * 2u, fp32, n, 1);
 		return (char *)g_adam_bf16
 		    + (size_t)(fp32 - g_adam_fp32) * 2u;
+	}
+	/*
+	** With the flat registered every trained weight is inside it. Any
+	** other pointer here is an activation (per-head K/V, scores...):
+	** it changes every microbatch, so it must not get a persistent twin.
+	*/
+	if (bf16 && g_adam_flat_n > 0)
+		return NULL;
 	for (i = 0; i < HALF_WT_SLOTS; i++) {
 		if (g_half_wt[i].fp32 == fp32) {
 			e = &g_half_wt[i];
@@ -1569,7 +1632,8 @@ static void *half_wt_get(const ann_real *fp32, size_t n, int bf16)
 				    != 0)
 					return NULL;
 				e->valid = 1;
-			}
+			} else
+				twin_check("wt", e->half, fp32, n, bf16);
 			return e->half;
 		}
 		if (free_slot < 0 && !g_half_wt[i].fp32)
@@ -2140,10 +2204,42 @@ extern "C" void *gpu_malloc(size_t nbytes)
 	return p;
 }
 
+/*
+** Twin caches are keyed on the FP32 device address. cudaMalloc reuses
+** addresses, so a twin of a freed buffer must not survive the free: a new
+** buffer at the same address (same size) would be served the old data.
+*/
+static void twins_forget_dev(const void *p)
+{
+	int i;
+
+	for (i = 0; i < HALF_WT_SLOTS; i++) {
+		if (g_half_wt[i].fp32 == (const ann_real *)p) {
+			if (g_half_wt[i].half)
+				cudaFree(g_half_wt[i].half);
+			g_half_wt[i].half = NULL;
+			g_half_wt[i].fp32 = NULL;
+			g_half_wt[i].n = 0;
+			g_half_wt[i].valid = 0;
+		}
+	}
+	for (i = 0; i < ACT_BF16_SLOTS; i++) {
+		if (g_act_bf16[i].fp32 == (const ann_real *)p) {
+			g_act_bf16[i].fp32 = NULL;
+			g_act_bf16[i].live = 0;
+		}
+	}
+#if CUDART_VERSION >= 12000 && defined(ANN_CUBLAS)
+	fp8_wt_invalidate((const ann_real *)p);
+#endif
+}
+
 extern "C" void gpu_free(void *p)
 {
-	if (p)
-		cudaFree(p);
+	if (!p)
+		return;
+	twins_forget_dev(p);
+	cudaFree(p);
 }
 
 extern "C" int gpu_memcpy_h2d(void *dst, const void *src, size_t nbytes)
@@ -2353,6 +2449,14 @@ static colsum_acc *colsum_acc_get(ann_real *db_host, int cols)
 	g_colsum_acc[free_slot].cols = cols;
 	g_colsum_acc[free_slot].dirty = 0;
 	return &g_colsum_acc[free_slot];
+}
+
+/* Debug: name of the pending (and cleared) CUDA error, "" when none. */
+extern "C" const char *gpu_debug_last_error(void)
+{
+	cudaError_t e = cudaGetLastError();
+
+	return e == cudaSuccess ? "" : cudaGetErrorString(e);
 }
 
 extern "C" void gpu_device_sync(void)
@@ -2736,6 +2840,15 @@ static void *bias_cache_get(const void *host, size_t bytes)
 				    cudaMemcpyHostToDevice, 0) != cudaSuccess)
 					return NULL;
 				e->epoch = g_wt_epoch;
+			} else if (twin_check_on()) {
+				unsigned char *tmp = (unsigned char *)malloc(bytes);
+
+				if (tmp && cudaMemcpy(tmp, e->dev, bytes,
+				    cudaMemcpyDeviceToHost) == cudaSuccess
+				    && memcmp(tmp, host, bytes) != 0)
+					fprintf(stderr, "[twin] STALE param host=%p bytes=%zu slot=%d\n",
+					    host, bytes, i);
+				free(tmp);
 			}
 			return e->dev;
 		}
@@ -2764,7 +2877,44 @@ static void *bias_cache_get(const void *host, size_t bytes)
 	return e->dev;
 }
 
-/* Bind host (or device) memory to a device pointer; slot = scratch id. */
+extern "C" void gpu_host_forget(const void *host)
+{
+	int i;
+
+	if (!host || !gpu_available())
+		return;
+	pthread_mutex_lock(&g_ew_mu);
+	for (i = 0; i < BIAS_CACHE_SLOTS; i++) {
+		if (g_bias_cache[i].host == host) {
+			if (g_bias_cache[i].dev)
+				cudaFree(g_bias_cache[i].dev);
+			g_bias_cache[i].dev = NULL;
+			g_bias_cache[i].host = NULL;
+			g_bias_cache[i].bytes = 0;
+		}
+	}
+	for (i = 0; i < COLSUM_ACC_SLOTS; i++) {
+		if (g_colsum_acc[i].host == (ann_real *)host) {
+			if (g_colsum_acc[i].dev)
+				cudaFree(g_colsum_acc[i].dev);
+			g_colsum_acc[i].dev = NULL;
+			g_colsum_acc[i].host = NULL;
+			g_colsum_acc[i].cols = 0;
+			g_colsum_acc[i].dirty = 0;
+		}
+	}
+	pthread_mutex_unlock(&g_ew_mu);
+}
+
+/*
+** Bind host (or device) memory to a device pointer; slot = scratch id.
+** Host memory is staged through the slot's scratch on every call. The
+** persistent bias cache is NOT consulted here: it is keyed on the host
+** address and only refreshed by gpu_half_wt_invalidate, which is right for
+** parameter vectors (ew_acquire_param) and wrong for anything else. CE
+** targets (malloc'ed per call at a recycled address) and the LayerNorm
+** inv_std of the backward used to hit it and were served stale.
+*/
 static int ew_acquire(ew_ref *r, int slot, const void *host, size_t bytes,
 	int up, int down)
 {

@@ -3,6 +3,7 @@
 */
 #include "main.h"
 #include "simd.h"
+#include "gpu.h"
 
 vec *vec_create(int n)
 {
@@ -26,6 +27,7 @@ void vec_free(vec **v)
 {
 	if (!v || !*v)
 		return;
+	gpu_host_forget((*v)->data);
 	free((*v)->data);
 	free(*v);
 	*v = NULL;
