@@ -823,20 +823,91 @@ static int fp8_scales_ensure(void)
 	return 0;
 }
 
-/* LN calls this before the one-pass kernel. Returns the E4M3 destination. */
-static int fp8_hot_prepare(int n, __nv_fp8_storage_t **buf, float **scale,
-	float **amax)
+/*
+** Delayed scaling is per tensor: the scale a tensor is quantized with comes
+** from its own amax of the previous microbatch. One shared scale for every
+** activation (or every gradient) of the network quantized each tensor with
+** the amax of whichever tensor came before it: a tensor larger than its
+** predecessor saturated at 448 (E4M3) and a smaller one lost its mantissa.
+** Slots are keyed on the FP32 source address (stable per layer buffer).
+*/
+#define FP8_ACT_SLOTS	512
+typedef struct {
+	const void	*key;
+	int		e5m2;
+	float		*scale;		/* [0] current, [1] next (wgrad swap) */
+	int		cur;
+} fp8_act_slot;
+static fp8_act_slot g_fp8_act[FP8_ACT_SLOTS];
+
+static fp8_act_slot *fp8_act_scale(const void *key, int e5m2)
 {
-	if (!g_fp8_fwd || n <= 0)
+	int i;
+	int free_slot = -1;
+	fp8_act_slot *e;
+	float one[2] = { 1.f, 1.f };
+
+	if (!key)
+		return NULL;
+	for (i = 0; i < FP8_ACT_SLOTS; i++) {
+		e = &g_fp8_act[i];
+		if (e->key == key && e->e5m2 == e5m2)
+			return e;
+		if (free_slot < 0 && !e->key)
+			free_slot = i;
+	}
+	if (free_slot < 0)
+		return NULL;
+	e = &g_fp8_act[free_slot];
+	if (!e->scale
+	    && cudaMalloc((void **)&e->scale, 2 * sizeof(float)) != cudaSuccess) {
+		e->scale = NULL;
+		return NULL;
+	}
+	if (cudaMemcpy(e->scale, one, sizeof(one), cudaMemcpyHostToDevice)
+	    != cudaSuccess)
+		return NULL;
+	e->key = key;
+	e->e5m2 = e5m2;
+	e->cur = 0;
+	return e;
+}
+
+static void fp8_act_forget(const void *key)
+{
+	int i;
+
+	for (i = 0; i < FP8_ACT_SLOTS; i++)
+		if (g_fp8_act[i].key == key)
+			g_fp8_act[i].key = NULL;
+}
+
+#define FP8_SCALE_CUR(e)	((e)->scale + (e)->cur)
+#define FP8_SCALE_NEXT(e)	((e)->scale + ((e)->cur ^ 1))
+
+/* The scale pointer of the LN output being quantized by the one-pass kernel. */
+static float *g_fp8_hot_scale;
+
+/* LN calls this before the one-pass kernel. Returns the E4M3 destination. */
+static int fp8_hot_prepare(int n, const ann_real *y, __nv_fp8_storage_t **buf,
+	float **scale, float **amax)
+{
+	fp8_act_slot *as;
+
+	if (!g_fp8_fwd || n <= 0 || !y)
 		return -1;
 	if (fp8_scales_ensure() != 0)
 		return -1;
 	if (ensure_fp8_buf(&g_fp8_hot_buf, &g_fp8_hot_cap, (size_t)n) != 0)
 		return -1;
+	as = fp8_act_scale(y, 0);
+	if (!as)
+		return -1;
 	if (cudaMemsetAsync(g_fp8_hot_amax, 0, sizeof(float), 0) != cudaSuccess)
 		return -1;
+	g_fp8_hot_scale = FP8_SCALE_CUR(as);
 	*buf = (__nv_fp8_storage_t *)g_fp8_hot_buf;
-	*scale = g_fp8_hot_quant;
+	*scale = g_fp8_hot_scale;
 	*amax = g_fp8_hot_amax;
 	return 0;
 }
@@ -852,9 +923,9 @@ static void fp8_hot_commit(const ann_real *src, int n)
 
 static void fp8_hot_finish(void)
 {
-	if (!g_fp8_hot_quant || !g_fp8_hot_amax)
+	if (!g_fp8_hot_scale || !g_fp8_hot_amax)
 		return;
-	amax_to_scale_kernel<<<1, 1>>>(g_fp8_hot_quant, g_fp8_hot_amax, 448.f);
+	amax_to_scale_kernel<<<1, 1>>>(g_fp8_hot_scale, g_fp8_hot_amax, 448.f);
 	g_fp8_hot_src = NULL;
 	g_fp8_hot_n = 0;
 }
@@ -865,7 +936,7 @@ static int fp8_hot_take(const ann_real *src, int n, void **buf, float **scale)
 	if (!src || src != g_fp8_hot_src || n != g_fp8_hot_n || !g_fp8_hot_buf)
 		return -1;
 	*buf = g_fp8_hot_buf;
-	*scale = g_fp8_hot_quant;
+	*scale = g_fp8_hot_scale;
 	return 0;
 }
 
@@ -1209,13 +1280,23 @@ static int cublas_lt_gemm_fp8_ex(cublasOperation_t opa, cublasOperation_t opb,
 			cublasLtMatmulDescDestroy(op);
 			return -1;
 		}
-		if (returned > 1) {
+		if (returned > 1 && !lt_heuristic_only()) {
 			cudaStreamCaptureStatus cs =
 			    cudaStreamCaptureStatusNone;
 			cudaEvent_t ev0, ev1;
 			float best_ms = 1e30f;
+			float *time_D = C;
+			int time_D_owned = 0;
 
-			if (cudaStreamIsCapturing(0, &cs) == cudaSuccess
+			/* Same rule as the BF16 path: beta != 0 times out of place. */
+			if (*beta != 0.0f) {
+				if (cudaMalloc(&time_D, (size_t)M * (size_t)N
+				    * sizeof(float)) == cudaSuccess)
+					time_D_owned = 1;
+				else
+					time_D = NULL;
+			}
+			if (time_D && cudaStreamIsCapturing(0, &cs) == cudaSuccess
 			    && cs == cudaStreamCaptureStatusNone
 			    && cudaEventCreate(&ev0) == cudaSuccess
 			    && cudaEventCreate(&ev1) == cudaSuccess) {
@@ -1229,7 +1310,7 @@ static int cublas_lt_gemm_fp8_ex(cublasOperation_t opa, cublasOperation_t opb,
 					(void)cudaEventRecord(ev0, 0);
 					r = cublasLtMatmul(g_cublaslt, op,
 					    alpha, B, layoutA, A, layoutB, beta,
-					    C, layoutC, C, layoutC,
+					    C, layoutC, time_D, layoutC,
 					    &heurs[hi].algo, g_lt_workspace,
 					    heurs[hi].workspaceSize > 0
 					    ? heurs[hi].workspaceSize
@@ -1247,6 +1328,8 @@ static int cublas_lt_gemm_fp8_ex(cublasOperation_t opa, cublasOperation_t opb,
 				cudaEventDestroy(ev0);
 				cudaEventDestroy(ev1);
 			}
+			if (time_D_owned)
+				cudaFree(time_D);
 		}
 		if (best_i < 0) {
 			for (hi = 0; hi < returned; hi++) {
@@ -1745,22 +1828,25 @@ static int cublas_gemm_rm_ha(ann_real *dC, const ann_real *dA, const ann_real *d
 		void *act8 = NULL;
 		float *act_scale = NULL;
 		int hot = 0;
+		fp8_act_slot *as = fp8_act_scale(dA, 0);
 
 		hot = (fp8_hot_take(dA, (int)nA, &act8, &act_scale) == 0);
-		if ((K & 15) == 0 && (N & 15) == 0 && (M & 15) == 0
+		if (!hot && as)
+			act_scale = FP8_SCALE_CUR(as);
+		if (act_scale && (K & 15) == 0 && (N & 15) == 0 && (M & 15) == 0
 		    && fp8_scales_ensure() == 0
 		    && fp8_wt_get_ex(dB, K, N, 1, 0, &wt_fp8, &wt_scale) == 0
 		    && (hot || (ensure_fp8_buf(&g_fp8_A, &g_fp8_A_cap, nA) == 0
-		    && fp8_quant_tensor(g_fp8_A, g_fp8_scale_A, dA, (int)nA, 0)
+		    && fp8_quant_tensor(g_fp8_A, act_scale, dA, (int)nA, 0)
 		    == 0))
 		    && cublas_lt_gemm_fp8_ex(CUBLAS_OP_T, CUBLAS_OP_N, N, M, K,
 		    &alpha, wt_fp8, K, wt_scale, CUDA_R_8F_E4M3,
-		    hot ? act8 : g_fp8_A, K, hot ? act_scale : g_fp8_scale_A,
+		    hot ? act8 : g_fp8_A, K, act_scale,
 		    CUDA_R_8F_E4M3, &beta, dC, N) == 0) {
 			if (hot)
 				fp8_hot_finish();
 			else
-				fp8_act_scale_commit(g_fp8_scale_A, 0);
+				fp8_act_scale_commit(act_scale, 0);
 			pthread_mutex_unlock(&g_gemm_mu);
 			return 0;
 		}
@@ -1949,15 +2035,17 @@ static int cublas_gemm_rm_bt(ann_real *dC, const ann_real *dA,
 	    && (K & 15) == 0 && (N & 15) == 0 && (M & 15) == 0) {
 		void *wt_fp8 = NULL;
 		float *wt_scale = NULL;
+		fp8_act_slot *as = fp8_act_scale(dA, 1);
 
-		if (fp8_scales_ensure() == 0
+		if (as && fp8_scales_ensure() == 0
 		    && ensure_fp8_buf(&g_fp8_A, &g_fp8_A_cap, nA) == 0
 		    && fp8_wt_get_ex(dB, N, K, 0, 0, &wt_fp8, &wt_scale) == 0
-		    && fp8_quant_tensor(g_fp8_A, g_fp8_scale_B, dA, (int)nA, 1) == 0
+		    && fp8_quant_tensor(g_fp8_A, FP8_SCALE_CUR(as), dA, (int)nA, 1)
+		    == 0
 		    && cublas_lt_gemm_fp8_ex(CUBLAS_OP_T, CUBLAS_OP_N, N, M, K,
 		    &alpha, wt_fp8, K, wt_scale, CUDA_R_8F_E4M3, g_fp8_A, K,
-		    g_fp8_scale_B, CUDA_R_8F_E5M2, &beta, dC, N) == 0) {
-			fp8_act_scale_commit(g_fp8_scale_B, 1);
+		    FP8_SCALE_CUR(as), CUDA_R_8F_E5M2, &beta, dC, N) == 0) {
+			fp8_act_scale_commit(FP8_SCALE_CUR(as), 1);
 			g_fp8_dgrad_fail = 0;
 			pthread_mutex_unlock(&g_gemm_mu);
 			return 0;
@@ -2068,25 +2156,22 @@ static int cublas_gemm_rm_at(ann_real *dC, const ann_real *dA,
 			goto fp8_wgrad_skip;
 	}
 	if (g_fp8_dgrad && (T & 15) == 0 && (M & 15) == 0 && (N & 15) == 0) {
-		if (fp8_scales_ensure() == 0
+		fp8_act_slot *wa = fp8_act_scale(dA, 0);
+		fp8_act_slot *wb = fp8_act_scale(dB, 1);
+
+		if (wa && wb && fp8_scales_ensure() == 0
 		    && ensure_fp8_buf(&g_fp8_A, &g_fp8_A_cap, nA) == 0
 		    && ensure_fp8_buf(&g_fp8_B, &g_fp8_B_cap, nB) == 0
-		    && fp8_quant_transpose_tensor(g_fp8_A, g_fp8_scale_WA,
-		    g_fp8_scale_WA_next, dA, T, M, 0) == 0
-		    && fp8_quant_transpose_tensor(g_fp8_B, g_fp8_scale_WB,
-		    g_fp8_scale_WB_next, dB, T, N, 1) == 0
+		    && fp8_quant_transpose_tensor(g_fp8_A, FP8_SCALE_CUR(wa),
+		    FP8_SCALE_NEXT(wa), dA, T, M, 0) == 0
+		    && fp8_quant_transpose_tensor(g_fp8_B, FP8_SCALE_CUR(wb),
+		    FP8_SCALE_NEXT(wb), dB, T, N, 1) == 0
 		    && cublas_lt_gemm_fp8_ex(CUBLAS_OP_T, CUBLAS_OP_N, N, M, T,
-		    &alpha, g_fp8_B, T, g_fp8_scale_WB, CUDA_R_8F_E5M2,
-		    g_fp8_A, T, g_fp8_scale_WA, CUDA_R_8F_E4M3, &beta, dC, N)
+		    &alpha, g_fp8_B, T, FP8_SCALE_CUR(wb), CUDA_R_8F_E5M2,
+		    g_fp8_A, T, FP8_SCALE_CUR(wa), CUDA_R_8F_E4M3, &beta, dC, N)
 		    == 0) {
-			float *tmp;
-
-			tmp = g_fp8_scale_WA;
-			g_fp8_scale_WA = g_fp8_scale_WA_next;
-			g_fp8_scale_WA_next = tmp;
-			tmp = g_fp8_scale_WB;
-			g_fp8_scale_WB = g_fp8_scale_WB_next;
-			g_fp8_scale_WB_next = tmp;
+			wa->cur ^= 1;
+			wb->cur ^= 1;
 			pthread_mutex_unlock(&g_gemm_mu);
 			return 0;
 		}
@@ -2231,6 +2316,7 @@ static void twins_forget_dev(const void *p)
 	}
 #if CUDART_VERSION >= 12000 && defined(ANN_CUBLAS)
 	fp8_wt_invalidate((const ann_real *)p);
+	fp8_act_forget(p);
 #endif
 }
 
@@ -5122,35 +5208,39 @@ extern "C" int gpu_attn_qkv_fused(mat *q, mat *k, mat *v, const mat *x,
 		void *act8 = NULL;
 		float *act_scale = NULL;
 		int hot = 0;
+		fp8_act_slot *as;
 
 		pthread_mutex_lock(&g_gemm_mu);
+		as = fp8_act_scale(dx, 0);
 		hot = (fp8_hot_take(dx, (int)nA, &act8, &act_scale) == 0);
-		if (fp8_scales_ensure() == 0
+		if (!hot && as)
+			act_scale = FP8_SCALE_CUR(as);
+		if (act_scale && fp8_scales_ensure() == 0
 		    && fp8_wt_get_ex(dwq, D, D, 1, 0, &wq8, &sq) == 0
 		    && fp8_wt_get_ex(dwk, D, D, 1, 0, &wk8, &sk) == 0
 		    && fp8_wt_get_ex(dwv, D, D, 1, 0, &wv8, &sv) == 0
 		    && (hot || (ensure_fp8_buf(&g_fp8_A, &g_fp8_A_cap, nA) == 0
-		    && fp8_quant_tensor(g_fp8_A, g_fp8_scale_A, dx, (int)nA, 0)
+		    && fp8_quant_tensor(g_fp8_A, act_scale, dx, (int)nA, 0)
 		    == 0))
 		    && cublas_lt_gemm_fp8_ex(CUBLAS_OP_T, CUBLAS_OP_N, D, N, D,
 		    &alpha, wq8, D, sq, CUDA_R_8F_E4M3,
 		    hot ? act8 : g_fp8_A, D,
-		    hot ? act_scale : g_fp8_scale_A, CUDA_R_8F_E4M3, &beta,
+		    act_scale, CUDA_R_8F_E4M3, &beta,
 		    dq, D) == 0
 		    && cublas_lt_gemm_fp8_ex(CUBLAS_OP_T, CUBLAS_OP_N, D, N, D,
 		    &alpha, wk8, D, sk, CUDA_R_8F_E4M3,
 		    hot ? act8 : g_fp8_A, D,
-		    hot ? act_scale : g_fp8_scale_A, CUDA_R_8F_E4M3, &beta,
+		    act_scale, CUDA_R_8F_E4M3, &beta,
 		    dk, D) == 0
 		    && cublas_lt_gemm_fp8_ex(CUBLAS_OP_T, CUBLAS_OP_N, D, N, D,
 		    &alpha, wv8, D, sv, CUDA_R_8F_E4M3,
 		    hot ? act8 : g_fp8_A, D,
-		    hot ? act_scale : g_fp8_scale_A, CUDA_R_8F_E4M3, &beta,
+		    act_scale, CUDA_R_8F_E4M3, &beta,
 		    dv, D) == 0) {
 			if (hot)
 				fp8_hot_finish();
 			else
-				fp8_act_scale_commit(g_fp8_scale_A, 0);
+				fp8_act_scale_commit(act_scale, 0);
 			pthread_mutex_unlock(&g_gemm_mu);
 			if (launch_done() != 0)
 				goto qkv_triple;
@@ -5377,7 +5467,8 @@ static int gpu_layernorm_forward_ex_locked(ann_real *y, const ann_real *x,
 		int bs = ew_block_for(d);
 
 #if defined(ANN_CUBLAS) && CUDART_VERSION >= 12000
-		if (d <= 4096 && fp8_hot_prepare(T * d, &y8, &sc8, &am8) == 0)
+		if (d <= 4096
+		    && fp8_hot_prepare(T * d, ry.dev, &y8, &sc8, &am8) == 0)
 			hot = 1;
 #endif
 		ln_fwd_kernel<<<T, bs, (size_t)d * sizeof(ann_real)>>>(ry.dev,
