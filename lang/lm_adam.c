@@ -550,6 +550,7 @@ void lm_adam_step_scaled(lm_adam *opt, double lr, double grad_scale)
 	*/
 	gpu_device_sync();
 	if (gpu_available() && adam_step_gpu(opt, lr, grad_scale) == 0) {
+		gpu_op_prof_dump();	/* ANN_OP_PROF=1 only */
 		/*
 		** Host bias / LN vectors were rewritten by the D2H scatter:
 		** drop their cached device copies so the next forward uploads

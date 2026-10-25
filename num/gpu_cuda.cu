@@ -2545,6 +2545,124 @@ extern "C" const char *gpu_debug_last_error(void)
 	return e == cudaSuccess ? "" : cudaGetErrorString(e);
 }
 
+/*
+** ANN_OP_PROF=1: per-operation GPU time from cudaEvent pairs recorded on
+** the default stream around every gpu_* entry (nsys records no CUDA
+** trace on this WSL). Pairs are resolved at gpu_device_sync and the
+** table is printed by gpu_op_prof_dump (the optimizer step).
+*/
+enum {
+	OP_GEMM_FWD, OP_GEMM_DGRAD, OP_GEMM_WGRAD, OP_QKV, OP_ATTN_FWD,
+	OP_ATTN_BWD, OP_LN_FWD, OP_LN_BWD, OP_SOFTMAX, OP_CE, OP_COLSUM,
+	OP_ELEMWISE, OP_RESID, OP_EMBED, OP_POSENC, OP_PACK, OP_ADAM, OP_N
+};
+static const char *g_op_name[OP_N] = {
+	"gemm_fwd", "gemm_dgrad", "gemm_wgrad", "qkv_fused", "attn_fwd",
+	"attn_bwd", "ln_fwd", "ln_bwd", "softmax", "ce", "colsum", "elemwise",
+	"resid", "embed", "posenc", "pack", "adam"
+};
+#define OP_EV_SLOTS	16384
+typedef struct {
+	int		op;
+	cudaEvent_t	e0;
+	cudaEvent_t	e1;
+} op_ev;
+static op_ev g_op_ev[OP_EV_SLOTS];
+static int g_op_ev_n;
+static int g_op_ev_made;
+static double g_op_ms[OP_N];
+static long g_op_calls[OP_N];
+static int g_op_depth;
+
+static int op_prof_on(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		const char *e = getenv("ANN_OP_PROF");
+
+		on = (e && e[0] == '1') ? 1 : 0;
+	}
+	return on;
+}
+
+static int op_begin(int op)
+{
+	op_ev *e;
+
+	if (!op_prof_on() || g_op_depth > 0 || g_op_ev_n >= OP_EV_SLOTS
+	    || stream_is_capturing())
+		return -1;
+	e = &g_op_ev[g_op_ev_n];
+	if (g_op_ev_n >= g_op_ev_made) {
+		if (cudaEventCreate(&e->e0) != cudaSuccess
+		    || cudaEventCreate(&e->e1) != cudaSuccess)
+			return -1;
+		g_op_ev_made++;
+	}
+	e->op = op;
+	(void)cudaEventRecord(e->e0, 0);
+	g_op_depth++;
+	return g_op_ev_n++;
+}
+
+static void op_end(int i)
+{
+	if (i < 0)
+		return;
+	(void)cudaEventRecord(g_op_ev[i].e1, 0);
+	g_op_depth--;
+}
+
+struct OpScope {
+	int	i;
+	OpScope(int op) { i = op_begin(op); }
+	~OpScope() { op_end(i); }
+};
+
+/* After a device sync: fold the recorded pairs into the per-op totals. */
+static void op_prof_resolve(void)
+{
+	int i;
+	float ms;
+
+	for (i = 0; i < g_op_ev_n; i++) {
+		if (cudaEventElapsedTime(&ms, g_op_ev[i].e0, g_op_ev[i].e1)
+		    == cudaSuccess) {
+			g_op_ms[g_op_ev[i].op] += ms;
+			g_op_calls[g_op_ev[i].op]++;
+		}
+	}
+	g_op_ev_n = 0;
+}
+
+extern "C" void gpu_op_prof_dump(void)
+{
+	double tot = 0.0;
+	long mb;
+	int i;
+
+	if (!op_prof_on())
+		return;
+	if (cudaDeviceSynchronize() == cudaSuccess)
+		op_prof_resolve();
+	for (i = 0; i < OP_N; i++)
+		tot += g_op_ms[i];
+	mb = g_op_calls[OP_CE] > 0 ? g_op_calls[OP_CE] : 1;
+	fprintf(stderr, "[opprof] %ld microbatches, %.1f ms/microbatch of GPU op time\n",
+	    mb, tot / (double)mb);
+	for (i = 0; i < OP_N; i++) {
+		if (g_op_calls[i] == 0)
+			continue;
+		fprintf(stderr, "[opprof]   %-11s %6.1f ms/mb %5.1f%% %6ld calls/mb\n",
+		    g_op_name[i], g_op_ms[i] / (double)mb,
+		    tot > 0.0 ? 100.0 * g_op_ms[i] / tot : 0.0,
+		    g_op_calls[i] / mb);
+		g_op_ms[i] = 0.0;
+		g_op_calls[i] = 0;
+	}
+}
+
 extern "C" void gpu_device_sync(void)
 {
 	cudaError_t err;
@@ -2554,8 +2672,11 @@ extern "C" void gpu_device_sync(void)
 	err = cudaDeviceSynchronize();
 	if (err != cudaSuccess)
 		fprintf(stderr, "gpu_device_sync: %s\n", cudaGetErrorString(err));
-	else
+	else {
 		colsum_flush_all();
+		if (op_prof_on())
+			op_prof_resolve();
+	}
 }
 
 /*
@@ -2583,6 +2704,7 @@ static int finish_out(mat *m, ann_real *dptr, int owned)
 
 extern "C" int gpu_mat_mul(mat *c, const mat *a, const mat *b)
 {
+	OpScope _op(OP_GEMM_FWD);
 	ann_real *dA;
 	ann_real *dB;
 	ann_real *dC;
@@ -2671,6 +2793,7 @@ __global__ static void outer_add_kernel(ann_real *DW, const ann_real *A, const a
 
 extern "C" int gpu_mat_mul_bt(mat *c, const mat *a, const mat *b)
 {
+	OpScope _op(OP_GEMM_DGRAD);
 	ann_real *dA;
 	ann_real *dB;
 	ann_real *dC;
@@ -2741,6 +2864,7 @@ __global__ static void gemm_at_kernel(const ann_real *A, const ann_real *B, ann_
 /* c = a^T b ; a (T x m), b (T x n) -> c (m x n). cuBLAS OP_T when built in. */
 extern "C" int gpu_mat_mul_at(mat *c, const mat *a, const mat *b)
 {
+	OpScope _op(OP_GEMM_WGRAD);
 	ann_real *dA;
 	ann_real *dB;
 	ann_real *dC;
@@ -2797,6 +2921,7 @@ extern "C" int gpu_mat_mul_at(mat *c, const mat *a, const mat *b)
 */
 extern "C" int gpu_mat_outer_add(mat *dw, const mat *a, const mat *b)
 {
+	OpScope _op(OP_GEMM_WGRAD);
 	ann_real *dW;
 	ann_real *dA;
 	ann_real *dB;
@@ -3382,6 +3507,7 @@ static int gpu_softmax_rows_locked(ann_real *rows, int n_rows, int n_cols)
 
 extern "C" int gpu_softmax_rows(ann_real *rows, int n_rows, int n_cols)
 {
+	OpScope _op(OP_SOFTMAX);
 	int rc;
 
 	pthread_mutex_lock(&g_ew_mu);
@@ -3854,6 +3980,7 @@ out:
 extern "C" int gpu_attn_flash_fwd(mat *concat, const mat *q, const mat *k,
 	const mat *v, int B, int T, int H, int dh, mat *lse)
 {
+	OpScope _op(OP_ATTN_FWD);
 	ann_real *dq;
 	ann_real *dk;
 	ann_real *dv;
@@ -4046,6 +4173,7 @@ extern "C" int gpu_attn_tiled_bwd(mat *dq, mat *dk, mat *dv,
 	const mat *dconcat, const mat *concat, const mat *q, const mat *k,
 	const mat *v, const mat *lse, int B, int T, int H, int dh)
 {
+	OpScope _op(OP_ATTN_BWD);
 	ann_real *a_dq;
 	ann_real *a_dk;
 	ann_real *a_dv;
@@ -4170,6 +4298,7 @@ rec_out:
 extern "C" int gpu_bias_relu_forward(ann_real *x, const ann_real *bias,
 	int rows, int cols)
 {
+	OpScope _op(OP_ELEMWISE);
 	ew_ref rx;
 	ew_ref rb;
 	size_t nb;
@@ -4222,6 +4351,7 @@ extern "C" int gpu_bias_relu_forward(ann_real *x, const ann_real *bias,
 extern "C" int gpu_ffn_w1_finish(ann_real *hidden, ann_real *pre,
 	const ann_real *bias, int rows, int cols)
 {
+	OpScope _op(OP_ELEMWISE);
 	ew_ref rh;
 	ew_ref rp;
 	ew_ref rb;
@@ -4278,6 +4408,7 @@ extern "C" int gpu_ffn_w1_finish(ann_real *hidden, ann_real *pre,
 static int gpu_mat_mul_epi(mat *c, const mat *a, const mat *b,
 	const ann_real *bias, int with_relu)
 {
+	OpScope _op(OP_GEMM_FWD);
 	ann_real *dA;
 	ann_real *dB;
 	ann_real *dC;
@@ -4904,6 +5035,7 @@ static int tc_upload_seqlens(int B)
 extern "C" int gpu_attn_tc_fwd(mat *concat, mat *w, const mat *q, const mat *k,
 	const mat *v, int B, int T, int H, int dh)
 {
+	OpScope _op(OP_ATTN_FWD);
 #ifdef ANN_CUBLAS
 	ann_real *dq;
 	ann_real *dk;
@@ -5025,6 +5157,7 @@ extern "C" int gpu_attn_tc_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat,
 	mat *w, const mat *q, const mat *k, const mat *v, int B, int T, int H,
 	int dh)
 {
+	OpScope _op(OP_ATTN_BWD);
 #ifdef ANN_CUBLAS
 	ann_real *a_q;
 	ann_real *a_k;
@@ -5189,6 +5322,7 @@ __global__ static void unpack_seq_rows_kernel(ann_real *dst, const ann_real *src
 extern "C" int gpu_attn_qkv_fused(mat *q, mat *k, mat *v, const mat *x,
 	const mat *wq, const mat *wk, const mat *wv)
 {
+	OpScope _op(OP_QKV);
 	/*
 	** Three GemmEx sharing one BF16/FP16 convert of X (same for Wq/Wk/Wv).
 	** One fat X@[Wq|Wk|Wv] was tried; pack/split overhead canceled the win
@@ -5437,6 +5571,7 @@ qkv_triple:
 extern "C" int gpu_pack_seq_rows(ann_real *dst, const ann_real *src, int B,
 	int T, int D)
 {
+	OpScope _op(OP_PACK);
 	int n;
 	int threads = 256;
 
@@ -5451,6 +5586,7 @@ extern "C" int gpu_pack_seq_rows(ann_real *dst, const ann_real *src, int B,
 extern "C" int gpu_unpack_seq_rows(ann_real *dst, const ann_real *src, int B,
 	int T, int D)
 {
+	OpScope _op(OP_PACK);
 	int n;
 	int threads = 256;
 
@@ -5555,6 +5691,7 @@ extern "C" int gpu_layernorm_forward_ex(ann_real *y, const ann_real *x,
 	const ann_real *gamma, const ann_real *beta, ann_real *x_hat,
 	ann_real *mean, ann_real *inv_std, int T, int d, double eps)
 {
+	OpScope _op(OP_LN_FWD);
 	int rc;
 
 	pthread_mutex_lock(&g_ew_mu);
@@ -5655,6 +5792,7 @@ extern "C" int gpu_layernorm_backward(mat *dx, const mat *dy, const ann_real *ga
 	const ann_real *x_hat, const ann_real *inv_std, int T, int d,
 	ann_real *dgamma, ann_real *dbeta)
 {
+	OpScope _op(OP_LN_BWD);
 	int rc;
 
 	pthread_mutex_lock(&g_ew_mu);
@@ -5692,6 +5830,7 @@ static int gpu_bias_row_add_locked(ann_real *x, const ann_real *bias, int rows,
 extern "C" int gpu_bias_row_add(ann_real *x, const ann_real *bias, int rows,
 	int cols)
 {
+	OpScope _op(OP_ELEMWISE);
 	int rc;
 
 	pthread_mutex_lock(&g_ew_mu);
@@ -5753,6 +5892,7 @@ static int gpu_relu_backward_locked(ann_real *dx, const ann_real *x_pre_relu_or_
 extern "C" int gpu_relu_backward(ann_real *dx, const ann_real *x_pre_relu_or_mask,
 	int n)
 {
+	OpScope _op(OP_ELEMWISE);
 	int rc;
 
 	pthread_mutex_lock(&g_ew_mu);
@@ -5791,6 +5931,7 @@ __global__ static void sumsq_kernel(const ann_real *x, int n, double *acc)
 
 extern "C" int gpu_grad_sumsq(const ann_real *d_x, int n, double *out)
 {
+	OpScope _op(OP_ADAM);
 	static double *s_acc;
 
 	if (!d_x || n <= 0 || !out || !gpu_available())
@@ -6005,6 +6146,7 @@ extern "C" int gpu_adam_step_dev_bf16(ann_real *d_p, void *d_p_bf16,
 	ann_real *d_g, ann_real *d_m, ann_real *d_v, int n, double lr,
 	double beta1, double beta2, double eps, int t, double grad_scale)
 {
+	OpScope _op(OP_ADAM);
 	double bc1;
 	double bc2;
 
@@ -6170,6 +6312,7 @@ static int mat_ensure_dev_auth(mat *m)
 
 extern "C" int gpu_mat_copy(mat *dst, const mat *src)
 {
+	OpScope _op(OP_RESID);
 	size_t n;
 
 	if (!dst || !src)
@@ -6191,6 +6334,7 @@ extern "C" int gpu_mat_copy(mat *dst, const mat *src)
 
 extern "C" int gpu_mat_add(mat *dst, const mat *src)
 {
+	OpScope _op(OP_RESID);
 	int n;
 	int bs;
 
@@ -6213,6 +6357,7 @@ extern "C" int gpu_mat_add(mat *dst, const mat *src)
 
 extern "C" int gpu_mat_add2(mat *dst, const mat *a, const mat *b)
 {
+	OpScope _op(OP_RESID);
 	int n;
 	int bs;
 
@@ -6240,6 +6385,7 @@ extern "C" int gpu_mat_add2(mat *dst, const mat *a, const mat *b)
 
 extern "C" int gpu_mat_axpy(mat *y, double a, const mat *x)
 {
+	OpScope _op(OP_RESID);
 	int n;
 	int bs;
 
@@ -6295,6 +6441,7 @@ __global__ static void embed_scatter_kernel(ann_real *dtable, const ann_real *do
 
 extern "C" int gpu_embed_lookup(mat *out, const mat *table, const int *ids, int n)
 {
+	OpScope _op(OP_EMBED);
 	int *d_ids;
 	int d;
 	int nd;
@@ -6336,6 +6483,7 @@ extern "C" int gpu_embed_lookup(mat *out, const mat *table, const int *ids, int 
 extern "C" int gpu_embed_scatter(mat *dtable, const mat *dout, const int *ids,
 	int n)
 {
+	OpScope _op(OP_EMBED);
 	int *d_ids;
 	int d;
 	int nd;
@@ -6480,6 +6628,7 @@ static int g_ce_last_rows;
 extern "C" int gpu_ce_delta_from_softmax(ann_real *probs, const int *tgt,
 	int rows, int V, ann_real *db_host, double *mean_ce)
 {
+	OpScope _op(OP_CE);
 	ew_ref rp;
 	ew_ref rt;
 	static ann_real *s_db_dev;
@@ -6600,6 +6749,7 @@ extern "C" int gpu_ce_fetch_mean(double *mean_ce, int rows)
 
 extern "C" int gpu_posenc_add_packed(ann_real *x, int B, int T, int D)
 {
+	OpScope _op(OP_POSENC);
 	ew_ref rx;
 	size_t nb;
 	int n;
@@ -6635,6 +6785,7 @@ extern "C" int gpu_posenc_add_packed(ann_real *x, int B, int T, int D)
 extern "C" int gpu_mat_col_sum_add(ann_real *db_host, const ann_real *x,
 	int rows, int cols)
 {
+	OpScope _op(OP_COLSUM);
 	ew_ref rx;
 	colsum_acc *acc;
 	size_t nb;

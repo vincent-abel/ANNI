@@ -109,6 +109,10 @@ const char *gpu_debug_last_error(void)
 	return "";
 }
 
+void gpu_op_prof_dump(void)
+{
+}
+
 int gpu_memset(void *dst, int value, size_t nbytes)
 {
 	(void)dst;

@@ -65,6 +65,8 @@ void	gpu_half_wt_invalidate(const ann_real *fp32_dev);
 void	gpu_host_forget(const void *host);
 /* Debug: pending CUDA error string (cleared by the call); "" when none. */
 const char	*gpu_debug_last_error(void);
+/* ANN_OP_PROF=1: print and reset the per-operation GPU time table (stderr). */
+void	gpu_op_prof_dump(void);
 /* Reconvert all cached weight twins in place (stable addresses; after Adam). */
 void	gpu_half_wt_refresh_all(void);
 /*
