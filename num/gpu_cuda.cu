@@ -187,6 +187,18 @@ static int cublas_gemm_ex_bf16_h(cublasHandle_t h, int N, int M, int K,
 }
 #endif
 
+static int lt_heuristic_only(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		const char *e = getenv("ANN_LT_HEURISTIC");
+
+		on = (e && e[0] == '1') ? 1 : 0;
+	}
+	return on;
+}
+
 /*
 ** cuBLASLt BF16/FP16 GEMM with cached heuristic. Falls back to GemmEx.
 ** Column-major dims match existing GemmEx callers (N,M,K with opa/opb).
@@ -341,6 +353,8 @@ static int cublas_lt_gemm_half(cublasOperation_t opa, cublasOperation_t opb,
 		float best_ms;
 		cudaEvent_t ev0;
 		cudaEvent_t ev1;
+		float *time_D;
+		int time_D_owned;
 
 		st = cublasLtMatmulAlgoGetHeuristic(g_cublaslt, op, layoutA,
 		    layoutB, layoutC, layoutC, pref, 16, heurs, &returned);
@@ -355,10 +369,32 @@ static int cublas_lt_gemm_half(cublasOperation_t opa, cublasOperation_t opb,
 		/*
 		** Time each workspace-fitting candidate once. Heuristic order
 		** is often wrong on sm_120; pick the measured winner.
+		**
+		** The timing runs are real GEMMs. With beta == 0 they are
+		** idempotent, but an accumulate call (beta == 1: dW += A^T dY)
+		** would add the product once per candidate into C. Time those
+		** out of place into a scratch D (Lt allows D != C), and skip
+		** the timing when that scratch cannot be allocated.
 		*/
 		best_i = -1;
 		best_ms = 1e30f;
-		if (cudaEventCreate(&ev0) == cudaSuccess
+		time_D = C;
+		time_D_owned = 0;
+		if (*beta != 0.0f) {
+			size_t d_bytes = (size_t)M * (size_t)N * sizeof(float);
+
+			if (cudaMalloc(&time_D, d_bytes) == cudaSuccess)
+				time_D_owned = 1;
+			else
+				time_D = NULL;
+		}
+		/*
+		** ANN_LT_HEURISTIC=1 skips the timing and takes the first
+		** fitting candidate: different algos round differently, so
+		** tests that compare runs want a load-independent choice.
+		*/
+		if (time_D && !lt_heuristic_only()
+		    && cudaEventCreate(&ev0) == cudaSuccess
 		    && cudaEventCreate(&ev1) == cudaSuccess) {
 			for (hi = 0; hi < returned; hi++) {
 				float ms;
@@ -368,8 +404,9 @@ static int cublas_lt_gemm_half(cublasOperation_t opa, cublasOperation_t opb,
 					continue;
 				(void)cudaEventRecord(ev0, 0);
 				r = cublasLtMatmul(g_cublaslt, op, alpha, B,
-				    layoutA, A, layoutB, beta, C, layoutC, C,
-				    layoutC, &heurs[hi].algo, g_lt_workspace,
+				    layoutA, A, layoutB, beta, C, layoutC,
+				    time_D, layoutC, &heurs[hi].algo,
+				    g_lt_workspace,
 				    heurs[hi].workspaceSize > 0
 				    ? heurs[hi].workspaceSize
 				    : g_lt_workspace_bytes, 0);
@@ -388,6 +425,8 @@ static int cublas_lt_gemm_half(cublasOperation_t opa, cublasOperation_t opb,
 			cudaEventDestroy(ev0);
 			cudaEventDestroy(ev1);
 		}
+		if (time_D_owned)
+			cudaFree(time_D);
 		if (best_i < 0) {
 			for (hi = 0; hi < returned; hi++) {
 				if (heurs[hi].workspaceSize
