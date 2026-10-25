@@ -17,7 +17,7 @@ FALL=${2:?fallback binary}
 shift 2
 FLAGS=${*:---bf16 --flash-attn}
 T0=$(date +%H:%M:%S)
-if pgrep -f 'anni lm train' >/dev/null; then
+if pgrep -f '^\./anni lm train' >/dev/null; then
 	echo "training still running; pause it first"
 	exit 1
 fi
