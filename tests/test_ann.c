@@ -680,6 +680,60 @@ static double lm_grad_abs_sum(lm *model)
 }
 
 /* Packed B=3 (fat GEMMs, per-sequence causal attention) == 3 sequential steps. */
+/* Chat fine-tune: masked positions add no loss and no hidden gradient. */
+static void test_lm_loss_mask(void)
+{
+	enum { NB = 2, TT = 8 };
+	lm *model;
+	lm_cache *cp;
+	mat *dh;
+	int ids[NB * TT];
+	unsigned char mask[NB * TT];
+	double ce_all;
+	double ce_ones;
+	double ce_some;
+	double row;
+	int i;
+	int d;
+
+	srand(22);
+	model = lm_create();
+	cp = lm_cache_create_packed(NB, TT);
+	dh = mat_create(NB * TT, LM_D_MODEL);
+	assert(model && cp && dh);
+	for (i = 0; i < NB * TT; i++)
+		ids[i] = 'a' + (rand() % 20);
+	assert(lm_forward_cache_packed(model, ids, NB, TT, cp) == 0);
+	lm_zero_grad(model);
+	assert(lm_loss_backward_packed(model, cp, ids, NB, TT, dh, &ce_all) == 0);
+	memset(mask, 1, sizeof(mask));
+	lm_loss_set_mask(mask);
+	lm_zero_grad(model);
+	assert(lm_loss_backward_packed(model, cp, ids, NB, TT, dh, &ce_ones) == 0);
+	assert(fabs(ce_all - ce_ones) < 1e-5);
+	/* Keep only the targets at t = 2 and 5 of each sequence. */
+	memset(mask, 0, sizeof(mask));
+	mask[2] = mask[5] = mask[TT + 2] = mask[TT + 5] = 1;
+	lm_zero_grad(model);
+	assert(lm_loss_backward_packed(model, cp, ids, NB, TT, dh, &ce_some) == 0);
+	lm_loss_set_mask(NULL);
+	assert(ce_some > 0.0 && fabs(ce_some - ce_all) > 1e-6);
+	(void)mat_ensure_host(dh);
+	for (i = 0; i < NB * TT; i++) {
+		row = 0.0;
+		for (d = 0; d < LM_D_MODEL; d++)
+			row += fabs(dh->data[(size_t)i * LM_D_MODEL + d]);
+		/* Hidden row t predicts token t + 1. */
+		if (i % TT == 1 || i % TT == 4)
+			assert(row > 0.0);
+		else
+			assert(row == 0.0);
+	}
+	mat_free(&dh);
+	lm_cache_free(&cp);
+	lm_free(&model);
+}
+
 static void test_lm_packed_matches_sequential(void)
 {
 	enum { NB = 3, TT = 8 };
@@ -1023,6 +1077,30 @@ static void test_text_dataset_ids_file(void)
 	text_dataset_free(&ds);
 	assert(!ds);
 	remove("objects/test_ids.bin");
+}
+
+/* *_mids.bin: negative ids decode to -(v+1) and come back masked. */
+static void test_text_dataset_masked_ids(void)
+{
+	text_dataset *ds;
+	FILE *fp;
+	int vals[8] = { 10, -12, -13, 14, 15, -17, 18, 19 };
+	int ids[LM_MAX_CTX];
+	unsigned char loss[LM_MAX_CTX];
+	int n;
+
+	fp = fopen("objects/test_chat_mids.bin", "wb");
+	assert(fp && fwrite(vals, sizeof(int), 8, fp) == 8);
+	fclose(fp);
+	ds = text_dataset_load_tok("objects/test_chat_mids.bin", 8, NULL);
+	assert(ds && ds->masked);
+	assert(text_dataset_window_mask(ds, 0, ids, loss, &n) == 0 && n == 8);
+	assert(ids[0] == 10 && ids[1] == 11 && ids[2] == 12 && ids[5] == 16);
+	assert(loss[0] == 1 && loss[1] == 0 && loss[2] == 0 && loss[3] == 1);
+	assert(loss[5] == 0 && loss[7] == 1);
+	assert(text_dataset_head(ds, ids, 4) == 4 && ids[1] == 11);
+	text_dataset_free(&ds);
+	remove("objects/test_chat_mids.bin");
 }
 
 /* Pretokenized mixes pass 2^31 ids: window count must not overflow. */
@@ -1552,6 +1630,7 @@ int main(void)
 	test_lm_backprop_head();
 	test_text_dataset();
 	test_text_dataset_ids_file();
+	test_text_dataset_masked_ids();
 	test_text_dataset_huge_ids();
 	test_chat_reply_cut();
 	test_bpe_roundtrip();
@@ -1559,6 +1638,7 @@ int main(void)
 	test_split_and_stream();
 	test_lm_train_corpus();
 	test_lm_packed_matches_sequential();
+	test_lm_loss_mask();
 	test_lm_serialize_roundtrip();
 	test_lm_merge_average();
 	test_lm_checkpoint_resume();

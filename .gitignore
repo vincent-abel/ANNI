@@ -40,6 +40,7 @@ gui/__pycache__/
 scripts/__pycache__/
 scripts/pretok_ids
 scripts/bpe_train
+scripts/pretok_chat
 
 # models, vocabs, local train artifacts (never vendored)
 models/
@@ -63,3 +64,4 @@ data/chat*
 
 # local run logs
 logs/
+data/.mix_built
