@@ -441,6 +441,8 @@ int attn_mha_forward_cache(mat *out, attn *a, const mat *x, int causal,
 			return -1;
 		write_head(c->concat, c->o_h[h], h, a->d_head);
 	}
+	/* Host wrote concat (mat_fill may have marked its twin current). */
+	mat_host_dirty(c->concat);
 	if (mat_mul(out, c->concat, a->wo) != 0)
 		return -1;
 	return 0;

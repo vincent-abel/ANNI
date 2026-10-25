@@ -2696,10 +2696,18 @@ static int finish_out(mat *m, ann_real *dptr, int owned)
 			m->on_device = MAT_DEV_DEVICE;
 		return 0;
 	}
+	/*
+	** Eager: mirror the result to the host and leave the host
+	** authoritative (host code may edit it in place without marking). A
+	** device-only mat (no host pages) stays device-authoritative: marking
+	** it HOST handed every consumer a NULL host pointer and the CPU
+	** fallbacks read zeros, which made eager-mode forwards (resume start
+	** NLL, lm info, generation) evaluate a loaded model near random.
+	*/
 	if (m->data && gpu_memcpy_d2h(m->data, dptr, mat_bytes(m)) != 0)
 		return -1;
 	if (m->d_data && !owned && m->on_device != MAT_DEV_ALIASED)
-		m->on_device = MAT_DEV_HOST;
+		m->on_device = m->data ? MAT_DEV_HOST : MAT_DEV_DEVICE;
 	return 0;
 }
 
