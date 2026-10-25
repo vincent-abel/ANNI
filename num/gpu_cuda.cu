@@ -1512,6 +1512,15 @@ extern "C" void gpu_half_wt_invalidate(const ann_real *fp32)
 static int op_begin_nested(int op);
 static void op_end(int i);
 #define OP_CONVERT_ID	17	/* == OP_CONVERT; enum is defined further down */
+#define OP_ATT_PACK_ID	18
+#define OP_ATT_GEMM_ID	19
+#define OP_ATT_SMX_ID	20
+/* Nested sub-step timer (inside attn_fwd / attn_bwd scopes). */
+struct OpNest {
+	int	i;
+	OpNest(int op) { i = op_begin_nested(op); }
+	~OpNest() { op_end(i); }
+};
 
 static int half_wt_convert(void *dst, const ann_real *src, int n, int bf16)
 {
@@ -2554,12 +2563,13 @@ enum {
 	OP_GEMM_FWD, OP_GEMM_DGRAD, OP_GEMM_WGRAD, OP_QKV, OP_ATTN_FWD,
 	OP_ATTN_BWD, OP_LN_FWD, OP_LN_BWD, OP_SOFTMAX, OP_CE, OP_COLSUM,
 	OP_ELEMWISE, OP_RESID, OP_EMBED, OP_POSENC, OP_PACK, OP_ADAM,
-	OP_CONVERT, OP_N
+	OP_CONVERT, OP_ATT_PACK, OP_ATT_GEMM, OP_ATT_SMX, OP_N
 };
 static const char *g_op_name[OP_N] = {
 	"gemm_fwd", "gemm_dgrad", "gemm_wgrad", "qkv_fused", "attn_fwd",
 	"attn_bwd", "ln_fwd", "ln_bwd", "softmax", "ce", "colsum", "elemwise",
-	"resid", "embed", "posenc", "pack", "adam", "convert"
+	"resid", "embed", "posenc", "pack", "adam", "convert", "att_pack",
+	"att_gemm", "att_smx"
 };
 #define OP_EV_SLOTS	16384
 typedef struct {
@@ -5238,24 +5248,24 @@ extern "C" int gpu_attn_tc_fwd(mat *concat, mat *w, const mat *q, const mat *k,
 		    || ensure_half_buf(&g_tc_half_k, &g_tc_half_k_cap,
 		    (size_t)npack * 2) != 0)
 			goto tc_fwd_out;
-		attn_pack_heads_bf16_kernel<<<(npack + threads - 1) / threads,
-		    threads>>>((__nv_bfloat16 *)g_tc_half_q, dq, B, T, H, dh);
-		attn_pack_heads_bf16_kernel<<<(npack + threads - 1) / threads,
-		    threads>>>((__nv_bfloat16 *)g_tc_half_k, dk, B, T, H, dh);
-		attn_pack_heads_kernel<<<(npack + threads - 1) / threads,
-		    threads>>>(g_tc_v, dv, B, T, H, dh);
-		if (tc_gemm_qk_half(dw, T, dh, batch, 1) != 0)
+		{ OpNest _n(OP_ATT_PACK_ID); attn_pack_heads_bf16_kernel<<<(npack + threads - 1) / threads,
+		    threads>>>((__nv_bfloat16 *)g_tc_half_q, dq, B, T, H, dh); }
+		{ OpNest _n(OP_ATT_PACK_ID); attn_pack_heads_bf16_kernel<<<(npack + threads - 1) / threads,
+		    threads>>>((__nv_bfloat16 *)g_tc_half_k, dk, B, T, H, dh); }
+		{ OpNest _n(OP_ATT_PACK_ID); attn_pack_heads_kernel<<<(npack + threads - 1) / threads,
+		    threads>>>(g_tc_v, dv, B, T, H, dh); }
+		if (OpNest(OP_ATT_GEMM_ID), tc_gemm_qk_half(dw, T, dh, batch, 1) != 0)
 			goto tc_fwd_out;
 	} else
 #endif
 	{
-		attn_pack_heads_kernel<<<(npack + threads - 1) / threads,
-		    threads>>>(g_tc_q, dq, B, T, H, dh);
-		attn_pack_heads_kernel<<<(npack + threads - 1) / threads,
-		    threads>>>(g_tc_k, dk, B, T, H, dh);
-		attn_pack_heads_kernel<<<(npack + threads - 1) / threads,
-		    threads>>>(g_tc_v, dv, B, T, H, dh);
-		if (tc_gemm_qk_batched(dw, g_tc_q, g_tc_k, T, dh, batch) != 0)
+		{ OpNest _n(OP_ATT_PACK_ID); attn_pack_heads_kernel<<<(npack + threads - 1) / threads,
+		    threads>>>(g_tc_q, dq, B, T, H, dh); }
+		{ OpNest _n(OP_ATT_PACK_ID); attn_pack_heads_kernel<<<(npack + threads - 1) / threads,
+		    threads>>>(g_tc_k, dk, B, T, H, dh); }
+		{ OpNest _n(OP_ATT_PACK_ID); attn_pack_heads_kernel<<<(npack + threads - 1) / threads,
+		    threads>>>(g_tc_v, dv, B, T, H, dh); }
+		if (OpNest(OP_ATT_GEMM_ID), tc_gemm_qk_batched(dw, g_tc_q, g_tc_k, T, dh, batch) != 0)
 			goto tc_fwd_out;
 	}
 	scale = (ann_real)(1.0 / sqrt((double)dh));
@@ -5265,14 +5275,14 @@ extern "C" int gpu_attn_tc_fwd(mat *concat, mat *w, const mat *q, const mat *k,
 
 		while (nth < T && nth < ATT_BLOCK)
 			nth <<= 1;
-		attn_tc_softmax_kernel<<<sgrid, nth>>>(dw, NULL, T, H, scale,
+		{ OpNest _n(OP_ATT_SMX_ID); attn_tc_softmax_kernel<<<sgrid, nth>>>(dw, NULL, T, H, scale,
 		    g_att_seqlens_host ? g_att_seqlens_dev : NULL,
-		    tc_fp8_softmax_buf(batch, T));
+		    tc_fp8_softmax_buf(batch, T)); }
 	}
-	if (tc_gemm_pv_batched(g_tc_o, dw, g_tc_v, T, dh, batch) != 0)
+	if (OpNest(OP_ATT_GEMM_ID), tc_gemm_pv_batched(g_tc_o, dw, g_tc_v, T, dh, batch) != 0)
 		goto tc_fwd_out;
-	attn_unpack_heads_kernel<<<(npack + threads - 1) / threads, threads>>>(
-	    dc, g_tc_o, B, T, H, dh);
+	{ OpNest _n(OP_ATT_PACK_ID); attn_unpack_heads_kernel<<<(npack + threads - 1) / threads, threads>>>(
+	    dc, g_tc_o, B, T, H, dh); }
 	if (launch_done() == 0 && finish_out(concat, dc, oc) == 0) {
 		w->on_device = MAT_DEV_DEVICE;
 		rc = 0;
@@ -5370,43 +5380,43 @@ extern "C" int gpu_attn_tc_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat,
 		int nth = 32;
 
 		/* Pack Q/K/V and dO. */
-		attn_pack_heads_kernel<<<(npack + threads - 1) / threads,
-		    threads>>>(g_tc_q, a_q, B, T, H, dh);
-		attn_pack_heads_kernel<<<(npack + threads - 1) / threads,
-		    threads>>>(g_tc_k, a_k, B, T, H, dh);
-		attn_pack_heads_kernel<<<(npack + threads - 1) / threads,
-		    threads>>>(g_tc_v, a_v, B, T, H, dh);
-		attn_pack_heads_kernel<<<(npack + threads - 1) / threads,
-		    threads>>>(g_tc_o, a_dc, B, T, H, dh);
-		if (tc_gemm_qk_batched(dw, g_tc_q, g_tc_k, T, dh, batch) != 0)
+		{ OpNest _n(OP_ATT_PACK_ID); attn_pack_heads_kernel<<<(npack + threads - 1) / threads,
+		    threads>>>(g_tc_q, a_q, B, T, H, dh); }
+		{ OpNest _n(OP_ATT_PACK_ID); attn_pack_heads_kernel<<<(npack + threads - 1) / threads,
+		    threads>>>(g_tc_k, a_k, B, T, H, dh); }
+		{ OpNest _n(OP_ATT_PACK_ID); attn_pack_heads_kernel<<<(npack + threads - 1) / threads,
+		    threads>>>(g_tc_v, a_v, B, T, H, dh); }
+		{ OpNest _n(OP_ATT_PACK_ID); attn_pack_heads_kernel<<<(npack + threads - 1) / threads,
+		    threads>>>(g_tc_o, a_dc, B, T, H, dh); }
+		if (OpNest(OP_ATT_GEMM_ID), tc_gemm_qk_batched(dw, g_tc_q, g_tc_k, T, dh, batch) != 0)
 			goto tc_bwd_out;
 		while (nth < T && nth < ATT_BLOCK)
 			nth <<= 1;
-		attn_tc_softmax_kernel<<<sgrid, nth>>>(dw, NULL, T, H,
+		{ OpNest _n(OP_ATT_SMX_ID); attn_tc_softmax_kernel<<<sgrid, nth>>>(dw, NULL, T, H,
 		    (ann_real)scale,
 		    g_att_seqlens_host ? g_att_seqlens_dev : NULL,
-		    tc_fp8_softmax_buf(batch, T));
+		    tc_fp8_softmax_buf(batch, T)); }
 		/* dP = dO V^T (needs V); then dV = W^T dO (overwrites V). */
-		if (tc_gemm_do_vt(g_tc_dp, g_tc_o, g_tc_v, T, dh, batch) != 0)
+		if (OpNest(OP_ATT_GEMM_ID), tc_gemm_do_vt(g_tc_dp, g_tc_o, g_tc_v, T, dh, batch) != 0)
 			goto tc_bwd_out;
-		if (tc_gemm_wt_do(g_tc_v, dw, g_tc_o, T, dh, batch) != 0)
+		if (OpNest(OP_ATT_GEMM_ID), tc_gemm_wt_do(g_tc_v, dw, g_tc_o, T, dh, batch) != 0)
 			goto tc_bwd_out;
-		attn_tc_softmax_bwd_kernel<<<sgrid, nth>>>(g_tc_dp, NULL, dw,
-		    T, H, g_att_seqlens_host ? g_att_seqlens_dev : NULL);
+		{ OpNest _n(OP_ATT_SMX_ID); attn_tc_softmax_bwd_kernel<<<sgrid, nth>>>(g_tc_dp, NULL, dw,
+		    T, H, g_att_seqlens_host ? g_att_seqlens_dev : NULL); }
 		/* dQ = dS K -> g_tc_o; dK = dS^T Q -> g_tc_k (Q still in g_tc_q). */
-		if (tc_gemm_ds_k(g_tc_o, g_tc_dp, g_tc_k, T, dh, batch, scale)
+		if (OpNest(OP_ATT_GEMM_ID), tc_gemm_ds_k(g_tc_o, g_tc_dp, g_tc_k, T, dh, batch, scale)
 		    != 0)
 			goto tc_bwd_out;
-		if (tc_gemm_dst_q(g_tc_k, g_tc_dp, g_tc_q, T, dh, batch, scale)
+		if (OpNest(OP_ATT_GEMM_ID), tc_gemm_dst_q(g_tc_k, g_tc_dp, g_tc_q, T, dh, batch, scale)
 		    != 0)
 			goto tc_bwd_out;
 	}
-	attn_unpack_heads_kernel<<<(npack + threads - 1) / threads, threads>>>(
-	    a_dq, g_tc_o, B, T, H, dh);
-	attn_unpack_heads_kernel<<<(npack + threads - 1) / threads, threads>>>(
-	    a_dk, g_tc_k, B, T, H, dh);
-	attn_unpack_heads_kernel<<<(npack + threads - 1) / threads, threads>>>(
-	    a_dv, g_tc_v, B, T, H, dh);
+	{ OpNest _n(OP_ATT_PACK_ID); attn_unpack_heads_kernel<<<(npack + threads - 1) / threads, threads>>>(
+	    a_dq, g_tc_o, B, T, H, dh); }
+	{ OpNest _n(OP_ATT_PACK_ID); attn_unpack_heads_kernel<<<(npack + threads - 1) / threads, threads>>>(
+	    a_dk, g_tc_k, B, T, H, dh); }
+	{ OpNest _n(OP_ATT_PACK_ID); attn_unpack_heads_kernel<<<(npack + threads - 1) / threads, threads>>>(
+	    a_dv, g_tc_v, B, T, H, dh); }
 	if (launch_done() == 0 && finish_out(dq, a_dq, o[4]) == 0
 	    && finish_out(dk, a_dk, o[5]) == 0
 	    && finish_out(dv, a_dv, o[6]) == 0)
