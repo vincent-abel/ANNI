@@ -5328,8 +5328,8 @@ static int tc_upload_seqlens(int B)
 #define FA_SPAD	8		/* fp32 score row pad (bank spread) */
 
 __global__ static void attn_fa_wmma_fwd_kernel(ann_real *out, ann_real *lse,
-	const ann_real *q, const ann_real *k, const ann_real *v, int T, int H,
-	int dh, float scale)
+	const __nv_bfloat16 *q, const __nv_bfloat16 *k, const __nv_bfloat16 *v,
+	int T, int H, int dh, float scale)
 {
 	using namespace nvcuda;
 	extern __shared__ unsigned char fa_sm[];
@@ -5353,11 +5353,12 @@ __global__ static void attn_fa_wmma_fwd_kernel(ann_real *out, ann_real *lse,
 	const int nkt = qt + 1;				/* causal: key tiles 0..qt */
 	int i, kt, kk, nt, c;
 
-	/* Q tile -> BF16 shared (rows q0..q0+63). */
-	for (i = threadIdx.x; i < FA_BQ * dh; i += blockDim.x) {
-		int r = i / dh, cc = i % dh;
-		Qs[r * dh + cc] = __float2bfloat16(
-		    q[(row0 + q0 + r) * D + h * dh + cc]);
+	/* Q tile (head-major BF16, contiguous 64 x dh) -> shared. */
+	{
+		const __nv_bfloat16 *qsrc = q + ((size_t)bh * T + q0) * dh;
+
+		for (i = threadIdx.x; i < FA_BQ * dh; i += blockDim.x)
+			Qs[i] = qsrc[i];
 	}
 	if (threadIdx.x < FA_BQ) {
 		rm[threadIdx.x] = -1e30f;
@@ -5369,10 +5370,11 @@ __global__ static void attn_fa_wmma_fwd_kernel(ann_real *out, ann_real *lse,
 	for (kt = 0; kt < nkt; kt++) {
 		const int k0 = kt * FA_BK;
 
-		for (i = threadIdx.x; i < FA_BK * dh; i += blockDim.x) {
-			int r = i / dh, cc = i % dh;
-			Ks[r * dh + cc] = __float2bfloat16(
-			    k[(row0 + k0 + r) * D + h * dh + cc]);
+		{
+			const __nv_bfloat16 *ksrc = k + ((size_t)bh * T + k0) * dh;
+
+			for (i = threadIdx.x; i < FA_BK * dh; i += blockDim.x)
+				Ks[i] = ksrc[i];
 		}
 		__syncthreads();
 		/* S_w = Q_w K^T: 16 x 64 per warp. */
@@ -5430,12 +5432,14 @@ __global__ static void attn_fa_wmma_fwd_kernel(ann_real *out, ann_real *lse,
 		for (kt = 0; kt < nkt; kt++) {
 			const int k0 = kt * FA_BK;
 
-			for (i = threadIdx.x; i < FA_BK * dh; i += blockDim.x) {
-				int r = i / dh, cc = i % dh;
-				Ks[r * dh + cc] = __float2bfloat16(
-				    k[(row0 + k0 + r) * D + h * dh + cc]);
-				Vs[r * dh + cc] = __float2bfloat16(
-				    v[(row0 + k0 + r) * D + h * dh + cc]);
+			{
+				const __nv_bfloat16 *ksrc = k + ((size_t)bh * T + k0) * dh;
+				const __nv_bfloat16 *vsrc = v + ((size_t)bh * T + k0) * dh;
+
+				for (i = threadIdx.x; i < FA_BK * dh; i += blockDim.x) {
+					Ks[i] = ksrc[i];
+					Vs[i] = vsrc[i];
+				}
 			}
 			__syncthreads();
 			for (nt = 0; nt < FA_BK / 16; nt++) {
@@ -5550,10 +5554,26 @@ extern "C" int gpu_attn_fa_fwd(mat *concat, const mat *q, const mat *k,
 		goto fa_out;
 	{
 		dim3 grid(B * H, T / FA_BQ);
+		size_t npack = (size_t)B * H * T * dh;
+		int threads = 256;
+		int blocks = (int)((npack + threads - 1) / threads);
 
-		attn_fa_wmma_fwd_kernel<<<grid, 32 * FA_WARPS, smem>>>(dc,
-		    lse->d_data, dq, dk, dv, T, H, dh,
-		    (float)(1.0 / sqrt((double)dh)));
+		/* Operands once as head-major BF16: half the bytes per tile load. */
+		if (ensure_half_buf(&g_tc_half_q, &g_tc_half_q_cap, npack * 2) != 0
+		    || ensure_half_buf(&g_tc_half_k, &g_tc_half_k_cap, npack * 2) != 0
+		    || ensure_half_buf(&g_tc_half_v, &g_tc_half_v_cap, npack * 2) != 0)
+			goto fa_out;
+		{ OpNest _n(OP_ATT_PACK_ID); attn_pack_heads_bf16_kernel<<<blocks, threads>>>(
+		    (__nv_bfloat16 *)g_tc_half_q, dq, B, T, H, dh); }
+		{ OpNest _n(OP_ATT_PACK_ID); attn_pack_heads_bf16_kernel<<<blocks, threads>>>(
+		    (__nv_bfloat16 *)g_tc_half_k, dk, B, T, H, dh); }
+		{ OpNest _n(OP_ATT_PACK_ID); attn_pack_heads_bf16_kernel<<<blocks, threads>>>(
+		    (__nv_bfloat16 *)g_tc_half_v, dv, B, T, H, dh); }
+		{ OpNest _n(OP_ATT_GEMM_ID); attn_fa_wmma_fwd_kernel<<<grid, 32 * FA_WARPS, smem>>>(dc,
+		    lse->d_data, (const __nv_bfloat16 *)g_tc_half_q,
+		    (const __nv_bfloat16 *)g_tc_half_k,
+		    (const __nv_bfloat16 *)g_tc_half_v, T, H, dh,
+		    (float)(1.0 / sqrt((double)dh))); }
 	}
 	if (launch_done() == 0 && finish_out(concat, dc, oc) == 0) {
 		lse->on_device = MAT_DEV_DEVICE;
@@ -5602,9 +5622,9 @@ __global__ static void attn_fa_dvec_kernel(float *dvec, const ann_real *dO,
 ** (FP32) per query tile. No score matrix in HBM.
 */
 __global__ static void attn_fa_wmma_bwd_kernel(ann_real *dq, ann_real *dk,
-	ann_real *dv, const ann_real *q, const ann_real *k, const ann_real *v,
-	const ann_real *dO, const float *lse, const float *dvec, int T, int H,
-	int dh, float scale)
+	ann_real *dv, const __nv_bfloat16 *q, const __nv_bfloat16 *k,
+	const __nv_bfloat16 *v, const __nv_bfloat16 *dO, const float *lse,
+	const float *dvec, int T, int H, int dh, float scale)
 {
 	using namespace nvcuda;
 	extern __shared__ unsigned char fa_sm[];
@@ -5636,21 +5656,24 @@ __global__ static void attn_fa_wmma_bwd_kernel(ann_real *dq, ann_real *dk,
 		wmma::fill_fragment(dkacc[nt], 0.0f);
 		wmma::fill_fragment(dvacc[nt], 0.0f);
 	}
-	for (i = threadIdx.x; i < FA_BK * dh; i += blockDim.x) {
-		int r = i / dh, cc = i % dh;
-		size_t off = (row0 + k0 + r) * D + h * dh + cc;
-		Ks[r * dh + cc] = __float2bfloat16(k[off]);
-		Vs[r * dh + cc] = __float2bfloat16(v[off]);
+	{
+		const __nv_bfloat16 *ksrc = k + ((size_t)bh * T + k0) * dh;
+		const __nv_bfloat16 *vsrc = v + ((size_t)bh * T + k0) * dh;
+
+		for (i = threadIdx.x; i < FA_BK * dh; i += blockDim.x) {
+			Ks[i] = ksrc[i];
+			Vs[i] = vsrc[i];
+		}
 	}
 	__syncthreads();
 	for (qt = kt; qt < T / FA_BQ; qt++) {
 		const int q0 = qt * FA_BQ;
+		const __nv_bfloat16 *qsrc = q + ((size_t)bh * T + q0) * dh;
+		const __nv_bfloat16 *dsrc = dO + ((size_t)bh * T + q0) * dh;
 
 		for (i = threadIdx.x; i < FA_BQ * dh; i += blockDim.x) {
-			int r = i / dh, cc = i % dh;
-			size_t off = (row0 + q0 + r) * D + h * dh + cc;
-			Qs[r * dh + cc] = __float2bfloat16(q[off]);
-			dOs[r * dh + cc] = __float2bfloat16(dO[off]);
+			Qs[i] = qsrc[i];
+			dOs[i] = dsrc[i];
 		}
 		if (threadIdx.x < FA_BQ) {
 			ls[threadIdx.x] = lse[(size_t)bh * T + q0 + threadIdx.x];
@@ -5847,11 +5870,33 @@ extern "C" int gpu_attn_fa_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat,
 		if (cudaMemsetAsync(ptr[5], 0, (size_t)B * T * H * dh
 		    * sizeof(ann_real), 0) != cudaSuccess)
 			goto fa_bwd_out;
-		attn_fa_dvec_kernel<<<(unsigned)((nrows + 255) / 256), 256>>>(
-		    g_fa_dvec, ptr[0], ptr[1], (int)nrows, T, H, dh);
-		attn_fa_wmma_bwd_kernel<<<grid, 32 * FA_WARPS, smem>>>(ptr[5],
-		    ptr[6], a_dv, ptr[2], ptr[3], ptr[4], ptr[0], lse->d_data,
-		    g_fa_dvec, T, H, dh, (float)(1.0 / sqrt((double)dh)));
+		{
+			size_t npack = (size_t)B * H * T * dh;
+			int threads = 256;
+			int blocks = (int)((npack + threads - 1) / threads);
+
+			if (ensure_half_buf(&g_tc_half_q, &g_tc_half_q_cap, npack * 2) != 0
+			    || ensure_half_buf(&g_tc_half_k, &g_tc_half_k_cap, npack * 2) != 0
+			    || ensure_half_buf(&g_tc_half_v, &g_tc_half_v_cap, npack * 2) != 0
+			    || ensure_half_buf(&g_tc_half_do, &g_tc_half_do_cap, npack * 2) != 0)
+				goto fa_bwd_out;
+			{ OpNest _n(OP_ATT_PACK_ID); attn_pack_heads_bf16_kernel<<<blocks, threads>>>(
+			    (__nv_bfloat16 *)g_tc_half_q, ptr[2], B, T, H, dh); }
+			{ OpNest _n(OP_ATT_PACK_ID); attn_pack_heads_bf16_kernel<<<blocks, threads>>>(
+			    (__nv_bfloat16 *)g_tc_half_k, ptr[3], B, T, H, dh); }
+			{ OpNest _n(OP_ATT_PACK_ID); attn_pack_heads_bf16_kernel<<<blocks, threads>>>(
+			    (__nv_bfloat16 *)g_tc_half_v, ptr[4], B, T, H, dh); }
+			{ OpNest _n(OP_ATT_PACK_ID); attn_pack_heads_bf16_kernel<<<blocks, threads>>>(
+			    (__nv_bfloat16 *)g_tc_half_do, ptr[0], B, T, H, dh); }
+		}
+		{ OpNest _n(OP_ATT_SMX_ID); attn_fa_dvec_kernel<<<(unsigned)((nrows + 255) / 256), 256>>>(
+		    g_fa_dvec, ptr[0], ptr[1], (int)nrows, T, H, dh); }
+		{ OpNest _n(OP_ATT_GEMM_ID); attn_fa_wmma_bwd_kernel<<<grid, 32 * FA_WARPS, smem>>>(ptr[5],
+		    ptr[6], a_dv, (const __nv_bfloat16 *)g_tc_half_q,
+		    (const __nv_bfloat16 *)g_tc_half_k,
+		    (const __nv_bfloat16 *)g_tc_half_v,
+		    (const __nv_bfloat16 *)g_tc_half_do, lse->d_data,
+		    g_fa_dvec, T, H, dh, (float)(1.0 / sqrt((double)dh))); }
 		if (launch_done() == 0 && finish_out(dq, ptr[5], o[5]) == 0
 		    && finish_out(dk, ptr[6], o[6]) == 0
 		    && finish_out(dv, a_dv, odv) == 0)
