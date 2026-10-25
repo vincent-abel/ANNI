@@ -105,7 +105,7 @@ finetune() {
 	    --tokenizer bpe --vocab data/mix.vocab \
 	    --window 256 --stride 256 --batch 16 --grad-accum 8 --epochs 2 \
 	    --lr 5e-5 --lr-decay none --grad-clip 1.0 --weight-decay 0.1 \
-	    --flash-attn --bf16 --eval-every 1 --eval-windows 256 --seed 2 -d
+	    --flash-attn --eval-every 1 --eval-windows 256 --seed 2 -d
 }
 
 pretrain() {
@@ -117,9 +117,9 @@ pretrain() {
 	    --data data/mix_train_ids.bin --val-data data/mix_val_ids.bin \
 	    --tokenizer bpe --vocab data/mix.vocab \
 	    --window 256 --stride 256 --batch 16 --grad-accum 32 --epochs 1 \
-	    --lr 1.5e-4 --lr-warmup 1500 --lr-decay cosine --lr-decay-steps 27600 --adam-beta2 0.95 \
+	    --lr 3e-4 --lr-warmup 1000 --lr-decay cosine --lr-decay-steps 28100 --adam-beta2 0.95 \
 	    --grad-clip 1.0 --weight-decay 0.1 \
-	    --flash-attn --bf16 \
+	    --flash-attn \
 	    --eval-every 1 --eval-windows 256 --ckpt-minutes 30 --seed 1 -d
 }
 
