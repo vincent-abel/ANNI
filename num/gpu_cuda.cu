@@ -30,6 +30,7 @@ extern "C" {
 
 static int g_sync_mode;
 static void devvec_forget(const void *host);
+static void fa_pack_forget(const void *p);
 static int g_compute_prec;
 static int g_fp8_fwd;
 static int g_fp8_dgrad;
@@ -2435,6 +2436,7 @@ static void twins_forget_dev(const void *p)
 	fp8_wt_invalidate((const ann_real *)p);
 	fp8_act_forget(p);
 #endif
+	fa_pack_forget(p);
 }
 
 extern "C" void gpu_free(void *p)
@@ -5493,6 +5495,68 @@ static int fa_wmma_ok(int T, int dh)
 	    && !g_att_seqlens_host;
 }
 
+/*
+** Packed BF16 Q, K, V of each layer's forward, kept for that layer's
+** backward (keyed on the FP32 q pointer: the per-layer cache mats are
+** stable). 36 slots cover 12 layers; 24 MB per slot at B=16, T=256.
+*/
+#define FA_PACK_SLOTS	36
+typedef struct {
+	const ann_real	*q;
+	void		*qkv;		/* 3 x n BF16: q, k, v head-major */
+	size_t		cap;
+	size_t		n;
+	int		live;
+} fa_pack_slot;
+static fa_pack_slot g_fa_pack[FA_PACK_SLOTS];
+static int g_fa_pack_rr;
+
+static fa_pack_slot *fa_pack_get(const ann_real *q, size_t n, int create)
+{
+	int i;
+	int free_slot = -1;
+	fa_pack_slot *e;
+
+	for (i = 0; i < FA_PACK_SLOTS; i++) {
+		if (g_fa_pack[i].q == q && g_fa_pack[i].n == n)
+			return &g_fa_pack[i];
+		if (free_slot < 0 && !g_fa_pack[i].q)
+			free_slot = i;
+	}
+	if (!create)
+		return NULL;
+	if (free_slot < 0)
+		free_slot = (g_fa_pack_rr++) % FA_PACK_SLOTS;
+	e = &g_fa_pack[free_slot];
+	if (e->cap < n * 6) {
+		if (e->qkv)
+			cudaFree(e->qkv);
+		e->qkv = NULL;
+		e->cap = 0;
+		if (cudaMalloc(&e->qkv, n * 6) != cudaSuccess) {
+			e->qkv = NULL;
+			e->q = NULL;
+			return NULL;
+		}
+		e->cap = n * 6;
+	}
+	e->q = q;
+	e->n = n;
+	e->live = 0;
+	return e;
+}
+
+static void fa_pack_forget(const void *p)
+{
+	int i;
+
+	for (i = 0; i < FA_PACK_SLOTS; i++)
+		if (g_fa_pack[i].q == (const ann_real *)p) {
+			g_fa_pack[i].q = NULL;
+			g_fa_pack[i].live = 0;
+		}
+}
+
 /* 1 when the fused tensor-core attention will take this shape in BF16 mode. */
 extern "C" int gpu_attn_fa_usable(int T, int dh)
 {
@@ -5545,22 +5609,31 @@ extern "C" int gpu_attn_fa_fwd(mat *concat, const mat *q, const mat *k,
 		int threads = 256;
 		int blocks = (int)((npack + threads - 1) / threads);
 
-		/* Operands once as head-major BF16: half the bytes per tile load. */
-		if (ensure_half_buf(&g_tc_half_q, &g_tc_half_q_cap, npack * 2) != 0
-		    || ensure_half_buf(&g_tc_half_k, &g_tc_half_k_cap, npack * 2) != 0
-		    || ensure_half_buf(&g_tc_half_v, &g_tc_half_v_cap, npack * 2) != 0)
-			goto fa_out;
-		{ OpNest _n(OP_ATT_PACK_ID); attn_pack_heads_bf16_kernel<<<blocks, threads>>>(
-		    (__nv_bfloat16 *)g_tc_half_q, dq, B, T, H, dh); }
-		{ OpNest _n(OP_ATT_PACK_ID); attn_pack_heads_bf16_kernel<<<blocks, threads>>>(
-		    (__nv_bfloat16 *)g_tc_half_k, dk, B, T, H, dh); }
-		{ OpNest _n(OP_ATT_PACK_ID); attn_pack_heads_bf16_kernel<<<blocks, threads>>>(
-		    (__nv_bfloat16 *)g_tc_half_v, dv, B, T, H, dh); }
+		fa_pack_slot *ps = oq ? NULL : fa_pack_get(dq, npack, 1);
+		__nv_bfloat16 *hq, *hk, *hv;
+
+		/* Operands once as head-major BF16, kept for the backward. */
+		if (ps) {
+			hq = (__nv_bfloat16 *)ps->qkv;
+			hk = hq + npack;
+			hv = hk + npack;
+		} else {
+			if (ensure_half_buf(&g_tc_half_q, &g_tc_half_q_cap, npack * 2) != 0
+			    || ensure_half_buf(&g_tc_half_k, &g_tc_half_k_cap, npack * 2) != 0
+			    || ensure_half_buf(&g_tc_half_v, &g_tc_half_v_cap, npack * 2) != 0)
+				goto fa_out;
+			hq = (__nv_bfloat16 *)g_tc_half_q;
+			hk = (__nv_bfloat16 *)g_tc_half_k;
+			hv = (__nv_bfloat16 *)g_tc_half_v;
+		}
+		{ OpNest _n(OP_ATT_PACK_ID); attn_pack_heads_bf16_kernel<<<blocks, threads>>>(hq, dq, B, T, H, dh); }
+		{ OpNest _n(OP_ATT_PACK_ID); attn_pack_heads_bf16_kernel<<<blocks, threads>>>(hk, dk, B, T, H, dh); }
+		{ OpNest _n(OP_ATT_PACK_ID); attn_pack_heads_bf16_kernel<<<blocks, threads>>>(hv, dv, B, T, H, dh); }
 		{ OpNest _n(OP_ATT_GEMM_ID); attn_fa_wmma_fwd_kernel<<<grid, 32 * FA_WARPS, smem>>>(dc,
-		    lse->d_data, (const __nv_bfloat16 *)g_tc_half_q,
-		    (const __nv_bfloat16 *)g_tc_half_k,
-		    (const __nv_bfloat16 *)g_tc_half_v, T, H, dh,
+		    lse->d_data, hq, hk, hv, T, H, dh,
 		    (float)(1.0 / sqrt((double)dh))); }
+		if (ps)
+			ps->live = 1;
 	}
 	if (launch_done() == 0 && finish_out(concat, dc, oc) == 0) {
 		lse->on_device = MAT_DEV_DEVICE;
@@ -5809,6 +5882,7 @@ extern "C" int gpu_attn_fa_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat,
 	int o[7];
 	int i, rc = -1;
 	size_t smem, nrows;
+	const __nv_bfloat16 *hq = NULL, *hk = NULL, *hv = NULL;
 
 	if (!dq || !dk || !dv || !dconcat || !concat || !q || !k || !v || !lse
 	    || !lse->d_data || !att_args_ok(B, T, H, dh) || !fa_wmma_ok(T, dh)
@@ -5883,26 +5957,38 @@ extern "C" int gpu_attn_fa_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat,
 			int threads = 256;
 			int blocks = (int)((npack + threads - 1) / threads);
 
-			if (ensure_half_buf(&g_tc_half_q, &g_tc_half_q_cap, npack * 2) != 0
-			    || ensure_half_buf(&g_tc_half_k, &g_tc_half_k_cap, npack * 2) != 0
-			    || ensure_half_buf(&g_tc_half_v, &g_tc_half_v_cap, npack * 2) != 0
-			    || ensure_half_buf(&g_tc_half_do, &g_tc_half_do_cap, npack * 2) != 0)
+			fa_pack_slot *ps = o[2] ? NULL : fa_pack_get(ptr[2], npack, 0);
+
+			if (ensure_half_buf(&g_tc_half_do, &g_tc_half_do_cap, npack * 2) != 0)
 				goto fa_bwd_out;
-			{ OpNest _n(OP_ATT_PACK_ID); attn_pack_heads_bf16_kernel<<<blocks, threads>>>(
-			    (__nv_bfloat16 *)g_tc_half_q, ptr[2], B, T, H, dh); }
-			{ OpNest _n(OP_ATT_PACK_ID); attn_pack_heads_bf16_kernel<<<blocks, threads>>>(
-			    (__nv_bfloat16 *)g_tc_half_k, ptr[3], B, T, H, dh); }
-			{ OpNest _n(OP_ATT_PACK_ID); attn_pack_heads_bf16_kernel<<<blocks, threads>>>(
-			    (__nv_bfloat16 *)g_tc_half_v, ptr[4], B, T, H, dh); }
+			if (ps && ps->live) {
+				/* The forward's packed Q, K, V (consumed once). */
+				hq = (const __nv_bfloat16 *)ps->qkv;
+				hk = hq + npack;
+				hv = hk + npack;
+				ps->live = 0;
+			} else {
+				if (ensure_half_buf(&g_tc_half_q, &g_tc_half_q_cap, npack * 2) != 0
+				    || ensure_half_buf(&g_tc_half_k, &g_tc_half_k_cap, npack * 2) != 0
+				    || ensure_half_buf(&g_tc_half_v, &g_tc_half_v_cap, npack * 2) != 0)
+					goto fa_bwd_out;
+				{ OpNest _n(OP_ATT_PACK_ID); attn_pack_heads_bf16_kernel<<<blocks, threads>>>(
+				    (__nv_bfloat16 *)g_tc_half_q, ptr[2], B, T, H, dh); }
+				{ OpNest _n(OP_ATT_PACK_ID); attn_pack_heads_bf16_kernel<<<blocks, threads>>>(
+				    (__nv_bfloat16 *)g_tc_half_k, ptr[3], B, T, H, dh); }
+				{ OpNest _n(OP_ATT_PACK_ID); attn_pack_heads_bf16_kernel<<<blocks, threads>>>(
+				    (__nv_bfloat16 *)g_tc_half_v, ptr[4], B, T, H, dh); }
+				hq = (const __nv_bfloat16 *)g_tc_half_q;
+				hk = (const __nv_bfloat16 *)g_tc_half_k;
+				hv = (const __nv_bfloat16 *)g_tc_half_v;
+			}
 			{ OpNest _n(OP_ATT_PACK_ID); attn_pack_heads_bf16_kernel<<<blocks, threads>>>(
 			    (__nv_bfloat16 *)g_tc_half_do, ptr[0], B, T, H, dh); }
 		}
 		{ OpNest _n(OP_ATT_SMX_ID); attn_fa_dvec_kernel<<<(unsigned)((nrows + 255) / 256), 256>>>(
 		    g_fa_dvec, ptr[0], ptr[1], (int)nrows, T, H, dh); }
 		{ OpNest _n(OP_ATT_GEMM_ID); attn_fa_wmma_bwd_kernel<<<grid, 32 * FA_WARPS, smem>>>(ptr[5],
-		    ptr[6], a_dv, (const __nv_bfloat16 *)g_tc_half_q,
-		    (const __nv_bfloat16 *)g_tc_half_k,
-		    (const __nv_bfloat16 *)g_tc_half_v,
+		    ptr[6], a_dv, hq, hk, hv,
 		    (const __nv_bfloat16 *)g_tc_half_do, lse->d_data,
 		    g_fa_dvec, T, H, dh, (float)(1.0 / sqrt((double)dh))); }
 		if (launch_done() == 0 && finish_out(dq, ptr[5], o[5]) == 0
