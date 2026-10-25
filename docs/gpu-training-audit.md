@@ -2,7 +2,7 @@
 
 ## Abstract
 
-The talk-170m pretraining diverged in BF16 at a learning rate where FP32 was stable, so the GPU training path (`num/gpu_cuda.cu`, `lang/lm_adam.c`, `lang/lm.c`) was audited end to end against a CPU reference on the small test model. One bug was BF16-specific; the four most damaging ones affected every precision and had been active since the FP8/residency rewrite. The worst: the cross-entropy targets were cached on the device by host address and never refreshed, so after the first optimizer step every microbatch was scored and back-propagated against the targets of one fixed microbatch. Eight defects were fixed, each verified by a GPU regression test (`make test-gpu`) that compares the BF16 and FP32 gradients tensor by tensor from the first step and checks that a forward pass is a pure function of its inputs.
+The talk-170m pretraining diverged in BF16 at a learning rate where FP32 was stable, so the GPU training path (`num/gpu_cuda.cu`, `lang/lm_adam.c`, `lang/lm.c`) was audited end to end against a CPU reference on the small test model. One bug was BF16-specific; the four most damaging ones affected every precision and had been active since the FP8/residency rewrite. The worst: the cross-entropy targets were cached on the device by host address and never refreshed, so after the first optimizer step every microbatch was scored and back-propagated against the targets of one fixed microbatch. Nine defects were fixed, each verified by a GPU regression test (`make test-gpu`) that compares the BF16 and FP32 gradients tensor by tensor from the first step and checks that a forward pass is a pure function of its inputs.
 
 ## Method
 
@@ -27,11 +27,15 @@ An env-gated verifier (`ANN_TWIN_CHECK=1`) re-converts every cached BF16 twin an
 7. **Residency marked wrong after host fallbacks (all precisions).** The pattern `p = mat_compute_ptr(m); gpu_op(p); mat_mark_device(m)` marked the device authoritative even when `p` was the host pointer, so the following ops read the stale twin. Fix: `mat_mark_written(m, p)` marks whichever side the kernel wrote; used at every such site in `lm.c`, `ffn.c`, `layernorm.c`.
 8. **Twin caches outliving their buffers (BF16, latent).** Half-precision weight twins and the two activation twins are keyed on the FP32 device address; `cudaMalloc` reuses addresses, and `half_wt_get` also accepted activations (per-head K/V in the fallback attention path) as if they were weights. Fix: `gpu_free` drops any twin of the freed buffer, `vec_free` drops the device copy and column-sum accumulator of a freed host vector, and once the Adam flat is registered only pointers inside it get a persistent twin.
 
+9. **FP8 delayed scaling shared one scale across all tensors (FP8).** The E4M3/E5M2 path kept a single device scale for every forward activation, another for every dgrad operand and one pair for wgrad, and the LayerNorm one-pass quantizer one scale for every LN output. Delayed scaling means a tensor is quantized with the amax recorded by the *previous* call, which here was a different tensor of a different layer: whenever the magnitude rose the values saturated at 448 (E4M3 `SATFINITE`), and when it fell the tensor lost its mantissa bits. Fix: scale slots keyed on the FP32 source address (`fp8_act_scale`), one per tensor and format, so each tensor sees its own previous amax, as in TransformerEngine. The FP8 cuBLASLt wrapper had the same algorithm-timing accumulate bug as defect 4 and got the same out-of-place fix. The FP8 weight cache itself was sound: 320 slots cover the 146 (weight, layout) pairs of the 12-block model, and the device Adam step invalidates it.
+
 Not fixed, noted: the cuBLASLt algorithm cache evicts into slot 0 when full (thrash, performance only); CUDA-graph replay re-reads host targets only through the captured memcpy nodes, so `--cuda-graphs` still needs pinned, stable target buffers; there is no final LayerNorm before the output head (quality, not correctness).
 
 ## Results on the test model
 
 Before the fixes, two identical runs in one process gave different step-1 losses (5.572 vs 5.554 against a CPU reference of 5.582) and BF16 gradients 1.2x to 7.3x larger than FP32. After the fixes GPU FP32 matches the CPU reference to all printed digits over three Adam steps (per-parameter checksums identical), two runs are bitwise repeatable, and BF16 stays within the tolerances above at every step; the largest BF16 deviation is dW1 at about 12% relative error with the same norm, from ReLU-mask flips near zero.
+
+With the per-tensor scales, FP8 training on the test model stays within 1e-2 of the FP32 loss over four steps and every weight gradient within 23% relative error and 3% in norm (BF16: 13% and 1%). `make test-gpu` checks BF16 and FP8 against FP32 at those tolerances.
 
 ## Consequence for the talk-170m run
 
