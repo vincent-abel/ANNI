@@ -129,6 +129,7 @@
 - [FFN ReLU backward in one pass (80 TF)](ffn-relu-backward-fusion.md)
 - [Fused attention on mma.sync (93 TF)](attention-fa2-mma.md)
 - [BF16 outputs straight from the GEMMs (97 TF)](bf16-direct-outputs.md)
+- [Code audit: dead paths and remaining compute](code-audit-dead-paths-and-compute.md)
 - [Plan: proper 8-bit and 4-bit training](low-precision-plan.md)
 
 ### From toy LM → small LLM
