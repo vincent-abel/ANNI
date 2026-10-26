@@ -32,6 +32,7 @@ static int g_sync_mode;
 static void devvec_forget(const void *host);
 static void fa_pack_forget(const void *p);
 static void qkv_bf16_forget(const void *p);
+static int twin_emit_on(void);
 static int g_compute_prec;
 static int g_fp8_fwd;
 static int g_fp8_dgrad;
@@ -2255,8 +2256,18 @@ static int cublas_gemm_rm_bias_relu(ann_real *dC, const ann_real *dA,
 ** N x K (both row-major), C is M x N. CUBLAS_OP_T reads B transposed in place
 ** -- no host (or device) transpose copy.
 */
+static int cublas_gemm_rm_bt_ex(ann_real *dC, const ann_real *dA,
+	const ann_real *dB, int M, int N, int K, int accumulate, void *out16);
+
 static int cublas_gemm_rm_bt(ann_real *dC, const ann_real *dA,
 	const ann_real *dB, int M, int N, int K, int accumulate)
+{
+	return cublas_gemm_rm_bt_ex(dC, dA, dB, M, N, K, accumulate, NULL);
+}
+
+/* out16: write the product as BF16 there (Lt, no FP32 C) instead of dC. BF16 mode, beta = 0 only. */
+static int cublas_gemm_rm_bt_ex(ann_real *dC, const ann_real *dA,
+	const ann_real *dB, int M, int N, int K, int accumulate, void *out16)
 {
 	const ann_real alpha = 1.0f;
 	const ann_real beta = accumulate ? 1.0f : 0.0f;
@@ -2348,8 +2359,13 @@ static int cublas_gemm_rm_bt(ann_real *dC, const ann_real *dA,
 				pthread_mutex_unlock(&g_gemm_mu);
 				return -1;
 			}
-			rc = cublas_gemm_ex_bf16(CUBLAS_OP_T, CUBLAS_OP_N, N,
-			    M, K, &alpha, hB_use, K, hA_use, K, &beta, dC, N);
+			if (out16 && !accumulate)
+				rc = cublas_lt_gemm_half(CUBLAS_OP_T, CUBLAS_OP_N, N, M, K,
+				    &alpha, hB_use, K, hA_use, K, &beta, (float *)out16, N, 1,
+				    CUBLASLT_EPILOGUE_DEFAULT, NULL, NULL, 1);
+			else
+				rc = cublas_gemm_ex_bf16(CUBLAS_OP_T, CUBLAS_OP_N, N,
+				    M, K, &alpha, hB_use, K, hA_use, K, &beta, dC, N);
 			pthread_mutex_unlock(&g_gemm_mu);
 			return rc;
 		}
@@ -3251,6 +3267,69 @@ extern "C" int gpu_mat_mul_bt_acc(mat *c, const mat *a, const mat *b)
 		gpu_free(dB);
 	if (ownC)
 		gpu_free(dC);
+	return rc;
+#else
+	(void)c; (void)a; (void)b;
+	return -1;
+#endif
+}
+
+/*
+** c = a b^T written only as the BF16 gradient twin of c (training, BF16
+** mode): the attention backward reads the twin strided, so the FP32 c is
+** never written (it is marked device-resident but holds nothing). -1 =
+** caller uses gpu_mat_mul_bt / mat_mul_wt.
+*/
+extern "C" int gpu_mat_mul_bt_twin(mat *c, const mat *a, const mat *b)
+{
+#ifdef ANN_CUBLAS
+	OpScope _op(OP_GEMM_DGRAD);
+	ann_real *dA;
+	ann_real *dB;
+	ann_real *dC;
+	int ownA;
+	int ownB;
+	int ownC;
+	void *tw;
+	int rc = -1;
+
+	if (!c || !a || !b || !gpu_available() || g_compute_prec != GPU_PREC_BF16
+	    || g_sync_mode == GPU_SYNC_EAGER || stream_is_capturing() || !twin_emit_on())
+		return -1;
+#if CUDART_VERSION >= 12000
+	if (g_fp8_dgrad)	/* the FP8 dgrad writes FP32 and would leave the twin unwritten */
+		return -1;
+#endif
+	if (a->cols != b->cols || c->rows != a->rows || c->cols != b->rows)
+		return -1;
+	if (ensure_dev(a, &dA, &ownA) != 0)
+		return -1;
+	if (ensure_dev(b, &dB, &ownB) != 0) {
+		if (ownA)
+			gpu_free(dA);
+		return -1;
+	}
+	if (ensure_dev_out(c, &dC, &ownC) != 0 || ownC) {
+		if (ownA)
+			gpu_free(dA);
+		if (ownB)
+			gpu_free(dB);
+		return -1;
+	}
+	pthread_mutex_lock(&g_gemm_mu);
+	tw = grad_twin_reserve(dC, (size_t)c->rows * (size_t)c->cols);
+	pthread_mutex_unlock(&g_gemm_mu);
+	if (tw && cublas_gemm_rm_bt_ex(dC, dA, dB, a->rows, b->rows, a->cols, 0, tw) == 0
+	    && launch_done() == 0 && finish_out(c, dC, 0) == 0)
+		rc = 0;
+	else if (tw) {
+		grad_twin_forget(dC);
+		(void)cudaGetLastError();
+	}
+	if (ownA)
+		gpu_free(dA);
+	if (ownB)
+		gpu_free(dB);
 	return rc;
 #else
 	(void)c; (void)a; (void)b;
@@ -6193,6 +6272,45 @@ __global__ static void attn_fa_dvec_kernel(float *dvec, const ann_real *dO,
 	dvec[idx] = acc;
 }
 
+/* Same from the BF16 twin of dO (model layout). */
+__global__ static void attn_fa_dvec16_kernel(float *dvec, const __nv_bfloat16 *dO,
+	const ann_real *O, int nrows, int T, int H, int dh)
+{
+	int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	int bh = idx / T;
+	int i = idx % T;
+	int b = bh / H;
+	int h = bh % H;
+	int D = H * dh;
+	size_t off;
+	float acc = 0.0f;
+	int c;
+
+	if (idx >= nrows)
+		return;
+	off = ((size_t)b * T + i) * D + h * dh;
+	for (c = 0; c < dh; c++)
+		acc += __bfloat162float(dO[off + c]) * O[off + c];
+	dvec[idx] = acc;
+}
+
+/* Head-major BF16 pack from a BF16 model-layout matrix (dO twin on the fallback path). */
+__global__ static void attn_pack_heads_bf16_from16_kernel(__nv_bfloat16 *out,
+	const __nv_bfloat16 *in, int B, int T, int H, int dh)
+{
+	size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+	size_t n = (size_t)B * H * T * dh;
+	int c, t, h, b;
+
+	if (idx >= n)
+		return;
+	c = (int)(idx % dh);
+	t = (int)((idx / dh) % T);
+	h = (int)((idx / ((size_t)dh * T)) % H);
+	b = (int)(idx / ((size_t)dh * T * H));
+	out[idx] = in[((size_t)b * T + t) * (size_t)H * dh + (size_t)h * dh + c];
+}
+
 /*
 ** Fused causal attention backward (FA-2 order): one block per (b, h,
 ** 64-key tile), four warps of 16 key rows. Query tiles from the diagonal
@@ -6465,6 +6583,7 @@ extern "C" int gpu_attn_fa_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat,
 		ann_real *a_dv;
 		int odv = 0;
 		dim3 grid(B * H, T / FA_BK);
+		const __nv_bfloat16 *dO16 = NULL;
 
 		if (ensure_dev_out(dv, &a_dv, &odv) != 0)
 			goto fa_bwd_out;
@@ -6475,6 +6594,13 @@ extern "C" int gpu_attn_fa_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat,
 			size_t npack = (size_t)B * H * T * dh;
 			int threads = 256;
 			int blocks = (int)((npack + threads - 1) / threads);
+
+			/* The Wo dgrad may have left dO only as a BF16 twin (gpu_mat_mul_bt_twin). */
+			if (!o[0]) {
+				pthread_mutex_lock(&g_gemm_mu);
+				dO16 = (const __nv_bfloat16 *)grad_twin_take(ptr[0], npack);
+				pthread_mutex_unlock(&g_gemm_mu);
+			}
 
 			qkv_bf16_slot *qs = o[2] ? NULL : qkv_bf16_get(ptr[2], B * T, H * dh, 0);
 			fa_pack_slot *ps = o[2] ? NULL : fa_pack_get(ptr[2], npack, 0);
@@ -6500,14 +6626,21 @@ extern "C" int gpu_attn_fa_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat,
 					if (!dv16)
 						dk16 = NULL;
 				}
-				{ OpNest _n(OP_ATT_PACK_ID); attn_pack_heads_bf16_kernel<<<blocks, threads>>>(
-				    (__nv_bfloat16 *)g_tc_half_do, ptr[0], B, T, H, dh); }
-				{ OpNest _n(OP_ATT_SMX_ID); attn_fa_dvec_kernel<<<(unsigned)((nrows + 255) / 256), 256>>>(
-				    g_fa_dvec, ptr[0], ptr[1], (int)nrows, T, H, dh); }
+				if (dO16) {
+					/* dO's BF16 twin (written by the Wo dgrad GEMM), read strided; dvec from it. */
+					{ OpNest _n(OP_ATT_SMX_ID); attn_fa_dvec16_kernel<<<(unsigned)((nrows + 255) / 256), 256>>>(
+					    g_fa_dvec, dO16, ptr[1], (int)nrows, T, H, dh); }
+				} else {
+					{ OpNest _n(OP_ATT_PACK_ID); attn_pack_heads_bf16_kernel<<<blocks, threads>>>(
+					    (__nv_bfloat16 *)g_tc_half_do, ptr[0], B, T, H, dh); }
+					{ OpNest _n(OP_ATT_SMX_ID); attn_fa_dvec_kernel<<<(unsigned)((nrows + 255) / 256), 256>>>(
+					    g_fa_dvec, ptr[0], ptr[1], (int)nrows, T, H, dh); }
+				}
 				{ OpNest _n(OP_ATT_GEMM_ID); if (fa2_bwd_launch_lay(ptr[5], ptr[6], a_dv, bq, bq + Dm, bq + 2 * Dm,
-				    (const __nv_bfloat16 *)g_tc_half_do, lse->d_data, g_fa_dvec,
+				    dO16 ? dO16 : (const __nv_bfloat16 *)g_tc_half_do, lse->d_data, g_fa_dvec,
 				    B, T, H, dh, (float)(1.0 / sqrt((double)dh)),
-				    fa2_lay_rows(T, 3 * Dm, dh), fa2_lay_headmajor(T, H, dh),
+				    fa2_lay_rows(T, 3 * Dm, dh),
+				    dO16 ? fa2_lay_rows(T, Dm, dh) : fa2_lay_headmajor(T, H, dh),
 				    (__nv_bfloat16 *)dk16, (__nv_bfloat16 *)dv16) != 0) {
 					if (dk16) {
 						grad_twin_forget(ptr[6]);
@@ -6538,11 +6671,21 @@ extern "C" int gpu_attn_fa_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat,
 				hk = (const __nv_bfloat16 *)g_tc_half_k;
 				hv = (const __nv_bfloat16 *)g_tc_half_v;
 			}
-			{ OpNest _n(OP_ATT_PACK_ID); attn_pack_heads_bf16_kernel<<<blocks, threads>>>(
-			    (__nv_bfloat16 *)g_tc_half_do, ptr[0], B, T, H, dh); }
+			if (dO16) {
+				{ OpNest _n(OP_ATT_PACK_ID); attn_pack_heads_bf16_from16_kernel<<<blocks, threads>>>(
+				    (__nv_bfloat16 *)g_tc_half_do, dO16, B, T, H, dh); }
+			} else {
+				{ OpNest _n(OP_ATT_PACK_ID); attn_pack_heads_bf16_kernel<<<blocks, threads>>>(
+				    (__nv_bfloat16 *)g_tc_half_do, ptr[0], B, T, H, dh); }
+			}
 		}
-		{ OpNest _n(OP_ATT_SMX_ID); attn_fa_dvec_kernel<<<(unsigned)((nrows + 255) / 256), 256>>>(
-		    g_fa_dvec, ptr[0], ptr[1], (int)nrows, T, H, dh); }
+		if (dO16) {
+			{ OpNest _n(OP_ATT_SMX_ID); attn_fa_dvec16_kernel<<<(unsigned)((nrows + 255) / 256), 256>>>(
+			    g_fa_dvec, dO16, ptr[1], (int)nrows, T, H, dh); }
+		} else {
+			{ OpNest _n(OP_ATT_SMX_ID); attn_fa_dvec_kernel<<<(unsigned)((nrows + 255) / 256), 256>>>(
+			    g_fa_dvec, ptr[0], ptr[1], (int)nrows, T, H, dh); }
+		}
 		{
 			OpNest _n(OP_ATT_GEMM_ID);
 

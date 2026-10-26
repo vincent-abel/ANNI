@@ -101,6 +101,8 @@ int	gpu_mat_mul_backward(mat *da, mat *db, const mat *dc,
 int	gpu_mat_mul_bt(mat *c, const mat *a, const mat *b);
 /* c += a b^T (cuBLAS beta = 1); -1 = do c = a b^T into a scratch and add. */
 int	gpu_mat_mul_bt_acc(mat *c, const mat *a, const mat *b);
+/* c = a b^T as c's BF16 gradient twin only (BF16 training); the FP32 c stays unwritten. -1 = use gpu_mat_mul_bt. */
+int	gpu_mat_mul_bt_twin(mat *c, const mat *a, const mat *b);
 /* c = a^T b (a: T x m, b: T x n -> c: m x n); cuBLAS OP_T when built in. */
 int	gpu_mat_mul_at(mat *c, const mat *a, const mat *b);
 int	gpu_mat_outer_add(mat *dw, const mat *a, const mat *b);
