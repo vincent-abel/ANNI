@@ -178,6 +178,17 @@ int	gpu_bias_row_add(ann_real *x, const ann_real *bias, int rows, int cols);
 int	gpu_ce_delta_from_softmax(ann_real *probs, const int *tgt, int rows,
 		int V, ann_real *db_host, double *mean_ce);
 /*
+** BF16 batch training: logits (device, rows x V) -> softmax, CE and db_host
+** as gpu_ce_delta_from_softmax, with delta = p - onehot written only as BF16
+** in place over the logits and served to the head's wgrad / dgrad GEMMs as
+** their gradient twin. 0 = done (the FP32 buffer no longer holds logits nor
+** delta); -1 = not applicable, logits intact; -2 = failed, logits lost.
+** gpu_ce_bf16_delta_done(logits) after both GEMMs: 0 when both consumed it.
+*/
+int	gpu_ce_softmax_delta_bf16(ann_real *logits, const int *tgt, int rows,
+		int V, ann_real *db_host, double *mean_ce);
+int	gpu_ce_bf16_delta_done(const ann_real *logits);
+/*
 ** S2: Add sinusoidal posenc in place to packed (B*T) x D; position t restarts
 ** each sequence. x may be device-resident.
 */
