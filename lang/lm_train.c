@@ -79,10 +79,6 @@ static unsigned int g_shuffle_seed = 1;
 static int g_act_checkpoint;
 static int g_varlen;
 static int g_cuda_graphs;
-static int g_graph_B;
-static int g_graph_T;
-static int g_graph_ready;
-static int g_graph_warmed;
 static int g_compute_prec;
 
 void lm_train_set_progress(train_progress_fn fn, void *userdata)
@@ -498,11 +494,7 @@ void lm_train_set_varlen(int on)
 void lm_train_set_cuda_graphs(int on)
 {
 	g_cuda_graphs = on ? 1 : 0;
-	g_graph_ready = 0;
-	g_graph_warmed = 0;
-	g_graph_B = 0;
-	g_graph_T = 0;
-	gpu_graph_destroy();
+	lm_graph_enable(g_cuda_graphs);
 }
 
 void lm_train_set_compute_prec(int prec)
@@ -705,7 +697,7 @@ static int train_mid_val_due(int done, int total, int *next_pct)
 
 /* Forward + loss + backward for the first b sequences already in p->ids.
 ** mean_ce may be NULL; otherwise receives mean CE over predicting rows.
-** S4: optional CUDA Graph capture/replay when B,T steady and no varlen lens. */
+** --cuda-graphs batches go through lm_graph_step instead (pack_run). */
 static int pack_run_body(lm *model, pack_ctx *p, int b, double *mean_ce,
 	pack_slot *s, const int *lens)
 {
@@ -801,58 +793,15 @@ static int pack_run(lm *model, pack_ctx *p, int b, double *mean_ce)
 			lens = p->lens;
 	}
 	/*
-	** Graphs need fixed device addresses and no host ops in the region.
-	** Skip when varlen seqlens change the mask, or B/T changes.
+	** Graphs (lm_graph_step): the loss mask and varlen seqlens are host
+	** data read while building targets / masks, so those batches never
+	** take the graph path.
 	*/
-	/* Graph capture includes CE→pinned D2H; fetch mean after replay. */
-	/* A loss mask is host data read while building targets: no graphs. */
-	if (g_cuda_graphs && gpu_available() && !lens && !p->mask) {
-		if (g_graph_ready && g_graph_B == b && g_graph_T == p->T) {
-			if (gpu_graph_replay() == 0) {
-				if (mean_ce) {
-					int rows = b * (p->T > 1 ? p->T - 1 : 1);
-
-					if (gpu_ce_fetch_mean(mean_ce, rows) != 0)
-						*mean_ce = -1.0;
-				}
-				return 0;
-			}
-			g_graph_ready = 0;
-			gpu_graph_destroy();
-		}
-		/*
-		** Warm one uncaptured step so cudaMalloc/scratch resize happen
-		** outside BeginCapture (malloc during capture segfaults).
-		*/
-		if (!g_graph_warmed || g_graph_B != b || g_graph_T != p->T) {
-			int rc;
-
-			rc = pack_run_body(model, p, b, mean_ce, s, NULL);
-			g_graph_warmed = 1;
-			g_graph_B = b;
-			g_graph_T = p->T;
-			g_graph_ready = 0;
-			return rc;
-		}
-		if (gpu_graph_begin() == 0) {
-			int body_rc = pack_run_body(model, p, b, NULL, s, NULL);
-
-			if (body_rc == 0 && gpu_graph_end() == 0) {
-				g_graph_ready = 1;
-				if (mean_ce) {
-					int rows = b * (p->T > 1 ? p->T - 1 : 1);
-
-					if (gpu_ce_fetch_mean(mean_ce, rows) != 0)
-						*mean_ce = -1.0;
-				}
-				return 0;
-			}
-			/* Must leave capture mode even when body fails. */
-			if (body_rc != 0)
-				(void)gpu_graph_end();
-			gpu_graph_destroy();
-			g_graph_ready = 0;
-		}
+	if (g_cuda_graphs && !lens && !p->mask) {
+		gpu_attn_set_seqlens(NULL);
+		lm_loss_set_mask(NULL);
+		return lm_graph_step(model, s->c, s->dh, p->ids, b, p->T,
+		    mean_ce);
 	}
 	return pack_run_body(model, p, b, mean_ce, s, lens);
 }
@@ -1008,18 +957,12 @@ static double probe_windows(lm *model, const text_dataset *ds,
 	if (buf != pk->ids_next)
 		free(buf);
 	/* The probe reused the training cache buffers: recapture the graph. */
-	if (g_graph_ready) {
-		g_graph_ready = 0;
-		gpu_graph_destroy();
-	}
+	lm_graph_invalidate();
 	return sum / (double)lim;
 bail:
 	if (buf != pk->ids_next)
 		free(buf);
-	if (g_graph_ready) {
-		g_graph_ready = 0;
-		gpu_graph_destroy();
-	}
+	lm_graph_invalidate();
 	return nll_windows_seq(model, ds, max_windows);
 }
 

@@ -313,14 +313,37 @@ void	gpu_host_free(void *p);
 void	*gpu_copy_stream(void);
 
 /*
-** R12: capture/replay helpers for a fixed microbatch. begin/end wrap the
-** default stream; replay returns -1 if no graph. Capture fails if host ops
-** remain in the region (expected until full residency).
+** R12: CUDA-graph capture / replay of one training microbatch (lm_graph_step).
+** begin/end capture the compute stream; replay launches the graph and
+** returns -1 when there is none or it may no longer be replayed (a device
+** buffer it uses was freed, or one of its temporaries is held by someone
+** else: gpu_graph_replayable). end fails if anything inside the capture
+** allocated, freed or synchronised.
+**
+** gpu_graph_set_mode(1) switches on what a replayed microbatch needs, all
+** of it outside the default path: gpu_malloc / gpu_free recycle exact-size
+** blocks (so a steady microbatch allocates nothing), the head bias gradient
+** accumulates on the device until gpu_device_sync, and the gradient twin
+** round robin restarts every microbatch.
+**
+** gpu_ids_stage copies the n token ids into a page-locked ring and from
+** there, on the compute stream, into one fixed device buffer; until
+** gpu_ids_unstage, embedding lookup / scatter calls with ids or alias read
+** that buffer and gpu_ce_targets_staged(ids, B, T) builds the next-token
+** targets from it on the device (no host target array at all).
+** gpu_param_epoch changes at every optimizer step (weight twins rebuilt).
 */
 int	gpu_graph_begin(void);
 int	gpu_graph_end(void);
 int	gpu_graph_replay(void);
+int	gpu_graph_replayable(void);
 void	gpu_graph_destroy(void);
+void	gpu_graph_set_mode(int on);
+int	gpu_graph_supported(void);
+unsigned	gpu_param_epoch(void);
+int	gpu_ids_stage(const int *ids, const int *alias, int n);
+void	gpu_ids_unstage(void);
+const int	*gpu_ce_targets_staged(const int *ids, int B, int T);
 
 /*
 ** Single-stream decode. Weight mats are device twins (row-major Din x Dout);

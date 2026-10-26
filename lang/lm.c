@@ -409,7 +409,7 @@ static void head_bias_add(lm *model, mat *delta, int rows)
 ** accumulates dW_head / db_head. Also used by the packed path with gathered rows.
 */
 static int ce_rows_backward(lm *model, const mat *hv, const int *tgt, int rows,
-	mat *dhv, double *mean_ce_out)
+	mat *dhv, double *mean_ce_out, int tgt_dev)
 {
 	mat *delta;
 	ann_real *tmp;
@@ -428,7 +428,13 @@ static int ce_rows_backward(lm *model, const mat *hv, const int *tgt, int rows,
 	bias_pending = 0;
 	V = model->vocab_size;
 	n_valid = 0;
-	for (t = 0; t < rows; t++) {
+	/*
+	** tgt_dev: device targets (gpu_ce_targets_staged), every row has one
+	** and only the device CE below can read them.
+	*/
+	if (tgt_dev)
+		n_valid = rows;
+	for (t = 0; !tgt_dev && t < rows; t++) {
 		if (tgt[t] < -1 || tgt[t] >= V)
 			return -1;
 		n_valid += tgt[t] >= 0;
@@ -518,7 +524,9 @@ static int ce_rows_backward(lm *model, const mat *hv, const int *tgt, int rows,
 				*mean_ce_out = n_valid > 0 && ce_sum >= 0.0
 				    ? ce_sum * (double)rows / (double)n_valid
 				    : -1.0;
-		} else {
+		} else if (tgt_dev)
+			goto fail;
+		else {
 			(void)mat_ensure_host(delta);
 			ce_sum = 0.0;
 			for (t = 0; t < rows; t++) {
@@ -596,7 +604,7 @@ int lm_loss_backward(lm *model, const lm_cache *c, const int *ids, int n,
 	dhv.on_device = MAT_DEV_HOST;
 	dhv.rows = rows;
 	dhv.cols = LM_D_MODEL;
-	if (ce_rows_backward(model, &hv, ids + 1, rows, &dhv, mean_ce) != 0)
+	if (ce_rows_backward(model, &hv, ids + 1, rows, &dhv, mean_ce, 0) != 0)
 		return -1;
 	mat_host_dirty(dhidden);
 	return 0;
@@ -755,6 +763,7 @@ int lm_loss_backward_packed_lens(lm *model, const lm_cache *c, const int *ids,
 	mat *hc;
 	mat *dhc;
 	int *tgt;
+	const int *dtgt;
 	int rows;
 	int b;
 	int t;
@@ -772,8 +781,10 @@ int lm_loss_backward_packed_lens(lm *model, const lm_cache *c, const int *ids,
 	rb = (size_t)LM_D_MODEL * sizeof(ann_real);
 	hc = reuse_mat(&g_pack_hc, rows, LM_D_MODEL);
 	dhc = reuse_mat(&g_pack_dhc, rows, LM_D_MODEL);
-	tgt = malloc((size_t)rows * sizeof(int));
-	if (!hc || !dhc || !tgt) {
+	/* Staged ids (graph mode): the targets are built on the device. */
+	dtgt = !lens && !g_loss_mask ? gpu_ce_targets_staged(ids, B, T) : NULL;
+	tgt = dtgt ? NULL : malloc((size_t)rows * sizeof(int));
+	if (!hc || !dhc || (!tgt && !dtgt)) {
 		free(tgt);
 		return -1;
 	}
@@ -783,7 +794,7 @@ int lm_loss_backward_packed_lens(lm *model, const lm_cache *c, const int *ids,
 	    && hc->d_data && gpu_available()
 	    && gpu_pack_seq_rows(hc->d_data, c->hidden->d_data, B, T,
 	    LM_D_MODEL) == 0) {
-		for (b = 0; b < B; b++)
+		for (b = 0; tgt && b < B; b++)
 			for (t = 0; t < T - 1; t++)
 				tgt[b * (T - 1) + t] = packed_target(ids, b * T + t);
 		hc->on_device = MAT_DEV_DEVICE;
@@ -794,12 +805,13 @@ int lm_loss_backward_packed_lens(lm *model, const lm_cache *c, const int *ids,
 		memcpy(&hc->data[(size_t)b * (T - 1) * LM_D_MODEL],
 		    &c->hidden->data[(size_t)b * T * LM_D_MODEL],
 		    (size_t)(T - 1) * rb);
-		for (t = 0; t < T - 1; t++)
+		for (t = 0; tgt && t < T - 1; t++)
 			tgt[b * (T - 1) + t] = packed_target(ids, b * T + t);
 	}
 	mat_host_dirty(hc);
 gather_done:
-	rc = ce_rows_backward(model, hc, tgt, rows, dhc, mean_ce);
+	rc = ce_rows_backward(model, hc, dtgt ? dtgt : tgt, rows, dhc, mean_ce,
+	    dtgt != NULL);
 	if (rc == 0) {
 		mat_zero_dev(dhidden);
 		if (dhc->d_data && dhc->on_device != MAT_DEV_HOST
@@ -848,6 +860,119 @@ int lm_backward_packed(lm *model, const mat *dhidden, const lm_cache *c)
 		gpu_grad_twins_clear();	/* no BF16 gradient twin outlives its microbatch */
 		return rc;
 	}
+}
+
+/*
+** S4: CUDA-graph microbatch (--cuda-graphs). The first microbatch after
+** every optimizer step runs uncaptured: it rebuilds the BF16 weight twins
+** and re-uploads the biases, and leaves every lazily sized buffer and pool
+** block in place. The next one with the same B and T is captured once
+** (the capture only records; the graph is then launched) and every later
+** one replays it: the same kernels on the same addresses, with the new
+** token ids staged into the graph's fixed device buffer beforehand.
+** Replay is refused (and the graph captured again) whenever an address it
+** holds may have changed owner (gpu_graph_replayable); a capture that
+** needed anything illegal is dropped, and after LM_GRAPH_MAX_FAILS of those
+** the run goes on uncaptured.
+*/
+#define LM_GRAPH_MAX_FAILS	3
+
+static struct {
+	int		on;
+	int		B;
+	int		T;
+	int		warm;		/* an uncaptured microbatch ran in epoch */
+	unsigned	epoch;
+	int		ready;
+	int		fails;
+	long		replays;
+} g_graph;
+
+void lm_graph_enable(int on)
+{
+	memset(&g_graph, 0, sizeof(g_graph));
+	g_graph.on = on ? 1 : 0;
+	gpu_graph_set_mode(g_graph.on);
+}
+
+/* Drop the captured graph (its buffers were reused): the next steady microbatch captures again. */
+void lm_graph_invalidate(void)
+{
+	if (!g_graph.ready)
+		return;
+	g_graph.ready = 0;
+	gpu_graph_destroy();
+}
+
+long lm_graph_replays(void)
+{
+	return g_graph.replays;
+}
+
+static int graph_body(lm *model, lm_cache *c, mat *dh, const int *ids, int B,
+	int T, double *mean_ce)
+{
+	if (lm_forward_cache_packed(model, ids, B, T, c) != 0
+	    || lm_loss_backward_packed(model, c, ids, B, T, dh, mean_ce) != 0)
+		return -1;
+	return lm_backward_packed(model, dh, c);
+}
+
+int lm_graph_step(lm *model, lm_cache *c, mat *dh, const int *ids, int B,
+	int T, double *mean_ce)
+{
+	int steady;
+	int rc;
+
+	if (!model || !c || !dh || !ids)
+		return -1;
+	if (!g_graph.on || B < 2 || g_loss_mask || !gpu_graph_supported()
+	    || gpu_ids_stage(ids, c->ids, B * T) != 0)
+		return graph_body(model, c, dh, ids, B, T, mean_ce);
+	if (g_graph.B != B || g_graph.T != T) {
+		gpu_graph_destroy();
+		g_graph.ready = 0;
+		g_graph.warm = 0;
+		g_graph.B = B;
+		g_graph.T = T;
+	}
+	steady = g_graph.warm && g_graph.epoch == gpu_param_epoch();
+	if (steady && g_graph.ready && gpu_graph_replay() == 0)
+		goto replayed;
+	g_graph.ready = 0;
+	if (steady && g_graph.fails < LM_GRAPH_MAX_FAILS
+	    && gpu_graph_begin() == 0) {
+		rc = graph_body(model, c, dh, ids, B, T, NULL);
+		if (gpu_graph_end() == 0 && rc == 0 && gpu_graph_replay() == 0) {
+			static int said;
+
+			if (!said++)
+				fprintf(stderr, "[graph] training microbatch captured "
+				    "(B=%d T=%d): steady microbatches replay it\n", B, T);
+			g_graph.ready = 1;
+			goto replayed;
+		}
+		/* Nothing of the capture ran: do the microbatch for real. */
+		gpu_graph_destroy();
+		gpu_grad_twins_clear();
+		if (++g_graph.fails == LM_GRAPH_MAX_FAILS)
+			fprintf(stderr, "cuda graphs: capture failed %d times, "
+			    "training on without graphs (ANN_GRAPH_DEBUG=1 says why)\n",
+			    LM_GRAPH_MAX_FAILS);
+	}
+	rc = graph_body(model, c, dh, ids, B, T, mean_ce);
+	gpu_ids_unstage();
+	g_graph.warm = 1;
+	g_graph.epoch = gpu_param_epoch();
+	return rc;
+replayed:
+	gpu_ids_unstage();
+	/* Host-only state the replay did not touch. */
+	gpu_grad_twins_clear();
+	g_graph.replays++;
+	if (mean_ce && gpu_ce_fetch_mean(mean_ce, B * (T - 1)) != 0)
+		*mean_ce = -1.0;
+	return 0;
 }
 
 /*

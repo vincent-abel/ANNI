@@ -106,6 +106,16 @@ int	lm_loss_backward_packed_lens(lm *model, const lm_cache *c,
 		double *mean_ce);
 int	lm_backward_packed(lm *model, const mat *dhidden, const lm_cache *c);
 /*
+** One packed microbatch (forward, CE, backward) of B sequences of T ids;
+** with lm_graph_enable(1) a steady microbatch is a CUDA-graph replay (see
+** lm.c). No loss mask, no varlen. lm_graph_replays counts the replays.
+*/
+int	lm_graph_step(lm *model, lm_cache *c, mat *dh, const int *ids, int B,
+	    int T, double *mean_ce);
+void	lm_graph_enable(int on);
+long	lm_graph_replays(void);
+void	lm_graph_invalidate(void);
+/*
 ** Loss mask for the packed loss: mask[b*T+t] = 0 drops the loss of
 ** predicting token t of sequence b (chat fine-tune: user turns). The
 ** pointer is kept until the next call; NULL restores loss on every token.

@@ -733,8 +733,48 @@ int gpu_graph_replay(void)
 	return -1;
 }
 
+int gpu_graph_replayable(void)
+{
+	return 0;
+}
+
 void gpu_graph_destroy(void)
 {
+}
+
+void gpu_graph_set_mode(int on)
+{
+	(void)on;
+}
+
+int gpu_graph_supported(void)
+{
+	return 0;
+}
+
+unsigned gpu_param_epoch(void)
+{
+	return 0;
+}
+
+int gpu_ids_stage(const int *ids, const int *alias, int n)
+{
+	(void)ids;
+	(void)alias;
+	(void)n;
+	return -1;
+}
+
+void gpu_ids_unstage(void)
+{
+}
+
+const int *gpu_ce_targets_staged(const int *ids, int B, int T)
+{
+	(void)ids;
+	(void)B;
+	(void)T;
+	return NULL;
 }
 
 gpu_dec *gpu_dec_create(int n_layers, int d_model, int d_ff, int vocab,

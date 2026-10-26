@@ -572,10 +572,10 @@ static int fa2_bwd_launch_lay16(float *dq, float *dk, float *dv, const __nv_bflo
 	if (ld16 <= 0)
 		ld16 = H * dh;
 	switch (dh) {
-	case 16: attn_fa2_bwd_kernel<16><<<grid, 32 * FA2_WARPS>>>(dq, dk, dv, q, k, v, dO, lse, dvec, T, H, scale, lq, lo, dk16, dv16, of, ld16); break;
-	case 32: attn_fa2_bwd_kernel<32><<<grid, 32 * FA2_WARPS>>>(dq, dk, dv, q, k, v, dO, lse, dvec, T, H, scale, lq, lo, dk16, dv16, of, ld16); break;
-	case 48: attn_fa2_bwd_kernel<48><<<grid, 32 * FA2_WARPS>>>(dq, dk, dv, q, k, v, dO, lse, dvec, T, H, scale, lq, lo, dk16, dv16, of, ld16); break;
-	default: attn_fa2_bwd_kernel<64><<<grid, 32 * FA2_WARPS>>>(dq, dk, dv, q, k, v, dO, lse, dvec, T, H, scale, lq, lo, dk16, dv16, of, ld16); break;
+	case 16: attn_fa2_bwd_kernel<16><<<grid, 32 * FA2_WARPS, 0, g_st>>>(dq, dk, dv, q, k, v, dO, lse, dvec, T, H, scale, lq, lo, dk16, dv16, of, ld16); break;
+	case 32: attn_fa2_bwd_kernel<32><<<grid, 32 * FA2_WARPS, 0, g_st>>>(dq, dk, dv, q, k, v, dO, lse, dvec, T, H, scale, lq, lo, dk16, dv16, of, ld16); break;
+	case 48: attn_fa2_bwd_kernel<48><<<grid, 32 * FA2_WARPS, 0, g_st>>>(dq, dk, dv, q, k, v, dO, lse, dvec, T, H, scale, lq, lo, dk16, dv16, of, ld16); break;
+	default: attn_fa2_bwd_kernel<64><<<grid, 32 * FA2_WARPS, 0, g_st>>>(dq, dk, dv, q, k, v, dO, lse, dvec, T, H, scale, lq, lo, dk16, dv16, of, ld16); break;
 	}
 	return 0;
 }
@@ -600,10 +600,10 @@ static int fa2_fwd_launch_lay(float *out, float *lse, const __nv_bfloat16 *q,
 	if (!fa2_ok(T, dh))
 		return -1;
 	switch (dh) {
-	case 16: attn_fa2_fwd_kernel<16><<<grid, 32 * FA2_WARPS>>>(out, lse, q, k, v, T, H, scale, lq, out16); break;
-	case 32: attn_fa2_fwd_kernel<32><<<grid, 32 * FA2_WARPS>>>(out, lse, q, k, v, T, H, scale, lq, out16); break;
-	case 48: attn_fa2_fwd_kernel<48><<<grid, 32 * FA2_WARPS>>>(out, lse, q, k, v, T, H, scale, lq, out16); break;
-	default: attn_fa2_fwd_kernel<64><<<grid, 32 * FA2_WARPS>>>(out, lse, q, k, v, T, H, scale, lq, out16); break;
+	case 16: attn_fa2_fwd_kernel<16><<<grid, 32 * FA2_WARPS, 0, g_st>>>(out, lse, q, k, v, T, H, scale, lq, out16); break;
+	case 32: attn_fa2_fwd_kernel<32><<<grid, 32 * FA2_WARPS, 0, g_st>>>(out, lse, q, k, v, T, H, scale, lq, out16); break;
+	case 48: attn_fa2_fwd_kernel<48><<<grid, 32 * FA2_WARPS, 0, g_st>>>(out, lse, q, k, v, T, H, scale, lq, out16); break;
+	default: attn_fa2_fwd_kernel<64><<<grid, 32 * FA2_WARPS, 0, g_st>>>(out, lse, q, k, v, T, H, scale, lq, out16); break;
 	}
 	return 0;
 }
