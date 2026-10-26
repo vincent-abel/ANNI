@@ -208,6 +208,10 @@ int gpu_layernorm_backward_acc(mat *dx, const mat *dy, const ann_real *gamma,
 	return -1;
 }
 
+void gpu_grad_twins_clear(void)
+{
+}
+
 int gpu_mat_mul_bt_acc(mat *c, const mat *a, const mat *b)
 {
 	(void)c;

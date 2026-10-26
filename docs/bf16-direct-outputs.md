@@ -30,8 +30,15 @@ Pause-window gate 2026-10-26 20:52 (both candidates in one binary, fallback cand
 | FA2 attention (candidate 7) | 19.7 / 38.3 ms | 61.4k | 92.7 |
 | + fused BF16 QKV, BF16-only ReLU output (8 + 9) | 17.3 / 38.4 ms | 64.3k | 97.2 |
 | + lazy pre-activation buffer, BF16-only LayerNorm output (10 + 12) | | 64.7k | 97.7 |
+| + producer-written gradient twins, per-layer QKV weight pack (13) | 16.7 / 38.9 ms | 64.8k | 97.8 |
 
 Candidate 12 adds the LayerNorm output to the same scheme (`ln_fwd_kernel` stores the BF16 twin instead of FP32 `y`; `ANN_LN_BF16=0` restores it) and stops allocating the FFN pre-activation buffer that only the fallback paths use (64 MB per layer): the gate's peak VRAM went from 13485 to 12604 MiB, the live run from 86.9% to under 82% of the card. The gain in speed is within the bench noise (+1%); the memory was the point.
+
+## Candidate 13: gradient twins written by their producers
+
+The gradients that the next GEMMs need in BF16 were still converted by the wgrad (`grad_twin_put`): dK and dV from the attention backward, and the block's residual-path gradients from the accumulating LayerNorm backward. `attn_fa2_bwd_kernel` now also stores BF16 dK / dV into two reserved twin slots, and `ln_bwd_kernel` (accumulate mode) stores the BF16 twin of its result; `grad_twin_peek` in the wgrad and `grad_twin_take` in the dgrad pick them up. The packed `[W_Q|W_K|W_V]` matrix is cached per layer instead of being repacked for every layer (its single cache thrashed between the twelve layers, 12 extra kernels per microbatch).
+
+Two rules came out of the test suite while doing this. A twin keyed on a device buffer must never outlive the microbatch (`gpu_grad_twins_clear` at the end of `lm_backward_packed`): the first block's LayerNorm backward has no GEMM consumer, and the next microbatch reuses that buffer for the last block's incoming gradient. And a dgrad that does not consume the twin (the FP8 path) must forget it, or with a larger slot pool a later wgrad peeks a stale one; `make test-gpu` caught both as wrong `dw1` / `dw2` gradients.
 
 ## Pitfalls
 
