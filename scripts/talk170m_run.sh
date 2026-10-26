@@ -40,6 +40,7 @@ PY="$HOME/.venvs/anni-data/bin/python"
 SMI=/usr/lib/wsl/lib/nvidia-smi
 command -v nvidia-smi >/dev/null && SMI=nvidia-smi
 NVCC="$HOME/cuda13/usr/local/cuda-13.0/bin/nvcc"
+[ -x "$NVCC" ] || NVCC=$(ls -d /usr/local/cuda-13*/bin/nvcc 2>/dev/null | tail -1)
 OUT=models/talk170m.bin
 CHAT=models/talk170m-chat.bin
 
