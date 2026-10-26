@@ -135,10 +135,17 @@ static block_cache *block_cache_alloc(int B, int T, int n_heads, int d_head)
 	/* Device-only when CUDA is up — host mirrors of all layers blew WSL RAM. */
 	c->x_in = mat_create_dev(n, LM_D_MODEL);
 	c->ln1_out = mat_create_dev(n, LM_D_MODEL);
-	c->attn_out = mat_create_dev(n, LM_D_MODEL);
+	/*
+	** attn_out is read only by the B == 1 path (the packed attention folds
+	** the residual into the Wo GEMM) and ffn_out by nothing at all; both
+	** were 16 MiB per layer of never-touched VRAM (ANN_VRAM_LAZY=0 keeps them).
+	*/
+	if (B == 1 || !attn_vram_lazy())
+		c->attn_out = mat_create_dev(n, LM_D_MODEL);
 	c->x_mid = mat_create_dev(n, LM_D_MODEL);
 	c->ln2_out = mat_create_dev(n, LM_D_MODEL);
-	c->ffn_out = mat_create_dev(n, LM_D_MODEL);
+	if (!attn_vram_lazy())
+		c->ffn_out = mat_create_dev(n, LM_D_MODEL);
 	c->ln1c = ln_cache_create(n);
 	if (B == 1)
 		c->attnc = attn_cache_create(T, n_heads, d_head);
@@ -146,8 +153,9 @@ static block_cache *block_cache_alloc(int B, int T, int n_heads, int d_head)
 		c->attnpc = attn_pcache_create(B, T, n_heads, d_head);
 	c->ln2c = ln_cache_create(n);
 	c->ffnc = ffn_cache_create(n);
-	if (!c->x_in || !c->ln1_out || !c->attn_out || !c->x_mid
-	    || !c->ln2_out || !c->ffn_out || !c->ln1c
+	if (!c->x_in || !c->ln1_out || !c->x_mid
+	    || (!c->attn_out && (B == 1 || !attn_vram_lazy()))
+	    || !c->ln2_out || (!c->ffn_out && !attn_vram_lazy()) || !c->ln1c
 	    || (!c->attnc && !c->attnpc)
 	    || !c->ln2c || !c->ffnc) {
 		block_cache_free(&c);
@@ -213,8 +221,10 @@ static void block_cache_repin(block_cache *bc)
 	if (bc->attnpc) {
 		mat_try_pin(bc->attnpc->x_in);
 		mat_try_pin(bc->attnpc->q);
-		mat_try_pin(bc->attnpc->k);
-		mat_try_pin(bc->attnpc->v);
+		if (!attn_vram_lazy()) {
+			mat_try_pin(bc->attnpc->k);
+			mat_try_pin(bc->attnpc->v);
+		}
 		mat_try_pin(bc->attnpc->concat);
 	}
 	if (bc->ln1c)
