@@ -6942,7 +6942,13 @@ extern "C" int gpu_attn_fa_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat,
 			/* The Wo dgrad may have left dO only as a BF16 twin (gpu_mat_mul_bt_twin). */
 			if (!o[0]) {
 				pthread_mutex_lock(&g_gemm_mu);
-				dO16 = (const __nv_bfloat16 *)grad_twin_take(ptr[0], npack);
+				{
+					int ld16 = H * dh;	/* dense twin: row stride D */
+
+					dO16 = (const __nv_bfloat16 *)grad_twin_take(ptr[0], npack, H * dh, &ld16);
+					if (dO16 && ld16 != H * dh)
+						dO16 = NULL;	/* a strided twin is not what the kernel expects */
+				}
 				pthread_mutex_unlock(&g_gemm_mu);
 			}
 
