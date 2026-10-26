@@ -83,6 +83,9 @@ typedef struct	attn_pcache {
 	int		d_head;
 } attn_pcache;
 
+/* ANN_VRAM_LAZY=0 restores the eager allocation of never-touched buffers. */
+int		attn_vram_lazy(void);
+
 /* S7: skip storing B·H·T·T weights; recompute in backward. */
 void		attn_set_flash(int on);
 int		attn_flash_enabled(void);

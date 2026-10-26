@@ -2751,6 +2751,34 @@ static int ensure_dev(const mat *m, ann_real **out, int *owned)
 }
 
 /*
+** ensure_dev for a K or V cache mat that may be lazy (ANN_VRAM_LAZY): the
+** fused FA2 QKV GEMM leaves K and V only inside the layer's BF16 qkv slot, so
+** the FP32 mats own no storage at all (no device buffer, no host copy) and
+** *out stays NULL. A caller that really needs the FP32 values checks *out.
+*/
+static int vram_lazy_on(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		const char *e = getenv("ANN_VRAM_LAZY");
+
+		on = !(e && e[0] == '0');
+	}
+	return on;
+}
+
+static int ensure_dev_kv(const mat *m, ann_real **out, int *owned)
+{
+	if (!m->d_data && !m->data) {
+		*owned = 0;
+		*out = NULL;
+		return 0;
+	}
+	return ensure_dev(m, out, owned);
+}
+
+/*
 ** Output buffer for a pure-write result. Always attach a persistent twin so
 ** BATCH/act-checkpoint can drop and re-alloc without falling back to a host
 ** mirror farm (owned temps used to force D2H into m->data).
@@ -6512,8 +6540,8 @@ extern "C" int gpu_attn_fa_fwd(mat *concat, const mat *q, const mat *k,
 	}
 	pthread_mutex_lock(&g_att_mu);
 	oq = ok = ov = oc = 0;
-	if (ensure_dev(q, &dq, &oq) != 0 || ensure_dev(k, &dk, &ok) != 0
-	    || ensure_dev(v, &dv, &ov) != 0
+	if (ensure_dev(q, &dq, &oq) != 0 || ensure_dev_kv(k, &dk, &ok) != 0
+	    || ensure_dev_kv(v, &dv, &ov) != 0
 	    || ensure_dev_out(concat, &dc, &oc) != 0)
 		goto fa_out;
 	{
@@ -6539,6 +6567,8 @@ extern "C" int gpu_attn_fa_fwd(mat *concat, const mat *q, const mat *k,
 				fprintf(stderr, "[attn] FA2 kernels on the fused BF16 QKV rows (no head packing)\n");
 			goto fa_launched;
 		}
+		if (!dk || !dv)
+			goto fa_out;	/* lazy K/V: only the strided FA2 path above can run */
 		ps = oq ? NULL : fa_pack_get(dq, npack, 1);
 		/* Operands once as head-major BF16, kept for the backward. */
 		if (ps) {
@@ -6918,8 +6948,8 @@ extern "C" int gpu_attn_fa_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat,
 	if (ensure_dev(dconcat, &ptr[0], &o[0]) != 0
 	    || ensure_dev(concat, &ptr[1], &o[1]) != 0
 	    || ensure_dev(q, &ptr[2], &o[2]) != 0
-	    || ensure_dev(k, &ptr[3], &o[3]) != 0
-	    || ensure_dev(v, &ptr[4], &o[4]) != 0
+	    || ensure_dev_kv(k, &ptr[3], &o[3]) != 0
+	    || ensure_dev_kv(v, &ptr[4], &o[4]) != 0
 	    || ensure_dev_out(dq, &ptr[5], &o[5]) != 0
 	    || ensure_dev_out(dk, &ptr[6], &o[6]) != 0)
 		goto fa_bwd_out;
@@ -6955,7 +6985,13 @@ extern "C" int gpu_attn_fa_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat,
 			qkv_bf16_slot *qs = o[2] ? NULL : qkv_bf16_get(ptr[2], B * T, H * dh, 0);
 			fa_pack_slot *ps = o[2] ? NULL : fa_pack_get(ptr[2], npack, 0);
 
-			if (ensure_half_buf(&g_tc_half_do, &g_tc_half_do_cap, npack * 2) != 0)
+			/*
+			** The head-major dO scratch is only written by the paths that
+			** do not read dO's BF16 twin strided; allocate it on first
+			** real use (16 MB otherwise never touched).
+			*/
+			if (!(qs && qs->live && fa2_on() && dO16 && vram_lazy_on())
+			    && ensure_half_buf(&g_tc_half_do, &g_tc_half_do_cap, npack * 2) != 0)
 				goto fa_bwd_out;
 			if (qs && qs->live && fa2_on()) {
 				/* The fused QKV GEMM's BF16 rows; dO packed head-major. */
@@ -7007,6 +7043,8 @@ extern "C" int gpu_attn_fa_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat,
 				hv = hk + npack;
 				ps->live = 0;
 			} else {
+				if (!ptr[3] || !ptr[4])
+					goto fa_bwd_out;	/* lazy K/V: no FP32 values to pack */
 				if (ensure_half_buf(&g_tc_half_q, &g_tc_half_q_cap, npack * 2) != 0
 				    || ensure_half_buf(&g_tc_half_k, &g_tc_half_k_cap, npack * 2) != 0
 				    || ensure_half_buf(&g_tc_half_v, &g_tc_half_v_cap, npack * 2) != 0)
@@ -7489,10 +7527,20 @@ extern "C" int gpu_attn_qkv_fused(mat *q, mat *k, mat *v, const mat *x,
 		goto qkv_triple;
 	if (ensure_dev_out(q, &dq, &oq) != 0)
 		goto qkv_triple;
-	if (ensure_dev_out(k, &dk, &ok) != 0)
-		goto qkv_triple;
-	if (ensure_dev_out(v, &dv, &ov) != 0)
-		goto qkv_triple;
+	/*
+	** Lazy K/V (ANN_VRAM_LAZY): when the FA2 GEMM below will leave K and V
+	** only in the BF16 qkv slot, their FP32 mats need no device buffer
+	** (2 x 16 MB per layer). Any other path allocates them on demand.
+	*/
+	if (!(vram_lazy_on() && !k->d_data && !v->d_data && !k->data && !v->data
+	    && g_compute_prec == GPU_PREC_BF16 && !g_fp8_fwd && hint_T > 0
+	    && fa2_on() && !stream_is_capturing() && fa2_ok(hint_T, hint_dh)
+	    && (D & 7) == 0)) {
+		if (ensure_dev_out(k, &dk, &ok) != 0)
+			goto qkv_triple;
+		if (ensure_dev_out(v, &dv, &ov) != 0)
+			goto qkv_triple;
+	}
 	nA = (size_t)N * (size_t)D;
 #if defined(ANN_CUBLAS) && CUDART_VERSION >= 12000
 	if (g_fp8_fwd && (D & 15) == 0 && (N & 15) == 0) {
@@ -7619,6 +7667,9 @@ extern "C" int gpu_attn_qkv_fused(mat *q, mat *k, mat *v, const mat *x,
 		** Overlap the three independent projections on dedicated
 		** streams. Falls back to serial rm_ha if setup fails.
 		*/
+		if ((!dk || !dv) && (ensure_dev_out(k, &dk, &ok) != 0
+		    || ensure_dev_out(v, &dv, &ov) != 0))
+			goto qkv_triple;	/* lazy K/V, FA2 GEMM did not run */
 		{
 			void *hwq;
 			void *hwk;
@@ -7691,8 +7742,10 @@ qkv_done:
 	if (launch_done() != 0)
 		goto qkv_triple;
 	q->on_device = MAT_DEV_DEVICE;
-	k->on_device = MAT_DEV_DEVICE;
-	v->on_device = MAT_DEV_DEVICE;
+	if (k->d_data)
+		k->on_device = MAT_DEV_DEVICE;
+	if (v->d_data)
+		v->on_device = MAT_DEV_DEVICE;
 	if (ox && dx)
 		gpu_free(dx);
 	if (owq && dwq)

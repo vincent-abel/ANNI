@@ -620,6 +620,32 @@ int attn_flash_enabled(void)
 	return g_flash_attn;
 }
 
+int attn_vram_lazy(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		const char *e = getenv("ANN_VRAM_LAZY");
+
+		on = !(e && e[0] == '0');
+	}
+	return on;
+}
+
+/*
+** K and V of the packed cache: with the fused FA2 QKV GEMM they only ever
+** live in the BF16 qkv slot, so the FP32 mats are headers without storage;
+** gpu_attn_qkv_fused allocates them on demand on any other path.
+*/
+static mat *pcache_kv_create(int n)
+{
+	mat *m = mat_create_dev(n, LM_D_MODEL);
+
+	if (m && attn_vram_lazy())
+		mat_device_free(m);
+	return m;
+}
+
 attn_pcache *attn_pcache_create(int B, int T, int n_heads, int d_head)
 {
 	attn_pcache *c;
@@ -640,8 +666,8 @@ attn_pcache *attn_pcache_create(int B, int T, int n_heads, int d_head)
 	c->d_head = d_head;
 	c->x_in = mat_create_dev(n, LM_D_MODEL);
 	c->q = mat_create_dev(n, LM_D_MODEL);
-	c->k = mat_create_dev(n, LM_D_MODEL);
-	c->v = mat_create_dev(n, LM_D_MODEL);
+	c->k = pcache_kv_create(n);
+	c->v = pcache_kv_create(n);
 	c->concat = mat_create_dev(n, LM_D_MODEL);
 	c->seq = calloc((size_t)B, sizeof(attn_cache *));
 	if (!c->x_in || !c->q || !c->k || !c->v || !c->concat || !c->seq) {
@@ -650,8 +676,10 @@ attn_pcache *attn_pcache_create(int B, int T, int n_heads, int d_head)
 	}
 	mat_try_pin(c->x_in);
 	mat_try_pin(c->q);
-	mat_try_pin(c->k);
-	mat_try_pin(c->v);
+	if (!attn_vram_lazy()) {
+		mat_try_pin(c->k);
+		mat_try_pin(c->v);
+	}
 	mat_try_pin(c->concat);
 	/*
 	** Per-layer causal logsumexp (B·H·T), not a shared global. The tiled
@@ -718,8 +746,10 @@ static int pcache_ensure_scratch(attn_pcache *c)
 		c->dk = mat_create_dev(c->n, LM_D_MODEL);
 		c->dv = mat_create_dev(c->n, LM_D_MODEL);
 		c->dconcat = mat_create_dev(c->n, LM_D_MODEL);
-		c->dtmp = mat_create_dev(c->n, LM_D_MODEL);
-		if (c->dq && c->dk && c->dv && c->dconcat && c->dtmp) {
+		/* dtmp only serves mat_mul_wt_add's fallback: see pcache_wt_add. */
+		if (!attn_vram_lazy())
+			c->dtmp = mat_create_dev(c->n, LM_D_MODEL);
+		if (c->dq && c->dk && c->dv && c->dconcat) {
 			mat_try_pin(c->dq);
 			mat_try_pin(c->dk);
 			mat_try_pin(c->dv);
@@ -727,7 +757,21 @@ static int pcache_ensure_scratch(attn_pcache *c)
 			mat_try_pin(c->dtmp);
 		}
 	}
-	return (c->dq && c->dk && c->dv && c->dconcat && c->dtmp) ? 0 : -1;
+	return (c->dq && c->dk && c->dv && c->dconcat) ? 0 : -1;
+}
+
+/* dx += g W^T: the cuBLAS accumulate needs no scratch; dtmp on first fallback. */
+static int pcache_wt_add(attn_pcache *c, mat *dx, const mat *g, const mat *w)
+{
+	if (!c->dtmp) {
+		if (gpu_mat_mul_bt_acc(dx, g, w) == 0)
+			return 0;
+		c->dtmp = mat_create_dev(c->n, LM_D_MODEL);
+		if (!c->dtmp)
+			return -1;
+		mat_try_pin(c->dtmp);
+	}
+	return mat_mul_wt_add(dx, g, w, c->dtmp);
 }
 
 void attn_pcache_free(attn_pcache **c)
@@ -925,7 +969,6 @@ int attn_mha_backward_packed(mat *dx, const mat *dout, attn *a,
 	mat *dq;
 	mat *dk;
 	mat *dv;
-	mat *tmp;
 	int T;
 	int nh;
 	int fail;
@@ -944,7 +987,6 @@ int attn_mha_backward_packed(mat *dx, const mat *dout, attn *a,
 	dq = c->dq;
 	dk = c->dk;
 	dv = c->dv;
-	tmp = c->dtmp;
 	/* Fat weight grads + dconcat over all B*T rows. */
 	if (mat_outer_add(a->dwo, c->concat, dout) != 0)
 		return -1;
@@ -1105,9 +1147,9 @@ proj:
 		return -1;
 	if (mat_mul_wt(dx, dq, a->wq) != 0)
 		return -1;
-	if (mat_mul_wt_add(dx, dk, a->wk, tmp) != 0)
+	if (pcache_wt_add(c, dx, dk, a->wk) != 0)
 		return -1;
-	if (mat_mul_wt_add(dx, dv, a->wv, tmp) != 0)
+	if (pcache_wt_add(c, dx, dv, a->wv) != 0)
 		return -1;
 	return 0;
 }
