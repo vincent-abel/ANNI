@@ -6,6 +6,8 @@
 **	  3. bias / LN vectors trained and refreshed on the device
 **	  4. a freed model leaves no pending CUDA error (aliased dW frees)
 **	  5. BF16 gradients track FP32 from step 1 (cuBLASLt timing loop)
+**	  7. the batched validation probe matches lm_nll window by window
+**	  8. CUDA-graph replay gives the losses and gradients of the plain run
 */
 #define _POSIX_C_SOURCE 200112L
 #include <assert.h>
@@ -469,6 +471,154 @@ static void test_probe_packed(void)
 	rig_close(&r);
 }
 
+/*
+** 8. --cuda-graphs: GACC microbatches per Adam step, so each step has an
+** uncaptured microbatch, then a captured one (step 1) or replays. Losses
+** and every gradient (weights, embedding, head bias, FFN / LN vectors)
+** must match the plain run; the replay count proves the graph ran.
+** The plain run is not bitwise reproducible itself (float atomics in the
+** CE sum, the bias column sums and the embedding scatter): two plain runs
+** differ by up to ~5e-6 in a loss and ~5e-7 relative in a gradient, which
+** the third run measures and prints. The bounds sit just above that; a
+** stale id, target or bias in a replay moves them by 1e-3 and more.
+*/
+#define GACC 3
+#define GVEC 4	/* db_head, b0.db1, b0.ln1.dgamma, last block db2 */
+
+static void train_graphs(int graphs, int prec, double *loss, float **snaps,
+	int *nt, int *sizes, char names[][16], long *replays)
+{
+	static int ids[B * T];
+	rig r;
+	mat *g[NT];
+	vec *v[GVEC];
+	int s;
+	int a;
+	int i;
+
+	rig_open(&r, prec);
+	lm_graph_enable(graphs);
+	*nt = collect(r.m, g, names);
+	v[0] = r.m->db_head;
+	v[1] = r.m->tr->blocks[0].ffn->db1;
+	v[2] = r.m->tr->blocks[0].ln1->dgamma;
+	v[3] = r.m->tr->blocks[r.m->tr->n_blocks - 1].ffn->db2;
+	for (i = 0; i < *nt; i++)
+		sizes[i] = g[i]->rows * g[i]->cols;
+	for (i = 0; i < GVEC; i++) {
+		sprintf(names[*nt + i], "vec%d", i);
+		sizes[*nt + i] = v[i]->n;
+	}
+	for (s = 0; s < STEPS; s++) {
+		lm_adam_zero_grad(r.m);
+		vec_zero(r.m->db_head);
+		for (a = 0; a < GACC; a++) {
+			double ce = -1.0;
+
+			fill_ids(ids, 555u + 1000u * s + 10u * a);
+			assert(lm_graph_step(r.m, r.c, r.dh, ids, B, T, &ce) == 0);
+			loss[s * GACC + a] = ce;
+		}
+		gpu_device_sync();
+		for (i = 0; i < *nt + GVEC; i++) {
+			size_t nb = (size_t)sizes[i] * sizeof(float);
+
+			snaps[s * NT + i] = malloc(nb);
+			assert(snaps[s * NT + i]);
+			if (i < *nt) {
+				assert(mat_pull_host(g[i]) == 0);
+				memcpy(snaps[s * NT + i], g[i]->data, nb);
+			} else
+				memcpy(snaps[s * NT + i], v[i - *nt]->data, nb);
+		}
+		lm_adam_step_scaled(r.opt, 1e-3,
+		    1.0 / (double)(GACC * B * (T - 1)));
+	}
+	*replays = lm_graph_replays();
+	lm_graph_enable(0);
+	rig_close(&r);
+}
+
+static double max_rel_diff(const float *a, const float *b, int n)
+{
+	double num = 0.0;
+	double den = 0.0;
+	int j;
+
+	for (j = 0; j < n; j++) {
+		double d = (double)a[j] - (double)b[j];
+
+		num += d * d;
+		den += (double)a[j] * a[j];
+	}
+	return sqrt(num / (den + 1e-30));
+}
+
+/* Largest loss gap and gradient relative error between two runs; frees b. */
+static void graphs_diff(const double *la, const double *lb, float **sa,
+	float **sb, int nv, const int *sizes, char names[][16], double grad_tol,
+	double *lworst, double *gworst)
+{
+	int s;
+	int i;
+
+	*lworst = 0.0;
+	*gworst = 0.0;
+	for (i = 0; i < STEPS * GACC; i++)
+		if (fabs(la[i] - lb[i]) > *lworst)
+			*lworst = fabs(la[i] - lb[i]);
+	for (s = 0; s < STEPS; s++)
+		for (i = 0; i < nv; i++) {
+			double d = max_rel_diff(sa[s * NT + i], sb[s * NT + i],
+			    sizes[i]);
+
+			if (d > grad_tol)
+				printf("    step %d %s: rel diff %.3g\n", s + 1,
+				    names[i], d);
+			if (d > *gworst)
+				*gworst = d;
+			free(sb[s * NT + i]);
+			sb[s * NT + i] = NULL;
+		}
+}
+
+static void check_graphs_match(const char *tag, int prec, double loss_tol,
+	double grad_tol)
+{
+	static float *s0[STEPS * NT];
+	static float *s1[STEPS * NT];
+	static float *s2[STEPS * NT];
+	double l0[STEPS * GACC];
+	double l1[STEPS * GACC];
+	double l2[STEPS * GACC];
+	int sizes[NT];
+	char names[NT][16];
+	long rep0;
+	long rep1;
+	long rep2;
+	double lg, gg, ln, gn;
+	int nt;
+	int i;
+
+	assert(NT >= 16 + GVEC);
+	train_graphs(0, prec, l0, s0, &nt, sizes, names, &rep0);
+	train_graphs(1, prec, l1, s1, &nt, sizes, names, &rep1);
+	train_graphs(0, prec, l2, s2, &nt, sizes, names, &rep2);
+	graphs_diff(l0, l1, s0, s1, nt + GVEC, sizes, names, grad_tol, &lg, &gg);
+	graphs_diff(l0, l2, s0, s2, nt + GVEC, sizes, names, 1.0, &ln, &gn);
+	for (i = 0; i < STEPS * NT; i++) {
+		free(s0[i]);
+		s0[i] = NULL;
+	}
+	printf("  %s: losses %.6f..%.6f; graphs vs plain: max |dloss| %.3g, "
+	    "max grad rel diff %.3g (plain vs plain %.3g, %.3g); replays %ld\n",
+	    tag, l1[0], l1[STEPS * GACC - 1], lg, gg, ln, gn, rep1);
+	assert(rep0 == 0 && rep2 == 0);
+	assert(rep1 == STEPS * (GACC - 1));
+	assert(lg <= loss_tol);
+	assert(gg <= grad_tol);
+}
+
 int main(void)
 {
 	if (!gpu_available()) {
@@ -495,6 +645,9 @@ int main(void)
 	printf("Tensor-Core attention path: bf16 vs fp32\n");
 	check_tracks_fp32("bf16-tc", GPU_PREC_BF16, 2e-3, 0.2, 0.1);
 	g_flash = 1;
+	printf("cuda graphs vs plain run\n");
+	check_graphs_match("bf16", GPU_PREC_BF16, 2e-5, 2e-6);
+	check_graphs_match("fp32", GPU_PREC_FP32, 2e-5, 2e-6);
 	printf("test_gpu: all passed\n");
 	return 0;
 }

@@ -14,6 +14,7 @@
 #ifdef _WIN32
 #include "ann_posix.h"
 #else
+#include <execinfo.h>
 #include <pthread.h>
 #endif
 #ifdef ANN_CUBLAS
@@ -33,9 +34,96 @@ static int g_compute_prec;
 static int g_fp8_fwd;
 static int g_fp8_dgrad;
 static cudaStream_t g_copy_stream;
+/*
+** Compute stream: every kernel, cuBLAS call and async copy of the training
+** path goes here. A blocking stream (cudaStreamCreate) orders itself with the
+** legacy default stream exactly as stream 0 did, so the synchronous
+** cudaMemcpy calls keep their meaning; unlike stream 0 it can be captured
+** into a CUDA graph (cudaStreamBeginCapture refuses the legacy stream).
+*/
+static cudaStream_t g_st;
+
+/*
+** CUDA-graph bookkeeping for every device allocation in this file.
+** A captured graph holds raw device addresses: any cudaFree may hand one of
+** them to a new owner, so each free bumps g_dev_free_gen and a graph older
+** than the current generation is never replayed. cudaMalloc / cudaFree are
+** illegal inside a capture (they invalidate it); they are refused there and
+** the capture is marked bad, so a path that was not warmed up before the
+** capture costs a re-capture instead of a broken graph. A path that takes
+** another branch when an allocation fails is harmless for the same reason:
+** the bad capture is thrown away, never replayed.
+*/
+static unsigned long g_dev_free_gen;
+static int g_capture_bad;
+static int g_graph_mode;	/* gpu_graph_set_mode: lm_graph_step is in use */
+
+static int capturing_now(void)
+{
+	cudaStreamCaptureStatus cs;
+
+	if (!g_st || cudaStreamIsCapturing(g_st, &cs) != cudaSuccess)
+		return 0;
+	/* Invalidated still counts: the host must keep off the device. */
+	return cs != cudaStreamCaptureStatusNone;
+}
+
+/* ANN_GRAPH_DEBUG=1: say why a capture was thrown away. */
+static int graph_debug_on(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		const char *e = getenv("ANN_GRAPH_DEBUG");
+
+		on = (e && e[0] == '1') ? 1 : 0;
+	}
+	return on;
+}
+
+static void capture_refuse(const char *what, int line)
+{
+	if (graph_debug_on() && !g_capture_bad) {
+		fprintf(stderr, "[graph] capture refused: %s at gpu_cuda.cu:%d\n",
+		    what, line);
+#ifndef _WIN32
+		{
+			void *bt[24];
+
+			backtrace_symbols_fd(bt, backtrace(bt, 24), 2);
+		}
+#endif
+	}
+	g_capture_bad = 1;
+}
+
+static cudaError_t ann_dev_malloc(void **p, size_t n, int line)
+{
+	if (capturing_now()) {
+		capture_refuse("cudaMalloc", line);
+		*p = NULL;
+		return cudaErrorStreamCaptureUnsupported;
+	}
+	return cudaMalloc(p, n);
+}
+
+static cudaError_t ann_dev_free(void *p, int line)
+{
+	if (!p)
+		return cudaSuccess;
+	if (capturing_now()) {
+		capture_refuse("cudaFree", line);
+		return cudaErrorStreamCaptureUnsupported;
+	}
+	g_dev_free_gen++;
+	return cudaFree(p);
+}
+#define cudaMalloc(p, n)	ann_dev_malloc((void **)(p), (n), __LINE__)
+#define cudaFree(p)		ann_dev_free((void *)(p), __LINE__)
 static cudaGraph_t g_graph;
 static cudaGraphExec_t g_graph_exec;
 static int g_graph_ok;
+static unsigned long g_graph_gen;	/* g_dev_free_gen when captured */
 
 extern "C" void gpu_set_compute_prec(int prec)
 {
@@ -125,6 +213,12 @@ static int cublas_ensure(void)
 #elif defined(CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION)
 	(void)cublasSetMathMode(g_cublas, CUBLAS_DEFAULT_MATH);
 #endif
+	(void)gpu_available();	/* creates g_st */
+	if (cublasSetStream(g_cublas, g_st) != CUBLAS_STATUS_SUCCESS) {
+		cublasLtDestroy(g_cublaslt);
+		cublasDestroy(g_cublas);
+		return -1;
+	}
 	if (cudaMalloc(&g_lt_workspace, LT_WS_BYTES) == cudaSuccess)
 		g_lt_workspace_bytes = LT_WS_BYTES;
 	else {
@@ -269,7 +363,7 @@ static int cublas_lt_gemm_half(cublasOperation_t opa, cublasOperation_t opb,
 		st = cublasLtMatmul(g_cublaslt, e->desc, alpha, B, e->layoutA,
 		    A, e->layoutB, beta, C, e->layoutC, D, e->layoutC,
 		    &e->algo, g_lt_workspace,
-		    e->ws > 0 ? e->ws : g_lt_workspace_bytes, 0);
+		    e->ws > 0 ? e->ws : g_lt_workspace_bytes, g_st);
 		return st == CUBLAS_STATUS_SUCCESS ? 0 : -1;
 	}
 	if (e->handles) {
@@ -415,15 +509,15 @@ static int cublas_lt_gemm_half(cublasOperation_t opa, cublasOperation_t opb,
 
 				if (heurs[hi].workspaceSize > g_lt_workspace_bytes)
 					continue;
-				(void)cudaEventRecord(ev0, 0);
+				(void)cudaEventRecord(ev0, g_st);
 				r = cublasLtMatmul(g_cublaslt, op, alpha, B,
 				    layoutA, A, layoutB, beta, C, layoutC,
 				    time_D, layoutC, &heurs[hi].algo,
 				    g_lt_workspace,
 				    heurs[hi].workspaceSize > 0
 				    ? heurs[hi].workspaceSize
-				    : g_lt_workspace_bytes, 0);
-				(void)cudaEventRecord(ev1, 0);
+				    : g_lt_workspace_bytes, g_st);
+				(void)cudaEventRecord(ev1, g_st);
 				if (r != CUBLAS_STATUS_SUCCESS)
 					continue;
 				(void)cudaEventSynchronize(ev1);
@@ -468,13 +562,13 @@ static int cublas_lt_gemm_half(cublasOperation_t opa, cublasOperation_t opb,
 					(void)cudaGetLastError();
 					continue;
 				}
-				(void)cudaEventRecord(ev0, 0);
+				(void)cudaEventRecord(ev0, g_st);
 				r = cublasLtMatmul(g_cublaslt, op, alpha, B,
 				    layoutA, A, layoutB, beta, C, layoutC,
 				    time_D, layoutC, &alt.algo, g_lt_workspace,
 				    alt.workspaceSize > 0 ? alt.workspaceSize
-				    : g_lt_workspace_bytes, 0);
-				(void)cudaEventRecord(ev1, 0);
+				    : g_lt_workspace_bytes, g_st);
+				(void)cudaEventRecord(ev1, g_st);
 				if (r != CUBLAS_STATUS_SUCCESS)
 					continue;
 				(void)cudaEventSynchronize(ev1);
@@ -546,7 +640,7 @@ static int cublas_lt_gemm_half(cublasOperation_t opa, cublasOperation_t opb,
 	}
 	st = cublasLtMatmul(g_cublaslt, op, alpha, B, layoutA, A, layoutB, beta,
 	    C, layoutC, D, layoutC, &e->algo,
-	    g_lt_workspace, e->ws > 0 ? e->ws : g_lt_workspace_bytes, 0);
+	    g_lt_workspace, e->ws > 0 ? e->ws : g_lt_workspace_bytes, g_st);
 	cublasLtMatmulPreferenceDestroy(pref);
 	return st == CUBLAS_STATUS_SUCCESS ? 0 : -1;
 }
@@ -852,7 +946,7 @@ static int fp8_hot_prepare(int n, const ann_real *y, __nv_fp8_storage_t **buf,
 	as = fp8_act_scale(y, 0);
 	if (!as)
 		return -1;
-	if (cudaMemsetAsync(g_fp8_hot_amax, 0, sizeof(float), 0) != cudaSuccess)
+	if (cudaMemsetAsync(g_fp8_hot_amax, 0, sizeof(float), g_st) != cudaSuccess)
 		return -1;
 	g_fp8_hot_scale = FP8_SCALE_CUR(as);
 	*buf = (__nv_fp8_storage_t *)g_fp8_hot_buf;
@@ -874,7 +968,7 @@ static void fp8_hot_finish(void)
 {
 	if (!g_fp8_hot_scale || !g_fp8_hot_amax)
 		return;
-	amax_to_scale_kernel<<<1, 1>>>(g_fp8_hot_scale, g_fp8_hot_amax, 448.f);
+	amax_to_scale_kernel<<<1, 1, 0, g_st>>>(g_fp8_hot_scale, g_fp8_hot_amax, 448.f);
 	g_fp8_hot_src = NULL;
 	g_fp8_hot_n = 0;
 }
@@ -905,19 +999,19 @@ static int fp8_quant_now(void *dst_fp8, float *scale_dev, const float *src,
 		return -1;
 	if (fp8_scales_ensure() != 0)
 		return -1;
-	cudaMemsetAsync(g_fp8_amax_buf, 0, sizeof(float), 0);
+	cudaMemsetAsync(g_fp8_amax_buf, 0, sizeof(float), g_st);
 	blocks = (n + threads * 4 - 1) / (threads * 4);
 	if (blocks > 1024)
 		blocks = 1024;
 	if (blocks < 1)
 		blocks = 1;
-	f32_amax_block_kernel<<<blocks, threads>>>(g_fp8_amax_buf, src, n);
-	amax_to_scale_kernel<<<1, 1>>>(scale_dev, g_fp8_amax_buf,
+	f32_amax_block_kernel<<<blocks, threads, 0, g_st>>>(g_fp8_amax_buf, src, n);
+	amax_to_scale_kernel<<<1, 1, 0, g_st>>>(scale_dev, g_fp8_amax_buf,
 	    fp8_max_finite(e5m2));
 	blocks = (n + threads * 4 - 1) / (threads * 4);
 	if (blocks < 1)
 		blocks = 1;
-	f32_to_fp8_vec_kernel<<<blocks, threads>>>(
+	f32_to_fp8_vec_kernel<<<blocks, threads, 0, g_st>>>(
 	    (__nv_fp8_storage_t *)dst_fp8, src, n, scale_dev, e5m2);
 	return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }
@@ -935,16 +1029,16 @@ static int fp8_quant_transpose_now(void *dst_fp8, float *scale_dev,
 		return -1;
 	if (fp8_scales_ensure() != 0)
 		return -1;
-	cudaMemsetAsync(g_fp8_amax_buf, 0, sizeof(float), 0);
+	cudaMemsetAsync(g_fp8_amax_buf, 0, sizeof(float), g_st);
 	blocks = (n + threads * 4 - 1) / (threads * 4);
 	if (blocks > 1024)
 		blocks = 1024;
 	if (blocks < 1)
 		blocks = 1;
-	f32_amax_block_kernel<<<blocks, threads>>>(g_fp8_amax_buf, src, n);
-	amax_to_scale_kernel<<<1, 1>>>(scale_dev, g_fp8_amax_buf,
+	f32_amax_block_kernel<<<blocks, threads, 0, g_st>>>(g_fp8_amax_buf, src, n);
+	amax_to_scale_kernel<<<1, 1, 0, g_st>>>(scale_dev, g_fp8_amax_buf,
 	    fp8_max_finite(e5m2));
-	f32_transpose_to_fp8_kernel<<<grid, block>>>(
+	f32_transpose_to_fp8_kernel<<<grid, block, 0, g_st>>>(
 	    (__nv_fp8_storage_t *)dst_fp8, src, rows, cols, scale_dev, e5m2);
 	return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }
@@ -964,11 +1058,11 @@ static int fp8_quant_tensor(void *dst_fp8, float *scale_dev, const float *src,
 		return -1;
 	if (fp8_scales_ensure() != 0)
 		return -1;
-	cudaMemsetAsync(g_fp8_amax_buf, 0, sizeof(float), 0);
+	cudaMemsetAsync(g_fp8_amax_buf, 0, sizeof(float), g_st);
 	blocks = (n + threads * 4 - 1) / (threads * 4);
 	if (blocks < 1)
 		blocks = 1;
-	f32_to_fp8_delayed_kernel<<<blocks, threads>>>(
+	f32_to_fp8_delayed_kernel<<<blocks, threads, 0, g_st>>>(
 	    (__nv_fp8_storage_t *)dst_fp8, g_fp8_amax_buf, src, n, scale_dev,
 	    e5m2);
 	return cudaGetLastError() == cudaSuccess ? 0 : -1;
@@ -978,7 +1072,7 @@ static void fp8_act_scale_commit(float *scale, int e5m2)
 {
 	if (!scale || !g_fp8_amax_buf)
 		return;
-	amax_to_scale_kernel<<<1, 1>>>(scale, g_fp8_amax_buf,
+	amax_to_scale_kernel<<<1, 1, 0, g_st>>>(scale, g_fp8_amax_buf,
 	    fp8_max_finite(e5m2));
 }
 
@@ -1135,7 +1229,7 @@ static int cublas_lt_gemm_fp8_ex(cublasOperation_t opa, cublasOperation_t opb,
 		st = cublasLtMatmul(g_cublaslt, e->desc, alpha, B, e->layoutA,
 		    A, e->layoutB, beta, C, e->layoutC, C, e->layoutC,
 		    &e->algo, g_lt_workspace,
-		    e->ws > 0 ? e->ws : g_lt_workspace_bytes, 0);
+		    e->ws > 0 ? e->ws : g_lt_workspace_bytes, g_st);
 		return st == CUBLAS_STATUS_SUCCESS ? 0 : -1;
 	}
 	if (e->handles) {
@@ -1220,7 +1314,7 @@ static int cublas_lt_gemm_fp8_ex(cublasOperation_t opa, cublasOperation_t opb,
 				else
 					time_D = NULL;
 			}
-			if (time_D && cudaStreamIsCapturing(0, &cs) == cudaSuccess
+			if (time_D && cudaStreamIsCapturing(g_st, &cs) == cudaSuccess
 			    && cs == cudaStreamCaptureStatusNone
 			    && cudaEventCreate(&ev0) == cudaSuccess
 			    && cudaEventCreate(&ev1) == cudaSuccess) {
@@ -1231,15 +1325,15 @@ static int cublas_lt_gemm_fp8_ex(cublasOperation_t opa, cublasOperation_t opb,
 					if (heurs[hi].workspaceSize
 					    > g_lt_workspace_bytes)
 						continue;
-					(void)cudaEventRecord(ev0, 0);
+					(void)cudaEventRecord(ev0, g_st);
 					r = cublasLtMatmul(g_cublaslt, op,
 					    alpha, B, layoutA, A, layoutB, beta,
 					    C, layoutC, time_D, layoutC,
 					    &heurs[hi].algo, g_lt_workspace,
 					    heurs[hi].workspaceSize > 0
 					    ? heurs[hi].workspaceSize
-					    : g_lt_workspace_bytes, 0);
-					(void)cudaEventRecord(ev1, 0);
+					    : g_lt_workspace_bytes, g_st);
+					(void)cudaEventRecord(ev1, g_st);
 					if (r != CUBLAS_STATUS_SUCCESS)
 						continue;
 					(void)cudaEventSynchronize(ev1);
@@ -1295,7 +1389,7 @@ static int cublas_lt_gemm_fp8_ex(cublasOperation_t opa, cublasOperation_t opb,
 	}
 	st = cublasLtMatmul(g_cublaslt, op, alpha, B, layoutA, A, layoutB, beta,
 	    C, layoutC, C, layoutC, &e->algo,
-	    g_lt_workspace, e->ws > 0 ? e->ws : g_lt_workspace_bytes, 0);
+	    g_lt_workspace, e->ws > 0 ? e->ws : g_lt_workspace_bytes, g_st);
 	cublasLtMatmulPreferenceDestroy(pref);
 	/* desc and layouts stay on the shape slot. */
 	return st == CUBLAS_STATUS_SUCCESS ? 0 : -1;
@@ -1531,6 +1625,13 @@ extern "C" void gpu_grad_twins_clear(void)
 	}
 	g_qkv_d16.key = NULL;
 	g_qkv_d16.live = 0;
+	/*
+	** Graph mode: every microbatch then reserves the same slots in the
+	** same order, so a slot sized by the uncaptured microbatch is never
+	** grown inside a capture.
+	*/
+	if (g_graph_mode)
+		g_grad_twin_rr = 0;
 }
 
 static void grad_twin_forget(const void *p)
@@ -1627,7 +1728,7 @@ static int half_wt_convert(void *dst, const ann_real *src, int n, int bf16)
 		blocks = (n + threads * 4 - 1) / (threads * 4);
 		if (blocks < 1)
 			blocks = 1;
-		f32_to_bf16_kernel<<<blocks, threads>>>(
+		f32_to_bf16_kernel<<<blocks, threads, 0, g_st>>>(
 		    (__nv_bfloat16 *)dst, src, n);
 		rc = cudaGetLastError() == cudaSuccess ? 0 : -1;
 		op_end(prof);
@@ -2016,6 +2117,11 @@ static int cublas_gemm_rm(ann_real *dC, const ann_real *dA, const ann_real *dB,
 	return cublas_gemm_rm_ha(dC, dA, dB, M, N, K, NULL);
 }
 
+static void *bias_cache_get(const void *host, size_t bytes);
+static int ew_is_dev(const void *p);
+/* The device bias the epilogue reads: g_lt_bias_dev or a bias_cache copy. */
+static const float *g_lt_bias_cur;
+
 /* Upload host bias into persistent device scratch (length N). */
 static int lt_bias_upload(const ann_real *bias_host, int N)
 {
@@ -2024,6 +2130,22 @@ static int lt_bias_upload(const ann_real *bias_host, int N)
 	if (!bias_host || N <= 0)
 		return -1;
 	nb = (size_t)N * sizeof(float);
+	/*
+	** Graph mode: the parameter's own persistent copy, refreshed once
+	** per optimizer step like every other bias (ew_acquire_param). The
+	** synchronous upload below cannot be captured, and a graph would
+	** read the scratch with whatever bias was uploaded last.
+	*/
+	if (g_graph_mode && !ew_is_dev(bias_host)) {
+		g_lt_bias_cur = (const float *)bias_cache_get(bias_host, nb);
+		if (g_lt_bias_cur)
+			return 0;
+		if (capturing_now()) {
+			capture_refuse("epilogue bias outside the bias cache", __LINE__);
+			return -1;
+		}
+	}
+	g_lt_bias_cur = g_lt_bias_dev;
 	if (g_lt_bias_cap < nb) {
 		if (g_lt_bias_dev)
 			cudaFree(g_lt_bias_dev);
@@ -2033,6 +2155,7 @@ static int lt_bias_upload(const ann_real *bias_host, int N)
 			return -1;
 		g_lt_bias_cap = nb;
 	}
+	g_lt_bias_cur = g_lt_bias_dev;
 	return cudaMemcpy(g_lt_bias_dev, bias_host, nb, cudaMemcpyHostToDevice)
 	    == cudaSuccess ? 0 : -1;
 }
@@ -2072,7 +2195,7 @@ static int cublas_gemm_rm_epi_res(ann_real *dC, const ann_real *dA,
 	if (bias_host && out_bf16 && !bias_dev) {
 		/* The epilogue bias in BF16, as the BF16 output requires. */
 		if (ensure_half_buf(&g_lt_bias16, &g_lt_bias16_cap, (size_t)N * 2) != 0
-		    || half_wt_convert(g_lt_bias16, g_lt_bias_dev, N, 1) != 0) {
+		    || half_wt_convert(g_lt_bias16, g_lt_bias_cur, N, 1) != 0) {
 			pthread_mutex_unlock(&g_gemm_mu);
 			return -1;
 		}
@@ -2112,7 +2235,7 @@ static int cublas_gemm_rm_epi_res(ann_real *dC, const ann_real *dA,
 	rc = cublas_lt_gemm_half(CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha,
 	    hB_use, N, hA_use, K, &beta, res ? (ann_real *)res : dC, N, 1, epi,
 	    !bias_host ? NULL : bias_dev ? (const float *)bias_dev
-	    : (out_bf16 ? (const float *)g_lt_bias16 : g_lt_bias_dev),
+	    : (out_bf16 ? (const float *)g_lt_bias16 : g_lt_bias_cur),
 	    res ? dC : NULL, out_bf16);
 	pthread_mutex_unlock(&g_gemm_mu);
 	return rc;
@@ -2347,12 +2470,21 @@ __global__ static void gemm_kernel(const ann_real *A, const ann_real *B, ann_rea
 	C[row * N + col] = sum;
 }
 
+static pthread_once_t g_st_once = PTHREAD_ONCE_INIT;
+
+static void compute_stream_create(void)
+{
+	if (cudaStreamCreate(&g_st) != cudaSuccess)
+		g_st = 0;	/* legacy stream: everything works but capture */
+}
+
 extern "C" int gpu_available(void)
 {
 	int n;
 
 	if (cudaGetDeviceCount(&n) != cudaSuccess || n <= 0)
 		return 0;
+	pthread_once(&g_st_once, compute_stream_create);
 	return 1;
 }
 
@@ -2383,12 +2515,273 @@ extern "C" const char *gpu_backend_name(void)
 #endif
 }
 
+/*
+** Graph mode: exact-size block recycling behind gpu_malloc / gpu_free.
+** Every mat temporary of a microbatch is a gpu_malloc / gpu_free pair; a
+** steady microbatch asks for the same sizes in the same order, so after one
+** uncaptured microbatch a capture finds every block it needs in the pool
+** (no cudaMalloc inside the capture) and gets the same addresses back.
+**
+** Blocks handed out or returned inside a capture are the graph's own
+** temporaries (pb->graph). The next uncaptured microbatch may borrow them,
+** but a replay while one is out would overwrite a live buffer: they are
+** counted in g_pool_graph_out and gpu_graph_replayable waits for zero.
+** Returning any other block bumps g_dev_free_gen exactly as cudaFree does:
+** the graph may still read it through its owner.
+*/
+typedef struct {
+	void	*p;
+	size_t	n;
+	int	free;
+	int	graph;	/* a temporary of the current graph */
+	int	out;	/* a graph temporary lent outside the capture */
+} pool_blk;
+typedef struct {
+	size_t	n;
+	int	*stk;	/* g_pool indices of free blocks, LIFO */
+	int	cnt;
+	int	cap;
+} pool_bin;
+#define POOL_HASH	(1 << 17)	/* g_pool index + 1 by address, 0 = empty */
+/* gpu_malloc / gpu_free also run on OpenMP threads (per-head attention). */
+static pthread_mutex_t g_pool_mu = PTHREAD_MUTEX_INITIALIZER;
+static pool_blk *g_pool;
+static int g_pool_n;
+static int g_pool_cap;
+static int *g_pool_hash;
+static pool_bin *g_pool_bin;
+static int g_pool_nbin;
+static long g_pool_graph_out;
+
+static unsigned pool_slot(const void *p)
+{
+	unsigned long long k = (unsigned long long)(size_t)p;
+
+	k ^= k >> 29;
+	k *= 0x9e3779b97f4a7c15ULL;
+	return (unsigned)(k >> 40) & (POOL_HASH - 1);
+}
+
+static int pool_find(const void *p)
+{
+	unsigned h;
+	int i;
+
+	if (!g_pool_hash)
+		return -1;
+	for (h = pool_slot(p); (i = g_pool_hash[h]) != 0; h = (h + 1) & (POOL_HASH - 1))
+		if (g_pool[i - 1].p == p)
+			return i - 1;
+	return -1;
+}
+
+static pool_bin *pool_bin_for(size_t n, int create)
+{
+	int i;
+
+	for (i = 0; i < g_pool_nbin; i++)
+		if (g_pool_bin[i].n == n)
+			return &g_pool_bin[i];
+	if (!create)
+		return NULL;
+	{
+		pool_bin *nb = (pool_bin *)realloc(g_pool_bin,
+		    (size_t)(g_pool_nbin + 1) * sizeof(pool_bin));
+
+		if (!nb)
+			return NULL;
+		g_pool_bin = nb;
+	}
+	memset(&g_pool_bin[g_pool_nbin], 0, sizeof(pool_bin));
+	g_pool_bin[g_pool_nbin].n = n;
+	return &g_pool_bin[g_pool_nbin++];
+}
+
+static int pool_push(int i)
+{
+	pool_bin *b = pool_bin_for(g_pool[i].n, 1);
+
+	if (!b)
+		return -1;
+	if (b->cnt == b->cap) {
+		int nc = b->cap ? b->cap * 2 : 16;
+		int *ns = (int *)realloc(b->stk, (size_t)nc * sizeof(int));
+
+		if (!ns)
+			return -1;
+		b->stk = ns;
+		b->cap = nc;
+	}
+	b->stk[b->cnt++] = i;
+	g_pool[i].free = 1;
+	return 0;
+}
+
+/* Track a fresh cudaMalloc block; -1 when the tables cannot grow. */
+static int pool_add(void *p, size_t n)
+{
+	unsigned h;
+
+	if (!g_pool_hash) {
+		g_pool_hash = (int *)calloc(POOL_HASH, sizeof(int));
+		if (!g_pool_hash)
+			return -1;
+	}
+	/* Half full at most: the table is never rehashed. */
+	if (g_pool_n >= POOL_HASH / 2)
+		return -1;
+	if (g_pool_n == g_pool_cap) {
+		int nc = g_pool_cap ? g_pool_cap * 2 : 1024;
+		pool_blk *np = (pool_blk *)realloc(g_pool,
+		    (size_t)nc * sizeof(pool_blk));
+
+		if (!np)
+			return -1;
+		g_pool = np;
+		g_pool_cap = nc;
+	}
+	g_pool[g_pool_n].p = p;
+	g_pool[g_pool_n].n = n;
+	g_pool[g_pool_n].free = 0;
+	g_pool[g_pool_n].graph = 0;
+	g_pool[g_pool_n].out = 0;
+	for (h = pool_slot(p); g_pool_hash[h] != 0; h = (h + 1) & (POOL_HASH - 1))
+		;
+	g_pool_hash[h] = ++g_pool_n;
+	return 0;
+}
+
+/*
+** Give every free block back to the driver and forget all of them (blocks
+** still in use become ordinary allocations again). A graph may hold any of
+** these addresses: g_dev_free_gen moves on.
+*/
+static void pool_release_all(void)
+{
+	int i;
+
+	for (i = 0; i < g_pool_n; i++)
+		if (g_pool[i].free)
+			(void)cudaFree(g_pool[i].p);
+	for (i = 0; i < g_pool_nbin; i++)
+		free(g_pool_bin[i].stk);
+	free(g_pool_bin);
+	g_pool_bin = NULL;
+	g_pool_nbin = 0;
+	free(g_pool);
+	g_pool = NULL;
+	g_pool_n = 0;
+	g_pool_cap = 0;
+	free(g_pool_hash);
+	g_pool_hash = NULL;
+	g_pool_graph_out = 0;
+	g_dev_free_gen++;
+}
+
+/*
+** At gpu_device_sync (the optimizer step): give back the idle blocks no
+** graph uses (an evaluation's leftovers, or every temporary before the
+** first capture), so the pool never holds more than a microbatch needs,
+** and compact the tables. A graph cannot hold a block that is free and not
+** its own: freeing it from its owner already moved g_dev_free_gen on.
+*/
+static void pool_trim_idle(void)
+{
+	int *remap;
+	int i;
+	int n;
+	unsigned h;
+
+	n = 0;
+	for (i = 0; i < g_pool_n; i++)
+		n += !g_pool[i].p || (g_pool[i].free && !g_pool[i].graph);
+	if (n == 0)
+		return;
+	remap = (int *)malloc((size_t)(g_pool_n ? g_pool_n : 1) * sizeof(int));
+	if (!remap)
+		return;
+	n = 0;
+	for (i = 0; i < g_pool_n; i++) {
+		if (!g_pool[i].p || (g_pool[i].free && !g_pool[i].graph)) {
+			/* (cudaFree): the real call, no new generation. */
+			if (g_pool[i].p)
+				(void)(cudaFree)(g_pool[i].p);
+			remap[i] = -1;
+			continue;
+		}
+		remap[i] = n;
+		g_pool[n++] = g_pool[i];
+	}
+	g_pool_n = n;
+	/* The graph's blocks keep their LIFO order in every bin. */
+	for (i = 0; i < g_pool_nbin; i++) {
+		pool_bin *b = &g_pool_bin[i];
+		int j;
+		int k = 0;
+
+		for (j = 0; j < b->cnt; j++)
+			if (remap[b->stk[j]] >= 0)
+				b->stk[k++] = remap[b->stk[j]];
+		b->cnt = k;
+	}
+	free(remap);
+	memset(g_pool_hash, 0, POOL_HASH * sizeof(int));
+	for (i = 0; i < g_pool_n; i++) {
+		for (h = pool_slot(g_pool[i].p); g_pool_hash[h] != 0;
+		    h = (h + 1) & (POOL_HASH - 1))
+			;
+		g_pool_hash[h] = i + 1;
+	}
+}
+
 extern "C" void *gpu_malloc(size_t nbytes)
 {
 	void *p;
 
 	if (nbytes == 0 || !gpu_available())
 		return NULL;
+	if (g_graph_mode) {
+		pool_bin *b;
+
+		pthread_mutex_lock(&g_pool_mu);
+		b = pool_bin_for(nbytes, 0);
+		if (b && b->cnt > 0) {
+			int i = b->stk[--b->cnt];
+
+			g_pool[i].free = 0;
+			if (capturing_now())
+				g_pool[i].graph = 1;
+			else if (g_pool[i].graph) {
+				g_pool[i].out = 1;
+				g_pool_graph_out++;
+			}
+			p = g_pool[i].p;
+			pthread_mutex_unlock(&g_pool_mu);
+			return p;
+		}
+		if (capturing_now()) {
+			capture_refuse("gpu_malloc of a size the pool lacks", __LINE__);
+			pthread_mutex_unlock(&g_pool_mu);
+			return NULL;
+		}
+		if (cudaMalloc(&p, nbytes) != cudaSuccess) {
+			/* Out of memory: the pool's idle blocks go first. */
+			(void)cudaGetLastError();
+			pool_release_all();
+			if (cudaMalloc(&p, nbytes) != cudaSuccess) {
+				pthread_mutex_unlock(&g_pool_mu);
+				return NULL;
+			}
+		}
+		if (pool_add(p, nbytes) != 0) {
+			static int warned;
+
+			if (!warned++)
+				fprintf(stderr, "[graph] block pool full: plain allocations from now on\n");
+		}
+		pthread_mutex_unlock(&g_pool_mu);
+		return p;
+	}
 	if (cudaMalloc(&p, nbytes) != cudaSuccess)
 		return NULL;
 	return p;
@@ -2427,11 +2820,46 @@ static void twins_forget_dev(const void *p)
 #endif
 }
 
+/* Frees refused inside a capture: done right after it ends. */
+#define DEFER_FREE_MAX	64
+static void *g_defer_free[DEFER_FREE_MAX];
+static int g_defer_free_n;
+
 extern "C" void gpu_free(void *p)
 {
+	int i;
+
 	if (!p)
 		return;
 	twins_forget_dev(p);
+	if (g_graph_mode) {
+		pthread_mutex_lock(&g_pool_mu);
+		if ((i = pool_find(p)) >= 0 && !g_pool[i].free) {
+			if (g_pool[i].out) {
+				g_pool[i].out = 0;
+				g_pool_graph_out--;
+			}
+			if (capturing_now())
+				g_pool[i].graph = 1;
+			else if (!g_pool[i].graph)
+				g_dev_free_gen++;
+			if (pool_push(i) == 0) {
+				pthread_mutex_unlock(&g_pool_mu);
+				return;
+			}
+			/* No room to keep it: an ordinary free, the entry is dead. */
+			g_pool[i].p = NULL;
+			g_pool[i].n = 0;
+		}
+		pthread_mutex_unlock(&g_pool_mu);
+	}
+	if (capturing_now()) {
+		capture_refuse("gpu_free of an unpooled buffer", __LINE__);
+		if (g_defer_free_n < DEFER_FREE_MAX) {
+			g_defer_free[g_defer_free_n++] = p;
+			return;
+		}
+	}
 	cudaFree(p);
 }
 
@@ -2440,7 +2868,7 @@ extern "C" int gpu_memcpy_h2d(void *dst, const void *src, size_t nbytes)
 	if (!dst || !src || nbytes == 0)
 		return -1;
 	/* Async on default stream; same-stream kernels/copies order themselves. */
-	return cudaMemcpyAsync(dst, src, nbytes, cudaMemcpyHostToDevice, 0)
+	return cudaMemcpyAsync(dst, src, nbytes, cudaMemcpyHostToDevice, g_st)
 	    == cudaSuccess ? 0 : -1;
 }
 
@@ -2478,20 +2906,20 @@ extern "C" int gpu_memcpy_d2h_async(void *dst, const void *src, size_t nbytes)
 {
 	if (!dst || !src || nbytes == 0)
 		return -1;
-	return cudaMemcpyAsync(dst, src, nbytes, cudaMemcpyDeviceToHost, 0)
+	return cudaMemcpyAsync(dst, src, nbytes, cudaMemcpyDeviceToHost, g_st)
 	    == cudaSuccess ? 0 : -1;
 }
 
 extern "C" int gpu_stream_sync(void)
 {
-	return cudaStreamSynchronize(0) == cudaSuccess ? 0 : -1;
+	return cudaStreamSynchronize(g_st) == cudaSuccess ? 0 : -1;
 }
 
 extern "C" int gpu_memcpy_d2d(void *dst, const void *src, size_t nbytes)
 {
 	if (!dst || !src || nbytes == 0)
 		return -1;
-	return cudaMemcpyAsync(dst, src, nbytes, cudaMemcpyDeviceToDevice, 0)
+	return cudaMemcpyAsync(dst, src, nbytes, cudaMemcpyDeviceToDevice, g_st)
 	    == cudaSuccess ? 0 : -1;
 }
 
@@ -2499,7 +2927,7 @@ extern "C" int gpu_memset(void *dst, int value, size_t nbytes)
 {
 	if (!dst || nbytes == 0)
 		return -1;
-	return cudaMemset(dst, value, nbytes) == cudaSuccess ? 0 : -1;
+	return cudaMemsetAsync(dst, value, nbytes, g_st) == cudaSuccess ? 0 : -1;
 }
 
 static size_t mat_bytes(const mat *m)
@@ -2591,11 +3019,7 @@ static int ensure_dev_out(mat *m, ann_real **out, int *owned)
 */
 static int stream_is_capturing(void)
 {
-	cudaStreamCaptureStatus st;
-
-	if (cudaStreamIsCapturing(0, &st) != cudaSuccess)
-		return 0;
-	return st == cudaStreamCaptureStatusActive;
+	return capturing_now();
 }
 
 static int launch_done(void)
@@ -2639,7 +3063,7 @@ static void colsum_flush_all(void)
 				a->host[j] += tmp[j];
 		}
 		free(tmp);
-		(void)cudaMemset(a->dev, 0, nb);
+		(void)cudaMemsetAsync(a->dev, 0, nb, g_st);
 		a->dirty = 0;
 	}
 }
@@ -2665,7 +3089,7 @@ static colsum_acc *colsum_acc_get(ann_real *db_host, int cols)
 		g_colsum_acc[free_slot].dev = NULL;
 		return NULL;
 	}
-	(void)cudaMemset(g_colsum_acc[free_slot].dev, 0, nb);
+	(void)cudaMemsetAsync(g_colsum_acc[free_slot].dev, 0, nb, g_st);
 	g_colsum_acc[free_slot].host = db_host;
 	g_colsum_acc[free_slot].cols = cols;
 	g_colsum_acc[free_slot].dirty = 0;
@@ -2730,6 +3154,19 @@ static int op_begin(int op)
 	op_ev *e;
 	int i;
 
+	if (graph_debug_on() && g_st) {
+		static int said;
+		cudaStreamCaptureStatus cs;
+
+		/* Name the first op that starts after the capture broke. */
+		if (cudaStreamIsCapturing(g_st, &cs) == cudaSuccess) {
+			if (cs == cudaStreamCaptureStatusNone)
+				said = 0;
+			else if (cs == cudaStreamCaptureStatusInvalidated && !said++)
+				fprintf(stderr, "[graph] capture already invalid when %s starts\n",
+				    g_op_name[op]);
+		}
+	}
 	if (!op_prof_on() || stream_is_capturing())
 		return -1;
 	pthread_mutex_lock(&g_op_mu);
@@ -2748,7 +3185,7 @@ static int op_begin(int op)
 		g_op_ev_made++;
 	}
 	e->op = op;
-	if (cudaEventRecord(e->e0, 0) != cudaSuccess) {
+	if (cudaEventRecord(e->e0, g_st) != cudaSuccess) {
 		static int warned;
 
 		if (!warned++)
@@ -2788,7 +3225,7 @@ static int op_begin_nested(int op)
 		g_op_ev_made++;
 	}
 	e->op = op;
-	if (cudaEventRecord(e->e0, 0) != cudaSuccess) {
+	if (cudaEventRecord(e->e0, g_st) != cudaSuccess) {
 		(void)cudaGetLastError();
 		pthread_mutex_unlock(&g_op_mu);
 		return -1;
@@ -2804,7 +3241,7 @@ static void op_end(int i)
 	if (i < 0)
 		return;
 	pthread_mutex_lock(&g_op_mu);
-	if (cudaEventRecord(g_op_ev[i].e1, 0) != cudaSuccess)
+	if (cudaEventRecord(g_op_ev[i].e1, g_st) != cudaSuccess)
 		(void)cudaGetLastError();
 	g_op_depth--;
 	pthread_mutex_unlock(&g_op_mu);
@@ -2886,6 +3323,11 @@ extern "C" void gpu_device_sync(void)
 		colsum_flush_all();
 		if (op_prof_on())
 			op_prof_resolve();
+		if (g_graph_mode) {
+			pthread_mutex_lock(&g_pool_mu);
+			pool_trim_idle();
+			pthread_mutex_unlock(&g_pool_mu);
+		}
 	}
 }
 
@@ -2958,7 +3400,7 @@ extern "C" int gpu_mat_mul(mat *c, const mat *a, const mat *b)
 #endif
 		block = dim3(16, 16);
 		grid = dim3((c->cols + 15) / 16, (c->rows + 15) / 16);
-		gemm_kernel<<<grid, block>>>(dA, dB, dC, a->rows, b->cols,
+		gemm_kernel<<<grid, block, 0, g_st>>>(dA, dB, dC, a->rows, b->cols,
 		    a->cols);
 #ifdef ANN_CUBLAS
 	}
@@ -3045,7 +3487,7 @@ extern "C" int gpu_mat_mul_bt(mat *c, const mat *a, const mat *b)
 #endif
 		block = dim3(16, 16);
 		grid = dim3((c->cols + 15) / 16, (c->rows + 15) / 16);
-		gemm_bt_kernel<<<grid, block>>>(dA, dB, dC, a->rows, b->rows,
+		gemm_bt_kernel<<<grid, block, 0, g_st>>>(dA, dB, dC, a->rows, b->rows,
 		    a->cols);
 #ifdef ANN_CUBLAS
 	}
@@ -3231,7 +3673,7 @@ extern "C" int gpu_mat_mul_at(mat *c, const mat *a, const mat *b)
 #endif
 		block = dim3(16, 16);
 		grid = dim3((c->cols + 15) / 16, (c->rows + 15) / 16);
-		gemm_at_kernel<<<grid, block>>>(dA, dB, dC, a->rows, a->cols,
+		gemm_at_kernel<<<grid, block, 0, g_st>>>(dA, dB, dC, a->rows, a->cols,
 		    b->cols);
 #ifdef ANN_CUBLAS
 	}
@@ -3288,7 +3730,7 @@ extern "C" int gpu_mat_outer_add(mat *dw, const mat *a, const mat *b)
 #endif
 		block = dim3(16, 16);
 		grid = dim3((dw->cols + 15) / 16, (dw->rows + 15) / 16);
-		outer_add_kernel<<<grid, block>>>(dW, dA, dB, a->rows, a->cols,
+		outer_add_kernel<<<grid, block, 0, g_st>>>(dW, dA, dB, a->rows, a->cols,
 		    b->cols);
 #ifdef ANN_CUBLAS
 	}
@@ -3332,12 +3774,9 @@ static int ew_is_dev(const void *p)
 	cudaPointerAttributes a;
 
 	/*
-	** cudaPointerGetAttributes is illegal during graph capture and was
-	** segfaulting --cuda-graphs. After warmup, large buffers are device
-	** activations; small ones go through bias_cache.
+	** Legal during a stream capture (probed on CUDA 13.3 in every capture
+	** mode), so a host pointer is never taken for a device one there.
 	*/
-	if (stream_is_capturing())
-		return 1;
 	if (cudaPointerGetAttributes(&a, p) != cudaSuccess) {
 		(void)cudaGetLastError();
 		return 0;
@@ -3386,7 +3825,7 @@ static void *bias_cache_get(const void *host, size_t bytes)
 			}
 			if (e->epoch != g_wt_epoch) {
 				if (cudaMemcpyAsync(e->dev, host, bytes,
-				    cudaMemcpyHostToDevice, 0) != cudaSuccess)
+				    cudaMemcpyHostToDevice, g_st) != cudaSuccess)
 					return NULL;
 				e->epoch = g_wt_epoch;
 			} else if (twin_check_on()) {
@@ -3415,7 +3854,7 @@ static void *bias_cache_get(const void *host, size_t bytes)
 		e->dev = NULL;
 		return NULL;
 	}
-	if (cudaMemcpyAsync(e->dev, host, bytes, cudaMemcpyHostToDevice, 0)
+	if (cudaMemcpyAsync(e->dev, host, bytes, cudaMemcpyHostToDevice, g_st)
 	    != cudaSuccess) {
 		cudaFree(e->dev);
 		e->host = NULL;
@@ -3595,7 +4034,7 @@ static void *devvec_get(const void *host, size_t bytes)
 		e->dev = NULL;
 		return NULL;
 	}
-	(void)cudaMemset(e->dev, 0, bytes);
+	(void)cudaMemsetAsync(e->dev, 0, bytes, g_st);
 	e->host = host;
 	e->bytes = bytes;
 	return e->dev;
@@ -4205,22 +4644,22 @@ static int ln_fast_ok(int d, const void *a, const void *b, const void *c,
 
 #define LNF_DISPATCH(NVV, KERNEL, GRID, ...) \
 	switch (NVV) { \
-	case 1: KERNEL<1><<<GRID, LNF_WARPS * 32>>>(__VA_ARGS__); break; \
-	case 2: KERNEL<2><<<GRID, LNF_WARPS * 32>>>(__VA_ARGS__); break; \
-	case 3: KERNEL<3><<<GRID, LNF_WARPS * 32>>>(__VA_ARGS__); break; \
-	case 4: KERNEL<4><<<GRID, LNF_WARPS * 32>>>(__VA_ARGS__); break; \
-	case 5: KERNEL<5><<<GRID, LNF_WARPS * 32>>>(__VA_ARGS__); break; \
-	case 6: KERNEL<6><<<GRID, LNF_WARPS * 32>>>(__VA_ARGS__); break; \
-	case 7: KERNEL<7><<<GRID, LNF_WARPS * 32>>>(__VA_ARGS__); break; \
-	case 8: KERNEL<8><<<GRID, LNF_WARPS * 32>>>(__VA_ARGS__); break; \
-	case 9: KERNEL<9><<<GRID, LNF_WARPS * 32>>>(__VA_ARGS__); break; \
-	case 10: KERNEL<10><<<GRID, LNF_WARPS * 32>>>(__VA_ARGS__); break; \
-	case 11: KERNEL<11><<<GRID, LNF_WARPS * 32>>>(__VA_ARGS__); break; \
-	case 12: KERNEL<12><<<GRID, LNF_WARPS * 32>>>(__VA_ARGS__); break; \
-	case 13: KERNEL<13><<<GRID, LNF_WARPS * 32>>>(__VA_ARGS__); break; \
-	case 14: KERNEL<14><<<GRID, LNF_WARPS * 32>>>(__VA_ARGS__); break; \
-	case 15: KERNEL<15><<<GRID, LNF_WARPS * 32>>>(__VA_ARGS__); break; \
-	default: KERNEL<16><<<GRID, LNF_WARPS * 32>>>(__VA_ARGS__); break; \
+	case 1: KERNEL<1><<<GRID, LNF_WARPS * 32, 0, g_st>>>(__VA_ARGS__); break; \
+	case 2: KERNEL<2><<<GRID, LNF_WARPS * 32, 0, g_st>>>(__VA_ARGS__); break; \
+	case 3: KERNEL<3><<<GRID, LNF_WARPS * 32, 0, g_st>>>(__VA_ARGS__); break; \
+	case 4: KERNEL<4><<<GRID, LNF_WARPS * 32, 0, g_st>>>(__VA_ARGS__); break; \
+	case 5: KERNEL<5><<<GRID, LNF_WARPS * 32, 0, g_st>>>(__VA_ARGS__); break; \
+	case 6: KERNEL<6><<<GRID, LNF_WARPS * 32, 0, g_st>>>(__VA_ARGS__); break; \
+	case 7: KERNEL<7><<<GRID, LNF_WARPS * 32, 0, g_st>>>(__VA_ARGS__); break; \
+	case 8: KERNEL<8><<<GRID, LNF_WARPS * 32, 0, g_st>>>(__VA_ARGS__); break; \
+	case 9: KERNEL<9><<<GRID, LNF_WARPS * 32, 0, g_st>>>(__VA_ARGS__); break; \
+	case 10: KERNEL<10><<<GRID, LNF_WARPS * 32, 0, g_st>>>(__VA_ARGS__); break; \
+	case 11: KERNEL<11><<<GRID, LNF_WARPS * 32, 0, g_st>>>(__VA_ARGS__); break; \
+	case 12: KERNEL<12><<<GRID, LNF_WARPS * 32, 0, g_st>>>(__VA_ARGS__); break; \
+	case 13: KERNEL<13><<<GRID, LNF_WARPS * 32, 0, g_st>>>(__VA_ARGS__); break; \
+	case 14: KERNEL<14><<<GRID, LNF_WARPS * 32, 0, g_st>>>(__VA_ARGS__); break; \
+	case 15: KERNEL<15><<<GRID, LNF_WARPS * 32, 0, g_st>>>(__VA_ARGS__); break; \
+	default: KERNEL<16><<<GRID, LNF_WARPS * 32, 0, g_st>>>(__VA_ARGS__); break; \
 	}
 
 static int ln_fwd_fast_launch(ann_real *y, const ann_real *x,
@@ -4313,7 +4752,7 @@ static int gpu_softmax_rows_locked(ann_real *rows, int n_rows, int n_cols)
 	if (ew_acquire(&r, 0, rows,
 	    (size_t)n_rows * (size_t)n_cols * sizeof(ann_real), 1, 1) != 0)
 		return -1;
-	softmax_rows_kernel<<<n_rows, ew_block_for(n_cols)>>>(r.dev, n_cols);
+	softmax_rows_kernel<<<n_rows, ew_block_for(n_cols), 0, g_st>>>(r.dev, n_cols);
 	if (ew_launch_ok() != 0)
 		return -1;
 	rc = ew_release(&r);
@@ -4361,7 +4800,7 @@ static int gpu_softmax_bwd_rows_locked(ann_real *dx, const ann_real *y,
 	} else if (ew_acquire(&rdx, 2, dx, nb, 0, 1) != 0) {
 		return -1;
 	}
-	softmax_bwd_kernel<<<n_rows, ew_block_for(n_cols)>>>(rdx.dev, ry.dev,
+	softmax_bwd_kernel<<<n_rows, ew_block_for(n_cols), 0, g_st>>>(rdx.dev, ry.dev,
 	    rdy.dev, n_cols);
 	if (ew_launch_ok() != 0)
 		return -1;
@@ -4658,7 +5097,7 @@ extern "C" int gpu_attn_causal_fwd(mat *concat, mat *w, const mat *q,
 		    (size_t)B * sizeof(int)) != 0)
 			goto out;
 	}
-	attn_fwd_kernel<<<B * H * T, ATT_BLOCK, smem>>>(dc, dw, dq, dk, dv,
+	attn_fwd_kernel<<<B * H * T, ATT_BLOCK, smem, g_st>>>(dc, dw, dq, dk, dv,
 	    T, H, dh, (ann_real)(1.0 / sqrt((double)dh)),
 	    g_att_seqlens_host ? g_att_seqlens_dev : NULL, NULL);
 	if (launch_done() == 0 && finish_out(concat, dc, oc) == 0) {
@@ -4731,7 +5170,7 @@ extern "C" int gpu_attn_flash_fwd(mat *concat, const mat *q, const mat *k,
 		    (size_t)B * sizeof(int)) != 0)
 			goto flash_out;
 	}
-	attn_fwd_kernel<<<B * H * T, ATT_BLOCK, smem>>>(dc, NULL, dq, dk, dv,
+	attn_fwd_kernel<<<B * H * T, ATT_BLOCK, smem, g_st>>>(dc, NULL, dq, dk, dv,
 	    T, H, dh, (ann_real)(1.0 / sqrt((double)dh)),
 	    g_att_seqlens_host ? g_att_seqlens_dev : NULL, dL);
 	if (launch_done() == 0 && finish_out(concat, dc, oc) == 0
@@ -4925,11 +5364,11 @@ extern "C" int gpu_attn_tiled_bwd(mat *dq, mat *dk, mat *dv,
 	a_dk = ptr[6];
 	a_dv = ptr[7];
 	nbytes = (size_t)B * (size_t)T * (size_t)(H * dh) * sizeof(ann_real);
-	if (cudaMemset(a_dk, 0, nbytes) != cudaSuccess
-	    || cudaMemset(a_dv, 0, nbytes) != cudaSuccess)
+	if (cudaMemsetAsync(a_dk, 0, nbytes, g_st) != cudaSuccess
+	    || cudaMemsetAsync(a_dv, 0, nbytes, g_st) != cudaSuccess)
 		goto tiled_bwd_out;
 	smem = (size_t)(4 * dh + 2 * FA_BC * dh) * sizeof(ann_real);
-	attn_tiled_bwd_kernel<<<B * H * T, ATT_BLOCK, smem>>>(a_dq, a_dk, a_dv,
+	attn_tiled_bwd_kernel<<<B * H * T, ATT_BLOCK, smem, g_st>>>(a_dq, a_dk, a_dv,
 	    a_dc, a_o, a_q, a_k, a_v, a_L, T, H, dh,
 	    (ann_real)(1.0 / sqrt((double)dh)),
 	    g_att_seqlens_host ? g_att_seqlens_dev : NULL);
@@ -4984,7 +5423,7 @@ extern "C" int gpu_ffn_w1_finish(ann_real *hidden, ann_real *pre,
 		pthread_mutex_unlock(&g_ew_mu);
 		return -1;
 	}
-	bias_relu_dst_kernel<<<(n + EW_BLOCK - 1) / EW_BLOCK, EW_BLOCK>>>(
+	bias_relu_dst_kernel<<<(n + EW_BLOCK - 1) / EW_BLOCK, EW_BLOCK, 0, g_st>>>(
 	    rh.dev, rp.dev, have_bias ? rb.dev : NULL, n, cols);
 	if (ew_launch_ok() != 0) {
 		pthread_mutex_unlock(&g_ew_mu);
@@ -5087,8 +5526,7 @@ static int gpu_mat_mul_epi(mat *c, const mat *a, const mat *b,
 	** keeps the FP32 output plus a conversion).
 	*/
 	if (with_relu && !ownC && g_compute_prec == GPU_PREC_BF16
-	    && g_sync_mode != GPU_SYNC_EAGER && !stream_is_capturing()
-	    && hid_bf16_on()) {
+	    && g_sync_mode != GPU_SYNC_EAGER && hid_bf16_on()) {
 		act_bf16_slot *as = act_bf16_reserve(dC, a->rows * b->cols);
 
 		if (as) {
@@ -5273,10 +5711,10 @@ extern "C" int gpu_attn_causal_bwd(mat *dq, mat *dk, mat *dv,
 	a_dk = ptr[5];
 	a_dv = ptr[6];
 	smem = (size_t)(dh + T) * sizeof(ann_real);
-	attn_bwd_rows_kernel<<<B * H * T, ATT_BLOCK, smem>>>(a_dq, g_att_ds,
+	attn_bwd_rows_kernel<<<B * H * T, ATT_BLOCK, smem, g_st>>>(a_dq, g_att_ds,
 	    a_dc, w->d_data, a_k, a_v, T, H, dh,
 	    (ann_real)(1.0 / sqrt((double)dh)));
-	attn_bwd_cols_kernel<<<B * H * T, ATT_BLOCK>>>(a_dk, a_dv, a_dc,
+	attn_bwd_cols_kernel<<<B * H * T, ATT_BLOCK, 0, g_st>>>(a_dk, a_dv, a_dc,
 	    w->d_data, g_att_ds, a_q, T, H, dh);
 	if (launch_done() == 0 && finish_out(dq, a_dq, o[4]) == 0
 	    && finish_out(dk, a_dk, o[5]) == 0
@@ -5567,9 +6005,9 @@ static int tc_gemm_qk_batched(ann_real *scores, const ann_real *Q,
 
 		if (blocks < 1)
 			blocks = 1;
-		f32_to_bf16_kernel<<<blocks, threads>>>(
+		f32_to_bf16_kernel<<<blocks, threads, 0, g_st>>>(
 		    (__nv_bfloat16 *)g_tc_half_q, Q, (int)n);
-		f32_to_bf16_kernel<<<blocks, threads>>>(
+		f32_to_bf16_kernel<<<blocks, threads, 0, g_st>>>(
 		    (__nv_bfloat16 *)g_tc_half_k, K, (int)n);
 		return tc_gemm_qk_half(scores, T, dh, batch);
 	}
@@ -5847,7 +6285,7 @@ static void *qkv_wt_get(const void *hwq, const void *hwk, const void *hwv, int D
 		e->key = NULL;
 		return NULL;
 	}
-	qkv_wt_pack_kernel<<<(unsigned)((n + 255) / 256), 256>>>((__nv_bfloat16 *)e->buf,
+	qkv_wt_pack_kernel<<<(unsigned)((n + 255) / 256), 256, 0, g_st>>>((__nv_bfloat16 *)e->buf,
 	    (const __nv_bfloat16 *)hwq, (const __nv_bfloat16 *)hwk,
 	    (const __nv_bfloat16 *)hwv, D);
 	if (cudaGetLastError() != cudaSuccess) {
@@ -6143,7 +6581,7 @@ extern "C" int gpu_attn_fa_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat,
 			goto fa_bwd_out;
 		if (ensure_dev_out(dv, &a_dv, &odv) != 0)
 			goto fa_bwd_out;
-		if (cudaMemsetAsync(ptr[5], 0, ndo * sizeof(ann_real), 0)
+		if (cudaMemsetAsync(ptr[5], 0, ndo * sizeof(ann_real), g_st)
 		    != cudaSuccess)
 			goto fa_bwd_done;
 		/* The Wo dgrad may have left dO only as a BF16 twin (gpu_mat_mul_bt_twin). */
@@ -6168,7 +6606,7 @@ extern "C" int gpu_attn_fa_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat,
 		*/
 		g_qkv_d16.live = 0;
 		g_qkv_d16.key = NULL;
-		if (!o[5] && !o[6] && !odv && !stream_is_capturing() && twin_emit_on()
+		if (!o[5] && !o[6] && !odv && twin_emit_on()
 		    && qkv_bwd_on() && !g_fp8_fwd && !g_fp8_dgrad && !twin_check_on()
 		    && (Dm & 3) == 0) {
 			pthread_mutex_lock(&g_gemm_mu);
@@ -6184,7 +6622,7 @@ extern "C" int gpu_attn_fa_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat,
 			pthread_mutex_unlock(&g_gemm_mu);
 		}
 		/* dK, dV also as BF16 twins: their wgrad and dgrad GEMMs then convert nothing. */
-		if (!merged && !o[6] && !odv && !stream_is_capturing() && twin_emit_on()) {
+		if (!merged && !o[6] && !odv && twin_emit_on()) {
 			pthread_mutex_lock(&g_gemm_mu);
 			dk16 = grad_twin_reserve(ptr[6], ndo);
 			dv16 = dk16 ? grad_twin_reserve(a_dv, ndo) : NULL;
@@ -6199,7 +6637,7 @@ extern "C" int gpu_attn_fa_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat,
 			fused_of = ptr[1];
 		} else if (dO16) {
 			/* dO's BF16 twin (written by the Wo dgrad GEMM), read strided; dvec from it. */
-			{ OpNest _n(OP_ATT_SMX_ID); attn_fa_dvec16_kernel<<<(unsigned)((nrows + 255) / 256), 256>>>(
+			{ OpNest _n(OP_ATT_SMX_ID); attn_fa_dvec16_kernel<<<(unsigned)((nrows + 255) / 256), 256, 0, g_st>>>(
 			    g_fa_dvec, dO16, ptr[1], (int)nrows, T, H, dh); }
 		} else {
 			/* FP32 dO only: BF16 rows in scratch (same rounding as the twin), dvec from the FP32. */
@@ -6214,9 +6652,9 @@ extern "C" int gpu_attn_fa_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat,
 				}
 				goto fa_bwd_done;
 			}
-			{ OpNest _n(OP_ATT_PACK_ID); f32_to_bf16_kernel<<<blocks, threads>>>(
+			{ OpNest _n(OP_ATT_PACK_ID); f32_to_bf16_kernel<<<blocks, threads, 0, g_st>>>(
 			    (__nv_bfloat16 *)g_tc_half_do, ptr[0], n); }
-			{ OpNest _n(OP_ATT_SMX_ID); attn_fa_dvec_kernel<<<(unsigned)((nrows + 255) / 256), 256>>>(
+			{ OpNest _n(OP_ATT_SMX_ID); attn_fa_dvec_kernel<<<(unsigned)((nrows + 255) / 256), 256, 0, g_st>>>(
 			    g_fa_dvec, ptr[0], ptr[1], (int)nrows, T, H, dh); }
 		}
 		/*
@@ -6243,7 +6681,7 @@ extern "C" int gpu_attn_fa_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat,
 			/* dQ (atomics, FP32) into its block of the merged rows. */
 			size_t n4 = ndo / 4;
 
-			{ OpNest _n(OP_ATT_PACK_ID); f32_to_bf16_ld_kernel<<<(unsigned)((n4 + 255) / 256), 256>>>(
+			{ OpNest _n(OP_ATT_PACK_ID); f32_to_bf16_ld_kernel<<<(unsigned)((n4 + 255) / 256), 256, 0, g_st>>>(
 			    (__nv_bfloat16 *)g_qkv_d16.buf, 3 * Dm, ptr[5], B * T, Dm); }
 		}
 		if (launch_done() == 0 && finish_out(dq, ptr[5], o[5]) == 0
@@ -6482,21 +6920,21 @@ extern "C" int gpu_attn_tc_fwd(mat *concat, mat *w, const mat *q, const mat *k,
 		    (size_t)batch * T * T * 2) != 0)
 			goto tc_fwd_out;
 		{ OpNest _n(OP_ATT_PACK_ID); attn_pack_heads_bf16_kernel<<<(npack + threads - 1) / threads,
-		    threads>>>((__nv_bfloat16 *)g_tc_half_q, dq, B, T, H, dh); }
+		    threads, 0, g_st>>>((__nv_bfloat16 *)g_tc_half_q, dq, B, T, H, dh); }
 		{ OpNest _n(OP_ATT_PACK_ID); attn_pack_heads_bf16_kernel<<<(npack + threads - 1) / threads,
-		    threads>>>((__nv_bfloat16 *)g_tc_half_k, dk, B, T, H, dh); }
+		    threads, 0, g_st>>>((__nv_bfloat16 *)g_tc_half_k, dk, B, T, H, dh); }
 		{ OpNest _n(OP_ATT_PACK_ID); attn_pack_heads_bf16_kernel<<<(npack + threads - 1) / threads,
-		    threads>>>((__nv_bfloat16 *)g_tc_half_v, dv, B, T, H, dh); }
+		    threads, 0, g_st>>>((__nv_bfloat16 *)g_tc_half_v, dv, B, T, H, dh); }
 		if (OpNest(OP_ATT_GEMM_ID), tc_gemm_qk_half(dw, T, dh, batch) != 0)
 			goto tc_fwd_out;
 	} else
 	{
 		{ OpNest _n(OP_ATT_PACK_ID); attn_pack_heads_kernel<<<(npack + threads - 1) / threads,
-		    threads>>>(g_tc_q, dq, B, T, H, dh); }
+		    threads, 0, g_st>>>(g_tc_q, dq, B, T, H, dh); }
 		{ OpNest _n(OP_ATT_PACK_ID); attn_pack_heads_kernel<<<(npack + threads - 1) / threads,
-		    threads>>>(g_tc_k, dk, B, T, H, dh); }
+		    threads, 0, g_st>>>(g_tc_k, dk, B, T, H, dh); }
 		{ OpNest _n(OP_ATT_PACK_ID); attn_pack_heads_kernel<<<(npack + threads - 1) / threads,
-		    threads>>>(g_tc_v, dv, B, T, H, dh); }
+		    threads, 0, g_st>>>(g_tc_v, dv, B, T, H, dh); }
 		if (OpNest(OP_ATT_GEMM_ID), tc_gemm_qk_batched(dw, g_tc_q, g_tc_k, T, dh, batch) != 0)
 			goto tc_fwd_out;
 	}
@@ -6507,7 +6945,7 @@ extern "C" int gpu_attn_tc_fwd(mat *concat, mat *w, const mat *q, const mat *k,
 
 		while (nth < T && nth < ATT_BLOCK)
 			nth <<= 1;
-		{ OpNest _n(OP_ATT_SMX_ID); attn_tc_softmax_kernel<<<sgrid, nth>>>(dw,
+		{ OpNest _n(OP_ATT_SMX_ID); attn_tc_softmax_kernel<<<sgrid, nth, 0, g_st>>>(dw,
 		    g_compute_prec == GPU_PREC_BF16
 		    ? (__nv_bfloat16 *)g_tc_half_p : NULL, T, H, scale,
 		    g_att_seqlens_host ? g_att_seqlens_dev : NULL); }
@@ -6522,7 +6960,7 @@ extern "C" int gpu_attn_tc_fwd(mat *concat, mat *w, const mat *q, const mat *k,
 	} else
 	if (OpNest(OP_ATT_GEMM_ID), tc_gemm_pv_batched(g_tc_o, dw, g_tc_v, T, dh, batch) != 0)
 		goto tc_fwd_out;
-	{ OpNest _n(OP_ATT_PACK_ID); attn_unpack_heads_kernel<<<(npack + threads - 1) / threads, threads>>>(
+	{ OpNest _n(OP_ATT_PACK_ID); attn_unpack_heads_kernel<<<(npack + threads - 1) / threads, threads, 0, g_st>>>(
 	    dc, g_tc_o, B, T, H, dh); }
 	if (launch_done() == 0 && finish_out(concat, dc, oc) == 0) {
 		w->on_device = MAT_DEV_DEVICE;
@@ -6638,17 +7076,17 @@ extern "C" int gpu_attn_tc_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat,
 		    (size_t)batch * ss * 2) != 0)
 			goto tc_bwd_out;
 		{ OpNest _n(OP_ATT_PACK_ID); attn_pack_heads_bf16_kernel<<<(npack + threads - 1) / threads,
-		    threads>>>((__nv_bfloat16 *)g_tc_half_q, a_q, B, T, H, dh); }
+		    threads, 0, g_st>>>((__nv_bfloat16 *)g_tc_half_q, a_q, B, T, H, dh); }
 		{ OpNest _n(OP_ATT_PACK_ID); attn_pack_heads_bf16_kernel<<<(npack + threads - 1) / threads,
-		    threads>>>((__nv_bfloat16 *)g_tc_half_k, a_k, B, T, H, dh); }
+		    threads, 0, g_st>>>((__nv_bfloat16 *)g_tc_half_k, a_k, B, T, H, dh); }
 		{ OpNest _n(OP_ATT_PACK_ID); attn_pack_heads_bf16_kernel<<<(npack + threads - 1) / threads,
-		    threads>>>((__nv_bfloat16 *)g_tc_half_v, a_v, B, T, H, dh); }
+		    threads, 0, g_st>>>((__nv_bfloat16 *)g_tc_half_v, a_v, B, T, H, dh); }
 		{ OpNest _n(OP_ATT_PACK_ID); attn_pack_heads_bf16_kernel<<<(npack + threads - 1) / threads,
-		    threads>>>((__nv_bfloat16 *)g_tc_half_do, a_dc, B, T, H, dh); }
+		    threads, 0, g_st>>>((__nv_bfloat16 *)g_tc_half_do, a_dc, B, T, H, dh); }
 		/* S = Q K^T (recomputed), P = softmax(S) in FP32 + BF16. */
 		if (OpNest(OP_ATT_GEMM_ID), tc_gemm_qk_half(dw, T, dh, batch) != 0)
 			goto tc_bwd_out;
-		{ OpNest _n(OP_ATT_SMX_ID); attn_tc_softmax_kernel<<<sgrid, nth>>>(dw,
+		{ OpNest _n(OP_ATT_SMX_ID); attn_tc_softmax_kernel<<<sgrid, nth, 0, g_st>>>(dw,
 		    (__nv_bfloat16 *)g_tc_half_p, T, H, (ann_real)scale,
 		    g_att_seqlens_host ? g_att_seqlens_dev : NULL); }
 		/* dP = dO V^T: col-major dP^T[T,T] = V[dh,T]^T dO^T[dh,T]. */
@@ -6662,7 +7100,7 @@ extern "C" int gpu_attn_tc_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat,
 		    g_tc_half_p, T, ss, g_tc_v, dh, sv, batch) != 0)
 			goto tc_bwd_out;
 		/* dS = P (dP - rowsum(P dP)) in FP32 + BF16. */
-		{ OpNest _n(OP_ATT_SMX_ID); attn_tc_softmax_bwd_kernel<<<sgrid, nth>>>(g_tc_dp,
+		{ OpNest _n(OP_ATT_SMX_ID); attn_tc_softmax_bwd_kernel<<<sgrid, nth, 0, g_st>>>(g_tc_dp,
 		    (__nv_bfloat16 *)g_tc_half_ds, dw, T, H,
 		    g_att_seqlens_host ? g_att_seqlens_dev : NULL); }
 		/* dQ = scale dS K: col-major dQ^T[dh,T] = K^T[dh,T] dS^T[T,T]. */
@@ -6681,18 +7119,18 @@ extern "C" int gpu_attn_tc_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat,
 
 		/* Pack Q/K/V and dO. */
 		{ OpNest _n(OP_ATT_PACK_ID); attn_pack_heads_kernel<<<(npack + threads - 1) / threads,
-		    threads>>>(g_tc_q, a_q, B, T, H, dh); }
+		    threads, 0, g_st>>>(g_tc_q, a_q, B, T, H, dh); }
 		{ OpNest _n(OP_ATT_PACK_ID); attn_pack_heads_kernel<<<(npack + threads - 1) / threads,
-		    threads>>>(g_tc_k, a_k, B, T, H, dh); }
+		    threads, 0, g_st>>>(g_tc_k, a_k, B, T, H, dh); }
 		{ OpNest _n(OP_ATT_PACK_ID); attn_pack_heads_kernel<<<(npack + threads - 1) / threads,
-		    threads>>>(g_tc_v, a_v, B, T, H, dh); }
+		    threads, 0, g_st>>>(g_tc_v, a_v, B, T, H, dh); }
 		{ OpNest _n(OP_ATT_PACK_ID); attn_pack_heads_kernel<<<(npack + threads - 1) / threads,
-		    threads>>>(g_tc_o, a_dc, B, T, H, dh); }
+		    threads, 0, g_st>>>(g_tc_o, a_dc, B, T, H, dh); }
 		if (OpNest(OP_ATT_GEMM_ID), tc_gemm_qk_batched(dw, g_tc_q, g_tc_k, T, dh, batch) != 0)
 			goto tc_bwd_out;
 		while (nth < T && nth < ATT_BLOCK)
 			nth <<= 1;
-		{ OpNest _n(OP_ATT_SMX_ID); attn_tc_softmax_kernel<<<sgrid, nth>>>(dw, NULL, T, H,
+		{ OpNest _n(OP_ATT_SMX_ID); attn_tc_softmax_kernel<<<sgrid, nth, 0, g_st>>>(dw, NULL, T, H,
 		    (ann_real)scale,
 		    g_att_seqlens_host ? g_att_seqlens_dev : NULL); }
 		/* dP = dO V^T (needs V); then dV = W^T dO (overwrites V). */
@@ -6700,7 +7138,7 @@ extern "C" int gpu_attn_tc_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat,
 			goto tc_bwd_out;
 		if (OpNest(OP_ATT_GEMM_ID), tc_gemm_wt_do(g_tc_v, dw, g_tc_o, T, dh, batch) != 0)
 			goto tc_bwd_out;
-		{ OpNest _n(OP_ATT_SMX_ID); attn_tc_softmax_bwd_kernel<<<sgrid, nth>>>(g_tc_dp, NULL, dw,
+		{ OpNest _n(OP_ATT_SMX_ID); attn_tc_softmax_bwd_kernel<<<sgrid, nth, 0, g_st>>>(g_tc_dp, NULL, dw,
 		    T, H, g_att_seqlens_host ? g_att_seqlens_dev : NULL); }
 		/* dQ = dS K -> g_tc_o; dK = dS^T Q -> g_tc_k (Q still in g_tc_q). */
 		if (OpNest(OP_ATT_GEMM_ID), tc_gemm_ds_k(g_tc_o, g_tc_dp, g_tc_k, T, dh, batch, scale)
@@ -6710,11 +7148,11 @@ extern "C" int gpu_attn_tc_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat,
 		    != 0)
 			goto tc_bwd_out;
 	}
-	{ OpNest _n(OP_ATT_PACK_ID); attn_unpack_heads_kernel<<<(npack + threads - 1) / threads, threads>>>(
+	{ OpNest _n(OP_ATT_PACK_ID); attn_unpack_heads_kernel<<<(npack + threads - 1) / threads, threads, 0, g_st>>>(
 	    a_dq, g_tc_o, B, T, H, dh); }
-	{ OpNest _n(OP_ATT_PACK_ID); attn_unpack_heads_kernel<<<(npack + threads - 1) / threads, threads>>>(
+	{ OpNest _n(OP_ATT_PACK_ID); attn_unpack_heads_kernel<<<(npack + threads - 1) / threads, threads, 0, g_st>>>(
 	    a_dk, g_tc_k, B, T, H, dh); }
-	{ OpNest _n(OP_ATT_PACK_ID); attn_unpack_heads_kernel<<<(npack + threads - 1) / threads, threads>>>(
+	{ OpNest _n(OP_ATT_PACK_ID); attn_unpack_heads_kernel<<<(npack + threads - 1) / threads, threads, 0, g_st>>>(
 	    a_dv, g_tc_v, B, T, H, dh); }
 	if (launch_done() == 0 && finish_out(dq, a_dq, o[4]) == 0
 	    && finish_out(dk, a_dk, o[5]) == 0
@@ -6842,7 +7280,7 @@ extern "C" int gpu_attn_qkv_fused(mat *q, mat *k, mat *v, const mat *x,
 	*/
 	if (!(vram_lazy_on() && !k->d_data && !v->d_data && !k->data && !v->data
 	    && g_compute_prec == GPU_PREC_BF16 && !g_fp8_fwd && hint_T > 0
-	    && fa2_on() && !stream_is_capturing() && fa2_ok(hint_T, hint_dh)
+	    && fa2_on() && fa2_ok(hint_T, hint_dh)
 	    && (D & 7) == 0)) {
 		if (ensure_dev_out(k, &dk, &ok) != 0)
 			goto qkv_triple;
@@ -6940,7 +7378,7 @@ extern "C" int gpu_attn_qkv_fused(mat *q, mat *k, mat *v, const mat *x,
 		** the FP32 q/k/v are never written (their mats are marked
 		** device-resident but hold nothing) and nothing is packed.
 		*/
-		if (use_bf16 && hint_T > 0 && fa2_on() && !stream_is_capturing()
+		if (use_bf16 && hint_T > 0 && fa2_on()
 		    && fa2_ok(hint_T, hint_dh) && !oq && !ok && !ov
 		    && (D & 7) == 0) {
 			qkv_bf16_slot *qs = qkv_bf16_get(dq, N, D, 1);
@@ -6984,8 +7422,15 @@ extern "C" int gpu_attn_qkv_fused(mat *q, mat *k, mat *v, const mat *x,
 			int i;
 			int par = 0;
 
-			if (use_bf16 && !stream_is_capturing()
-			    && qkv_par_ensure() == 0) {
+			/*
+			** Three streams and a host wait per call: not
+			** capturable. A capture that would need them is
+			** thrown away rather than run on another GEMM
+			** path (other algorithms, other rounding).
+			*/
+			if (use_bf16 && stream_is_capturing())
+				capture_refuse("parallel QKV streams", __LINE__);
+			else if (use_bf16 && qkv_par_ensure() == 0) {
 				hwq = half_wt_get(dwq, (size_t)D * (size_t)D,
 				    1);
 				hwk = half_wt_get(dwk, (size_t)D * (size_t)D,
@@ -6993,7 +7438,7 @@ extern "C" int gpu_attn_qkv_fused(mat *q, mat *k, mat *v, const mat *x,
 				hwv = half_wt_get(dwv, (size_t)D * (size_t)D,
 				    1);
 				if (hwq && hwk && hwv
-				    && cudaEventRecord(g_qkv_ready, 0)
+				    && cudaEventRecord(g_qkv_ready, g_st)
 				    == cudaSuccess) {
 					void *hW[3];
 					ann_real *dC[3];
@@ -7086,7 +7531,7 @@ extern "C" int gpu_pack_seq_rows(ann_real *dst, const ann_real *src, int B,
 	if (!dst || !src || B <= 0 || T < 2 || D <= 0 || !gpu_available())
 		return -1;
 	n = B * (T - 1) * D;
-	pack_seq_rows_kernel<<<(n + threads - 1) / threads, threads>>>(dst, src,
+	pack_seq_rows_kernel<<<(n + threads - 1) / threads, threads, 0, g_st>>>(dst, src,
 	    B, T, D);
 	return launch_done();
 }
@@ -7101,7 +7546,7 @@ extern "C" int gpu_unpack_seq_rows(ann_real *dst, const ann_real *src, int B,
 	if (!dst || !src || B <= 0 || T < 2 || D <= 0 || !gpu_available())
 		return -1;
 	n = B * (T - 1) * D;
-	unpack_seq_rows_kernel<<<(n + threads - 1) / threads, threads>>>(dst,
+	unpack_seq_rows_kernel<<<(n + threads - 1) / threads, threads, 0, g_st>>>(dst,
 	    src, B, T, D);
 	return launch_done();
 }
@@ -7177,7 +7622,7 @@ static int gpu_layernorm_forward_ex_locked(ann_real *y, const ann_real *x,
 			    x_hat ? rh.dev : NULL, mean ? rm.dev : NULL,
 			    inv_std ? ri.dev : NULL, T, d, (ann_real)eps, y16);
 		else
-			ln_fwd_kernel<<<T, bs, (size_t)d * sizeof(ann_real)>>>(ry.dev,
+			ln_fwd_kernel<<<T, bs, (size_t)d * sizeof(ann_real), g_st>>>(ry.dev,
 			    rx.dev, rg.dev, rb.dev, x_hat ? rh.dev : NULL,
 			    mean ? rm.dev : NULL, inv_std ? ri.dev : NULL, d,
 			    (ann_real)eps, y8, sc8, am8, y16);
@@ -7228,7 +7673,7 @@ extern "C" int gpu_layernorm_forward_ex(ann_real *y, const ann_real *x,
 	** ANN_LN_BF16=0 keeps the FP32 output plus a conversion.
 	*/
 	if (y && T > 0 && d > 0 && g_compute_prec == GPU_PREC_BF16
-	    && g_sync_mode != GPU_SYNC_EAGER && !stream_is_capturing()
+	    && g_sync_mode != GPU_SYNC_EAGER
 	    && ln_bf16_on() && ew_is_dev(y))
 		as = act_bf16_reserve(y, T * d);
 	pthread_mutex_lock(&g_ew_mu);
@@ -7331,7 +7776,7 @@ static int gpu_layernorm_backward_locked(mat *dx, const mat *dy, const ann_real 
 
 		/* Accumulate mode (training): the result feeds wgrad/dgrad GEMMs; hand them its BF16 twin. */
 		if (accumulate && dx->d_data && g_compute_prec == GPU_PREC_BF16
-		    && !stream_is_capturing() && twin_emit_on()) {
+		    && twin_emit_on()) {
 			pthread_mutex_lock(&g_gemm_mu);
 			dx16 = grad_twin_reserve(dx->d_data, (size_t)T * (size_t)d);
 			pthread_mutex_unlock(&g_gemm_mu);
@@ -7352,7 +7797,7 @@ static int gpu_layernorm_backward_locked(mat *dx, const mat *dy, const ann_real 
 			}
 			return -1;
 		} else {
-			ln_bwd_kernel<<<T, ew_block_for(d)>>>(rdx.dev, rdy.dev, rg.dev, rh.dev,
+			ln_bwd_kernel<<<T, ew_block_for(d), 0, g_st>>>(rdx.dev, rdy.dev, rg.dev, rh.dev,
 			    ri.dev, NULL, NULL, d, accumulate, (__nv_bfloat16 *)dx16);
 		}
 		if (dx16 && ew_launch_ok() != 0) {
@@ -7366,9 +7811,9 @@ static int gpu_layernorm_backward_locked(mat *dx, const mat *dy, const ann_real 
 		dim3 grid((d + EW_BLOCK - 1) / EW_BLOCK,
 		    (T + COLSUM_SLAB - 1) / COLSUM_SLAB);
 
-		col_sum_tiled_kernel<<<grid, EW_BLOCK>>>(acc_b->dev, rdy.dev,
+		col_sum_tiled_kernel<<<grid, EW_BLOCK, 0, g_st>>>(acc_b->dev, rdy.dev,
 		    NULL, T, d);
-		col_sum_tiled_kernel<<<grid, EW_BLOCK>>>(acc_g->dev, rdy.dev,
+		col_sum_tiled_kernel<<<grid, EW_BLOCK, 0, g_st>>>(acc_g->dev, rdy.dev,
 		    rh.dev, T, d);
 	}
 	if (ew_launch_ok() != 0)
@@ -7484,7 +7929,7 @@ extern "C" int gpu_layernorm_xhat(ann_real *x_hat, const ann_real *x,
 		ri = (ann_real *)(ew_is_dev(inv_std) ? (void *)inv_std
 		    : devvec_get(inv_std, vb));
 		if (rm && ri) {
-			ln_xhat_kernel<<<(unsigned)((n + 255) / 256), 256>>>(
+			ln_xhat_kernel<<<(unsigned)((n + 255) / 256), 256, 0, g_st>>>(
 			    rh.dev, rx.dev, rm, ri, T, d);
 			if (ew_launch_ok() == 0) {
 				int did = ew_release(&rh);
@@ -7514,7 +7959,7 @@ static int gpu_bias_row_add_locked(ann_real *x, const ann_real *bias, int rows,
 	if (ew_acquire(&rx, 0, x, (size_t)n * sizeof(ann_real), 1, 1) != 0
 	    || ew_acquire_param(&rb, 1, bias, (size_t)cols * sizeof(ann_real)) != 0)
 		return -1;
-	bias_add_kernel<<<(int)((n + 255) / 256), 256>>>(rx.dev, rb.dev, (int)n,
+	bias_add_kernel<<<(int)((n + 255) / 256), 256, 0, g_st>>>(rx.dev, rb.dev, (int)n,
 	    cols);
 	if (ew_launch_ok() != 0)
 		return -1;
@@ -7549,7 +7994,7 @@ static int gpu_relu_backward_locked(ann_real *dx, const ann_real *x_pre_relu_or_
 	    || ew_acquire(&rr, 1, x_pre_relu_or_mask,
 	    (size_t)n * sizeof(ann_real), 1, 0) != 0)
 		return -1;
-	relu_bwd_kernel<<<(n + 255) / 256, 256>>>(rdx.dev, rr.dev, n);
+	relu_bwd_kernel<<<(n + 255) / 256, 256, 0, g_st>>>(rdx.dev, rr.dev, n);
 	if (ew_launch_ok() != 0)
 		return -1;
 	rc = ew_release(&rdx);
@@ -7644,7 +8089,7 @@ extern "C" int gpu_ffn_relu_bwd_fused(mat *dh, const mat *hidden,
 	size_t n;
 
 	if (!dh || !hidden || !db1_host || !gpu_available()
-	    || g_compute_prec != GPU_PREC_BF16 || stream_is_capturing())
+	    || g_compute_prec != GPU_PREC_BF16)
 		return -1;
 	rows = dh->rows;
 	cols = dh->cols;
@@ -7675,7 +8120,7 @@ extern "C" int gpu_ffn_relu_bwd_fused(mat *dh, const mat *hidden,
 		dim3 grid((cols / 4 + EW_BLOCK - 1) / EW_BLOCK,
 		    (rows + COLSUM_SLAB - 1) / COLSUM_SLAB);
 
-		relu_bwd_pack_colsum_kernel<<<grid, EW_BLOCK>>>(
+		relu_bwd_pack_colsum_kernel<<<grid, EW_BLOCK, 0, g_st>>>(
 		    (__nv_bfloat16 *)twin, acc->dev, ddh, dhid,
 		    (const __nv_bfloat16 *)hid16, rows, cols);
 	}
@@ -7700,7 +8145,7 @@ extern "C" int gpu_ffn_relu_bwd_fused(mat *dh, const mat *hidden,
 		for (j = 0; j < cols; j++)
 			db1_host[j] += db_tmp[j];
 		free(db_tmp);
-		(void)cudaMemset(acc->dev, 0, (size_t)cols * sizeof(ann_real));
+		(void)cudaMemsetAsync(acc->dev, 0, (size_t)cols * sizeof(ann_real), g_st);
 		acc->dirty = 0;
 	}
 	pthread_mutex_unlock(&g_ew_mu);
@@ -7809,7 +8254,7 @@ extern "C" int gpu_grad_sumsq(const ann_real *d_x, int n, double *out)
 		s_acc = NULL;
 		return -1;
 	}
-	if (cudaMemset(s_acc, 0, sizeof(double)) != cudaSuccess)
+	if (cudaMemsetAsync(s_acc, 0, sizeof(double), g_st) != cudaSuccess)
 		return -1;
 	if (sumsq_gs_on() && ((uintptr_t)d_x & 15) == 0) {
 		static int s_blocks;
@@ -7830,9 +8275,9 @@ extern "C" int gpu_grad_sumsq(const ann_real *d_x, int n, double *out)
 			nb = s_blocks;
 		if (nb < 1)
 			nb = 1;
-		sumsq_gs_kernel<<<nb, 256>>>(d_x, (size_t)n, s_acc);
+		sumsq_gs_kernel<<<nb, 256, 0, g_st>>>(d_x, (size_t)n, s_acc);
 	} else
-		sumsq_kernel<<<(n + 255) / 256, 256>>>(d_x, n, s_acc);
+		sumsq_kernel<<<(n + 255) / 256, 256, 0, g_st>>>(d_x, n, s_acc);
 	if (cudaGetLastError() != cudaSuccess)
 		return -1;
 	return cudaMemcpy(out, s_acc, sizeof(double), cudaMemcpyDeviceToHost)
@@ -7997,22 +8442,22 @@ extern "C" int gpu_adam_step_dev_bf16(ann_real *d_p, void *d_p_bf16,
 		int done = n4 << 2;
 
 		if (n4 > 0)
-			adam_kernel_bf16_v4<<<(n4 + 255) / 256, 256>>>(
+			adam_kernel_bf16_v4<<<(n4 + 255) / 256, 256, 0, g_st>>>(
 			    (float4 *)d_p, (uint2 *)d_p_bf16, (float4 *)d_g,
 			    (float4 *)d_m, (float4 *)d_v, n4, lr, beta1, beta2,
 			    eps, bc1, bc2, (ann_real)grad_scale, g_adam_wd);
 		/* The n % 4 tail (none at the production sizes) stays scalar. */
 		if (done < n)
-			adam_kernel_bf16<<<1, 256>>>(d_p + done,
+			adam_kernel_bf16<<<1, 256, 0, g_st>>>(d_p + done,
 			    (__nv_bfloat16 *)d_p_bf16 + done, d_g + done,
 			    d_m + done, d_v + done, n - done, lr, beta1, beta2,
 			    eps, bc1, bc2, (ann_real)grad_scale, g_adam_wd);
 	} else if (d_p_bf16 && g_compute_prec == GPU_PREC_BF16) {
-		adam_kernel_bf16<<<(n + 255) / 256, 256>>>(d_p,
+		adam_kernel_bf16<<<(n + 255) / 256, 256, 0, g_st>>>(d_p,
 		    (__nv_bfloat16 *)d_p_bf16, d_g, d_m, d_v, n, lr, beta1,
 		    beta2, eps, bc1, bc2, (ann_real)grad_scale, g_adam_wd);
 	} else
-		adam_kernel<<<(n + 255) / 256, 256>>>(d_p, d_g, d_m, d_v, n, lr,
+		adam_kernel<<<(n + 255) / 256, 256, 0, g_st>>>(d_p, d_g, d_m, d_v, n, lr,
 		    beta1, beta2, eps, bc1, bc2, (ann_real)grad_scale, g_adam_wd);
 	return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }
@@ -8100,7 +8545,7 @@ extern "C" int gpu_mat_add(mat *dst, const mat *src)
 		return -1;
 	n = dst->rows * dst->cols;
 	bs = 256;
-	add_kernel<<<(n + bs - 1) / bs, bs>>>(dst->d_data, src->d_data, n);
+	add_kernel<<<(n + bs - 1) / bs, bs, 0, g_st>>>(dst->d_data, src->d_data, n);
 	if (launch_done() != 0)
 		return -1;
 	dst->on_device = MAT_DEV_DEVICE;
@@ -8127,7 +8572,7 @@ extern "C" int gpu_mat_add2(mat *dst, const mat *a, const mat *b)
 		return -1;
 	n = dst->rows * dst->cols;
 	bs = 256;
-	add2_kernel<<<(n + bs - 1) / bs, bs>>>(dst->d_data, a->d_data, b->d_data,
+	add2_kernel<<<(n + bs - 1) / bs, bs, 0, g_st>>>(dst->d_data, a->d_data, b->d_data,
 	    n);
 	if (launch_done() != 0)
 		return -1;
@@ -8151,7 +8596,7 @@ extern "C" int gpu_mat_axpy(mat *y, double a, const mat *x)
 		return -1;
 	n = y->rows * y->cols;
 	bs = 256;
-	axpy_kernel<<<(n + bs - 1) / bs, bs>>>(y->d_data, x->d_data,
+	axpy_kernel<<<(n + bs - 1) / bs, bs, 0, g_st>>>(y->d_data, x->d_data,
 	    (ann_real)a, n);
 	if (launch_done() != 0)
 		return -1;
@@ -8222,7 +8667,7 @@ static int mb_nosync_on(void)
 	return on;
 }
 
-/* Device copy of host[0..bytes) on stream 0; NULL = use the old path. */
+/* Device copy of host[0..bytes) on the compute stream; NULL = use the old path. */
 static void *h2d_stage_put(h2d_stage *s, const void *host, size_t bytes)
 {
 	if (!host || bytes == 0 || !mb_nosync_on() || stream_is_capturing())
@@ -8260,14 +8705,148 @@ static void *h2d_stage_put(h2d_stage *s, const void *host, size_t bytes)
 		s->cap = bytes;
 	}
 	memcpy(s->pin, host, bytes);
-	if (cudaMemcpyAsync(s->dev, s->pin, bytes, cudaMemcpyHostToDevice, 0)
+	if (cudaMemcpyAsync(s->dev, s->pin, bytes, cudaMemcpyHostToDevice, g_st)
 	    != cudaSuccess)
 		return NULL;
-	if (cudaEventRecord(s->ev, 0) == cudaSuccess)
+	if (cudaEventRecord(s->ev, g_st) == cudaSuccess)
 		s->pending = 1;
-	else if (cudaStreamSynchronize(0) != cudaSuccess)
+	else if (cudaStreamSynchronize(g_st) != cudaSuccess)
 		return NULL;
 	return s->dev;
+}
+
+/*
+** Staged token ids (gpu_ids_stage): one fixed device buffer that a captured
+** graph reads, refilled on the compute stream before every microbatch from
+** a two-slot page-locked ring. The host waits for a slot's previous copy
+** (two microbatches back) before overwriting it, never for the compute.
+*/
+static int *g_ids_dev;
+static size_t g_ids_dev_cap;
+static int *g_ids_pin[2];
+static size_t g_ids_pin_cap;
+static cudaEvent_t g_ids_ev[2];
+static int g_ids_ev_used[2];
+static int g_ids_k;
+static const int *g_ids_key;
+static const int *g_ids_alias;
+static int g_ids_n;
+static int *g_tgt_dev;
+static size_t g_tgt_dev_cap;
+
+extern "C" int gpu_ids_stage(const int *ids, const int *alias, int n)
+{
+	size_t ib;
+	int k;
+
+	gpu_ids_unstage();
+	if (!ids || n <= 0 || !gpu_available() || capturing_now())
+		return -1;
+	ib = (size_t)n * sizeof(int);
+	if (g_ids_dev_cap < ib) {
+		if (g_ids_dev)
+			cudaFree(g_ids_dev);
+		g_ids_dev = NULL;
+		g_ids_dev_cap = 0;
+		if (cudaMalloc((void **)&g_ids_dev, ib) != cudaSuccess) {
+			g_ids_dev = NULL;
+			return -1;
+		}
+		g_ids_dev_cap = ib;
+	}
+	if (g_ids_pin_cap < ib) {
+		for (k = 0; k < 2; k++) {
+			if (g_ids_ev_used[k])
+				(void)cudaEventSynchronize(g_ids_ev[k]);
+			if (g_ids_pin[k])
+				cudaFreeHost(g_ids_pin[k]);
+			g_ids_pin[k] = NULL;
+		}
+		g_ids_pin_cap = 0;
+		for (k = 0; k < 2; k++)
+			if (cudaHostAlloc((void **)&g_ids_pin[k], ib,
+			    cudaHostAllocDefault) != cudaSuccess) {
+				g_ids_pin[k] = NULL;
+				return -1;
+			}
+		g_ids_pin_cap = ib;
+	}
+	k = g_ids_k;
+	g_ids_k ^= 1;
+	if (!g_ids_ev[k] && cudaEventCreateWithFlags(&g_ids_ev[k],
+	    cudaEventDisableTiming) != cudaSuccess) {
+		g_ids_ev[k] = NULL;
+		return -1;
+	}
+	if (g_ids_ev_used[k] && cudaEventSynchronize(g_ids_ev[k]) != cudaSuccess)
+		return -1;
+	memcpy(g_ids_pin[k], ids, ib);
+	if (cudaMemcpyAsync(g_ids_dev, g_ids_pin[k], ib, cudaMemcpyHostToDevice,
+	    g_st) != cudaSuccess
+	    || cudaEventRecord(g_ids_ev[k], g_st) != cudaSuccess)
+		return -1;
+	g_ids_ev_used[k] = 1;
+	g_ids_key = ids;
+	g_ids_alias = alias;
+	g_ids_n = n;
+	return 0;
+}
+
+extern "C" void gpu_ids_unstage(void)
+{
+	g_ids_key = NULL;
+	g_ids_alias = NULL;
+	g_ids_n = 0;
+}
+
+/* The staged device copy of ids (same host array or its alias), else NULL. */
+static const int *ids_staged(const int *ids, int n)
+{
+	if (!ids || n <= 0 || n != g_ids_n || !g_ids_dev)
+		return NULL;
+	return ids == g_ids_key || ids == g_ids_alias ? g_ids_dev : NULL;
+}
+
+__global__ static void next_token_targets_kernel(int *tgt, const int *ids,
+	int B, int T)
+{
+	int r = blockIdx.x * blockDim.x + threadIdx.x;
+	int b;
+
+	if (r >= B * (T - 1))
+		return;
+	b = r / (T - 1);
+	tgt[r] = ids[b * T + r % (T - 1) + 1];
+}
+
+/*
+** Row b*(T-1)+t predicts ids[b*T+t+1]: the packed CE targets built on the
+** device from the staged ids (no loss mask, no varlen: those are host data).
+*/
+extern "C" const int *gpu_ce_targets_staged(const int *ids, int B, int T)
+{
+	const int *d_ids;
+	size_t nb;
+	int rows;
+
+	if (B <= 0 || T < 2 || !(d_ids = ids_staged(ids, B * T)))
+		return NULL;
+	rows = B * (T - 1);
+	nb = (size_t)rows * sizeof(int);
+	if (g_tgt_dev_cap < nb) {
+		if (g_tgt_dev)
+			cudaFree(g_tgt_dev);
+		g_tgt_dev = NULL;
+		g_tgt_dev_cap = 0;
+		if (cudaMalloc((void **)&g_tgt_dev, nb) != cudaSuccess) {
+			g_tgt_dev = NULL;
+			return NULL;
+		}
+		g_tgt_dev_cap = nb;
+	}
+	next_token_targets_kernel<<<(rows + 255) / 256, 256, 0, g_st>>>(
+	    g_tgt_dev, d_ids, B, T);
+	return cudaGetLastError() == cudaSuccess ? g_tgt_dev : NULL;
 }
 
 extern "C" int gpu_embed_lookup(mat *out, const mat *table, const int *ids, int n)
@@ -8275,6 +8854,7 @@ extern "C" int gpu_embed_lookup(mat *out, const mat *table, const int *ids, int 
 	OpScope _op(OP_EMBED);
 	static h2d_stage s_ids;
 	int *d_ids;
+	const int *staged;
 	int d;
 	int nd;
 	size_t ib;
@@ -8286,11 +8866,20 @@ extern "C" int gpu_embed_lookup(mat *out, const mat *table, const int *ids, int 
 	d = table->cols;
 	if (mat_ensure_dev_auth((mat *)table) != 0 || mat_device_alloc(out) != 0)
 		return -1;
+	if ((staged = ids_staged(ids, n)) != NULL) {
+		nd = n * d;
+		embed_lookup_kernel<<<(nd + 255) / 256, 256, 0, g_st>>>(
+		    out->d_data, table->d_data, staged, n, d);
+		if (launch_done() != 0)
+			return -1;
+		out->on_device = MAT_DEV_DEVICE;
+		return 0;
+	}
 	ib = (size_t)n * sizeof(int);
 	d_ids = (int *)h2d_stage_put(&s_ids, ids, ib);
 	if (d_ids) {
 		nd = n * d;
-		embed_lookup_kernel<<<(nd + 255) / 256, 256>>>(out->d_data,
+		embed_lookup_kernel<<<(nd + 255) / 256, 256, 0, g_st>>>(out->d_data,
 		    table->d_data, d_ids, n, d);
 		if (launch_done() != 0)
 			return -1;
@@ -8313,7 +8902,7 @@ extern "C" int gpu_embed_lookup(mat *out, const mat *table, const int *ids, int 
 		return -1;
 	}
 	nd = n * d;
-	embed_lookup_kernel<<<(nd + 255) / 256, 256>>>(out->d_data, table->d_data,
+	embed_lookup_kernel<<<(nd + 255) / 256, 256, 0, g_st>>>(out->d_data, table->d_data,
 	    d_ids, n, d);
 	gpu_free(d_ids);
 	if (launch_done() != 0)
@@ -8328,6 +8917,7 @@ extern "C" int gpu_embed_scatter(mat *dtable, const mat *dout, const int *ids,
 	OpScope _op(OP_EMBED);
 	static h2d_stage s_ids;
 	int *d_ids;
+	const int *staged;
 	int d;
 	int nd;
 	size_t ib;
@@ -8345,11 +8935,20 @@ extern "C" int gpu_embed_scatter(mat *dtable, const mat *dout, const int *ids,
 			return -1;
 		dtable->on_device = MAT_DEV_SYNCED;
 	}
+	if ((staged = ids_staged(ids, n)) != NULL) {
+		nd = n * d;
+		embed_scatter_kernel<<<(nd + 255) / 256, 256, 0, g_st>>>(
+		    dtable->d_data, dout->d_data, staged, n, d);
+		if (launch_done() != 0)
+			return -1;
+		dtable->on_device = MAT_DEV_DEVICE;
+		return 0;
+	}
 	ib = (size_t)n * sizeof(int);
 	d_ids = (int *)h2d_stage_put(&s_ids, ids, ib);
 	if (d_ids) {
 		nd = n * d;
-		embed_scatter_kernel<<<(nd + 255) / 256, 256>>>(dtable->d_data,
+		embed_scatter_kernel<<<(nd + 255) / 256, 256, 0, g_st>>>(dtable->d_data,
 		    dout->d_data, d_ids, n, d);
 		if (launch_done() != 0)
 			return -1;
@@ -8364,7 +8963,7 @@ extern "C" int gpu_embed_scatter(mat *dtable, const mat *dout, const int *ids,
 		return -1;
 	}
 	nd = n * d;
-	embed_scatter_kernel<<<(nd + 255) / 256, 256>>>(dtable->d_data,
+	embed_scatter_kernel<<<(nd + 255) / 256, 256, 0, g_st>>>(dtable->d_data,
 	    dout->d_data, d_ids, n, d);
 	gpu_free(d_ids);
 	if (launch_done() != 0)
@@ -8576,7 +9175,7 @@ static int ce_softmax_delta_bf16_launch(ann_real *x, const int *tgt,
 		grid = rows;
 #define CE_BF16_CASE(NV) \
 	case NV: \
-		ce_softmax_delta_bf16_kernel<NV><<<grid, bs>>>(x, tgt, rows, V, \
+		ce_softmax_delta_bf16_kernel<NV><<<grid, bs, 0, g_st>>>(x, tgt, rows, V, \
 		    bias, db, ce_sum); \
 		return 0;
 	switch (nv <= 1 ? 1 : nv <= 2 ? 2 : nv <= 4 ? 4 : nv <= 8 ? 8
@@ -8592,6 +9191,15 @@ static int ce_softmax_delta_bf16_launch(ann_real *x, const int *tgt,
 		return -1;
 	}
 #undef CE_BF16_CASE
+}
+
+/* acc[j] += x[j]: one FP32 add per element, as a host loop would do. */
+__global__ static void vec_acc_kernel(ann_real *acc, const ann_real *x, int n)
+{
+	int j = blockIdx.x * blockDim.x + threadIdx.x;
+
+	if (j < n)
+		acc[j] += x[j];
 }
 
 /* Device CE sum + pinned host mirror (captured graph D2H updates host). */
@@ -8616,6 +9224,8 @@ static int ce_delta_run(ann_real *probs, const int *tgt, int rows, int V,
 	static h2d_stage s_tgt;	/* B8: pinned staging of the targets */
 	static ann_real *s_db_dev;
 	static ann_real *s_db_host;
+	static ann_real *s_dbg_dev;	/* graph mode: this microbatch's sums */
+	static size_t s_dbg_cap;
 	static size_t s_db_cap;
 	size_t nb;
 	size_t nbt;
@@ -8658,6 +9268,80 @@ static int ce_delta_run(ann_real *probs, const int *tgt, int rows, int V,
 		pthread_mutex_unlock(&g_ew_mu);
 		return -1;
 	}
+	/*
+	** Graph mode: db_head accumulates on the device (flushed into the
+	** host vector by gpu_device_sync), so the microbatch has no host step
+	** left and can be captured. Each microbatch's column sums still go to
+	** their own zeroed buffer first and are then added to the accumulator,
+	** element by element in microbatch order: the same FP32 additions, in
+	** the same order, as the host loop below (summing straight into the
+	** accumulator would reassociate them). The mean CE is read from the
+	** pinned mirror after a stream sync, only when asked for and never
+	** inside a capture (gpu_ce_fetch_mean after the replay).
+	*/
+	if (g_graph_mode) {
+		colsum_acc *acc = colsum_acc_get(db_host, V);
+
+		if (!acc)
+			goto ce_fail;
+		if (s_dbg_cap < need_db) {
+			if (s_dbg_dev)
+				cudaFree(s_dbg_dev);
+			s_dbg_dev = NULL;
+			s_dbg_cap = 0;
+			if (cudaMalloc((void **)&s_dbg_dev, need_db) != cudaSuccess) {
+				s_dbg_dev = NULL;
+				goto ce_fail;
+			}
+			s_dbg_cap = need_db;
+		}
+		cudaMemsetAsync(g_ce_dev, 0, sizeof(float), g_st);
+		cudaMemsetAsync(s_dbg_dev, 0, need_db, g_st);
+		if (fused) {
+#if CUDART_VERSION >= 11000
+			/* The fused head loss (softmax + CE + BF16 delta + column sums) on the compute stream. */
+			if (rp.dev != probs
+			    || ce_softmax_delta_bf16_launch(rp.dev, (const int *)rt.dev,
+			    rows, V, rb.dev, s_dbg_dev, g_ce_dev) != 0)
+				goto ce_fail;
+			*launched = 1;
+			if (ew_launch_ok() != 0)
+				goto ce_fail;
+#else
+			goto ce_fail;
+#endif
+		} else {
+			ce_onehot_ce_kernel<<<(rows + EW_BLOCK - 1) / EW_BLOCK, EW_BLOCK, 0, g_st>>>(
+			    rp.dev, (const int *)rt.dev, rows, V, g_ce_dev);
+			if (ew_launch_ok() != 0)
+				goto ce_fail;
+			{
+				dim3 grid((V + EW_BLOCK - 1) / EW_BLOCK,
+				    (rows + COLSUM_SLAB - 1) / COLSUM_SLAB);
+
+				col_sum_tiled_kernel<<<grid, EW_BLOCK, 0, g_st>>>(s_dbg_dev,
+				    rp.dev, NULL, rows, V);
+			}
+		}
+		vec_acc_kernel<<<(V + EW_BLOCK - 1) / EW_BLOCK, EW_BLOCK, 0, g_st>>>(
+		    acc->dev, s_dbg_dev, V);
+		if (ew_launch_ok() != 0)
+			goto ce_fail;
+		acc->dirty = 1;
+		if (cudaMemcpyAsync(g_ce_host_pinned, g_ce_dev, sizeof(float),
+		    cudaMemcpyDeviceToHost, g_st) != cudaSuccess)
+			goto ce_fail;
+		g_ce_last_rows = rows;
+		if (ew_release(&rp) < 0)
+			goto ce_fail;
+		if (mean_ce && !stream_is_capturing()) {
+			if (cudaStreamSynchronize(g_st) != cudaSuccess)
+				goto ce_fail;
+			*mean_ce = (double)(*g_ce_host_pinned) / (double)rows;
+		}
+		pthread_mutex_unlock(&g_ew_mu);
+		return 0;
+	}
 	if (s_db_cap < need_db) {
 		if (s_db_dev)
 			cudaFree(s_db_dev);
@@ -8679,8 +9363,8 @@ static int ce_delta_run(ann_real *probs, const int *tgt, int rows, int V,
 		}
 		s_db_cap = need_db;
 	}
-	cudaMemset(g_ce_dev, 0, sizeof(float));
-	cudaMemset(s_db_dev, 0, need_db);
+	cudaMemsetAsync(g_ce_dev, 0, sizeof(float), g_st);
+	cudaMemsetAsync(s_db_dev, 0, need_db, g_st);
 	if (fused) {
 		if (rp.dev != probs
 		    || ce_softmax_delta_bf16_launch(rp.dev, (const int *)rt.dev,
@@ -8691,14 +9375,14 @@ static int ce_delta_run(ann_real *probs, const int *tgt, int rows, int V,
 			goto ce_fail;
 	} else {
 		ce_onehot_ce_kernel<<<(rows + EW_BLOCK - 1) / EW_BLOCK,
-		    EW_BLOCK>>>(rp.dev, (const int *)rt.dev, rows, V, g_ce_dev);
+		    EW_BLOCK, 0, g_st>>>(rp.dev, (const int *)rt.dev, rows, V, g_ce_dev);
 		if (ew_launch_ok() != 0)
 			goto ce_fail;
 		{
 			dim3 grid((V + EW_BLOCK - 1) / EW_BLOCK,
 			    (rows + COLSUM_SLAB - 1) / COLSUM_SLAB);
 
-			col_sum_tiled_kernel<<<grid, EW_BLOCK>>>(s_db_dev, rp.dev,
+			col_sum_tiled_kernel<<<grid, EW_BLOCK, 0, g_st>>>(s_db_dev, rp.dev,
 			    NULL, rows, V);
 		}
 		if (ew_launch_ok() != 0)
@@ -8706,7 +9390,7 @@ static int ce_delta_run(ann_real *probs, const int *tgt, int rows, int V,
 	}
 	/* Always mirror CE to pinned host so graph replay can report NLL. */
 	if (cudaMemcpyAsync(g_ce_host_pinned, g_ce_dev, sizeof(float),
-	    cudaMemcpyDeviceToHost, 0) != cudaSuccess)
+	    cudaMemcpyDeviceToHost, g_st) != cudaSuccess)
 		goto ce_fail;
 	g_ce_last_rows = rows;
 	rc = ew_release(&rp);
@@ -8886,7 +9570,7 @@ extern "C" int gpu_ce_nll_rows(const ann_real *logits, const int *tgt,
 	    || ew_acquire(&rt, 1, tgt, (size_t)rows * sizeof(int), 1, 0) != 0
 	    || ew_acquire(&ro, 2, out, (size_t)rows * sizeof(float), 0, 1) != 0)
 		goto fail;
-	ce_nll_rows_kernel<<<rows, ew_block_for(V)>>>(rl.dev,
+	ce_nll_rows_kernel<<<rows, ew_block_for(V), 0, g_st>>>(rl.dev,
 	    (const int *)rt.dev, V, (float *)ro.dev);
 	if (ew_launch_ok() != 0)
 		goto fail;
@@ -8904,7 +9588,7 @@ extern "C" int gpu_ce_fetch_mean(double *mean_ce, int rows)
 {
 	if (!mean_ce || rows <= 0 || !g_ce_host_pinned || g_ce_last_rows <= 0)
 		return -1;
-	if (cudaStreamSynchronize(0) != cudaSuccess)
+	if (cudaStreamSynchronize(g_st) != cudaSuccess)
 		return -1;
 	*mean_ce = (double)(*g_ce_host_pinned) / (double)rows;
 	return 0;
@@ -8928,7 +9612,7 @@ extern "C" int gpu_posenc_add_packed(ann_real *x, int B, int T, int D)
 		pthread_mutex_unlock(&g_ew_mu);
 		return -1;
 	}
-	posenc_packed_kernel<<<(n + EW_BLOCK - 1) / EW_BLOCK, EW_BLOCK>>>(rx.dev,
+	posenc_packed_kernel<<<(n + EW_BLOCK - 1) / EW_BLOCK, EW_BLOCK, 0, g_st>>>(rx.dev,
 	    B, T, D);
 	if (ew_launch_ok() != 0) {
 		pthread_mutex_unlock(&g_ew_mu);
@@ -8971,7 +9655,7 @@ extern "C" int gpu_mat_col_sum_add(ann_real *db_host, const ann_real *x,
 		dim3 grid((cols + EW_BLOCK - 1) / EW_BLOCK,
 		    (rows + COLSUM_SLAB - 1) / COLSUM_SLAB);
 
-		col_sum_tiled_kernel<<<grid, EW_BLOCK>>>(acc->dev, rx.dev, NULL,
+		col_sum_tiled_kernel<<<grid, EW_BLOCK, 0, g_st>>>(acc->dev, rx.dev, NULL,
 		    rows, cols);
 	}
 	if (ew_launch_ok() != 0) {
@@ -9002,55 +9686,130 @@ extern "C" int gpu_mat_col_sum_add(ann_real *db_host, const ann_real *x,
 		for (j = 0; j < cols; j++)
 			db_host[j] += db_tmp[j];
 		free(db_tmp);
-		(void)cudaMemset(acc->dev, 0, (size_t)cols * sizeof(ann_real));
+		(void)cudaMemsetAsync(acc->dev, 0, (size_t)cols * sizeof(ann_real), g_st);
 		acc->dirty = 0;
 	}
 	pthread_mutex_unlock(&g_ew_mu);
 	return 0;
 }
 
+extern "C" void gpu_graph_set_mode(int on)
+{
+	on = on ? 1 : 0;
+	if (on == g_graph_mode)
+		return;
+	gpu_graph_destroy();
+	gpu_ids_unstage();
+	if (!on && gpu_available()) {
+		(void)cudaStreamSynchronize(g_st);
+		pthread_mutex_lock(&g_pool_mu);
+		pool_release_all();
+		pthread_mutex_unlock(&g_pool_mu);
+	}
+	g_graph_mode = on;
+}
+
+/* Graphs need the capturable compute stream; FP8 keeps host-side state. */
+extern "C" int gpu_graph_supported(void)
+{
+	return gpu_available() && g_st && !g_fp8_fwd && !g_fp8_dgrad;
+}
+
+extern "C" unsigned gpu_param_epoch(void)
+{
+	return g_wt_epoch;
+}
+
 extern "C" int gpu_graph_begin(void)
 {
-	if (!gpu_available())
+	if (!gpu_graph_supported() || !g_graph_mode)
 		return -1;
 	gpu_graph_destroy();
-	/* Drain copy stream so ThreadLocal capture on default stream is clean. */
 	if (g_copy_stream)
 		(void)cudaStreamSynchronize(g_copy_stream);
-	(void)cudaDeviceSynchronize();
-	if (cudaStreamBeginCapture(0, cudaStreamCaptureModeThreadLocal)
-	    != cudaSuccess)
+	if (cudaStreamSynchronize(g_st) != cudaSuccess)
 		return -1;
+	g_capture_bad = 0;
+	g_graph_gen = g_dev_free_gen;
+	/* ThreadLocal: an illegal call from this thread fails the capture. */
+	if (cudaStreamBeginCapture(g_st, cudaStreamCaptureModeThreadLocal)
+	    != cudaSuccess) {
+		(void)cudaGetLastError();
+		return -1;
+	}
 	return 0;
 }
 
 extern "C" int gpu_graph_end(void)
 {
-	if (!gpu_available())
+	cudaError_t err;
+	int i;
+
+	if (!g_st)
 		return -1;
-	if (cudaStreamEndCapture(0, &g_graph) != cudaSuccess)
+	err = cudaStreamEndCapture(g_st, &g_graph);
+	for (i = 0; i < g_defer_free_n; i++)
+		cudaFree(g_defer_free[i]);
+	g_defer_free_n = 0;
+	/* Blocks the capture took and kept are its owners' now, not temporaries. */
+	pthread_mutex_lock(&g_pool_mu);
+	for (i = 0; i < g_pool_n; i++)
+		if (g_pool[i].graph && !g_pool[i].free)
+			g_pool[i].graph = 0;
+	pthread_mutex_unlock(&g_pool_mu);
+	if (err != cudaSuccess || g_capture_bad || !g_graph
+	    || g_dev_free_gen != g_graph_gen) {
+		if (graph_debug_on())
+			fprintf(stderr, "[graph] capture dropped: %s%s%s\n",
+			    cudaGetErrorString(err),
+			    g_capture_bad ? ", refused call inside" : "",
+			    g_dev_free_gen != g_graph_gen ? ", buffer freed" : "");
+		(void)cudaGetLastError();
+		gpu_graph_destroy();
 		return -1;
+	}
 	if (cudaGraphInstantiate(&g_graph_exec, g_graph, NULL, NULL, 0)
 	    != cudaSuccess) {
-		cudaGraphDestroy(g_graph);
-		g_graph = NULL;
+		(void)cudaGetLastError();
+		gpu_graph_destroy();
 		return -1;
 	}
 	g_graph_ok = 1;
 	return 0;
 }
 
+/*
+** A graph may run only while every address it holds is still what it was:
+** no buffer freed since the capture and none of its temporaries lent out.
+*/
+extern "C" int gpu_graph_replayable(void)
+{
+	return g_graph_ok && g_graph_exec && g_dev_free_gen == g_graph_gen
+	    && g_pool_graph_out == 0;
+}
+
 extern "C" int gpu_graph_replay(void)
 {
-	if (!g_graph_ok || !g_graph_exec)
+	if (!gpu_graph_replayable()) {
+		static int said;
+
+		if (graph_debug_on() && g_graph_ok && said++ < 20)
+			fprintf(stderr, "[graph] not replayed:%s%s\n",
+			    g_dev_free_gen != g_graph_gen ? " a buffer was freed" : "",
+			    g_pool_graph_out ? " a graph temporary is lent out" : "");
 		return -1;
-	if (cudaGraphLaunch(g_graph_exec, 0) != cudaSuccess)
+	}
+	if (cudaGraphLaunch(g_graph_exec, g_st) != cudaSuccess) {
+		(void)cudaGetLastError();
 		return -1;
+	}
 	return launch_done();
 }
 
 extern "C" void gpu_graph_destroy(void)
 {
+	int i;
+
 	if (g_graph_exec) {
 		cudaGraphExecDestroy(g_graph_exec);
 		g_graph_exec = NULL;
@@ -9060,6 +9819,14 @@ extern "C" void gpu_graph_destroy(void)
 		g_graph = NULL;
 	}
 	g_graph_ok = 0;
+	/* Its temporaries are ordinary pool blocks again. */
+	pthread_mutex_lock(&g_pool_mu);
+	for (i = 0; i < g_pool_n; i++) {
+		g_pool[i].graph = 0;
+		g_pool[i].out = 0;
+	}
+	g_pool_graph_out = 0;
+	pthread_mutex_unlock(&g_pool_mu);
 }
 
 /*
