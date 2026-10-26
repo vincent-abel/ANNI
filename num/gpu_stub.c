@@ -571,6 +571,12 @@ void gpu_attn_qkv_bf16_hint(int T, int dh)
 	(void)dh;
 }
 
+int gpu_act_bf16_only(const mat *m)
+{
+	(void)m;
+	return 0;
+}
+
 int gpu_ffn_relu_bwd_fused(mat *dh, const mat *hidden, ann_real *db1_host)
 {
 	(void)dh;

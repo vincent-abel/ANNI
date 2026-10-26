@@ -1,0 +1,36 @@
+# BF16 outputs straight from the GEMMs (candidates 8 and 9)
+
+## Abstract
+
+In BF16 mode every activation was produced in FP32 by a GEMM, then converted (and for Q, K, V also re-laid out head-major) before the next tensor-core consumer read it. Two of those round trips are gone: the Q/K/V projection is now one cuBLASLt GEMM \(X\,[W_Q|W_K|W_V]\) whose output is BF16 rows `[B·T][3D]` that the FA2 attention kernels read strided (candidate 8), and the FFN's \(\mathrm{ReLU}(X W_1 + b_1)\) is written once as the BF16 twin that the W2 GEMM, its wgrad and the fused ReLU backward consume (candidate 9). The FP32 `q`, `k`, `v` and `hidden` mats of the layer caches are no longer written: their device buffers only serve as the keys of the BF16 slots.
+
+## Candidate 8: fused QKV projection
+
+- `cublas_lt_gemm_half` takes `out_bf16`: the C/D layout is BF16 and the epilogue bias, when there is one, must be BF16 as well (cuBLASLt refuses an FP32 bias with a BF16 output; `g_lt_bias16` is that copy).
+- `[W_Q|W_K|W_V]` is one BF16 `[D][3D]` matrix packed from the three Adam-flat twins by `qkv_wt_pack_kernel`, rebuilt once per optimizer step (keyed on the weight epoch).
+- The attention layer tells the projection that the fused attention will follow (`gpu_attn_qkv_bf16_hint(T, dh)`, one shot); `gpu_attn_qkv_fused` then writes the layer's `qkv_bf16` slot (24 MB at 4096 x 3072) with one Lt GEMM instead of three GemmEx calls on three streams, each followed by a host `cudaStreamSynchronize`.
+- `attn_fa2.cuh` addresses its operands through `fa2_lay` strides, so the same kernels read head-major packs (the harness, the fallback) or row-major slices (`ld = 3D`, head offset `h·dh`).
+
+Removed per layer and microbatch: three FP32 `[4096][1024]` writes, three head-packing passes in the forward, and the three host syncs.
+
+## Candidate 9: BF16-only ReLU output
+
+- `act_bf16_reserve` hands the W1 GEMM the layer's activation-twin buffer; `gpu_mat_mul_epi` runs the `RELU_BIAS` epilogue with `out_bf16` into it (batch mode only; `ANN_HID_BF16=0` restores the FP32 output plus conversion). The slot is marked `bf16_only`, which `ANN_TWIN_CHECK` skips and `gpu_act_bf16_only` reports.
+- `relu_bwd_pack_colsum_kernel` takes the mask from that twin (8 bytes per 4 elements instead of 16): `bf16(h) > 0 ⟺ h > 0` except for FP32 subnormals below the BF16 range, which are irrelevant to a ReLU gradient.
+- `ffn_backward` refuses to fall back to the FP32 mask when the hidden is BF16-only, so a failure is an error, never a silent wrong gradient.
+
+Removed per layer and microbatch: one 64 MB FP32 write, one 16.8 M-element conversion, half of the mask read.
+
+## Results
+
+Pause-window gate 2026-10-26 20:52 (both candidates in one binary, fallback candidate 7): PASS, peak VRAM 13485 MiB, 12-step loss trajectory identical to the reference.
+
+| Build | microbatch fwd / bwd | Bench tok/s | Meter TF |
+|---|---|---|---|
+| FA2 attention (candidate 7) | 19.7 / 38.3 ms | 61.4k | 92.7 |
+| + fused BF16 QKV, BF16-only ReLU output (8 + 9) | 17.3 / 38.4 ms | 64.3k | 97.2 |
+
+## Pitfalls
+
+- The FP32 `q`, `k`, `v`, `hidden` buffers hold nothing in BF16 training: any new consumer must read the twins (`act_bf16_get`, the `qkv_bf16` slot). Eager evaluation (`lm info`, generation) keeps the FP32 outputs.
+- cuBLASLt returns `CUBLAS_STATUS_NOT_SUPPORTED` for a cached algorithm when a later call's pointers are less aligned than the heuristic assumed (seen in `make test-gpu` on per-head slices); the wrappers fall back to the FP32 path or GemmEx, so this costs speed, not correctness.

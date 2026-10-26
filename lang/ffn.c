@@ -328,6 +328,9 @@ int ffn_backward(mat *dx, const mat *dout, ffn *f, const ffn_cache *c)
 		fused_relu = 1;
 		dhp = NULL;
 		prep = NULL;
+	} else if (gpu_act_bf16_only(c->hidden)) {
+		/* The FP32 hidden was never written: no mask for the fallback. */
+		return -1;
 	} else {
 		dhp = mat_compute_ptr(dh);
 		/* hidden>0 ⟺ pre>0 after ReLU; prefer hidden (Lt RELU_BIAS path). */

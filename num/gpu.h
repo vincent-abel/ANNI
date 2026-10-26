@@ -198,6 +198,8 @@ int	gpu_relu_backward(ann_real *dx, const ann_real *x_pre_relu_or_mask, int n);
 ** device-resident; the FP32 dh stays unmasked. -1 = do it in steps.
 */
 int	gpu_ffn_relu_bwd_fused(mat *dh, const mat *hidden, ann_real *db1_host);
+/* 1 when m's device buffer was never written and only its BF16 twin holds it (BF16-only ReLU output). */
+int	gpu_act_bf16_only(const mat *m);
 
 /*
 ** M1: fused causal MHA over B packed sequences (B*T) x (H*dh), one launch per
