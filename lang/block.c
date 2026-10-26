@@ -315,9 +315,8 @@ int tblock_backward(mat *dx, const mat *dout, tblock *b, const block_cache *c)
 	copy_mat(d_mid, dout);
 	if (ffn_backward(d_ffn_in, dout, b->ffn, c->ffnc) != 0)
 		return -1;
-	if (layernorm_backward(tmp, d_ffn_in, b->ln2, c->ln2c) != 0)
+	if (layernorm_backward_add(d_mid, d_ffn_in, b->ln2, c->ln2c, tmp) != 0)
 		return -1;
-	mat_axpy(d_mid, 1.0, tmp);
 
 	/* x_mid = x_in + attn_out */
 	copy_mat(dx, d_mid);
@@ -327,9 +326,8 @@ int tblock_backward(mat *dx, const mat *dout, tblock *b, const block_cache *c)
 			return -1;
 	} else if (attn_mha_backward(d_attn_out, d_mid, b->attn, c->attnc) != 0)
 		return -1;
-	if (layernorm_backward(tmp, d_attn_out, b->ln1, c->ln1c) != 0)
+	if (layernorm_backward_add(dx, d_attn_out, b->ln1, c->ln1c, tmp) != 0)
 		return -1;
-	mat_axpy(dx, 1.0, tmp);
 	return 0;
 }
 

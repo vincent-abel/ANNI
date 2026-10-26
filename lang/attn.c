@@ -567,12 +567,10 @@ int attn_mha_backward(mat *dx, const mat *dout, attn *a, const attn_cache *c)
 	/* dx = dq Wq^T + dk Wk^T + dv Wv^T */
 	if (mat_mul_wt(dx, dq, a->wq) != 0)
 		goto fail;
-	if (mat_mul_wt(tmp, dk, a->wk) != 0)
+	if (mat_mul_wt_add(dx, dk, a->wk, tmp) != 0)
 		goto fail;
-	mat_axpy(dx, 1.0, tmp);
-	if (mat_mul_wt(tmp, dv, a->wv) != 0)
+	if (mat_mul_wt_add(dx, dv, a->wv, tmp) != 0)
 		goto fail;
-	mat_axpy(dx, 1.0, tmp);
 
 	mat_free(&dconcat);
 	mat_free(&dq);
@@ -1100,11 +1098,9 @@ proj:
 		return -1;
 	if (mat_mul_wt(dx, dq, a->wq) != 0)
 		return -1;
-	if (mat_mul_wt(tmp, dk, a->wk) != 0)
+	if (mat_mul_wt_add(dx, dk, a->wk, tmp) != 0)
 		return -1;
-	mat_axpy(dx, 1.0, tmp);
-	if (mat_mul_wt(tmp, dv, a->wv) != 0)
+	if (mat_mul_wt_add(dx, dv, a->wv, tmp) != 0)
 		return -1;
-	mat_axpy(dx, 1.0, tmp);
 	return 0;
 }

@@ -192,6 +192,30 @@ int gpu_mat_outer_add(mat *dw, const mat *a, const mat *b)
 	return -1;
 }
 
+int gpu_layernorm_backward_acc(mat *dx, const mat *dy, const ann_real *gamma,
+	const ann_real *x_hat, const ann_real *inv_std, int T, int d,
+	ann_real *dgamma, ann_real *dbeta)
+{
+	(void)dx;
+	(void)dy;
+	(void)gamma;
+	(void)x_hat;
+	(void)inv_std;
+	(void)T;
+	(void)d;
+	(void)dgamma;
+	(void)dbeta;
+	return -1;
+}
+
+int gpu_mat_mul_bt_acc(mat *c, const mat *a, const mat *b)
+{
+	(void)c;
+	(void)a;
+	(void)b;
+	return -1;
+}
+
 int gpu_layernorm_backward(mat *dx, const mat *dy, const ann_real *gamma,
 	const ann_real *x_hat, const ann_real *inv_std, int T, int d,
 	ann_real *dgamma, ann_real *dbeta)

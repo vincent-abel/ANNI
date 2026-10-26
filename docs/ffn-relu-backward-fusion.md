@@ -27,6 +27,15 @@ The first attempt used cuBLASLt's `RELU_AUX_BIAS` epilogue on the W1 forward GEM
 
 Loss trajectory over the 12 gate steps identical to the reference; `make test-gpu` BF16 losses identical to the native build's at every step.
 
+## Candidate 6: accumulate instead of add
+
+The same profile showed 48 `axpy_kernel` launches per microbatch (1.5 ms): two per layer in the attention backward (`dx = dq Wq^T + dk Wk^T + dv Wv^T` built with a scratch product and an add) and two per layer for the block residual gradients (LayerNorm backward into a scratch, then added). Both now accumulate in place: `gpu_mat_mul_bt_acc` runs the dgrad GEMM with \(\beta = 1\) (`mat_mul_wt_add` in [`lang/gradutil.c`](../lang/gradutil.c)), and `gpu_layernorm_backward_acc` makes `ln_bwd_kernel` add its result (`layernorm_backward_add`). The values are the same sums in the same precision; only the scratch write and read go away. Two conversions went with it: the attention output `concat` is published as a BF16 twin by the fused attention forward (the Wo GEMM and its wgrad both read it), and the head's delta gets a dedicated gradient-twin slot (134 MB) so its dgrad reuses the wgrad's conversion.
+
+| Build | Bench tok/s | Meter TF | Peak VRAM |
+|---|---|---|---|
+| fused ReLU backward (candidate 5) | 52.7k | 79.6 | 13263 MiB |
+| + accumulate, concat twin, head twin (candidate 6) | 54.7k | 82.5 | 13566 MiB |
+
 ## Pitfalls
 
 - The FP32 `dh` is unmasked after the fused call: a later CPU or FP32 consumer of it would be wrong. Only the BF16 GEMM paths run after it; the fallback branch masks in place as before.

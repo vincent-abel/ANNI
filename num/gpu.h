@@ -97,11 +97,17 @@ int	gpu_mat_mul_bias_relu(mat *c, const mat *a, const mat *b,
 int	gpu_mat_mul_backward(mat *da, mat *db, const mat *dc,
 		const mat *a, const mat *b);
 int	gpu_mat_mul_bt(mat *c, const mat *a, const mat *b);
+/* c += a b^T (cuBLAS beta = 1); -1 = do c = a b^T into a scratch and add. */
+int	gpu_mat_mul_bt_acc(mat *c, const mat *a, const mat *b);
 /* c = a^T b (a: T x m, b: T x n -> c: m x n); cuBLAS OP_T when built in. */
 int	gpu_mat_mul_at(mat *c, const mat *a, const mat *b);
 int	gpu_mat_outer_add(mat *dw, const mat *a, const mat *b);
 /* Row LayerNorm backward; 0 = done on device, -1 = use CPU. */
 int	gpu_layernorm_backward(mat *dx, const mat *dy, const ann_real *gamma,
+		const ann_real *x_hat, const ann_real *inv_std, int T, int d,
+		ann_real *dgamma, ann_real *dbeta);
+/* dx += LayerNorm backward (dx must be device-resident); -1 = use the above + add. */
+int	gpu_layernorm_backward_acc(mat *dx, const mat *dy, const ann_real *gamma,
 		const ann_real *x_hat, const ann_real *inv_std, int T, int d,
 		ann_real *dgamma, ann_real *dbeta);
 /*

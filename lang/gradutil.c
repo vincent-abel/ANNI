@@ -140,6 +140,18 @@ int mat_mul_at(mat *c, const mat *a, const mat *b)
 ** y = x W: dx = dy W^T. GPU: one OP_T GEMM straight from the weight twin.
 ** CPU: host transpose + blocked mat_mul (faster than dot-product bt there).
 */
+int mat_mul_wt_add(mat *c, const mat *a, const mat *w, mat *tmp)
+{
+	if (!c || !a || !w || !tmp)
+		return -1;
+	if (gpu_mat_mul_bt_acc(c, a, w) == 0)
+		return 0;
+	if (mat_mul_wt(tmp, a, w) != 0)
+		return -1;
+	mat_axpy(c, 1.0, tmp);
+	return 0;
+}
+
 int mat_mul_wt(mat *c, const mat *a, const mat *w)
 {
 	mat *wt;

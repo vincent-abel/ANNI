@@ -31,6 +31,9 @@ int		layernorm_forward_cache(mat *x, layernorm *ln, ln_cache *c);
 /* out = LN(in); avoids copy_mat(out, in) before in-place LN. */
 int		layernorm_forward_into(mat *out, const mat *in, layernorm *ln,
 			ln_cache *c);
+/* dx += LayerNorm backward: fused on the GPU, else layernorm_backward into tmp and add. */
+int		layernorm_backward_add(mat *dx, const mat *dy, layernorm *ln,
+		    const ln_cache *c, mat *tmp);
 int		layernorm_backward(mat *dx, const mat *dy, layernorm *ln,
 			const ln_cache *c);
 
