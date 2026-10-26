@@ -29,6 +29,9 @@ Pause-window gate 2026-10-26 20:52 (both candidates in one binary, fallback cand
 |---|---|---|---|
 | FA2 attention (candidate 7) | 19.7 / 38.3 ms | 61.4k | 92.7 |
 | + fused BF16 QKV, BF16-only ReLU output (8 + 9) | 17.3 / 38.4 ms | 64.3k | 97.2 |
+| + lazy pre-activation buffer, BF16-only LayerNorm output (10 + 12) | | 64.7k | 97.7 |
+
+Candidate 12 adds the LayerNorm output to the same scheme (`ln_fwd_kernel` stores the BF16 twin instead of FP32 `y`; `ANN_LN_BF16=0` restores it) and stops allocating the FFN pre-activation buffer that only the fallback paths use (64 MB per layer): the gate's peak VRAM went from 13485 to 12604 MiB, the live run from 86.9% to under 82% of the card. The gain in speed is within the bench noise (+1%); the memory was the point.
 
 ## Pitfalls
 

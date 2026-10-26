@@ -43,7 +43,8 @@ static void block_cache_drop_device(block_cache *bc)
 	if (bc->ffnc) {
 		if (!bc->ffnc->x_in_alias)
 			mat_device_free(bc->ffnc->x_in);
-		mat_device_free(bc->ffnc->pre_act);
+		if (bc->ffnc->pre_act)
+			mat_device_free(bc->ffnc->pre_act);
 		mat_device_free(bc->ffnc->hidden);
 	}
 	if (bc->attnpc) {
@@ -205,7 +206,8 @@ static void block_cache_repin(block_cache *bc)
 	mat_try_pin(bc->ffn_out);
 	if (bc->ffnc) {
 		mat_try_pin(bc->ffnc->x_in);
-		mat_try_pin(bc->ffnc->pre_act);
+		if (bc->ffnc->pre_act)
+			mat_try_pin(bc->ffnc->pre_act);
 		mat_try_pin(bc->ffnc->hidden);
 	}
 	if (bc->attnpc) {
