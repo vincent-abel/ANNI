@@ -112,16 +112,27 @@ ffn_cache *ffn_cache_create(int T)
 		return NULL;
 	c->T = T;
 	c->x_in = mat_create_dev(T, LM_D_MODEL);
-	c->pre_act = mat_create_dev(T, LM_D_FF);
+	/* pre_act only serves the non-fused paths: allocated on first use (64 MB per layer at T=4096). */
+	c->pre_act = NULL;
 	c->hidden = mat_create_dev(T, LM_D_FF);
-	if (!c->x_in || !c->pre_act || !c->hidden) {
+	if (!c->x_in || !c->hidden) {
 		ffn_cache_free(&c);
 		return NULL;
 	}
 	mat_try_pin(c->x_in);
-	mat_try_pin(c->pre_act);
 	mat_try_pin(c->hidden);
 	return c;
+}
+
+/* The pre-activation buffer of the fallback paths, created on demand. */
+static mat *ffn_pre_act(ffn_cache *c)
+{
+	if (!c->pre_act) {
+		c->pre_act = mat_create_dev(c->T, LM_D_FF);
+		if (c->pre_act)
+			mat_try_pin(c->pre_act);
+	}
+	return c->pre_act;
 }
 
 void ffn_cache_free(ffn_cache **c)
@@ -162,7 +173,8 @@ int ffn_forward_cache_res(mat *out, const mat *x, ffn *f, ffn_cache *c,
 		mat_free(&c->x_in);
 	c->x_in = (mat *)x;
 	c->x_in_alias = 1;
-	mat_try_pin(c->pre_act);
+	if (c->pre_act)
+		mat_try_pin(c->pre_act);
 	mat_try_pin(c->hidden);
 	mat_try_pin(out);
 	/*
@@ -175,6 +187,8 @@ int ffn_forward_cache_res(mat *out, const mat *x, ffn *f, ffn_cache *c,
 	} else {
 		int bias_fused;
 
+		if (!ffn_pre_act(c))
+			return -1;
 		bias_fused = (gpu_mat_mul_bias(c->pre_act, x, f->w1,
 		    f->b1->data) == 0);
 		if (!bias_fused && mat_mul(c->pre_act, x, f->w1) != 0)
@@ -344,6 +358,8 @@ int ffn_backward(mat *dx, const mat *dout, ffn *f, const ffn_cache *c)
 	    || gpu_relu_backward(dhp, prep, T * LM_D_FF) != 0) {
 		const mat *mask = c->hidden->data ? c->hidden : c->pre_act;
 
+		if (!mask)
+			return -1;
 		(void)mat_ensure_host(dh);
 		(void)mat_ensure_host((mat *)mask);
 		for (t = 0; t < T; t++) {

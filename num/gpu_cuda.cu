@@ -3766,7 +3766,8 @@ __global__ static void softmax_bwd_kernel(ann_real *dx, const ann_real *y,
 __global__ static void ln_fwd_kernel(ann_real *y, const ann_real *x,
 	const ann_real *gamma, const ann_real *beta, ann_real *x_hat,
 	ann_real *mean_out, ann_real *inv_out, int d, ann_real eps,
-	__nv_fp8_storage_t *y8, const float *scale8, float *amax8)
+	__nv_fp8_storage_t *y8, const float *scale8, float *amax8,
+	__nv_bfloat16 *y16)
 {
 	extern __shared__ ann_real sx[];
 	__shared__ ann_real sh[EW_BLOCK];
@@ -3802,7 +3803,10 @@ __global__ static void ln_fwd_kernel(ann_real *y, const ann_real *x,
 
 		if (x_hat)
 			x_hat[off + j] = xh;
-		y[off + j] = yv;
+		if (y16)	/* BF16-only output: the twin the GEMMs read */
+			y16[off + j] = __float2bfloat16(yv);
+		else
+			y[off + j] = yv;
 		if (y8) {
 			amax = fmaxf(amax, fabsf(yv));
 			y8[off + j] = __nv_cvt_float_to_fp8(yv * inv_s, __NV_SATFINITE,
@@ -4855,6 +4859,18 @@ extern "C" int gpu_ffn_w1_finish(ann_real *hidden, ann_real *pre,
 	if (rc == 0)
 		act_bf16_publish(hidden, n);
 	return rc;
+}
+
+static int ln_bf16_on(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		const char *e = getenv("ANN_LN_BF16");
+
+		on = (e && e[0] == '0') ? 0 : 1;
+	}
+	return on;
 }
 
 static int hid_bf16_on(void)
@@ -7169,7 +7185,8 @@ extern "C" int gpu_unpack_seq_rows(ann_real *dst, const ann_real *src, int B,
 
 static int gpu_layernorm_forward_ex_locked(ann_real *y, const ann_real *x,
 	const ann_real *gamma, const ann_real *beta, ann_real *x_hat,
-	ann_real *mean, ann_real *inv_std, int T, int d, double eps)
+	ann_real *mean, ann_real *inv_std, int T, int d, double eps,
+	__nv_bfloat16 *y16)
 {
 	ew_ref rx;
 	ew_ref ry;
@@ -7233,7 +7250,7 @@ static int gpu_layernorm_forward_ex_locked(ann_real *y, const ann_real *x,
 		ln_fwd_kernel<<<T, bs, (size_t)d * sizeof(ann_real)>>>(ry.dev,
 		    rx.dev, rg.dev, rb.dev, x_hat ? rh.dev : NULL,
 		    mean ? rm.dev : NULL, inv_std ? ri.dev : NULL, d,
-		    (ann_real)eps, y8, sc8, am8);
+		    (ann_real)eps, y8, sc8, am8, y16);
 		if (ew_launch_ok() != 0)
 			return -1;
 #if defined(ANN_CUBLAS) && CUDART_VERSION >= 12000
@@ -7273,10 +7290,37 @@ extern "C" int gpu_layernorm_forward_ex(ann_real *y, const ann_real *x,
 {
 	OpScope _op(OP_LN_FWD);
 	int rc;
+	act_bf16_slot *as = NULL;
 
+	/*
+	** BF16 training: the LayerNorm output goes straight into its BF16
+	** twin (all its readers are GEMMs); the FP32 y is not written.
+	** ANN_LN_BF16=0 keeps the FP32 output plus a conversion.
+	*/
+	if (y && T > 0 && d > 0 && g_compute_prec == GPU_PREC_BF16
+	    && g_sync_mode != GPU_SYNC_EAGER && !stream_is_capturing()
+	    && ln_bf16_on() && ew_is_dev(y))
+		as = act_bf16_reserve(y, T * d);
 	pthread_mutex_lock(&g_ew_mu);
-	rc = gpu_layernorm_forward_ex_locked(y, x, gamma, beta, x_hat, mean, inv_std, T, d, eps);
+	rc = gpu_layernorm_forward_ex_locked(y, x, gamma, beta, x_hat, mean, inv_std, T, d, eps,
+	    as ? (__nv_bfloat16 *)as->half : NULL);
 	pthread_mutex_unlock(&g_ew_mu);
+	if (as) {
+		if (rc == 0) {
+			static int reported;
+
+			as->live = 1;
+			if (!reported++)
+				fprintf(stderr, "[ln] forward output written as its BF16 twin only\n");
+			return 0;
+		}
+		as->live = 0;
+		as->bf16_only = 0;
+		(void)cudaGetLastError();
+		pthread_mutex_lock(&g_ew_mu);
+		rc = gpu_layernorm_forward_ex_locked(y, x, gamma, beta, x_hat, mean, inv_std, T, d, eps, NULL);
+		pthread_mutex_unlock(&g_ew_mu);
+	}
 	if (rc == 0 && y && T > 0 && d > 0
 	    && g_compute_prec == GPU_PREC_BF16)
 		ln_bf16_publish(y, T * d, 1);
@@ -9071,7 +9115,7 @@ static void dec_launch_step(gpu_dec *g)
 
 		ln_fwd_kernel<<<1, lnb, lns, g->st>>>(g->ln, g->x, l->ln1_g,
 		    l->ln1_b, NULL, NULL, NULL, D, (ann_real)l->eps1, NULL, NULL,
-		    NULL);
+		    NULL, NULL);
 		qkv.W[0] = l->wq;
 		qkv.W[1] = l->wk;
 		qkv.W[2] = l->wv;
@@ -9088,7 +9132,7 @@ static void dec_launch_step(gpu_dec *g)
 		dec_gemv(g, g->x, g->o, l->wo, NULL, g->x, D, D, 0);
 		ln_fwd_kernel<<<1, lnb, lns, g->st>>>(g->ln, g->x, l->ln2_g,
 		    l->ln2_b, NULL, NULL, NULL, D, (ann_real)l->eps2, NULL, NULL,
-		    NULL);
+		    NULL, NULL);
 		dec_gemv(g, g->hid, g->ln, l->w1, l->b1, NULL, D, g->F, 1);
 		dec_gemv(g, g->x, g->hid, l->w2, l->b2, g->x, g->F, D, 0);
 	}
