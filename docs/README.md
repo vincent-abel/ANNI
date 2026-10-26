@@ -127,6 +127,7 @@
 - [Compile profile (E12)](compile-profile.md)
 - [GPU training audit: stale caches and BF16](gpu-training-audit.md)
 - [FFN ReLU backward in one pass (80 TF)](ffn-relu-backward-fusion.md)
+- [Fused attention on mma.sync (93 TF)](attention-fa2-mma.md)
 - [Plan: proper 8-bit and 4-bit training](low-precision-plan.md)
 
 ### From toy LM → small LLM
