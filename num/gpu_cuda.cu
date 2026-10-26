@@ -3995,6 +3995,312 @@ __global__ static void col_sum_tiled_kernel(ann_real *db, const ann_real *x,
 	atomicAdd(&db[c], s);
 }
 
+/*
+** ANN_LN_FAST: one warp per LayerNorm row, float4 loads/stores, the row held
+** in registers (NV float4 per lane, d % 4 == 0, d <= 128 * LNF_MAXNV). Same
+** math as ln_fwd_kernel / ln_bwd_kernel; the row sums use shuffles, so the
+** FP32 summation order differs (equally exact). Rows per block: LNF_WARPS.
+*/
+#define LNF_WARPS	4
+#define LNF_MAXNV	16
+#define LNF_BWD_MINB	4
+
+static int ln_fast_on(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		const char *e = getenv("ANN_LN_FAST");
+
+		on = (e && e[0] == '0') ? 0 : 1;
+	}
+	return on;
+}
+
+__device__ static inline float lnf_warp_sum(float v)
+{
+	v += __shfl_xor_sync(0xffffffffu, v, 16);
+	v += __shfl_xor_sync(0xffffffffu, v, 8);
+	v += __shfl_xor_sync(0xffffffffu, v, 4);
+	v += __shfl_xor_sync(0xffffffffu, v, 2);
+	v += __shfl_xor_sync(0xffffffffu, v, 1);
+	return v;
+}
+
+template <int NV>
+__global__ static void ln_fwd_warp_kernel(ann_real *y, const ann_real *x,
+	const ann_real *gamma, const ann_real *beta, ann_real *x_hat,
+	ann_real *mean_out, ann_real *inv_out, int d, ann_real eps,
+	__nv_bfloat16 *y16, int rows)
+{
+	int lane = threadIdx.x & 31;
+	int row = blockIdx.x * LNF_WARPS + (threadIdx.x >> 5);
+	int d4 = d >> 2;
+	size_t off;
+	float4 v[NV];
+	float s = 0.0f;
+	float mean;
+	float var = 0.0f;
+	float inv;
+	int i;
+
+	if (row >= rows)
+		return;
+	off = (size_t)row * (size_t)d4;
+	for (i = 0; i < NV; i++) {
+		int j = lane + 32 * i;
+
+		if (j < d4) {
+			v[i] = ((const float4 *)x)[off + j];
+			s += (v[i].x + v[i].y) + (v[i].z + v[i].w);
+		}
+	}
+	mean = lnf_warp_sum(s) / (float)d;
+	for (i = 0; i < NV; i++) {
+		int j = lane + 32 * i;
+
+		if (j < d4) {
+			float a = v[i].x - mean, b = v[i].y - mean;
+			float c = v[i].z - mean, e = v[i].w - mean;
+
+			var += (a * a + b * b) + (c * c + e * e);
+		}
+	}
+	var = lnf_warp_sum(var) / (float)d;
+	inv = 1.0f / sqrtf(var + eps);
+	for (i = 0; i < NV; i++) {
+		int j = lane + 32 * i;
+
+		if (j < d4) {
+			float4 g = ((const float4 *)gamma)[j];
+			float4 b = ((const float4 *)beta)[j];
+			float4 h;
+			float4 o;
+
+			h.x = (v[i].x - mean) * inv;
+			h.y = (v[i].y - mean) * inv;
+			h.z = (v[i].z - mean) * inv;
+			h.w = (v[i].w - mean) * inv;
+			o.x = h.x * g.x + b.x;
+			o.y = h.y * g.y + b.y;
+			o.z = h.z * g.z + b.z;
+			o.w = h.w * g.w + b.w;
+			if (x_hat)
+				((float4 *)x_hat)[off + j] = h;
+			if (y16) {
+				__nv_bfloat162 p0 = __floats2bfloat162_rn(o.x, o.y);
+				__nv_bfloat162 p1 = __floats2bfloat162_rn(o.z, o.w);
+				uint2 u;
+
+				u.x = *(unsigned *)&p0;
+				u.y = *(unsigned *)&p1;
+				((uint2 *)y16)[off + j] = u;
+			} else {
+				((float4 *)y)[off + j] = o;
+			}
+		}
+	}
+	if (lane == 0) {
+		if (mean_out)
+			mean_out[row] = mean;
+		if (inv_out)
+			inv_out[row] = inv;
+	}
+}
+
+/*
+** Backward: each warp owns rpw consecutive rows, keeps its dgamma / dbeta
+** partial sums in registers (per-lane columns) and adds them to the global
+** accumulators once at the end: no separate column-sum launches. dx may be
+** read (accumulate) and written by the same lane only.
+*/
+template <int NV>
+__global__ static void __launch_bounds__(LNF_WARPS * 32, LNF_BWD_MINB) ln_bwd_warp_kernel(
+	ann_real *dx, const ann_real *dy, const ann_real *gamma,
+	const ann_real *x_hat, const ann_real *inv_std, ann_real *dgamma,
+	ann_real *dbeta, int d, int accumulate, __nv_bfloat16 *dx16, int rows,
+	int rpw)
+{
+	int lane = threadIdx.x & 31;
+	int warp = blockIdx.x * LNF_WARPS + (threadIdx.x >> 5);
+	int d4 = d >> 2;
+	int r0 = warp * rpw;
+	int r1 = r0 + rpw;
+	float4 ag[NV];
+	float4 ab[NV];
+	float invd = 1.0f / (float)d;
+	int i;
+	int r;
+
+	if (r1 > rows)
+		r1 = rows;
+	if (r0 >= r1)
+		return;
+#pragma unroll
+	for (i = 0; i < NV; i++) {
+		ag[i] = make_float4(0.f, 0.f, 0.f, 0.f);
+		ab[i] = ag[i];
+	}
+	for (r = r0; r < r1; r++) {
+		size_t off = (size_t)r * (size_t)d4;
+		float inv = inv_std[r];
+		float sd = 0.0f;
+		float sdx = 0.0f;
+		float a;
+		float b;
+
+		/*
+		** Pass 1 sums, pass 2 reloads dy / x_hat / gamma: they are L1
+		** hits and keeping the row in registers made the kernel spill.
+		*/
+#pragma unroll
+		for (i = 0; i < NV; i++) {
+			int j = lane + 32 * i;
+
+			if (j < d4) {
+				float4 q = ((const float4 *)dy)[off + j];
+				float4 h = ((const float4 *)x_hat)[off + j];
+				float4 g = ((const float4 *)gamma)[j];
+				float tx = q.x * g.x, ty = q.y * g.y;
+				float tz = q.z * g.z, tw = q.w * g.w;
+
+				ab[i].x += q.x; ab[i].y += q.y;
+				ab[i].z += q.z; ab[i].w += q.w;
+				ag[i].x += q.x * h.x; ag[i].y += q.y * h.y;
+				ag[i].z += q.z * h.z; ag[i].w += q.w * h.w;
+				sd += (tx + ty) + (tz + tw);
+				sdx += (tx * h.x + ty * h.y) + (tz * h.z + tw * h.w);
+			}
+		}
+		a = lnf_warp_sum(sd);
+		b = lnf_warp_sum(sdx);
+#pragma unroll
+		for (i = 0; i < NV; i++) {
+			int j = lane + 32 * i;
+
+			if (j < d4) {
+				float4 q = ((const float4 *)dy)[off + j];
+				float4 h = ((const float4 *)x_hat)[off + j];
+				float4 g = ((const float4 *)gamma)[j];
+				float4 o;
+
+				o.x = (q.x * g.x - (a + h.x * b) * invd) * inv;
+				o.y = (q.y * g.y - (a + h.y * b) * invd) * inv;
+				o.z = (q.z * g.z - (a + h.z * b) * invd) * inv;
+				o.w = (q.w * g.w - (a + h.w * b) * invd) * inv;
+				if (accumulate) {
+					float4 p = ((const float4 *)dx)[off + j];
+
+					o.x += p.x; o.y += p.y; o.z += p.z; o.w += p.w;
+				}
+				((float4 *)dx)[off + j] = o;
+				if (dx16) {
+					__nv_bfloat162 p0 = __floats2bfloat162_rn(o.x, o.y);
+					__nv_bfloat162 p1 = __floats2bfloat162_rn(o.z, o.w);
+					uint2 u;
+
+					u.x = *(unsigned *)&p0;
+					u.y = *(unsigned *)&p1;
+					((uint2 *)dx16)[off + j] = u;
+				}
+			}
+		}
+	}
+#pragma unroll
+	for (i = 0; i < NV; i++) {
+		int j = lane + 32 * i;
+
+		if (j < d4) {
+			float *pg = dgamma + 4 * j;
+			float *pb = dbeta + 4 * j;
+
+			atomicAdd(pg, ag[i].x); atomicAdd(pg + 1, ag[i].y);
+			atomicAdd(pg + 2, ag[i].z); atomicAdd(pg + 3, ag[i].w);
+			atomicAdd(pb, ab[i].x); atomicAdd(pb + 1, ab[i].y);
+			atomicAdd(pb + 2, ab[i].z); atomicAdd(pb + 3, ab[i].w);
+		}
+	}
+}
+
+/* Eligible shapes / pointers (16-byte alignment for the float4 accesses). */
+static int ln_fast_ok(int d, const void *a, const void *b, const void *c,
+	const void *e, const void *f)
+{
+	const void *p[5];
+	int i;
+
+	p[0] = a; p[1] = b; p[2] = c; p[3] = e; p[4] = f;
+	if (!ln_fast_on() || d % 4 != 0 || d > 128 * LNF_MAXNV)
+		return 0;
+	for (i = 0; i < 5; i++)
+		if (p[i] && ((size_t)p[i] & 15) != 0)
+			return 0;
+	return 1;
+}
+
+#define LNF_DISPATCH(NVV, KERNEL, GRID, ...) \
+	switch (NVV) { \
+	case 1: KERNEL<1><<<GRID, LNF_WARPS * 32>>>(__VA_ARGS__); break; \
+	case 2: KERNEL<2><<<GRID, LNF_WARPS * 32>>>(__VA_ARGS__); break; \
+	case 3: KERNEL<3><<<GRID, LNF_WARPS * 32>>>(__VA_ARGS__); break; \
+	case 4: KERNEL<4><<<GRID, LNF_WARPS * 32>>>(__VA_ARGS__); break; \
+	case 5: KERNEL<5><<<GRID, LNF_WARPS * 32>>>(__VA_ARGS__); break; \
+	case 6: KERNEL<6><<<GRID, LNF_WARPS * 32>>>(__VA_ARGS__); break; \
+	case 7: KERNEL<7><<<GRID, LNF_WARPS * 32>>>(__VA_ARGS__); break; \
+	case 8: KERNEL<8><<<GRID, LNF_WARPS * 32>>>(__VA_ARGS__); break; \
+	case 9: KERNEL<9><<<GRID, LNF_WARPS * 32>>>(__VA_ARGS__); break; \
+	case 10: KERNEL<10><<<GRID, LNF_WARPS * 32>>>(__VA_ARGS__); break; \
+	case 11: KERNEL<11><<<GRID, LNF_WARPS * 32>>>(__VA_ARGS__); break; \
+	case 12: KERNEL<12><<<GRID, LNF_WARPS * 32>>>(__VA_ARGS__); break; \
+	case 13: KERNEL<13><<<GRID, LNF_WARPS * 32>>>(__VA_ARGS__); break; \
+	case 14: KERNEL<14><<<GRID, LNF_WARPS * 32>>>(__VA_ARGS__); break; \
+	case 15: KERNEL<15><<<GRID, LNF_WARPS * 32>>>(__VA_ARGS__); break; \
+	default: KERNEL<16><<<GRID, LNF_WARPS * 32>>>(__VA_ARGS__); break; \
+	}
+
+static int ln_fwd_fast_launch(ann_real *y, const ann_real *x,
+	const ann_real *gamma, const ann_real *beta, ann_real *x_hat,
+	ann_real *mean, ann_real *inv, int T, int d, ann_real eps,
+	__nv_bfloat16 *y16)
+{
+	int nv = (d / 4 + 31) / 32;
+	int grid = (T + LNF_WARPS - 1) / LNF_WARPS;
+
+	LNF_DISPATCH(nv, ln_fwd_warp_kernel, grid, y, x, gamma, beta, x_hat,
+	    mean, inv, d, eps, y16, T);
+	return 0;
+}
+
+/* Rows per warp of the backward: enough warps to fill the GPU, few atomics. */
+static int ln_bwd_rpw(void)
+{
+	static int v = 0;
+
+	if (!v) {
+		const char *e = getenv("ANN_LN_RPW");
+
+		v = e ? atoi(e) : 8;
+		if (v < 1)
+			v = 8;
+	}
+	return v;
+}
+
+static int ln_bwd_fast_launch(ann_real *dx, const ann_real *dy,
+	const ann_real *gamma, const ann_real *x_hat, const ann_real *inv_std,
+	ann_real *dgamma, ann_real *dbeta, int T, int d, int accumulate,
+	__nv_bfloat16 *dx16)
+{
+	int nv = (d / 4 + 31) / 32;
+	int rpw = ln_bwd_rpw();
+	int warps = (T + rpw - 1) / rpw;
+	int grid = (warps + LNF_WARPS - 1) / LNF_WARPS;
+
+	LNF_DISPATCH(nv, ln_bwd_warp_kernel, grid, dx, dy, gamma, x_hat,
+	    inv_std, dgamma, dbeta, d, accumulate, dx16, T, rpw);
+	return 0;
+}
+
 __global__ static void bias_add_kernel(ann_real *x, const ann_real *bias,
 	int n, int cols)
 {
@@ -7464,10 +7770,17 @@ static int gpu_layernorm_forward_ex_locked(ann_real *y, const ann_real *x,
 		    && fp8_hot_prepare(T * d, ry.dev, &y8, &sc8, &am8) == 0)
 			hot = 1;
 #endif
-		ln_fwd_kernel<<<T, bs, (size_t)d * sizeof(ann_real)>>>(ry.dev,
-		    rx.dev, rg.dev, rb.dev, x_hat ? rh.dev : NULL,
-		    mean ? rm.dev : NULL, inv_std ? ri.dev : NULL, d,
-		    (ann_real)eps, y8, sc8, am8, y16);
+		if (!y8 && ln_fast_ok(d, ry.dev, rx.dev, rg.dev, rb.dev,
+		    x_hat ? (void *)rh.dev : (void *)y16)
+		    && (!x_hat || !y16 || ((size_t)y16 & 15) == 0))
+			ln_fwd_fast_launch(ry.dev, rx.dev, rg.dev, rb.dev,
+			    x_hat ? rh.dev : NULL, mean ? rm.dev : NULL,
+			    inv_std ? ri.dev : NULL, T, d, (ann_real)eps, y16);
+		else
+			ln_fwd_kernel<<<T, bs, (size_t)d * sizeof(ann_real)>>>(ry.dev,
+			    rx.dev, rg.dev, rb.dev, x_hat ? rh.dev : NULL,
+			    mean ? rm.dev : NULL, inv_std ? ri.dev : NULL, d,
+			    (ann_real)eps, y8, sc8, am8, y16);
 		if (ew_launch_ok() != 0)
 			return -1;
 #if defined(ANN_CUBLAS) && CUDART_VERSION >= 12000
@@ -7567,6 +7880,7 @@ static int gpu_layernorm_backward_locked(mat *dx, const mat *dy, const ann_real 
 	size_t mb;
 	size_t vb;
 	size_t gb;
+	int fast_bwd = 0;
 	int did;
 	int rc;
 
@@ -7614,8 +7928,17 @@ static int gpu_layernorm_backward_locked(mat *dx, const mat *dy, const ann_real 
 			dx16 = grad_twin_reserve(dx->d_data, (size_t)T * (size_t)d);
 			pthread_mutex_unlock(&g_gemm_mu);
 		}
-		ln_bwd_kernel<<<T, ew_block_for(d)>>>(rdx.dev, rdy.dev, rg.dev, rh.dev,
-		    ri.dev, NULL, NULL, d, accumulate, (__nv_bfloat16 *)dx16);
+		if (ln_fast_ok(d, rdx.dev, rdy.dev, rg.dev, rh.dev, dx16)
+		    && ((size_t)ri.dev & 3) == 0 && ((size_t)acc_g->dev & 3) == 0
+		    && ((size_t)acc_b->dev & 3) == 0) {
+			fast_bwd = 1;
+			ln_bwd_fast_launch(rdx.dev, rdy.dev, rg.dev, rh.dev,
+			    ri.dev, acc_g->dev, acc_b->dev, T, d, accumulate,
+			    (__nv_bfloat16 *)dx16);
+		} else {
+			ln_bwd_kernel<<<T, ew_block_for(d)>>>(rdx.dev, rdy.dev, rg.dev, rh.dev,
+			    ri.dev, NULL, NULL, d, accumulate, (__nv_bfloat16 *)dx16);
+		}
 		if (dx16 && ew_launch_ok() != 0) {
 			grad_twin_forget(dx->d_data);
 			return -1;
@@ -7623,7 +7946,7 @@ static int gpu_layernorm_backward_locked(mat *dx, const mat *dy, const ann_real 
 	}
 	if (ew_launch_ok() != 0)
 		return -1;
-	{
+	if (!fast_bwd) {
 		dim3 grid((d + EW_BLOCK - 1) / EW_BLOCK,
 		    (T + COLSUM_SLAB - 1) / COLSUM_SLAB);
 

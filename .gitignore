@@ -69,3 +69,4 @@ data/.*
 data/ab_train_ids.bin
 data/prof_ids.bin
 tests/bench_attn
+tests/bench_ln
