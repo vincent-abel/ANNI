@@ -8487,6 +8487,63 @@ __global__ static void sumsq_kernel(const ann_real *x, int n, double *acc)
 		atomicAdd(acc, s[0]);
 }
 
+/*
+** Grid-stride variant (A1): a few blocks per SM each sum a strided share of x in
+** double, reduce with warp shuffles, then one double atomicAdd per block. The
+** one-block-per-256-values version above issued ~720k atomics on a single
+** address per step (5.3 ms); the result only feeds the clip norm, whose
+** summation order was already nondeterministic.
+*/
+__global__ static void sumsq_gs_kernel(const ann_real *x, size_t n, double *acc)
+{
+	__shared__ double s[32];
+	size_t stride = (size_t)gridDim.x * blockDim.x;
+	size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+	size_t n4 = n >> 2;
+	const float4 *x4 = (const float4 *)x;
+	double v = 0.0;
+	int lane = threadIdx.x & 31;
+	int w = threadIdx.x >> 5;
+	int k;
+
+	for (; i < n4; i += stride) {
+		float4 q = x4[i];
+
+		v += (double)q.x * (double)q.x;
+		v += (double)q.y * (double)q.y;
+		v += (double)q.z * (double)q.z;
+		v += (double)q.w * (double)q.w;
+	}
+	i = (n4 << 2) + (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+	for (; i < n; i += stride)
+		v += (double)x[i] * (double)x[i];
+	for (k = 16; k > 0; k >>= 1)
+		v += __shfl_down_sync(0xffffffffu, v, k);
+	if (lane == 0)
+		s[w] = v;
+	__syncthreads();
+	if (w == 0) {
+		v = lane < (int)(blockDim.x >> 5) ? s[lane] : 0.0;
+		for (k = 16; k > 0; k >>= 1)
+			v += __shfl_down_sync(0xffffffffu, v, k);
+		if (lane == 0)
+			atomicAdd(acc, v);
+	}
+}
+
+/* ANN_SUMSQ_GS=0: back to the one-block-per-256-values sumsq_kernel. */
+static int sumsq_gs_on(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		const char *e = getenv("ANN_SUMSQ_GS");
+
+		on = (e && e[0] == '0') ? 0 : 1;
+	}
+	return on;
+}
+
 extern "C" int gpu_grad_sumsq(const ann_real *d_x, int n, double *out)
 {
 	OpScope _op(OP_ADAM);
@@ -8500,7 +8557,28 @@ extern "C" int gpu_grad_sumsq(const ann_real *d_x, int n, double *out)
 	}
 	if (cudaMemset(s_acc, 0, sizeof(double)) != cudaSuccess)
 		return -1;
-	sumsq_kernel<<<(n + 255) / 256, 256>>>(d_x, n, s_acc);
+	if (sumsq_gs_on() && ((uintptr_t)d_x & 15) == 0) {
+		static int s_blocks;
+		int nb;
+
+		if (!s_blocks) {
+			int dev = 0;
+			int sms = 0;
+
+			cudaGetDevice(&dev);
+			if (cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount,
+			    dev) != cudaSuccess || sms <= 0)
+				sms = 32;
+			s_blocks = sms * 8;
+		}
+		nb = (int)(((size_t)n / 4 + 255) / 256);
+		if (nb > s_blocks)
+			nb = s_blocks;
+		if (nb < 1)
+			nb = 1;
+		sumsq_gs_kernel<<<nb, 256>>>(d_x, (size_t)n, s_acc);
+	} else
+		sumsq_kernel<<<(n + 255) / 256, 256>>>(d_x, n, s_acc);
 	if (cudaGetLastError() != cudaSuccess)
 		return -1;
 	return cudaMemcpy(out, s_acc, sizeof(double), cudaMemcpyDeviceToHost)
