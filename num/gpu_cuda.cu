@@ -1481,9 +1481,22 @@ static void *grad_twin_put(const ann_real *src, size_t n)
 	** round-robin slot to it: it gets the one big slot instead, so its
 	** dgrad reuses the wgrad's conversion for 134 MB of VRAM.
 	*/
-	if (n > GRAD_TWIN_BIG_N)
+	if (n > GRAD_TWIN_BIG_N) {
+		/*
+		** Opt-in (ANN_GRAD_TWIN_BIG=1): the 134 MB put the full
+		** talk-170m run at 86% of the card, over its 85% line.
+		*/
+		static int big_on = -1;
+
+		if (big_on < 0) {
+			const char *ev = getenv("ANN_GRAD_TWIN_BIG");
+
+			big_on = (ev && ev[0] == '1') ? 1 : 0;
+		}
+		if (!big_on)
+			return NULL;
 		e = &g_grad_twin[GRAD_TWIN_BIG];
-	else {
+	} else {
 		e = &g_grad_twin[g_grad_twin_rr % GRAD_TWIN_BIG];
 		g_grad_twin_rr++;
 	}
@@ -5504,6 +5517,21 @@ static int tc_upload_seqlens(int B)
 #define FA_SPAD	8		/* fp32 score row pad (bank spread) */
 #define FA_BPAD	4		/* backward pad: keeps 2 x 50.4 KB under the 100 KB SM */
 
+/* mma.sync / ldmatrix rewrite of the two kernels below (ANN_FA2=0 keeps WMMA). */
+#include "attn_fa2.cuh"
+
+static int fa2_on(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		const char *e = getenv("ANN_FA2");
+
+		on = (e && e[0] == '0') ? 0 : 1;
+	}
+	return on;
+}
+
 __global__ static void attn_fa_wmma_fwd_kernel(ann_real *out, ann_real *lse,
 	const __nv_bfloat16 *q, const __nv_bfloat16 *k, const __nv_bfloat16 *v,
 	int T, int H, int dh, float scale)
@@ -5801,9 +5829,19 @@ extern "C" int gpu_attn_fa_fwd(mat *concat, const mat *q, const mat *k,
 		{ OpNest _n(OP_ATT_PACK_ID); attn_pack_heads_bf16_kernel<<<blocks, threads>>>(hq, dq, B, T, H, dh); }
 		{ OpNest _n(OP_ATT_PACK_ID); attn_pack_heads_bf16_kernel<<<blocks, threads>>>(hk, dk, B, T, H, dh); }
 		{ OpNest _n(OP_ATT_PACK_ID); attn_pack_heads_bf16_kernel<<<blocks, threads>>>(hv, dv, B, T, H, dh); }
-		{ OpNest _n(OP_ATT_GEMM_ID); attn_fa_wmma_fwd_kernel<<<grid, 32 * FA_WARPS, smem>>>(dc,
-		    lse->d_data, hq, hk, hv, T, H, dh,
-		    (float)(1.0 / sqrt((double)dh))); }
+		{
+			OpNest _n(OP_ATT_GEMM_ID);
+			static int reported;
+
+			if (fa2_on() && fa2_fwd_launch(dc, lse->d_data, hq, hk, hv, B, T, H, dh,
+			    (float)(1.0 / sqrt((double)dh))) == 0) {
+				if (!reported++)
+					fprintf(stderr, "[attn] FA2 mma.sync attention kernels\n");
+			} else
+				attn_fa_wmma_fwd_kernel<<<grid, 32 * FA_WARPS, smem>>>(dc,
+				    lse->d_data, hq, hk, hv, T, H, dh,
+				    (float)(1.0 / sqrt((double)dh)));
+		}
 		if (ps)
 			ps->live = 1;
 	}
@@ -6162,10 +6200,17 @@ extern "C" int gpu_attn_fa_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat,
 		}
 		{ OpNest _n(OP_ATT_SMX_ID); attn_fa_dvec_kernel<<<(unsigned)((nrows + 255) / 256), 256>>>(
 		    g_fa_dvec, ptr[0], ptr[1], (int)nrows, T, H, dh); }
-		{ OpNest _n(OP_ATT_GEMM_ID); attn_fa_wmma_bwd_kernel<<<grid, 32 * FA_WARPS, smem>>>(ptr[5],
-		    ptr[6], a_dv, hq, hk, hv,
-		    (const __nv_bfloat16 *)g_tc_half_do, lse->d_data,
-		    g_fa_dvec, T, H, dh, (float)(1.0 / sqrt((double)dh))); }
+		{
+			OpNest _n(OP_ATT_GEMM_ID);
+
+			if (!fa2_on() || fa2_bwd_launch(ptr[5], ptr[6], a_dv, hq, hk, hv,
+			    (const __nv_bfloat16 *)g_tc_half_do, lse->d_data, g_fa_dvec,
+			    B, T, H, dh, (float)(1.0 / sqrt((double)dh))) != 0)
+				attn_fa_wmma_bwd_kernel<<<grid, 32 * FA_WARPS, smem>>>(ptr[5],
+				    ptr[6], a_dv, hq, hk, hv,
+				    (const __nv_bfloat16 *)g_tc_half_do, lse->d_data,
+				    g_fa_dvec, T, H, dh, (float)(1.0 / sqrt((double)dh)));
+		}
 		if (launch_done() == 0 && finish_out(dq, ptr[5], o[5]) == 0
 		    && finish_out(dk, ptr[6], o[6]) == 0
 		    && finish_out(dv, a_dv, odv) == 0)
