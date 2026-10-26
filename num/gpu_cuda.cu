@@ -1465,8 +1465,8 @@ static int g_act_bf16_rr;
 static int ensure_half_buf(void **buf, size_t *cap, size_t bytes);
 static int half_wt_convert(void *dst, const ann_real *src, int n, int bf16);
 
-#define GRAD_TWIN_SLOTS	5	/* 4 round robin (dq, dk, dv are converted before any is consumed) + 1 for the head delta */
-#define GRAD_TWIN_BIG	4	/* the slot for twins over GRAD_TWIN_BIG_N elements */
+#define GRAD_TWIN_SLOTS	9	/* 8 round robin (dq, dk, dv, the LN-backward outputs, dh...) + 1 for the head delta */
+#define GRAD_TWIN_BIG	8	/* the slot for twins over GRAD_TWIN_BIG_N elements */
 #define GRAD_TWIN_BIG_N	((size_t)16 * 1024 * 1024)
 typedef struct {
 	void		*half;
@@ -1563,6 +1563,22 @@ static void *grad_twin_peek(const ann_real *src, size_t n)
 		if (g_grad_twin[i].src == src && g_grad_twin[i].n == n)
 			return g_grad_twin[i].half;
 	return NULL;
+}
+
+/*
+** Drop every pending gradient twin: called when a microbatch's backward is
+** done, so a twin left by a producer without a GEMM consumer (the first
+** block's LayerNorm backward) can never be served for whatever the next
+** microbatch writes into that buffer.
+*/
+extern "C" void gpu_grad_twins_clear(void)
+{
+	int i;
+
+	for (i = 0; i < GRAD_TWIN_SLOTS; i++) {
+		g_grad_twin[i].src = NULL;
+		g_grad_twin[i].n = 0;
+	}
 }
 
 static void grad_twin_forget(const void *p)
@@ -2283,6 +2299,8 @@ static int cublas_gemm_rm_bt(ann_real *dC, const ann_real *dA,
 		    FP8_SCALE_CUR(as), CUDA_R_8F_E5M2, &beta, dC, N) == 0) {
 			fp8_act_scale_commit(FP8_SCALE_CUR(as), 1);
 			g_fp8_dgrad_fail = 0;
+			/* The BF16 twin the wgrad put is not consumed here: drop it, or a later wgrad could peek a stale one. */
+			grad_twin_forget(dA);
 			pthread_mutex_unlock(&g_gemm_mu);
 			return 0;
 		}
@@ -3829,7 +3847,8 @@ __global__ static void ln_fwd_kernel(ann_real *y, const ann_real *x,
 /* One block per row; dgamma/dbeta accumulate across rows with atomics. */
 __global__ static void ln_bwd_kernel(ann_real *dx, const ann_real *dy,
 	const ann_real *gamma, const ann_real *x_hat, const ann_real *inv_std,
-	ann_real *dgamma, ann_real *dbeta, int d, int accumulate)
+	ann_real *dgamma, ann_real *dbeta, int d, int accumulate,
+	__nv_bfloat16 *dx16)
 {
 	__shared__ ann_real sh[EW_BLOCK];
 	size_t off = (size_t)blockIdx.x * (size_t)d;
@@ -3858,9 +3877,10 @@ __global__ static void ln_bwd_kernel(ann_real *dx, const ann_real *dy,
 		g = dy[off + j] * gamma[j];
 		v = (g - (sum_dy + x_hat[off + j] * sum_dyx) / (ann_real)d) * inv;
 		if (accumulate)
-			dx[off + j] += v;
-		else
-			dx[off + j] = v;
+			v += dx[off + j];
+		dx[off + j] = v;
+		if (dx16)	/* twin for the GEMMs that read this gradient next */
+			dx16[off + j] = __float2bfloat16(v);
 	}
 }
 
@@ -4861,6 +4881,19 @@ extern "C" int gpu_ffn_w1_finish(ann_real *hidden, ann_real *pre,
 	return rc;
 }
 
+/* ANN_TWIN_EMIT=0: kernels do not write gradient twins (dK/dV, LayerNorm backward). */
+static int twin_emit_on(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		const char *e = getenv("ANN_TWIN_EMIT");
+
+		on = (e && e[0] == '0') ? 0 : 1;
+	}
+	return on;
+}
+
 static int ln_bf16_on(void)
 {
 	static int on = -1;
@@ -5744,27 +5777,49 @@ __global__ static void qkv_wt_pack_kernel(__nv_bfloat16 *dst, const __nv_bfloat1
 	    : j < 2 * D ? wk[(size_t)i * D + j - D] : wv[(size_t)i * D + j - 2 * D];
 }
 
-static void *g_qkv_wt;
-static size_t g_qkv_wt_cap;
-static const void *g_qkv_wt_key;
-static long g_qkv_wt_epoch = -1;
+/* One packed [Wq|Wk|Wv] per layer (keyed on its Wq twin), rebuilt when the weight epoch moves. */
+#define QKV_WT_SLOTS	16
+typedef struct {
+	const void	*key;
+	void		*buf;
+	size_t		cap;
+	long		epoch;
+} qkv_wt_slot;
+static qkv_wt_slot g_qkv_wt[QKV_WT_SLOTS];
+static int g_qkv_wt_rr;
 
 static void *qkv_wt_get(const void *hwq, const void *hwk, const void *hwv, int D)
 {
 	size_t n = (size_t)D * D * 3;
+	qkv_wt_slot *e = NULL;
+	int i;
 
-	if (g_qkv_wt && g_qkv_wt_key == hwq && g_qkv_wt_epoch == (long)g_wt_epoch)
-		return g_qkv_wt;
-	if (ensure_half_buf(&g_qkv_wt, &g_qkv_wt_cap, n * 2) != 0)
+	for (i = 0; i < QKV_WT_SLOTS; i++) {
+		if (g_qkv_wt[i].key == hwq) {
+			e = &g_qkv_wt[i];
+			break;
+		}
+		if (!e && !g_qkv_wt[i].key)
+			e = &g_qkv_wt[i];
+	}
+	if (!e)
+		e = &g_qkv_wt[(g_qkv_wt_rr++) % QKV_WT_SLOTS];
+	if (e->buf && e->key == hwq && e->epoch == (long)g_wt_epoch)
+		return e->buf;
+	if (ensure_half_buf(&e->buf, &e->cap, n * 2) != 0) {
+		e->key = NULL;
 		return NULL;
-	qkv_wt_pack_kernel<<<(unsigned)((n + 255) / 256), 256>>>((__nv_bfloat16 *)g_qkv_wt,
+	}
+	qkv_wt_pack_kernel<<<(unsigned)((n + 255) / 256), 256>>>((__nv_bfloat16 *)e->buf,
 	    (const __nv_bfloat16 *)hwq, (const __nv_bfloat16 *)hwk,
 	    (const __nv_bfloat16 *)hwv, D);
-	if (cudaGetLastError() != cudaSuccess)
+	if (cudaGetLastError() != cudaSuccess) {
+		e->key = NULL;
 		return NULL;
-	g_qkv_wt_key = hwq;
-	g_qkv_wt_epoch = (long)g_wt_epoch;
-	return g_qkv_wt;
+	}
+	e->key = hwq;
+	e->epoch = (long)g_wt_epoch;
+	return e->buf;
 }
 
 __global__ static void attn_fa_wmma_fwd_kernel(ann_real *out, ann_real *lse,
@@ -6431,7 +6486,20 @@ extern "C" int gpu_attn_fa_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat,
 				const __nv_bfloat16 *bq = (const __nv_bfloat16 *)qs->buf;
 				const int Dm = H * dh;
 
+				void *dk16 = NULL, *dv16 = NULL;
+
 				qs->live = 0;
+				/* dK, dV also as BF16 twins: their wgrad and dgrad GEMMs then convert nothing. */
+				if (!o[6] && !odv && !stream_is_capturing() && twin_emit_on()) {
+					pthread_mutex_lock(&g_gemm_mu);
+					dk16 = grad_twin_reserve(ptr[6], npack);
+					dv16 = dk16 ? grad_twin_reserve(a_dv, npack) : NULL;
+					if (!dv16 && dk16)
+						grad_twin_forget(ptr[6]);
+					pthread_mutex_unlock(&g_gemm_mu);
+					if (!dv16)
+						dk16 = NULL;
+				}
 				{ OpNest _n(OP_ATT_PACK_ID); attn_pack_heads_bf16_kernel<<<blocks, threads>>>(
 				    (__nv_bfloat16 *)g_tc_half_do, ptr[0], B, T, H, dh); }
 				{ OpNest _n(OP_ATT_SMX_ID); attn_fa_dvec_kernel<<<(unsigned)((nrows + 255) / 256), 256>>>(
@@ -6439,8 +6507,14 @@ extern "C" int gpu_attn_fa_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat,
 				{ OpNest _n(OP_ATT_GEMM_ID); if (fa2_bwd_launch_lay(ptr[5], ptr[6], a_dv, bq, bq + Dm, bq + 2 * Dm,
 				    (const __nv_bfloat16 *)g_tc_half_do, lse->d_data, g_fa_dvec,
 				    B, T, H, dh, (float)(1.0 / sqrt((double)dh)),
-				    fa2_lay_rows(T, 3 * Dm, dh), fa2_lay_headmajor(T, H, dh)) != 0)
-					goto fa_bwd_out; }
+				    fa2_lay_rows(T, 3 * Dm, dh), fa2_lay_headmajor(T, H, dh),
+				    (__nv_bfloat16 *)dk16, (__nv_bfloat16 *)dv16) != 0) {
+					if (dk16) {
+						grad_twin_forget(ptr[6]);
+						grad_twin_forget(a_dv);
+					}
+					goto fa_bwd_out;
+				} }
 				goto fa_bwd_launched;
 			}
 			if (ps && ps->live) {
@@ -7387,8 +7461,23 @@ static int gpu_layernorm_backward_locked(mat *dx, const mat *dy, const ann_real 
 	acc_b = colsum_acc_get(dbeta, d);
 	if (!acc_g || !acc_b)
 		return -1;
-	ln_bwd_kernel<<<T, ew_block_for(d)>>>(rdx.dev, rdy.dev, rg.dev, rh.dev,
-	    ri.dev, NULL, NULL, d, accumulate);
+	{
+		void *dx16 = NULL;
+
+		/* Accumulate mode (training): the result feeds wgrad/dgrad GEMMs; hand them its BF16 twin. */
+		if (accumulate && dx->d_data && g_compute_prec == GPU_PREC_BF16
+		    && !stream_is_capturing() && twin_emit_on()) {
+			pthread_mutex_lock(&g_gemm_mu);
+			dx16 = grad_twin_reserve(dx->d_data, (size_t)T * (size_t)d);
+			pthread_mutex_unlock(&g_gemm_mu);
+		}
+		ln_bwd_kernel<<<T, ew_block_for(d)>>>(rdx.dev, rdy.dev, rg.dev, rh.dev,
+		    ri.dev, NULL, NULL, d, accumulate, (__nv_bfloat16 *)dx16);
+		if (dx16 && ew_launch_ok() != 0) {
+			grad_twin_forget(dx->d_data);
+			return -1;
+		}
+	}
 	if (ew_launch_ok() != 0)
 		return -1;
 	{

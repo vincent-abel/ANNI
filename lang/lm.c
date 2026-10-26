@@ -809,7 +809,12 @@ int lm_backward_packed(lm *model, const mat *dhidden, const lm_cache *c)
 	if (!model || !dhidden || !c || !c->trc || dhidden->rows != c->n)
 		return -1;
 	/* c->n = B*T rows: transformer_backward / embed_backward are row-wise. */
-	return lm_backward(model, dhidden, c);
+	{
+		int rc = lm_backward(model, dhidden, c);
+
+		gpu_grad_twins_clear();	/* no BF16 gradient twin outlives its microbatch */
+		return rc;
+	}
 }
 
 /*

@@ -93,6 +93,8 @@ int	gpu_mat_mul_res(mat *d, const mat *a, const mat *b, const ann_real *bias,
 /* c = ReLU(a b + bias); cuBLASLt RELU_BIAS. Publishes BF16 twin of c. */
 int	gpu_mat_mul_bias_relu(mat *c, const mat *a, const mat *b,
 		const ann_real *bias);
+/* End of a microbatch backward: forget every pending BF16 gradient twin. */
+void	gpu_grad_twins_clear(void);
 /* dA = dC * B^T, dB = A^T * dC (NULL skips that output). */
 int	gpu_mat_mul_backward(mat *da, mat *db, const mat *dc,
 		const mat *a, const mat *b);
