@@ -18,6 +18,39 @@
 /* DH (head size, 16..64 by 16) is a template parameter; FA2_LDS(DH) is the
 ** smem row stride in bf16 (DH + 8: 144 B at 64, conflict-free ldmatrix). */
 #define FA2_LDS(DH)	((DH) + 8)
+
+/*
+** Where the BF16 rows of one tensor live: element (b, h, t, c) is at
+** base + b * bstride + h * hstride + t * ld + c. Head-major packs
+** (attn_pack_heads_bf16_kernel) have {H*T*DH, T*DH, DH}; a row-major
+** [b*T][ncols] matrix with the head's columns at hoff has {T*ld, DH, ld}
+** (base already offset by hoff).
+*/
+typedef struct {
+	long long	bstride;
+	long long	hstride;
+	int		ld;
+} fa2_lay;
+
+static fa2_lay fa2_lay_headmajor(int T, int H, int dh)
+{
+	fa2_lay l;
+
+	l.bstride = (long long)H * T * dh;
+	l.hstride = (long long)T * dh;
+	l.ld = dh;
+	return l;
+}
+
+static fa2_lay fa2_lay_rows(int T, int ld, int dh)
+{
+	fa2_lay l;
+
+	l.bstride = (long long)T * ld;
+	l.hstride = dh;
+	l.ld = ld;
+	return l;
+}
 #define FA2_WARPS	4
 
 __device__ __forceinline__ unsigned fa2_smem_addr(const void *p)
@@ -80,7 +113,8 @@ __device__ __forceinline__ void fa2_load_tile(__nv_bfloat16 *dst, const __nv_bfl
 template <int DH>
 __global__ static void __launch_bounds__(128)
 attn_fa2_fwd_kernel(float *out, float *lse, const __nv_bfloat16 *q,
-	const __nv_bfloat16 *k, const __nv_bfloat16 *v, int T, int H, float scale)
+	const __nv_bfloat16 *k, const __nv_bfloat16 *v, int T, int H, float scale,
+	fa2_lay lq)
 {
 	const int NT = DH / 8;		/* n-tiles over dh */
 	const int KS = DH / 16;		/* k-steps over dh */
@@ -96,9 +130,10 @@ attn_fa2_fwd_kernel(float *out, float *lse, const __nv_bfloat16 *q,
 	const int warp = threadIdx.x >> 5;
 	const int lane = threadIdx.x & 31;
 	const int D = H * DH;
-	const __nv_bfloat16 *qsrc = q + ((size_t)bh * T + q0) * DH;
-	const __nv_bfloat16 *ksrc = k + (size_t)bh * T * DH;
-	const __nv_bfloat16 *vsrc = v + (size_t)bh * T * DH;
+	const long long hoff = (long long)b * lq.bstride + (long long)h * lq.hstride;
+	const __nv_bfloat16 *qsrc = q + hoff + (long long)q0 * lq.ld;
+	const __nv_bfloat16 *ksrc = k + hoff;
+	const __nv_bfloat16 *vsrc = v + hoff;
 	unsigned qa[KS][4];		/* Q A-fragments, KS k-steps of 16 */
 	float oacc[NT][4];		/* O: NT n-tiles of 8 columns */
 	float m0 = -1e30f, m1 = -1e30f;	/* running max of rows lane/4 and lane/4 + 8 */
@@ -111,7 +146,7 @@ attn_fa2_fwd_kernel(float *out, float *lse, const __nv_bfloat16 *q,
 	for (n = 0; n < NT; n++)
 		for (i = 0; i < 4; i++)
 			oacc[n][i] = 0.0f;
-	fa2_load_tile<DH>(Qs, qsrc, DH);
+	fa2_load_tile<DH>(Qs, qsrc, lq.ld);
 	__syncthreads();
 	/* Q fragments: ldmatrix.x4 of {rows 0-7 | 8-15} x {k 0-7 | 8-15}. */
 	for (kk = 0; kk < KS; kk++) {
@@ -127,8 +162,8 @@ attn_fa2_fwd_kernel(float *out, float *lse, const __nv_bfloat16 *q,
 		unsigned pa[4][4];
 
 		__syncthreads();	/* previous tile fully consumed */
-		fa2_load_tile<DH>(Ks, ksrc + (size_t)k0 * DH, DH);
-		fa2_load_tile<DH>(Vs, vsrc + (size_t)k0 * DH, DH);
+		fa2_load_tile<DH>(Ks, ksrc + (long long)k0 * lq.ld, lq.ld);
+		fa2_load_tile<DH>(Vs, vsrc + (long long)k0 * lq.ld, lq.ld);
 		__syncthreads();
 		/* S = Q K^T: 8 n-tiles of 8 keys; B fragments by ldmatrix.x4 (two n-tiles per load). */
 		for (n = 0; n < 8; n++)
@@ -250,7 +285,8 @@ template <int DH>
 __global__ static void __launch_bounds__(128)
 attn_fa2_bwd_kernel(float *dq, float *dk, float *dv, const __nv_bfloat16 *q,
 	const __nv_bfloat16 *k, const __nv_bfloat16 *v, const __nv_bfloat16 *dO,
-	const float *lse, const float *dvec, int T, int H, float scale)
+	const float *lse, const float *dvec, int T, int H, float scale,
+	fa2_lay lq, fa2_lay lo)
 {
 	const int NT = DH / 8;
 	const int KS = DH / 16;
@@ -272,10 +308,11 @@ attn_fa2_bwd_kernel(float *dq, float *dk, float *dv, const __nv_bfloat16 *q,
 	const int warp = threadIdx.x >> 5;
 	const int lane = threadIdx.x & 31;
 	const int D = H * DH;
-	const __nv_bfloat16 *ksrc = k + ((size_t)bh * T + k0) * DH;
-	const __nv_bfloat16 *vsrc = v + ((size_t)bh * T + k0) * DH;
-	const __nv_bfloat16 *qsrc = q + (size_t)bh * T * DH;
-	const __nv_bfloat16 *dsrc = dO + (size_t)bh * T * DH;
+	const long long hoff = (long long)b * lq.bstride + (long long)h * lq.hstride;
+	const __nv_bfloat16 *ksrc = k + hoff + (long long)k0 * lq.ld;
+	const __nv_bfloat16 *vsrc = v + hoff + (long long)k0 * lq.ld;
+	const __nv_bfloat16 *qsrc = q + hoff;
+	const __nv_bfloat16 *dsrc = dO + (long long)b * lo.bstride + (long long)h * lo.hstride;
 	unsigned ka[KS][4];		/* K rows of this warp as A fragments (k = dh) */
 	unsigned va[KS][4];		/* V rows */
 	float dkacc[NT][4];
@@ -290,8 +327,8 @@ attn_fa2_bwd_kernel(float *dq, float *dk, float *dv, const __nv_bfloat16 *q,
 			dkacc[n][i] = 0.0f;
 			dvacc[n][i] = 0.0f;
 		}
-	fa2_load_tile<DH>(Ks, ksrc, DH);
-	fa2_load_tile<DH>(Vs0, vsrc, DH);
+	fa2_load_tile<DH>(Ks, ksrc, lq.ld);
+	fa2_load_tile<DH>(Vs0, vsrc, lq.ld);
 	__syncthreads();
 	for (kk = 0; kk < KS; kk++) {
 		const int off = (warp * 16 + (lane & 7) + ((lane >> 3) & 1) * 8) * LDS
@@ -307,8 +344,8 @@ attn_fa2_bwd_kernel(float *dq, float *dk, float *dv, const __nv_bfloat16 *q,
 		unsigned pa[4][4];
 
 		__syncthreads();	/* previous tile's Qs / dOs / dSt consumed */
-		fa2_load_tile<DH>(Qs, qsrc + (size_t)q0 * DH, DH);
-		fa2_load_tile<DH>(dOs, dsrc + (size_t)q0 * DH, DH);
+		fa2_load_tile<DH>(Qs, qsrc + (long long)q0 * lq.ld, lq.ld);
+		fa2_load_tile<DH>(dOs, dsrc + (long long)q0 * lo.ld, lo.ld);
 		if (threadIdx.x < FA2_BQ) {
 			ls[threadIdx.x] = lse[(size_t)bh * T + q0 + threadIdx.x];
 			dvs[threadIdx.x] = dvec[(size_t)bh * T + q0 + threadIdx.x];
@@ -453,40 +490,61 @@ attn_fa2_bwd_kernel(float *dq, float *dk, float *dv, const __nv_bfloat16 *q,
 	}
 }
 
-static int fa2_bwd_launch(float *dq, float *dk, float *dv, const __nv_bfloat16 *q,
+static int fa2_bwd_launch_lay(float *dq, float *dk, float *dv, const __nv_bfloat16 *q,
 	const __nv_bfloat16 *k, const __nv_bfloat16 *v, const __nv_bfloat16 *dO,
-	const float *lse, const float *dvec, int B, int T, int H, int dh, float scale)
+	const float *lse, const float *dvec, int B, int T, int H, int dh, float scale,
+	fa2_lay lq, fa2_lay lo)
 {
 	dim3 grid(B * H, T / FA2_BK);
 
 	if (!fa2_ok(T, dh))
 		return -1;
 	switch (dh) {
-	case 16: attn_fa2_bwd_kernel<16><<<grid, 32 * FA2_WARPS>>>(dq, dk, dv, q, k, v, dO, lse, dvec, T, H, scale); break;
-	case 32: attn_fa2_bwd_kernel<32><<<grid, 32 * FA2_WARPS>>>(dq, dk, dv, q, k, v, dO, lse, dvec, T, H, scale); break;
-	case 48: attn_fa2_bwd_kernel<48><<<grid, 32 * FA2_WARPS>>>(dq, dk, dv, q, k, v, dO, lse, dvec, T, H, scale); break;
-	default: attn_fa2_bwd_kernel<64><<<grid, 32 * FA2_WARPS>>>(dq, dk, dv, q, k, v, dO, lse, dvec, T, H, scale); break;
+	case 16: attn_fa2_bwd_kernel<16><<<grid, 32 * FA2_WARPS>>>(dq, dk, dv, q, k, v, dO, lse, dvec, T, H, scale, lq, lo); break;
+	case 32: attn_fa2_bwd_kernel<32><<<grid, 32 * FA2_WARPS>>>(dq, dk, dv, q, k, v, dO, lse, dvec, T, H, scale, lq, lo); break;
+	case 48: attn_fa2_bwd_kernel<48><<<grid, 32 * FA2_WARPS>>>(dq, dk, dv, q, k, v, dO, lse, dvec, T, H, scale, lq, lo); break;
+	default: attn_fa2_bwd_kernel<64><<<grid, 32 * FA2_WARPS>>>(dq, dk, dv, q, k, v, dO, lse, dvec, T, H, scale, lq, lo); break;
 	}
 	return 0;
 }
 
+/* Head-major packed q, k, v and dO. */
+static int fa2_bwd_launch(float *dq, float *dk, float *dv, const __nv_bfloat16 *q,
+	const __nv_bfloat16 *k, const __nv_bfloat16 *v, const __nv_bfloat16 *dO,
+	const float *lse, const float *dvec, int B, int T, int H, int dh, float scale)
+{
+	fa2_lay l = fa2_lay_headmajor(T, H, dh);
+
+	return fa2_bwd_launch_lay(dq, dk, dv, q, k, v, dO, lse, dvec, B, T, H, dh,
+	    scale, l, l);
+}
+
 /* Host launcher; q, k, v head-major [b][h][t][dh] BF16. */
 /* Host launcher; q, k, v head-major [b][h][t][dh] BF16; -1 = shape not covered. */
-static int fa2_fwd_launch(float *out, float *lse, const __nv_bfloat16 *q,
+static int fa2_fwd_launch_lay(float *out, float *lse, const __nv_bfloat16 *q,
 	const __nv_bfloat16 *k, const __nv_bfloat16 *v, int B, int T, int H, int dh,
-	float scale)
+	float scale, fa2_lay lq)
 {
 	dim3 grid(B * H, T / FA2_BQ);
 
 	if (!fa2_ok(T, dh))
 		return -1;
 	switch (dh) {
-	case 16: attn_fa2_fwd_kernel<16><<<grid, 32 * FA2_WARPS>>>(out, lse, q, k, v, T, H, scale); break;
-	case 32: attn_fa2_fwd_kernel<32><<<grid, 32 * FA2_WARPS>>>(out, lse, q, k, v, T, H, scale); break;
-	case 48: attn_fa2_fwd_kernel<48><<<grid, 32 * FA2_WARPS>>>(out, lse, q, k, v, T, H, scale); break;
-	default: attn_fa2_fwd_kernel<64><<<grid, 32 * FA2_WARPS>>>(out, lse, q, k, v, T, H, scale); break;
+	case 16: attn_fa2_fwd_kernel<16><<<grid, 32 * FA2_WARPS>>>(out, lse, q, k, v, T, H, scale, lq); break;
+	case 32: attn_fa2_fwd_kernel<32><<<grid, 32 * FA2_WARPS>>>(out, lse, q, k, v, T, H, scale, lq); break;
+	case 48: attn_fa2_fwd_kernel<48><<<grid, 32 * FA2_WARPS>>>(out, lse, q, k, v, T, H, scale, lq); break;
+	default: attn_fa2_fwd_kernel<64><<<grid, 32 * FA2_WARPS>>>(out, lse, q, k, v, T, H, scale, lq); break;
 	}
 	return 0;
+}
+
+/* Head-major packed q, k, v (the attn_pack_heads_bf16_kernel layout). */
+static int fa2_fwd_launch(float *out, float *lse, const __nv_bfloat16 *q,
+	const __nv_bfloat16 *k, const __nv_bfloat16 *v, int B, int T, int H, int dh,
+	float scale)
+{
+	return fa2_fwd_launch_lay(out, lse, q, k, v, B, T, H, dh, scale,
+	    fa2_lay_headmajor(T, H, dh));
 }
 
 #endif /* ATTN_FA2_CUH */
