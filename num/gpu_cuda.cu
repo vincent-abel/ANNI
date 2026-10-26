@@ -1507,6 +1507,37 @@ static void *grad_twin_take(const ann_real *src, size_t n)
 	return NULL;
 }
 
+/*
+** Reserve a twin slot for src without converting: a kernel fills it (the
+** fused ReLU backward writes the masked BF16 dh straight into it). No size
+** cap: one 32 MB slot for dh at 4096 x 4096.
+*/
+static void *grad_twin_reserve(const ann_real *src, size_t n)
+{
+	grad_twin_slot *e = &g_grad_twin[g_grad_twin_rr % GRAD_TWIN_SLOTS];
+
+	g_grad_twin_rr++;
+	if (ensure_half_buf(&e->half, &e->cap, n * 2) != 0) {
+		e->src = NULL;
+		e->n = 0;
+		return NULL;
+	}
+	e->src = src;
+	e->n = n;
+	return e->half;
+}
+
+/* The pending twin of src without clearing it (the wgrad reads it first). */
+static void *grad_twin_peek(const ann_real *src, size_t n)
+{
+	int i;
+
+	for (i = 0; i < GRAD_TWIN_SLOTS; i++)
+		if (g_grad_twin[i].src == src && g_grad_twin[i].n == n)
+			return g_grad_twin[i].half;
+	return NULL;
+}
+
 static void grad_twin_forget(const void *p)
 {
 	int i;
@@ -2330,6 +2361,8 @@ fp8_wgrad_skip:
 			}
 			hA_use = g_half_A;
 		}
+		if (!hB_use)
+			hB_use = grad_twin_peek(dB, nB);	/* masked by the fused ReLU bwd */
 		if (!hB_use) {
 			/* Convert G once, into the one-shot twin the dgrad reuses. */
 			hB_use = grad_twin_put(dB, nB);
@@ -7046,6 +7079,141 @@ extern "C" int gpu_relu_backward(ann_real *dx, const ann_real *x_pre_relu_or_mas
 	rc = gpu_relu_backward_locked(dx, x_pre_relu_or_mask, n);
 	pthread_mutex_unlock(&g_ew_mu);
 	return rc;
+}
+
+#if CUDART_VERSION >= 11000
+/*
+** FFN ReLU backward in one pass: dst = BF16(dh masked by hid > 0) and
+** acc[c] += column sums of the masked dh. One thread per 4 columns and
+** COLSUM_SLAB rows (float4 loads, bfloat162 stores), FP32 sums, one
+** atomic per column and slab (as col_sum_tiled_kernel). cols % 4 == 0.
+*/
+__global__ static void relu_bwd_pack_colsum_kernel(__nv_bfloat16 *dst,
+	ann_real *acc, const ann_real *dh, const ann_real *hid, int rows,
+	int cols)
+{
+	const int c0 = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
+	const int r0 = blockIdx.y * COLSUM_SLAB;
+	const int r1 = min(r0 + COLSUM_SLAB, rows);
+	float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+	int r;
+
+	if (c0 >= cols)
+		return;
+	for (r = r0; r < r1; r++) {
+		const size_t off = (size_t)r * cols + c0;
+		float4 g = *(const float4 *)(dh + off);
+		const float4 h = *(const float4 *)(hid + off);
+
+		g.x = h.x > 0.0f ? g.x : 0.0f;
+		g.y = h.y > 0.0f ? g.y : 0.0f;
+		g.z = h.z > 0.0f ? g.z : 0.0f;
+		g.w = h.w > 0.0f ? g.w : 0.0f;
+		s0 += g.x;
+		s1 += g.y;
+		s2 += g.z;
+		s3 += g.w;
+		*(__nv_bfloat162 *)(dst + off) = __floats2bfloat162_rn(g.x, g.y);
+		*(__nv_bfloat162 *)(dst + off + 2) = __floats2bfloat162_rn(g.z, g.w);
+	}
+	atomicAdd(acc + c0, s0);
+	atomicAdd(acc + c0 + 1, s1);
+	atomicAdd(acc + c0 + 2, s2);
+	atomicAdd(acc + c0 + 3, s3);
+}
+#endif
+
+/*
+** FFN backward, BF16 mode: the ReLU backward of dh (mask hidden > 0), its
+** BF16 twin for the W1 wgrad and dgrad GEMMs, and the b1 gradient column
+** sums in one kernel. The twin goes into a grad-twin slot keyed on dh's
+** device buffer (the wgrad peeks it, the dgrad takes it); db1 accumulates
+** like gpu_mat_col_sum_add. The FP32 dh is left unmasked: in this mode no
+** GEMM reads it. -1 = run the three steps (gpu_relu_backward, the
+** conversions inside the GEMMs, gpu_mat_col_sum_add).
+*/
+extern "C" int gpu_ffn_relu_bwd_fused(mat *dh, const mat *hidden,
+	ann_real *db1_host)
+{
+#if CUDART_VERSION >= 11000
+	OpScope _op(OP_ELEMWISE);
+	ann_real *ddh;
+	const ann_real *dhid;
+	colsum_acc *acc;
+	void *twin;
+	int rows, cols;
+	size_t n;
+
+	if (!dh || !hidden || !db1_host || !gpu_available()
+	    || g_compute_prec != GPU_PREC_BF16 || stream_is_capturing())
+		return -1;
+	rows = dh->rows;
+	cols = dh->cols;
+	if (hidden->rows != rows || hidden->cols != cols || (cols % 4) != 0
+	    || rows <= 0)
+		return -1;
+	/* Both must be device-resident in place: the twin is keyed on dh. */
+	if (!dh->d_data || dh->on_device != MAT_DEV_DEVICE || !hidden->d_data
+	    || hidden->on_device != MAT_DEV_DEVICE)
+		return -1;
+	ddh = dh->d_data;
+	dhid = hidden->d_data;
+	n = (size_t)rows * (size_t)cols;
+	pthread_mutex_lock(&g_gemm_mu);
+	twin = grad_twin_reserve(ddh, n);
+	pthread_mutex_unlock(&g_gemm_mu);
+	if (!twin)
+		return -1;
+	pthread_mutex_lock(&g_ew_mu);
+	acc = colsum_acc_get(db1_host, cols);
+	if (!acc) {
+		pthread_mutex_unlock(&g_ew_mu);
+		grad_twin_forget(ddh);
+		return -1;
+	}
+	{
+		dim3 grid((cols / 4 + EW_BLOCK - 1) / EW_BLOCK,
+		    (rows + COLSUM_SLAB - 1) / COLSUM_SLAB);
+
+		relu_bwd_pack_colsum_kernel<<<grid, EW_BLOCK>>>(
+		    (__nv_bfloat16 *)twin, acc->dev, ddh, dhid, rows, cols);
+	}
+	if (ew_launch_ok() != 0) {
+		pthread_mutex_unlock(&g_ew_mu);
+		grad_twin_forget(ddh);
+		return -1;
+	}
+	acc->dirty = 1;
+	if (g_sync_mode == GPU_SYNC_EAGER) {
+		ann_real *db_tmp = (ann_real *)malloc((size_t)cols * sizeof(ann_real));
+		int j;
+
+		if (!db_tmp || cudaDeviceSynchronize() != cudaSuccess
+		    || cudaMemcpy(db_tmp, acc->dev, (size_t)cols * sizeof(ann_real),
+		    cudaMemcpyDeviceToHost) != cudaSuccess) {
+			free(db_tmp);
+			pthread_mutex_unlock(&g_ew_mu);
+			grad_twin_forget(ddh);
+			return -1;
+		}
+		for (j = 0; j < cols; j++)
+			db1_host[j] += db_tmp[j];
+		free(db_tmp);
+		(void)cudaMemset(acc->dev, 0, (size_t)cols * sizeof(ann_real));
+		acc->dirty = 0;
+	}
+	pthread_mutex_unlock(&g_ew_mu);
+	{
+		static int reported;
+
+		if (!reported++)
+			fprintf(stderr, "[ffn] ReLU backward, BF16 twin of dh and db1 in one kernel\n");
+	}
+	return 0;
+#else
+	(void)dh; (void)hidden; (void)db1_host;
+	return -1;
+#endif
 }
 
 /* Decoupled weight decay for the device Adam kernels (host path: lm_adam.c). */
