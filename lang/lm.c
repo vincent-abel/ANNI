@@ -412,7 +412,10 @@ static int ce_rows_backward(lm *model, const mat *hv, const int *tgt, int rows,
 	int t;
 	int v;
 	int n_valid;	/* rows with a target; tgt -1 = masked (no loss) */
+	ann_real *ce_dp;	/* fused: logits buffer now holding the BF16 delta */
+	int rc;
 
+	ce_dp = NULL;
 	V = model->vocab_size;
 	n_valid = 0;
 	for (t = 0; t < rows; t++) {
@@ -450,6 +453,31 @@ static int ce_rows_backward(lm *model, const mat *hv, const int *tgt, int rows,
 					row[v] += model->b_head->data[v];
 			}
 			mat_host_dirty(delta);
+		}
+	}
+
+	/*
+	** 2+3 in one kernel for BF16 batch training: softmax, CE, db_head and
+	** the delta as BF16 only, in place over the logits, for the two GEMMs
+	** below (gpu_ce_softmax_delta_bf16). The FP32 delta is never formed.
+	*/
+	if (!model->w_head_q) {
+		ann_real *dp = mat_compute_ptr(delta);
+
+		ce_sum = -1.0;
+		rc = dp && dp == delta->d_data
+		    ? gpu_ce_softmax_delta_bf16(dp, tgt, rows, V,
+		    model->db_head->data, mean_ce_out ? &ce_sum : NULL) : -1;
+		if (rc == -2)
+			goto fail;
+		if (rc == 0) {
+			ce_dp = dp;
+			mat_mark_written(delta, dp);
+			if (mean_ce_out)
+				*mean_ce_out = n_valid > 0 && ce_sum >= 0.0
+				    ? ce_sum * (double)rows / (double)n_valid
+				    : -1.0;
+			goto gemms;
 		}
 	}
 
@@ -515,6 +543,7 @@ static int ce_rows_backward(lm *model, const mat *hv, const int *tgt, int rows,
 		}
 	}
 
+gemms:
 	/* 4. dW_head += H^T delta. */
 	if (mat_outer_add(model->dw_head, hv, delta) != 0)
 		goto fail;
@@ -522,8 +551,13 @@ static int ce_rows_backward(lm *model, const mat *hv, const int *tgt, int rows,
 	/* 5. dhv = delta W_head^T. */
 	if (mat_mul_wt(dhv, delta, model->w_head) != 0)
 		goto fail;
+	/* Fused: both GEMMs must have read the BF16 delta, not the FP32 buffer. */
+	if (ce_dp && gpu_ce_bf16_delta_done(ce_dp) != 0)
+		return -1;
 	return 0;
 fail:
+	if (ce_dp)
+		(void)gpu_ce_bf16_delta_done(ce_dp);
 	/* Keep g_ce_delta for reuse; caller sees failure. */
 	return -1;
 }

@@ -1466,16 +1466,25 @@ static int g_act_bf16_rr;
 static int ensure_half_buf(void **buf, size_t *cap, size_t bytes);
 static int half_wt_convert(void *dst, const ann_real *src, int n, int bf16);
 
-#define GRAD_TWIN_SLOTS	9	/* 8 round robin (dq, dk, dv, the LN-backward outputs, dh...) + 1 for the head delta */
+#define GRAD_TWIN_SLOTS	10	/* 8 round robin (dq, dk, dv, the LN-backward outputs, dh...) + the big one + the in-place head delta */
 #define GRAD_TWIN_BIG	8	/* the slot for twins over GRAD_TWIN_BIG_N elements */
 #define GRAD_TWIN_BIG_N	((size_t)16 * 1024 * 1024)
+/*
+** The head's BF16 delta written in place over its own FP32 logits rows by
+** the fused softmax-CE kernel: half points into the logits buffer (borrowed,
+** never allocated or freed through this slot) and ld is 2 V.
+*/
+#define GRAD_TWIN_INPLACE	9
 typedef struct {
 	void		*half;
 	size_t		cap;
 	const ann_real	*src;
 	size_t		n;
+	int		ld;	/* BF16 row stride in elements; 0 = dense (the GEMM's own) */
 } grad_twin_slot;
 static grad_twin_slot g_grad_twin[GRAD_TWIN_SLOTS];
+/* Bit 1: the head wgrad ran on the in-place twin; bit 2: the dgrad did. */
+static int g_ce_inplace_used;
 static int g_grad_twin_rr;
 static long g_grad_twin_hit;
 static long g_grad_twin_miss;
@@ -1517,11 +1526,16 @@ static void *grad_twin_put(const ann_real *src, size_t n)
 	}
 	e->src = src;
 	e->n = n;
+	e->ld = 0;
 	return e->half;
 }
 
-/* Take (and clear) the twin of src if one is pending. */
-static void *grad_twin_take(const ann_real *src, size_t n)
+/*
+** Take (and clear) the twin of src if one is pending; *ld = its BF16 row
+** stride, or dense_ld when the twin is packed.
+*/
+static void *grad_twin_take(const ann_real *src, size_t n, int dense_ld,
+	int *ld)
 {
 	int i;
 
@@ -1529,6 +1543,7 @@ static void *grad_twin_take(const ann_real *src, size_t n)
 		if (g_grad_twin[i].src == src && g_grad_twin[i].n == n) {
 			g_grad_twin[i].src = NULL;
 			g_grad_twin[i].n = 0;
+			*ld = g_grad_twin[i].ld ? g_grad_twin[i].ld : dense_ld;
 			return g_grad_twin[i].half;
 		}
 	}
@@ -1552,17 +1567,21 @@ static void *grad_twin_reserve(const ann_real *src, size_t n)
 	}
 	e->src = src;
 	e->n = n;
+	e->ld = 0;
 	return e->half;
 }
 
 /* The pending twin of src without clearing it (the wgrad reads it first). */
-static void *grad_twin_peek(const ann_real *src, size_t n)
+static void *grad_twin_peek(const ann_real *src, size_t n, int dense_ld,
+	int *ld)
 {
 	int i;
 
 	for (i = 0; i < GRAD_TWIN_SLOTS; i++)
-		if (g_grad_twin[i].src == src && g_grad_twin[i].n == n)
+		if (g_grad_twin[i].src == src && g_grad_twin[i].n == n) {
+			*ld = g_grad_twin[i].ld ? g_grad_twin[i].ld : dense_ld;
 			return g_grad_twin[i].half;
+		}
 	return NULL;
 }
 
@@ -2318,10 +2337,6 @@ static int cublas_gemm_rm_bt_ex(ann_real *dC, const ann_real *dA,
 		g_fp8_dgrad_fail++;
 	}
 #endif
-	if (ensure_half_buf(&g_half_A, &g_half_A_cap, nA * 2) != 0) {
-		pthread_mutex_unlock(&g_gemm_mu);
-		return -1;
-	}
 	{
 		int use_bf16 = (g_compute_prec == GPU_PREC_BF16);
 		void *hB_use;
@@ -2346,13 +2361,18 @@ static int cublas_gemm_rm_bt_ex(ann_real *dC, const ann_real *dA,
 #if CUDART_VERSION >= 11000
 		if (use_bf16) {
 			const void *hA_use = NULL;
+			int ldA = K;
 
-			hA_use = grad_twin_take(dA, nA);	/* converted by the wgrad */
+			/* converted by the wgrad, or written by its producer */
+			hA_use = grad_twin_take(dA, nA, K, &ldA);
 			if (hA_use)
 				g_grad_twin_hit++;
 			else {
 				g_grad_twin_miss++;
-				if (half_wt_convert(g_half_A, dA, (int)nA, 1) == 0)
+				/* Scratch sized on a miss only: the head's twin needs none. */
+				if (ensure_half_buf(&g_half_A, &g_half_A_cap, nA * 2)
+				    == 0
+				    && half_wt_convert(g_half_A, dA, (int)nA, 1) == 0)
 					hA_use = g_half_A;
 			}
 			if (!hA_use) {
@@ -2361,15 +2381,21 @@ static int cublas_gemm_rm_bt_ex(ann_real *dC, const ann_real *dA,
 			}
 			if (out16 && !accumulate)
 				rc = cublas_lt_gemm_half(CUBLAS_OP_T, CUBLAS_OP_N, N, M, K,
-				    &alpha, hB_use, K, hA_use, K, &beta, (float *)out16, N, 1,
+				    &alpha, hB_use, K, hA_use, ldA, &beta, (float *)out16, N, 1,
 				    CUBLASLT_EPILOGUE_DEFAULT, NULL, NULL, 1);
 			else
 				rc = cublas_gemm_ex_bf16(CUBLAS_OP_T, CUBLAS_OP_N, N,
-				    M, K, &alpha, hB_use, K, hA_use, K, &beta, dC, N);
+				    M, K, &alpha, hB_use, K, hA_use, ldA, &beta, dC, N);
+			if (rc == 0 && hA_use == g_grad_twin[GRAD_TWIN_INPLACE].half)
+				g_ce_inplace_used |= 2;
 			pthread_mutex_unlock(&g_gemm_mu);
 			return rc;
 		}
 #endif
+		if (ensure_half_buf(&g_half_A, &g_half_A_cap, nA * 2) != 0) {
+			pthread_mutex_unlock(&g_gemm_mu);
+			return -1;
+		}
 		f32_to_f16_kernel<<<(int)((nA + threads - 1) / threads),
 		    threads>>>((half *)g_half_A, dA, (int)nA);
 		rc = cublas_gemm_ex_f16(CUBLAS_OP_T, CUBLAS_OP_N, N, M, K,
@@ -2453,30 +2479,35 @@ static int cublas_gemm_rm_at(ann_real *dC, const ann_real *dA,
 	}
 #endif
 fp8_wgrad_skip:
-	if (ensure_half_buf(&g_half_A, &g_half_A_cap, nA * 2) != 0
-	    || ensure_half_buf(&g_half_B, &g_half_B_cap, nB * 2) != 0) {
-		pthread_mutex_unlock(&g_gemm_mu);
-		return -1;
-	}
 #if CUDART_VERSION >= 11000
 	if (g_compute_prec == GPU_PREC_BF16) {
 		const void *hA_use = act_bf16_get(dA, (int)nA);
 		const void *hB_use = act_bf16_get(dB, (int)nB);
+		int ldB = N;
 
+		/*
+		** The scratch buffers are sized only when a conversion is
+		** needed: the head's delta comes as a twin and would otherwise
+		** grow g_half_B to 134 MB for nothing.
+		*/
 		if (!hA_use) {
-			if (half_wt_convert(g_half_A, dA, (int)nA, 1) != 0) {
+			if (ensure_half_buf(&g_half_A, &g_half_A_cap, nA * 2) != 0
+			    || half_wt_convert(g_half_A, dA, (int)nA, 1) != 0) {
 				pthread_mutex_unlock(&g_gemm_mu);
 				return -1;
 			}
 			hA_use = g_half_A;
 		}
-		if (!hB_use)
-			hB_use = grad_twin_peek(dB, nB);	/* masked by the fused ReLU bwd */
+		if (!hB_use)	/* masked by the fused ReLU bwd, the head's CE kernel... */
+			hB_use = grad_twin_peek(dB, nB, N, &ldB);
 		if (!hB_use) {
 			/* Convert G once, into the one-shot twin the dgrad reuses. */
 			hB_use = grad_twin_put(dB, nB);
 			if (!hB_use) {
-				if (half_wt_convert(g_half_B, dB, (int)nB, 1) != 0) {
+				if (ensure_half_buf(&g_half_B, &g_half_B_cap,
+				    nB * 2) != 0
+				    || half_wt_convert(g_half_B, dB, (int)nB, 1)
+				    != 0) {
 					pthread_mutex_unlock(&g_gemm_mu);
 					return -1;
 				}
@@ -2484,11 +2515,18 @@ fp8_wgrad_skip:
 			}
 		}
 		rc = cublas_gemm_ex_bf16(CUBLAS_OP_N, CUBLAS_OP_T, N, M, T,
-		    &alpha, hB_use, N, hA_use, M, &beta, dC, N);
+		    &alpha, hB_use, ldB, hA_use, M, &beta, dC, N);
+		if (rc == 0 && hB_use == g_grad_twin[GRAD_TWIN_INPLACE].half)
+			g_ce_inplace_used |= 1;
 		pthread_mutex_unlock(&g_gemm_mu);
 		return rc;
 	}
 #endif
+	if (ensure_half_buf(&g_half_A, &g_half_A_cap, nA * 2) != 0
+	    || ensure_half_buf(&g_half_B, &g_half_B_cap, nB * 2) != 0) {
+		pthread_mutex_unlock(&g_gemm_mu);
+		return -1;
+	}
 	f32_to_f16_kernel<<<(int)((nA + threads - 1) / threads), threads>>>(
 	    (half *)g_half_A, dA, (int)nA);
 	f32_to_f16_kernel<<<(int)((nB + threads - 1) / threads), threads>>>(
@@ -8970,15 +9008,161 @@ __global__ static void posenc_packed_kernel(ann_real *x, int B, int T, int D)
 		x[i] += cosf(angle);
 }
 
+#if CUDART_VERSION >= 11000
+/*
+** Head loss in one pass (BF16 training): for each row of FP32 logits,
+** softmax, the CE term of the target, delta = p - onehot written as BF16 in
+** place over the row's own first half (row stride 2 V in BF16 elements),
+** and the db_head column sums of the FP32 delta. One block of ew_block_for(V)
+** threads per row at a time, each thread owning columns tid + k * blockDim
+** like softmax_rows_kernel, with the same max / sum reductions: the
+** probabilities, the CE and the delta are bitwise those of softmax_rows_kernel
+** + ce_onehot_ce_kernel. The row lives in registers between its single load
+** and the BF16 store (the store overwrites FP32 values of the same row, read
+** before the reductions' barriers). Blocks stride over the rows and keep
+** their column sums in registers: one atomic per column and block at the end.
+*/
+template <int NV>
+__global__ static void __launch_bounds__(EW_BLOCK)
+ce_softmax_delta_bf16_kernel(ann_real *x, const int *tgt, int rows, int V,
+	ann_real *db, float *ce_sum)
+{
+	__shared__ ann_real sh[EW_BLOCK];
+	float e[NV];
+	float cs[NV];
+	int k;
+	int r;
+
+#pragma unroll
+	for (k = 0; k < NV; k++)
+		cs[k] = 0.0f;
+	for (r = blockIdx.x; r < rows; r += gridDim.x) {
+		ann_real *row = x + (size_t)r * (size_t)V;
+		__nv_bfloat16 *drow = (__nv_bfloat16 *)row;
+		const int t = tgt[r];
+		ann_real m = -INFINITY;
+		ann_real s = 0.0f;
+		ann_real inv;
+
+		if (t < 0 || t >= V) {
+			/* Masked row (tgt -1): no loss and no gradient. */
+#pragma unroll
+			for (k = 0; k < NV; k++) {
+				const int j = threadIdx.x + k * blockDim.x;
+
+				if (j < V)
+					drow[j] = __float2bfloat16_rn(0.0f);
+			}
+			continue;	/* t is uniform: the whole block skips */
+		}
+#pragma unroll
+		for (k = 0; k < NV; k++) {
+			const int j = threadIdx.x + k * blockDim.x;
+
+			e[k] = j < V ? row[j] : -INFINITY;
+			if (j < V && e[k] > m)
+				m = e[k];
+		}
+		m = ew_block_max(m, sh);
+#pragma unroll
+		for (k = 0; k < NV; k++) {
+			const int j = threadIdx.x + k * blockDim.x;
+
+			if (j < V) {
+				e[k] = expf(e[k] - m);
+				s += e[k];
+			}
+		}
+		s = ew_block_sum(s, sh);
+		inv = 1.0f / s;
+#pragma unroll
+		for (k = 0; k < NV; k++) {
+			const int j = threadIdx.x + k * blockDim.x;
+			float d;
+
+			if (j >= V)
+				continue;
+			d = e[k] * inv;
+			if (j == t) {
+				float p = d < 1e-12f ? 1e-12f : d;
+
+				atomicAdd(ce_sum, -logf(p));
+				d -= 1.0f;
+			}
+			cs[k] += d;
+			drow[j] = __float2bfloat16_rn(d);
+		}
+	}
+#pragma unroll
+	for (k = 0; k < NV; k++) {
+		const int j = threadIdx.x + k * blockDim.x;
+
+		if (j < V)
+			atomicAdd(&db[j], cs[k]);
+	}
+}
+
+/* Launch the instance for nv = ceil(V / bs); -1 = no instance that large. */
+static int ce_softmax_delta_bf16_launch(ann_real *x, const int *tgt,
+	int rows, int V, ann_real *db, float *ce_sum)
+{
+	static int n_sm;
+	const int bs = ew_block_for(V);
+	const int nv = (V + bs - 1) / bs;
+	int grid;
+
+	if (n_sm <= 0) {
+		int dev = 0;
+
+		if (cudaGetDevice(&dev) != cudaSuccess
+		    || cudaDeviceGetAttribute(&n_sm,
+		    cudaDevAttrMultiProcessorCount, dev) != cudaSuccess
+		    || n_sm <= 0)
+			n_sm = 1;
+	}
+	/*
+	** About 150 registers per thread at nv = 64: one block per SM. Two
+	** waves of blocks so a slow SM does not hold the tail; each extra
+	** block costs V atomics on db.
+	*/
+	grid = 2 * n_sm;
+	if (grid > rows)
+		grid = rows;
+#define CE_BF16_CASE(NV) \
+	case NV: \
+		ce_softmax_delta_bf16_kernel<NV><<<grid, bs>>>(x, tgt, rows, V, \
+		    db, ce_sum); \
+		return 0;
+	switch (nv <= 1 ? 1 : nv <= 2 ? 2 : nv <= 4 ? 4 : nv <= 8 ? 8
+	    : nv <= 16 ? 16 : nv <= 32 ? 32 : nv <= 64 ? 64 : 0) {
+	CE_BF16_CASE(1)
+	CE_BF16_CASE(2)
+	CE_BF16_CASE(4)
+	CE_BF16_CASE(8)
+	CE_BF16_CASE(16)
+	CE_BF16_CASE(32)
+	CE_BF16_CASE(64)
+	default:
+		return -1;
+	}
+#undef CE_BF16_CASE
+}
+#endif
+
 /* Device CE sum + pinned host mirror (captured graph D2H updates host). */
 static float *g_ce_dev;
 static float *g_ce_host_pinned;
 static int g_ce_last_rows;
 
-extern "C" int gpu_ce_delta_from_softmax(ann_real *probs, const int *tgt,
-	int rows, int V, ann_real *db_host, double *mean_ce)
+/*
+** fused = 0: probs holds the softmax rows; the one-hot is subtracted in
+** place (FP32) and db is summed from it. fused = 1: probs holds the logits;
+** ce_softmax_delta_bf16_kernel does the softmax as well and leaves the BF16
+** delta in place (the caller registers the twin).
+*/
+static int ce_delta_run(ann_real *probs, const int *tgt, int rows, int V,
+	ann_real *db_host, double *mean_ce, int fused, int *launched)
 {
-	OpScope _op(OP_CE);
 	ew_ref rp;
 	ew_ref rt;
 	static ann_real *s_db_dev;
@@ -9041,19 +9225,33 @@ extern "C" int gpu_ce_delta_from_softmax(ann_real *probs, const int *tgt,
 	}
 	cudaMemset(g_ce_dev, 0, sizeof(float));
 	cudaMemset(s_db_dev, 0, need_db);
-	ce_onehot_ce_kernel<<<(rows + EW_BLOCK - 1) / EW_BLOCK, EW_BLOCK>>>(
-	    rp.dev, (const int *)rt.dev, rows, V, g_ce_dev);
-	if (ew_launch_ok() != 0)
+	if (fused) {
+#if CUDART_VERSION >= 11000
+		if (rp.dev != probs
+		    || ce_softmax_delta_bf16_launch(rp.dev, (const int *)rt.dev,
+		    rows, V, s_db_dev, g_ce_dev) != 0)
+			goto ce_fail;
+		*launched = 1;
+		if (ew_launch_ok() != 0)
+			goto ce_fail;
+#else
 		goto ce_fail;
-	{
-		dim3 grid((V + EW_BLOCK - 1) / EW_BLOCK,
-		    (rows + COLSUM_SLAB - 1) / COLSUM_SLAB);
+#endif
+	} else {
+		ce_onehot_ce_kernel<<<(rows + EW_BLOCK - 1) / EW_BLOCK,
+		    EW_BLOCK>>>(rp.dev, (const int *)rt.dev, rows, V, g_ce_dev);
+		if (ew_launch_ok() != 0)
+			goto ce_fail;
+		{
+			dim3 grid((V + EW_BLOCK - 1) / EW_BLOCK,
+			    (rows + COLSUM_SLAB - 1) / COLSUM_SLAB);
 
-		col_sum_tiled_kernel<<<grid, EW_BLOCK>>>(s_db_dev, rp.dev, NULL,
-		    rows, V);
+			col_sum_tiled_kernel<<<grid, EW_BLOCK>>>(s_db_dev, rp.dev,
+			    NULL, rows, V);
+		}
+		if (ew_launch_ok() != 0)
+			goto ce_fail;
 	}
-	if (ew_launch_ok() != 0)
-		goto ce_fail;
 	/* Always mirror CE to pinned host so graph replay can report NLL. */
 	if (cudaMemcpyAsync(g_ce_host_pinned, g_ce_dev, sizeof(float),
 	    cudaMemcpyDeviceToHost, 0) != cudaSuccess)
@@ -9085,6 +9283,103 @@ extern "C" int gpu_ce_delta_from_softmax(ann_real *probs, const int *tgt,
 ce_fail:
 	pthread_mutex_unlock(&g_ew_mu);
 	return -1;
+}
+
+extern "C" int gpu_ce_delta_from_softmax(ann_real *probs, const int *tgt,
+	int rows, int V, ann_real *db_host, double *mean_ce)
+{
+	OpScope _op(OP_CE);
+
+	int launched = 0;
+
+	return ce_delta_run(probs, tgt, rows, V, db_host, mean_ce, 0,
+	    &launched);
+}
+
+/*
+** Head loss fused for BF16 batch training (ANN_CE_BF16=0 disables): the
+** logits rows become softmax, CE and the BF16 delta in one kernel instead of
+** softmax_rows_kernel, ce_onehot_ce_kernel, col_sum_tiled_kernel and the two
+** FP32 -> BF16 conversions of the delta by the head wgrad and dgrad. The
+** delta is stored in place over the logits (no extra VRAM) and registered as
+** the in-place gradient twin of the logits buffer; the FP32 contents are
+** destroyed, so the head's wgrad (peek) and dgrad (take) must both run on
+** the twin, which gpu_ce_bf16_delta_done checks afterwards. -1 before any
+** write (logits intact): run the FP32 steps; -2: failed after the kernel
+** was launched, the logits may be overwritten.
+*/
+extern "C" int gpu_ce_softmax_delta_bf16(ann_real *logits, const int *tgt,
+	int rows, int V, ann_real *db_host, double *mean_ce)
+{
+#if CUDART_VERSION >= 11000
+	OpScope _op(OP_CE);
+	static int on = -1;
+	int launched = 0;
+	size_t n;
+
+	if (on < 0) {
+		const char *ev = getenv("ANN_CE_BF16");
+
+		on = (ev && ev[0] == '0') ? 0 : 1;
+	}
+	/*
+	** BF16 GEMMs only: the FP8 dgrad and the FP32 / FP16 paths read the
+	** FP32 delta. Batch mode only: eager evaluation keeps the FP32 steps.
+	*/
+	if (!on || !logits || !tgt || rows <= 0 || V <= 0 || !gpu_available()
+	    || g_compute_prec != GPU_PREC_BF16 || g_fp8_dgrad
+	    || g_sync_mode == GPU_SYNC_EAGER || !ew_is_dev(logits)
+	    || (V + ew_block_for(V) - 1) / ew_block_for(V) > 64)
+		return -1;
+	n = (size_t)rows * (size_t)V;
+	if (n > (size_t)0x7fffffff)
+		return -1;
+	if (ce_delta_run(logits, tgt, rows, V, db_host, mean_ce, 1, &launched)
+	    != 0)
+		return launched ? -2 : -1;	/* -2: the logits are lost */
+	pthread_mutex_lock(&g_gemm_mu);
+	g_grad_twin[GRAD_TWIN_INPLACE].half = (void *)logits;
+	g_grad_twin[GRAD_TWIN_INPLACE].cap = 0;
+	g_grad_twin[GRAD_TWIN_INPLACE].src = logits;
+	g_grad_twin[GRAD_TWIN_INPLACE].n = n;
+	g_grad_twin[GRAD_TWIN_INPLACE].ld = 2 * V;
+	g_ce_inplace_used = 0;
+	pthread_mutex_unlock(&g_gemm_mu);
+	{
+		static int reported;
+
+		if (!reported++)
+			fprintf(stderr, "[lm] head softmax, CE and BF16 delta in one kernel\n");
+	}
+	return 0;
+#else
+	(void)logits; (void)tgt; (void)rows; (void)V; (void)db_host;
+	(void)mean_ce;
+	return -1;
+#endif
+}
+
+/*
+** After the head's wgrad and dgrad: 0 when both ran on the in-place BF16
+** delta (the FP32 buffer holds no delta any more, so any other consumer
+** computed garbage); the twin is dropped either way.
+*/
+extern "C" int gpu_ce_bf16_delta_done(const ann_real *logits)
+{
+	int ok;
+
+	pthread_mutex_lock(&g_gemm_mu);
+	ok = g_ce_inplace_used == 3
+	    && g_grad_twin[GRAD_TWIN_INPLACE].half == (const void *)logits
+	    && g_grad_twin[GRAD_TWIN_INPLACE].src == NULL;
+	g_grad_twin[GRAD_TWIN_INPLACE].src = NULL;
+	g_grad_twin[GRAD_TWIN_INPLACE].n = 0;
+	g_grad_twin[GRAD_TWIN_INPLACE].half = NULL;
+	g_ce_inplace_used = 0;
+	pthread_mutex_unlock(&g_gemm_mu);
+	if (!ok)
+		fprintf(stderr, "[lm] head BF16 delta not consumed by both GEMMs\n");
+	return ok ? 0 : -1;
 }
 
 extern "C" int gpu_ce_fetch_mean(double *mean_ce, int rows)

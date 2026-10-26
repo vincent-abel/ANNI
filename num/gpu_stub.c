@@ -552,6 +552,24 @@ int gpu_ce_delta_from_softmax(ann_real *probs, const int *tgt, int rows, int V,
 	return -1;
 }
 
+int gpu_ce_softmax_delta_bf16(ann_real *logits, const int *tgt, int rows,
+	int V, ann_real *db_host, double *mean_ce)
+{
+	(void)logits;
+	(void)tgt;
+	(void)rows;
+	(void)V;
+	(void)db_host;
+	(void)mean_ce;
+	return -1;
+}
+
+int gpu_ce_bf16_delta_done(const ann_real *logits)
+{
+	(void)logits;
+	return -1;
+}
+
 int gpu_posenc_add_packed(ann_real *x, int B, int T, int D)
 {
 	(void)x;
