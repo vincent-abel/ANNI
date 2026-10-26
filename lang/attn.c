@@ -823,7 +823,9 @@ int attn_mha_forward_packed_res(mat *out, attn *a, const mat *x,
 		mat_free(&c->x_in);
 	c->x_in = (mat *)x;
 	c->x_in_alias = 1;
-	/* Fat projections: one (B*T) x D GEMM each. */
+	/* Fat projections: one (B*T) x D GEMM each (one BF16 GEMM when the fused attention follows). */
+	if (g_flash_attn && c->lse && gpu_attn_fa_usable(T, a->d_head))
+		gpu_attn_qkv_bf16_hint(T, a->d_head);
 	if (attn_qkv_project(c->q, c->k, c->v, a, x) != 0)
 		return -1;
 	/*

@@ -31,6 +31,7 @@ extern "C" {
 static int g_sync_mode;
 static void devvec_forget(const void *host);
 static void fa_pack_forget(const void *p);
+static void qkv_bf16_forget(const void *p);
 static int g_compute_prec;
 static int g_fp8_fwd;
 static int g_fp8_dgrad;
@@ -99,6 +100,7 @@ typedef struct {
 	int		bf16;
 	int		fp8;	/* separate from BF16 — never reuse BF16 algos */
 	int		epi;	/* cublasLtEpilogue_t; 0 = default */
+	int		obf;	/* C / D in BF16 instead of FP32 */
 	int		lda, ldb, ldc;
 	int		valid;
 	int		handles;
@@ -205,7 +207,7 @@ static int lt_heuristic_only(void)
 static int cublas_lt_gemm_half(cublasOperation_t opa, cublasOperation_t opb,
 	int N, int M, int K, const float *alpha, const void *B, int ldb,
 	const void *A, int lda, const float *beta, float *C, int ldc, int bf16,
-	cublasLtEpilogue_t epi, const float *bias_dev, float *Dout)
+	cublasLtEpilogue_t epi, const float *bias_dev, float *Dout, int out_bf16)
 {
 	float *D = Dout ? Dout : C;	/* D = alpha A B + beta C, out of place when Dout */
 	cublasLtMatmulDesc_t op;
@@ -232,7 +234,8 @@ static int cublas_lt_gemm_half(cublasOperation_t opa, cublasOperation_t opb,
 		e = &g_lt_algo[i];
 		if (e->valid && e->M == M && e->N == N && e->K == K
 		    && e->opa == (int)opa && e->opb == (int)opb
-		    && e->bf16 == bf16 && e->fp8 == 0 && e->epi == epi_i) {
+		    && e->bf16 == bf16 && e->fp8 == 0 && e->epi == epi_i
+		    && e->obf == out_bf16) {
 			slot = i;
 			break;
 		}
@@ -246,8 +249,8 @@ static int cublas_lt_gemm_half(cublasOperation_t opa, cublasOperation_t opb,
 	/* Reuse Lt handles. Creating them per GEMM is slower than a short GEMM. */
 	if (e->handles && e->valid && e->M == M && e->N == N && e->K == K
 	    && e->opa == (int)opa && e->opb == (int)opb && e->bf16 == bf16
-	    && e->fp8 == 0 && e->epi == epi_i && e->lda == lda && e->ldb == ldb
-	    && e->ldc == ldc) {
+	    && e->fp8 == 0 && e->epi == epi_i && e->obf == out_bf16
+	    && e->lda == lda && e->ldb == ldb && e->ldc == ldc) {
 		if (bias_dev != e->bias) {
 			(void)cublasLtMatmulDescSetAttribute(e->desc,
 			    CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias_dev,
@@ -325,7 +328,7 @@ static int cublas_lt_gemm_half(cublasOperation_t opa, cublasOperation_t opb,
 		cublasLtMatmulDescDestroy(op);
 		return -1;
 	}
-	if (cublasLtMatrixLayoutCreate(&layoutC, CUDA_R_32F, N, M, ldc)
+	if (cublasLtMatrixLayoutCreate(&layoutC, out_bf16 ? dt : CUDA_R_32F, N, M, ldc)
 	    != CUBLAS_STATUS_SUCCESS) {
 		cublasLtMatrixLayoutDestroy(layoutB);
 		cublasLtMatrixLayoutDestroy(layoutA);
@@ -345,7 +348,7 @@ static int cublas_lt_gemm_half(cublasOperation_t opa, cublasOperation_t opb,
 
 	if (!e->valid || e->M != M || e->N != N || e->K != K
 	    || e->opa != (int)opa || e->opb != (int)opb || e->bf16 != bf16
-	    || e->fp8 != 0 || e->epi != epi_i) {
+	    || e->fp8 != 0 || e->epi != epi_i || e->obf != out_bf16) {
 		cublasLtMatmulHeuristicResult_t heurs[16];
 		int hi;
 		int best_i;
@@ -380,7 +383,7 @@ static int cublas_lt_gemm_half(cublasOperation_t opa, cublasOperation_t opb,
 		time_D = D;
 		time_D_owned = 0;
 		if (*beta != 0.0f && D == C) {
-			size_t d_bytes = (size_t)M * (size_t)N * sizeof(float);
+			size_t d_bytes = (size_t)M * (size_t)N * (out_bf16 ? 2 : sizeof(float));
 
 			if (cudaMalloc(&time_D, d_bytes) == cudaSuccess)
 				time_D_owned = 1;
@@ -454,6 +457,7 @@ static int cublas_lt_gemm_half(cublasOperation_t opa, cublasOperation_t opb,
 		e->bf16 = bf16;
 		e->fp8 = 0;
 		e->epi = epi_i;
+		e->obf = out_bf16;
 		e->lda = lda;
 		e->ldb = ldb;
 		e->ldc = ldc;
@@ -1918,7 +1922,7 @@ static int cublas_gemm_ex_f16(cublasOperation_t opa, cublasOperation_t opb,
 	const void *A, int lda, const float *beta, float *C, int ldc)
 {
 	if (cublas_lt_gemm_half(opa, opb, N, M, K, alpha, B, ldb, A, lda, beta,
-	    C, ldc, 0, CUBLASLT_EPILOGUE_DEFAULT, NULL, NULL) == 0)
+	    C, ldc, 0, CUBLASLT_EPILOGUE_DEFAULT, NULL, NULL, 0) == 0)
 		return 0;
 #if CUDART_VERSION >= 11000
 	return cublasGemmEx(g_cublas, opa, opb, N, M, K, alpha, B, CUDA_R_16F,
@@ -1938,7 +1942,7 @@ static int cublas_gemm_ex_bf16(cublasOperation_t opa, cublasOperation_t opb,
 	const void *A, int lda, const float *beta, float *C, int ldc)
 {
 	if (cublas_lt_gemm_half(opa, opb, N, M, K, alpha, B, ldb, A, lda, beta,
-	    C, ldc, 1, CUBLASLT_EPILOGUE_DEFAULT, NULL, NULL) == 0)
+	    C, ldc, 1, CUBLASLT_EPILOGUE_DEFAULT, NULL, NULL, 0) == 0)
 		return 0;
 	/* FAST_16BF: plain COMPUTE_32F can pick SIMT on Blackwell. */
 	return cublasGemmEx(g_cublas, opa, opb, N, M, K, alpha, B, CUDA_R_16BF,
@@ -2152,7 +2156,7 @@ static int cublas_gemm_rm_epi_res(ann_real *dC, const ann_real *dA,
 	}
 	rc = cublas_lt_gemm_half(CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha,
 	    hB_use, N, hA_use, K, &beta, res ? (ann_real *)res : dC, N, 1, epi,
-	    bias_host ? g_lt_bias_dev : NULL, res ? dC : NULL);
+	    bias_host ? g_lt_bias_dev : NULL, res ? dC : NULL, 0);
 	pthread_mutex_unlock(&g_gemm_mu);
 	return rc;
 }
@@ -2499,6 +2503,7 @@ static void twins_forget_dev(const void *p)
 		}
 	}
 	grad_twin_forget(p);
+	qkv_bf16_forget(p);
 #if CUDART_VERSION >= 12000 && defined(ANN_CUBLAS)
 	fp8_wt_invalidate((const ann_real *)p);
 	fp8_act_forget(p);
@@ -5532,6 +5537,125 @@ static int fa2_on(void)
 	return on;
 }
 
+/*
+** Q, K, V of a layer as one BF16 row-major [B*T][3D] matrix written by the
+** fused QKV GEMM (gpu_attn_qkv_fused, BF16 output) and read strided by
+** the FA2 kernels: no FP32 q/k/v and no head packing. Keyed on the FP32 q
+** mat's device buffer (stable per layer); live between a forward and its
+** backward. 16 slots cover 12 layers; 24 MB per slot at B*T=4096, D=1024.
+*/
+#define QKV_BF16_SLOTS	16
+typedef struct {
+	const ann_real	*key;
+	void		*buf;
+	size_t		cap;
+	int		N;
+	int		D;
+	int		live;
+} qkv_bf16_slot;
+static qkv_bf16_slot g_qkv_bf16[QKV_BF16_SLOTS];
+static int g_qkv_bf16_rr;
+/* One-shot hint from the attention layer: the next QKV projection feeds the FA2 kernels at (T, dh). */
+static int g_qkv_hint_T;
+static int g_qkv_hint_dh;
+
+static qkv_bf16_slot *qkv_bf16_get(const ann_real *key, int N, int D, int create)
+{
+	int i;
+	int free_slot = -1;
+	qkv_bf16_slot *e;
+	size_t need = (size_t)N * (size_t)D * 3 * 2;
+
+	if (!key || N <= 0 || D <= 0)
+		return NULL;
+	for (i = 0; i < QKV_BF16_SLOTS; i++) {
+		if (g_qkv_bf16[i].key == key && g_qkv_bf16[i].N == N
+		    && g_qkv_bf16[i].D == D)
+			return &g_qkv_bf16[i];
+		if (free_slot < 0 && !g_qkv_bf16[i].key)
+			free_slot = i;
+	}
+	if (!create)
+		return NULL;
+	if (free_slot < 0)
+		free_slot = (g_qkv_bf16_rr++) % QKV_BF16_SLOTS;
+	e = &g_qkv_bf16[free_slot];
+	if (e->cap < need) {
+		if (e->buf)
+			cudaFree(e->buf);
+		e->buf = NULL;
+		e->cap = 0;
+		if (cudaMalloc(&e->buf, need) != cudaSuccess) {
+			e->buf = NULL;
+			e->key = NULL;
+			(void)cudaGetLastError();
+			return NULL;
+		}
+		e->cap = need;
+	}
+	e->key = key;
+	e->N = N;
+	e->D = D;
+	e->live = 0;
+	return e;
+}
+
+static void qkv_bf16_forget(const void *p)
+{
+	int i;
+
+	for (i = 0; i < QKV_BF16_SLOTS; i++)
+		if (g_qkv_bf16[i].key == (const ann_real *)p) {
+			g_qkv_bf16[i].key = NULL;
+			g_qkv_bf16[i].live = 0;
+		}
+}
+
+extern "C" void gpu_attn_qkv_bf16_hint(int T, int dh)
+{
+	g_qkv_hint_T = T;
+	g_qkv_hint_dh = dh;
+}
+
+/* [Wq | Wk | Wv] as one BF16 [D][3D] matrix from the three weight twins; rebuilt after each optimizer step. */
+__global__ static void qkv_wt_pack_kernel(__nv_bfloat16 *dst, const __nv_bfloat16 *wq,
+	const __nv_bfloat16 *wk, const __nv_bfloat16 *wv, int D)
+{
+	size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+	size_t n = (size_t)D * D * 3;
+	int i, j;
+
+	if (idx >= n)
+		return;
+	i = (int)(idx / (3 * D));
+	j = (int)(idx % (3 * D));
+	dst[idx] = j < D ? wq[(size_t)i * D + j]
+	    : j < 2 * D ? wk[(size_t)i * D + j - D] : wv[(size_t)i * D + j - 2 * D];
+}
+
+static void *g_qkv_wt;
+static size_t g_qkv_wt_cap;
+static const void *g_qkv_wt_key;
+static long g_qkv_wt_epoch = -1;
+
+static void *qkv_wt_get(const void *hwq, const void *hwk, const void *hwv, int D)
+{
+	size_t n = (size_t)D * D * 3;
+
+	if (g_qkv_wt && g_qkv_wt_key == hwq && g_qkv_wt_epoch == (long)g_wt_epoch)
+		return g_qkv_wt;
+	if (ensure_half_buf(&g_qkv_wt, &g_qkv_wt_cap, n * 2) != 0)
+		return NULL;
+	qkv_wt_pack_kernel<<<(unsigned)((n + 255) / 256), 256>>>((__nv_bfloat16 *)g_qkv_wt,
+	    (const __nv_bfloat16 *)hwq, (const __nv_bfloat16 *)hwk,
+	    (const __nv_bfloat16 *)hwv, D);
+	if (cudaGetLastError() != cudaSuccess)
+		return NULL;
+	g_qkv_wt_key = hwq;
+	g_qkv_wt_epoch = (long)g_wt_epoch;
+	return g_qkv_wt;
+}
+
 __global__ static void attn_fa_wmma_fwd_kernel(ann_real *out, ann_real *lse,
 	const __nv_bfloat16 *q, const __nv_bfloat16 *k, const __nv_bfloat16 *v,
 	int T, int H, int dh, float scale)
@@ -5809,9 +5933,24 @@ extern "C" int gpu_attn_fa_fwd(mat *concat, const mat *q, const mat *k,
 		int threads = 256;
 		int blocks = (int)((npack + threads - 1) / threads);
 
-		fa_pack_slot *ps = oq ? NULL : fa_pack_get(dq, npack, 1);
+		qkv_bf16_slot *qs = oq ? NULL : qkv_bf16_get(dq, B * T, H * dh, 0);
+		fa_pack_slot *ps = NULL;
 		__nv_bfloat16 *hq, *hk, *hv;
 
+		if (qs && qs->live && fa2_on()) {
+			/* The fused QKV GEMM's BF16 [B*T][3D] rows, read strided. */
+			static int reported;
+			const __nv_bfloat16 *bq = (const __nv_bfloat16 *)qs->buf;
+			const int Dm = H * dh;
+
+			{ OpNest _n(OP_ATT_GEMM_ID); if (fa2_fwd_launch_lay(dc, lse->d_data, bq, bq + Dm, bq + 2 * Dm, B, T, H, dh,
+			    (float)(1.0 / sqrt((double)dh)), fa2_lay_rows(T, 3 * Dm, dh)) != 0)
+				goto fa_out; }
+			if (!reported++)
+				fprintf(stderr, "[attn] FA2 kernels on the fused BF16 QKV rows (no head packing)\n");
+			goto fa_launched;
+		}
+		ps = oq ? NULL : fa_pack_get(dq, npack, 1);
 		/* Operands once as head-major BF16, kept for the backward. */
 		if (ps) {
 			hq = (__nv_bfloat16 *)ps->qkv;
@@ -5845,6 +5984,7 @@ extern "C" int gpu_attn_fa_fwd(mat *concat, const mat *q, const mat *k,
 		if (ps)
 			ps->live = 1;
 	}
+fa_launched:
 	if (launch_done() == 0 && finish_out(concat, dc, oc) == 0) {
 		lse->on_device = MAT_DEV_DEVICE;
 		rc = 0;
@@ -6170,10 +6310,28 @@ extern "C" int gpu_attn_fa_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat,
 			int threads = 256;
 			int blocks = (int)((npack + threads - 1) / threads);
 
+			qkv_bf16_slot *qs = o[2] ? NULL : qkv_bf16_get(ptr[2], B * T, H * dh, 0);
 			fa_pack_slot *ps = o[2] ? NULL : fa_pack_get(ptr[2], npack, 0);
 
 			if (ensure_half_buf(&g_tc_half_do, &g_tc_half_do_cap, npack * 2) != 0)
 				goto fa_bwd_out;
+			if (qs && qs->live && fa2_on()) {
+				/* The fused QKV GEMM's BF16 rows; dO packed head-major. */
+				const __nv_bfloat16 *bq = (const __nv_bfloat16 *)qs->buf;
+				const int Dm = H * dh;
+
+				qs->live = 0;
+				{ OpNest _n(OP_ATT_PACK_ID); attn_pack_heads_bf16_kernel<<<blocks, threads>>>(
+				    (__nv_bfloat16 *)g_tc_half_do, ptr[0], B, T, H, dh); }
+				{ OpNest _n(OP_ATT_SMX_ID); attn_fa_dvec_kernel<<<(unsigned)((nrows + 255) / 256), 256>>>(
+				    g_fa_dvec, ptr[0], ptr[1], (int)nrows, T, H, dh); }
+				{ OpNest _n(OP_ATT_GEMM_ID); if (fa2_bwd_launch_lay(ptr[5], ptr[6], a_dv, bq, bq + Dm, bq + 2 * Dm,
+				    (const __nv_bfloat16 *)g_tc_half_do, lse->d_data, g_fa_dvec,
+				    B, T, H, dh, (float)(1.0 / sqrt((double)dh)),
+				    fa2_lay_rows(T, 3 * Dm, dh), fa2_lay_headmajor(T, H, dh)) != 0)
+					goto fa_bwd_out; }
+				goto fa_bwd_launched;
+			}
 			if (ps && ps->live) {
 				/* The forward's packed Q, K, V (consumed once). */
 				hq = (const __nv_bfloat16 *)ps->qkv;
@@ -6211,6 +6369,7 @@ extern "C" int gpu_attn_fa_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat,
 				    (const __nv_bfloat16 *)g_tc_half_do, lse->d_data,
 				    g_fa_dvec, T, H, dh, (float)(1.0 / sqrt((double)dh)));
 		}
+fa_bwd_launched:
 		if (launch_done() == 0 && finish_out(dq, ptr[5], o[5]) == 0
 		    && finish_out(dk, ptr[6], o[6]) == 0
 		    && finish_out(dv, a_dv, odv) == 0)
@@ -6625,7 +6784,10 @@ extern "C" int gpu_attn_qkv_fused(mat *q, mat *k, mat *v, const mat *x,
 	int D;
 	int use_bf16;
 	size_t nA;
+	const int hint_T = g_qkv_hint_T;	/* one-shot: taken whatever path runs */
+	const int hint_dh = g_qkv_hint_dh;
 
+	g_qkv_hint_T = 0;
 	if (!q || !k || !v || !x || !wq || !wk || !wv || !gpu_available())
 		return -1;
 	N = x->rows;
@@ -6742,6 +6904,40 @@ extern "C" int gpu_attn_qkv_fused(mat *q, mat *k, mat *v, const mat *x,
 		}
 #ifdef ANN_CUBLAS
 		/*
+		** FA2 path: one GEMM X @ [Wq|Wk|Wv] straight to BF16 in the
+		** layer's qkv slot; the attention kernels read it strided, so
+		** the FP32 q/k/v are never written (their mats are marked
+		** device-resident but hold nothing) and nothing is packed.
+		*/
+		if (use_bf16 && hint_T > 0 && fa2_on() && !stream_is_capturing()
+		    && fa2_ok(hint_T, hint_dh) && !oq && !ok && !ov
+		    && (D & 7) == 0) {
+			qkv_bf16_slot *qs = qkv_bf16_get(dq, N, D, 1);
+			void *hwq = half_wt_get(dwq, (size_t)D * (size_t)D, 1);
+			void *hwk = half_wt_get(dwk, (size_t)D * (size_t)D, 1);
+			void *hwv = half_wt_get(dwv, (size_t)D * (size_t)D, 1);
+			const float alpha = 1.0f;
+			const float beta = 0.0f;
+			void *wqkv;
+			int rc = -1;
+
+			if (qs && hwq && hwk && hwv) {
+				pthread_mutex_lock(&g_gemm_mu);
+				wqkv = qkv_wt_get(hwq, hwk, hwv, D);
+				if (wqkv)
+					rc = cublas_lt_gemm_half(CUBLAS_OP_N, CUBLAS_OP_N,
+					    3 * D, N, D, &alpha, wqkv, 3 * D, x_half, D,
+					    &beta, (float *)qs->buf, 3 * D, 1,
+					    CUBLASLT_EPILOGUE_DEFAULT, NULL, NULL, 1);
+				pthread_mutex_unlock(&g_gemm_mu);
+			}
+			if (rc == 0) {
+				qs->live = 1;
+				goto qkv_done;
+			}
+			(void)cudaGetLastError();
+		}
+		/*
 		** Overlap the three independent projections on dedicated
 		** streams. Falls back to serial rm_ha if setup fails.
 		*/
@@ -6813,6 +7009,7 @@ extern "C" int gpu_attn_qkv_fused(mat *q, mat *k, mat *v, const mat *x,
 		goto qkv_triple;
 #endif
 	}
+qkv_done:
 	if (launch_done() != 0)
 		goto qkv_triple;
 	q->on_device = MAT_DEV_DEVICE;

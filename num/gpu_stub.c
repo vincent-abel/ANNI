@@ -565,6 +565,12 @@ int gpu_relu_forward(ann_real *x, int n)
 	return -1;
 }
 
+void gpu_attn_qkv_bf16_hint(int T, int dh)
+{
+	(void)T;
+	(void)dh;
+}
+
 int gpu_ffn_relu_bwd_fused(mat *dh, const mat *hidden, ann_real *db1_host)
 {
 	(void)dh;
