@@ -40,6 +40,10 @@ The gradients that the next GEMMs need in BF16 were still converted by the wgrad
 
 Two rules came out of the test suite while doing this. A twin keyed on a device buffer must never outlive the microbatch (`gpu_grad_twins_clear` at the end of `lm_backward_packed`): the first block's LayerNorm backward has no GEMM consumer, and the next microbatch reuses that buffer for the last block's incoming gradient. And a dgrad that does not consume the twin (the FP8 path) must forget it, or with a larger slot pool a later wgrad peeks a stale one; `make test-gpu` caught both as wrong `dw1` / `dw2` gradients.
 
+## Candidate 14: the attention output's gradient as a BF16 twin
+
+`gpu_mat_mul_bt_twin` runs the Wo dgrad (\(dO = dY\,W_O^T\)) as a cuBLASLt GEMM with a BF16 output into a reserved gradient-twin slot of `dconcat`; the FP32 `dconcat` is never written. `gpu_attn_fa_bwd` takes that twin, reads it strided (`fa2_lay_rows(T, D, dh)`) instead of packing heads, and computes \(D_i = \langle dO_i, O_i \rangle\) from it (`attn_fa_dvec16_kernel`). The FP8 dgrad path is excluded (it writes FP32 and would leave the twin unwritten; `make test-gpu`'s FP8 section caught that). Removed per layer: one 16 MB FP32 write, one head-packing pass, one FP32 read in dvec.
+
 ## Pitfalls
 
 - The FP32 `q`, `k`, `v`, `hidden` buffers hold nothing in BF16 training: any new consumer must read the twins (`act_bf16_get`, the `qkv_bf16` slot). Eager evaluation (`lm info`, generation) keeps the FP32 outputs.

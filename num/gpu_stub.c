@@ -212,6 +212,14 @@ void gpu_grad_twins_clear(void)
 {
 }
 
+int gpu_mat_mul_bt_twin(mat *c, const mat *a, const mat *b)
+{
+	(void)c;
+	(void)a;
+	(void)b;
+	return -1;
+}
+
 int gpu_mat_mul_bt_acc(mat *c, const mat *a, const mat *b)
 {
 	(void)c;

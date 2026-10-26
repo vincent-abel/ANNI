@@ -948,7 +948,12 @@ int attn_mha_backward_packed(mat *dx, const mat *dout, attn *a,
 	/* Fat weight grads + dconcat over all B*T rows. */
 	if (mat_outer_add(a->dwo, c->concat, dout) != 0)
 		return -1;
-	if (mat_mul_wt(dconcat, dout, a->wo) != 0)
+	/*
+	** Fused attention backward: dconcat only as the BF16 twin the kernel
+	** reads strided (no FP32 write, no head packing); else the FP32 product.
+	*/
+	if (!(c->fused == 5 && gpu_mat_mul_bt_twin(dconcat, dout, a->wo) == 0)
+	    && mat_mul_wt(dconcat, dout, a->wo) != 0)
 		return -1;
 	if (c->fused == 5) {
 		if (gpu_attn_fa_bwd(dq, dk, dv, dconcat, c->concat, c->q, c->k,
