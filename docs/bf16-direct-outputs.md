@@ -31,6 +31,8 @@ Pause-window gate 2026-10-26 20:52 (both candidates in one binary, fallback cand
 | + fused BF16 QKV, BF16-only ReLU output (8 + 9) | 17.3 / 38.4 ms | 64.3k | 97.2 |
 | + lazy pre-activation buffer, BF16-only LayerNorm output (10 + 12) | | 64.7k | 97.7 |
 | + producer-written gradient twins, per-layer QKV weight pack (13) | 16.7 / 38.9 ms | 64.8k | 97.8 |
+| + dO as a BF16 twin, warp-per-row LayerNorm (14 + 15) | 16.4 / 39.9 ms | 65.5k (idle-GPU bench; 13 = 65.2k) | 99.0 |
+| + fused head softmax / CE / BF16 delta (16) | 16.4 / 38.4 ms, loss 7.2 -> 5.7 ms | 67.3k | 101.7 |
 
 Candidate 12 adds the LayerNorm output to the same scheme (`ln_fwd_kernel` stores the BF16 twin instead of FP32 `y`; `ANN_LN_BF16=0` restores it) and stops allocating the FFN pre-activation buffer that only the fallback paths use (64 MB per layer): the gate's peak VRAM went from 13485 to 12604 MiB, the live run from 86.9% to under 82% of the card. The gain in speed is within the bench noise (+1%); the memory was the point.
 
@@ -43,6 +45,12 @@ Two rules came out of the test suite while doing this. A twin keyed on a device 
 ## Candidate 14: the attention output's gradient as a BF16 twin
 
 `gpu_mat_mul_bt_twin` runs the Wo dgrad (\(dO = dY\,W_O^T\)) as a cuBLASLt GEMM with a BF16 output into a reserved gradient-twin slot of `dconcat`; the FP32 `dconcat` is never written. `gpu_attn_fa_bwd` takes that twin, reads it strided (`fa2_lay_rows(T, D, dh)`) instead of packing heads, and computes \(D_i = \langle dO_i, O_i \rangle\) from it (`attn_fa_dvec16_kernel`). The FP8 dgrad path is excluded (it writes FP32 and would leave the twin unwritten; `make test-gpu`'s FP8 section caught that). Removed per layer: one 16 MB FP32 write, one head-packing pass, one FP32 read in dvec.
+
+## Candidates 15 and 16: LayerNorm kernels and the fused head loss
+
+Candidate 15 (worker branch `worker/ln-colsum`) runs the LayerNorm forward and backward as one warp per row with float4 traffic and folds the dgamma / dbeta column sums into the backward (two launches fewer per LayerNorm); `ANN_LN_FAST=0` restores the old kernels. On the full step it is a wash (the forward is at DRAM bandwidth when cold, the backward gains ~0.3 ms), kept for the launch count.
+
+Candidate 16 (worker branch `worker/ce-bf16`): `ce_softmax_delta_bf16_kernel` reads each FP32 logits row once (held in registers), computes the softmax, the CE term and the db_head column sums, and writes the delta \(p - \mathrm{onehot}\) only as BF16 in place over the first half of the row's own FP32 storage (row stride \(2V\)); the gradient-twin slots carry a row stride so the head wgrad and dgrad consume it without any conversion. `lang/lm.c` fails the step if either GEMM did not use the twin. It replaced softmax + CE + column sum + two 67 M-element conversions (about 1.2 GB of traffic) by one 268 MB read and one 134 MB write: the loss phase went from 7.2 to 5.7 ms per microbatch. `ANN_CE_BF16=0` restores the old path; eager mode, FP32, FP8 and the quantized head keep it.
 
 ## Pitfalls
 
