@@ -188,6 +188,36 @@ int layernorm_forward_cache(mat *x, layernorm *ln, ln_cache *c)
 	return 0;
 }
 
+int layernorm_backward_add(mat *dx, const mat *dy, layernorm *ln,
+	const ln_cache *c, mat *tmp)
+{
+	ann_real *dxp;
+	const ann_real *dyp;
+	const ann_real *xhp;
+
+	if (!dx || !dy || !ln || !c || !tmp)
+		return -1;
+	if (dx->rows != dy->rows || dx->cols != dy->cols)
+		return -1;
+	mat_try_pin(dx);
+	mat_try_pin((mat *)dy);
+	mat_try_pin(c->x_hat);
+	dxp = mat_compute_ptr(dx);
+	dyp = mat_compute_ptr_const(dy);
+	xhp = mat_compute_ptr_const(c->x_hat);
+	if (dxp && dyp && xhp
+	    && gpu_layernorm_backward_acc(dx, dy, ln->gamma->data, xhp,
+		c->inv_std->data, c->T, LM_D_MODEL, ln->dgamma->data,
+		ln->dbeta->data) == 0) {
+		mat_mark_device(dx);
+		return 0;
+	}
+	if (layernorm_backward(tmp, dy, ln, c) != 0)
+		return -1;
+	mat_axpy(dx, 1.0, tmp);
+	return 0;
+}
+
 int layernorm_backward(mat *dx, const mat *dy, layernorm *ln, const ln_cache *c)
 {
 	int t;

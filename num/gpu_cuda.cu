@@ -1438,7 +1438,7 @@ extern "C" void gpu_adam_set_bf16_flat(void *bf16, const ann_real *fp32, int n)
 ** FFN hidden→W2). Two slots so LN and FFN hidden do not clobber each other
 ** inside one block. Not a full per-layer residency (that doubles act VRAM).
 */
-#define ACT_BF16_SLOTS	48	/* ln1, ln2, hidden of every layer */
+#define ACT_BF16_SLOTS	64	/* ln1, ln2, hidden, concat of every layer */
 typedef struct {
 	const ann_real	*fp32;
 	void		*half;
@@ -1457,7 +1457,9 @@ static int g_act_bf16_rr;
 static int ensure_half_buf(void **buf, size_t *cap, size_t bytes);
 static int half_wt_convert(void *dst, const ann_real *src, int n, int bf16);
 
-#define GRAD_TWIN_SLOTS	4	/* dq, dk, dv are converted before any is consumed */
+#define GRAD_TWIN_SLOTS	5	/* 4 round robin (dq, dk, dv are converted before any is consumed) + 1 for the head delta */
+#define GRAD_TWIN_BIG	4	/* the slot for twins over GRAD_TWIN_BIG_N elements */
+#define GRAD_TWIN_BIG_N	((size_t)16 * 1024 * 1024)
 typedef struct {
 	void		*half;
 	size_t		cap;
@@ -1472,15 +1474,19 @@ static long g_grad_twin_miss;
 /* Convert G into a one-shot twin slot (round robin); NULL on failure. */
 static void *grad_twin_put(const ann_real *src, size_t n)
 {
-	grad_twin_slot *e = &g_grad_twin[g_grad_twin_rr % GRAD_TWIN_SLOTS];
+	grad_twin_slot *e;
 
 	/*
 	** The head's delta (rows x vocab, 134 MB in BF16) would size every
-	** slot to it: converting it twice costs less than 0.5 GB of VRAM.
+	** round-robin slot to it: it gets the one big slot instead, so its
+	** dgrad reuses the wgrad's conversion for 134 MB of VRAM.
 	*/
-	if (n > (size_t)16 * 1024 * 1024)
-		return NULL;
-	g_grad_twin_rr++;
+	if (n > GRAD_TWIN_BIG_N)
+		e = &g_grad_twin[GRAD_TWIN_BIG];
+	else {
+		e = &g_grad_twin[g_grad_twin_rr % GRAD_TWIN_BIG];
+		g_grad_twin_rr++;
+	}
 	if (ensure_half_buf(&e->half, &e->cap, n * 2) != 0
 	    || half_wt_convert(e->half, src, (int)n, 1) != 0) {
 		e->src = NULL;
@@ -1514,7 +1520,7 @@ static void *grad_twin_take(const ann_real *src, size_t n)
 */
 static void *grad_twin_reserve(const ann_real *src, size_t n)
 {
-	grad_twin_slot *e = &g_grad_twin[g_grad_twin_rr % GRAD_TWIN_SLOTS];
+	grad_twin_slot *e = &g_grad_twin[g_grad_twin_rr % GRAD_TWIN_BIG];
 
 	g_grad_twin_rr++;
 	if (ensure_half_buf(&e->half, &e->cap, n * 2) != 0) {
@@ -2165,10 +2171,10 @@ static int cublas_gemm_rm_bias_relu(ann_real *dC, const ann_real *dA,
 ** -- no host (or device) transpose copy.
 */
 static int cublas_gemm_rm_bt(ann_real *dC, const ann_real *dA,
-	const ann_real *dB, int M, int N, int K)
+	const ann_real *dB, int M, int N, int K, int accumulate)
 {
 	const ann_real alpha = 1.0f;
-	const ann_real beta = 0.0f;
+	const ann_real beta = accumulate ? 1.0f : 0.0f;
 	size_t nA;
 	size_t nB;
 	int threads = 256;
@@ -2192,7 +2198,7 @@ static int cublas_gemm_rm_bt(ann_real *dC, const ann_real *dA,
 	** scale is transpose-safe; sm_89/sm_120 rejects E5M2×E5M2). Delayed
 	** scale on dY via g_fp8_scale_B / g_fp8_scale_B_next.
 	*/
-	if (g_fp8_dgrad && g_fp8_dgrad_fail < 8
+	if (g_fp8_dgrad && g_fp8_dgrad_fail < 8 && !accumulate
 	    && (K & 15) == 0 && (N & 15) == 0 && (M & 15) == 0) {
 		void *wt_fp8 = NULL;
 		float *wt_scale = NULL;
@@ -3073,7 +3079,7 @@ extern "C" int gpu_mat_mul_bt(mat *c, const mat *a, const mat *b)
 		return -1;
 	}
 #ifdef ANN_CUBLAS
-	if (cublas_gemm_rm_bt(dC, dA, dB, a->rows, b->rows, a->cols) != 0) {
+	if (cublas_gemm_rm_bt(dC, dA, dB, a->rows, b->rows, a->cols, 0) != 0) {
 #endif
 		block = dim3(16, 16);
 		grid = dim3((c->cols + 15) / 16, (c->rows + 15) / 16);
@@ -3112,6 +3118,58 @@ __global__ static void gemm_at_kernel(const ann_real *A, const ann_real *B, ann_
 }
 
 /* c = a^T b ; a (T x m), b (T x n) -> c (m x n). cuBLAS OP_T when built in. */
+/*
+** c += a b^T (BF16 / FP32 cuBLAS with beta = 1): the dx accumulation of
+** the attention backward without a scratch product and an axpy pass. c is
+** uploaded when host-authoritative. -1 = no cuBLAS or GEMM failure.
+*/
+extern "C" int gpu_mat_mul_bt_acc(mat *c, const mat *a, const mat *b)
+{
+#ifdef ANN_CUBLAS
+	OpScope _op(OP_GEMM_DGRAD);
+	ann_real *dA;
+	ann_real *dB;
+	ann_real *dC;
+	int ownA;
+	int ownB;
+	int ownC;
+	int rc;
+
+	if (!c || !a || !b || !gpu_available())
+		return -1;
+	if (a->cols != b->cols || c->rows != a->rows || c->cols != b->rows)
+		return -1;
+	if (ensure_dev(a, &dA, &ownA) != 0)
+		return -1;
+	if (ensure_dev(b, &dB, &ownB) != 0) {
+		if (ownA)
+			gpu_free(dA);
+		return -1;
+	}
+	if (ensure_dev(c, &dC, &ownC) != 0) {
+		if (ownA)
+			gpu_free(dA);
+		if (ownB)
+			gpu_free(dB);
+		return -1;
+	}
+	rc = -1;
+	if (cublas_gemm_rm_bt(dC, dA, dB, a->rows, b->rows, a->cols, 1) == 0
+	    && launch_done() == 0 && finish_out(c, dC, ownC) == 0)
+		rc = 0;
+	if (ownA)
+		gpu_free(dA);
+	if (ownB)
+		gpu_free(dB);
+	if (ownC)
+		gpu_free(dC);
+	return rc;
+#else
+	(void)c; (void)a; (void)b;
+	return -1;
+#endif
+}
+
 extern "C" int gpu_mat_mul_at(mat *c, const mat *a, const mat *b)
 {
 	OpScope _op(OP_GEMM_WGRAD);
@@ -3697,7 +3755,7 @@ __global__ static void ln_fwd_kernel(ann_real *y, const ann_real *x,
 /* One block per row; dgamma/dbeta accumulate across rows with atomics. */
 __global__ static void ln_bwd_kernel(ann_real *dx, const ann_real *dy,
 	const ann_real *gamma, const ann_real *x_hat, const ann_real *inv_std,
-	ann_real *dgamma, ann_real *dbeta, int d)
+	ann_real *dgamma, ann_real *dbeta, int d, int accumulate)
 {
 	__shared__ ann_real sh[EW_BLOCK];
 	size_t off = (size_t)blockIdx.x * (size_t)d;
@@ -3721,9 +3779,14 @@ __global__ static void ln_bwd_kernel(ann_real *dx, const ann_real *dy,
 	sum_dy = ew_block_sum(sum_dy, sh);
 	sum_dyx = ew_block_sum(sum_dyx, sh);
 	for (j = threadIdx.x; j < d; j += blockDim.x) {
+		ann_real v;
+
 		g = dy[off + j] * gamma[j];
-		dx[off + j] = (g - (sum_dy + x_hat[off + j] * sum_dyx) / (ann_real)d)
-		    * inv;
+		v = (g - (sum_dy + x_hat[off + j] * sum_dyx) / (ann_real)d) * inv;
+		if (accumulate)
+			dx[off + j] += v;
+		else
+			dx[off + j] = v;
 	}
 }
 
@@ -5747,6 +5810,9 @@ extern "C" int gpu_attn_fa_fwd(mat *concat, const mat *q, const mat *k,
 	if (launch_done() == 0 && finish_out(concat, dc, oc) == 0) {
 		lse->on_device = MAT_DEV_DEVICE;
 		rc = 0;
+		/* BF16 twin of concat for the Wo GEMM now and its wgrad later. */
+		if (!oc)
+			act_bf16_publish(dc, B * T * H * dh);
 	}
 fa_out:
 	if (oq && dq)
@@ -6890,7 +6956,7 @@ extern "C" int gpu_layernorm_forward(ann_real *y, const ann_real *x,
 
 static int gpu_layernorm_backward_locked(mat *dx, const mat *dy, const ann_real *gamma,
 	const ann_real *x_hat, const ann_real *inv_std, int T, int d,
-	ann_real *dgamma, ann_real *dbeta)
+	ann_real *dgamma, ann_real *dbeta, int accumulate)
 {
 	ew_ref rdx;
 	ew_ref rdy;
@@ -6915,6 +6981,9 @@ static int gpu_layernorm_backward_locked(mat *dx, const mat *dy, const ann_real 
 	gb = (size_t)d * sizeof(ann_real);
 	/* Prefer device twins when authoritative (R1 residency). */
 	dyp = (dy->d_data && dy->on_device != MAT_DEV_HOST) ? dy->d_data : dy->data;
+	/* Accumulating needs the current dx on the device. */
+	if (accumulate && (!dx->d_data || dx->on_device == MAT_DEV_HOST))
+		return -1;
 	if (dx->d_data) {
 		if (ew_acquire(&rdx, 0, dx->d_data, mb, 0, 0) != 0)
 			return -1;
@@ -6938,7 +7007,7 @@ static int gpu_layernorm_backward_locked(mat *dx, const mat *dy, const ann_real 
 	if (!acc_g || !acc_b)
 		return -1;
 	ln_bwd_kernel<<<T, ew_block_for(d)>>>(rdx.dev, rdy.dev, rg.dev, rh.dev,
-	    ri.dev, NULL, NULL, d);
+	    ri.dev, NULL, NULL, d, accumulate);
 	if (ew_launch_ok() != 0)
 		return -1;
 	{
@@ -6976,7 +7045,22 @@ extern "C" int gpu_layernorm_backward(mat *dx, const mat *dy, const ann_real *ga
 	int rc;
 
 	pthread_mutex_lock(&g_ew_mu);
-	rc = gpu_layernorm_backward_locked(dx, dy, gamma, x_hat, inv_std, T, d, dgamma, dbeta);
+	rc = gpu_layernorm_backward_locked(dx, dy, gamma, x_hat, inv_std, T, d, dgamma, dbeta, 0);
+	pthread_mutex_unlock(&g_ew_mu);
+	return rc;
+}
+
+/* Same, dx += LayerNorm backward (dx device-resident): the residual-path
+** gradient add of a block fused into the LN backward kernel. */
+extern "C" int gpu_layernorm_backward_acc(mat *dx, const mat *dy, const ann_real *gamma,
+	const ann_real *x_hat, const ann_real *inv_std, int T, int d,
+	ann_real *dgamma, ann_real *dbeta)
+{
+	OpScope _op(OP_LN_BWD);
+	int rc;
+
+	pthread_mutex_lock(&g_ew_mu);
+	rc = gpu_layernorm_backward_locked(dx, dy, gamma, x_hat, inv_std, T, d, dgamma, dbeta, 1);
 	pthread_mutex_unlock(&g_ew_mu);
 	return rc;
 }
