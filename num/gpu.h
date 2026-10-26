@@ -185,6 +185,13 @@ int	gpu_relu_forward(ann_real *x, int n);
 ** a 0-1 mask -- all three agree because z > 0 <=> relu(z) > 0 <=> mask != 0.
 */
 int	gpu_relu_backward(ann_real *dx, const ann_real *x_pre_relu_or_mask, int n);
+/*
+** FFN backward (BF16 mode): ReLU backward of dh by hidden > 0, the BF16 twin
+** of the masked dh for the following W1 GEMMs, and db1_host += column sums
+** (accumulated like gpu_mat_col_sum_add), one kernel. dh and hidden must be
+** device-resident; the FP32 dh stays unmasked. -1 = do it in steps.
+*/
+int	gpu_ffn_relu_bwd_fused(mat *dh, const mat *hidden, ann_real *db1_host);
 
 /*
 ** M1: fused causal MHA over B packed sequences (B*T) x (H*dh), one launch per

@@ -281,6 +281,7 @@ int ffn_backward(mat *dx, const mat *dout, ffn *f, const ffn_cache *c)
 	int T;
 	ann_real *dhp;
 	const ann_real *prep;
+	int fused_relu = 0;
 
 	if (!dx || !dout || !f || !c)
 		return -1;
@@ -318,12 +319,25 @@ int ffn_backward(mat *dx, const mat *dout, ffn *f, const ffn_cache *c)
 	/* dh = dout * W2^T then ReLU mask (GEMM may use GPU). */
 	if (mat_mul_wt(dh, dout, f->w2) != 0)
 		return -1;
-	dhp = mat_compute_ptr(dh);
-	/* hidden>0 ⟺ pre>0 after ReLU; prefer hidden (Lt RELU_BIAS path). */
-	prep = mat_compute_ptr_const(c->hidden);
-	if (!prep)
-		prep = mat_compute_ptr_const(c->pre_act);
-	if (!dhp || !prep
+	/*
+	** BF16 mode: ReLU mask, BF16 twin of dh for the W1 GEMMs and db1 in
+	** one kernel (the FP32 dh stays unmasked, no GEMM reads it then).
+	*/
+	if (!gpu_fp8()
+	    && gpu_ffn_relu_bwd_fused(dh, c->hidden, f->db1->data) == 0) {
+		fused_relu = 1;
+		dhp = NULL;
+		prep = NULL;
+	} else {
+		dhp = mat_compute_ptr(dh);
+		/* hidden>0 ⟺ pre>0 after ReLU; prefer hidden (Lt RELU_BIAS path). */
+		prep = mat_compute_ptr_const(c->hidden);
+		if (!prep)
+			prep = mat_compute_ptr_const(c->pre_act);
+	}
+	if (fused_relu)
+		;
+	else if (!dhp || !prep
 	    || gpu_relu_backward(dhp, prep, T * LM_D_FF) != 0) {
 		const mat *mask = c->hidden->data ? c->hidden : c->pre_act;
 
@@ -340,7 +354,7 @@ int ffn_backward(mat *dx, const mat *dout, ffn *f, const ffn_cache *c)
 		mat_mark_written(dh, dhp);
 	if (mat_outer_add(f->dw1, c->x_in, dh) != 0)
 		return -1;
-	{
+	if (!fused_relu) {
 		ann_real *dhptr = mat_compute_ptr(dh);
 
 		if (!dhptr

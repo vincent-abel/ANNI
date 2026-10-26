@@ -541,6 +541,14 @@ int gpu_relu_forward(ann_real *x, int n)
 	return -1;
 }
 
+int gpu_ffn_relu_bwd_fused(mat *dh, const mat *hidden, ann_real *db1_host)
+{
+	(void)dh;
+	(void)hidden;
+	(void)db1_host;
+	return -1;
+}
+
 int gpu_relu_backward(ann_real *dx, const ann_real *x_pre_relu_or_mask, int n)
 {
 	(void)dx;
