@@ -114,6 +114,8 @@ static lt_algo_entry g_lt_algo[LT_ALGO_CACHE];
 /* Device bias scratch for Lt epilogues (host vec biases are not aliased). */
 static float *g_lt_bias_dev;
 static size_t g_lt_bias_cap;
+static void *g_lt_bias16;	/* BF16 copy for BF16-output epilogues */
+static size_t g_lt_bias16_cap;
 /* Parallel QKV: three handles/streams so Wq/Wk/Wv GEMMs overlap. */
 static cudaStream_t g_qkv_stream[3];
 static cublasHandle_t g_qkv_blas[3];
@@ -294,7 +296,8 @@ static int cublas_lt_gemm_half(cublasOperation_t opa, cublasOperation_t opb,
 	(void)cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSB,
 	    &opb, sizeof(opb));
 	if (epi != CUBLASLT_EPILOGUE_DEFAULT) {
-		cudaDataType_t bdt = CUDA_R_32F;
+		/* cuBLASLt wants the bias in the output type: BF16 with a BF16 D. */
+		cudaDataType_t bdt = out_bf16 ? dt : CUDA_R_32F;
 
 		if (cublasLtMatmulDescSetAttribute(op,
 		    CUBLASLT_MATMUL_DESC_EPILOGUE, &epi, sizeof(epi))
@@ -1449,6 +1452,7 @@ typedef struct {
 	size_t		cap;
 	int		n;
 	int		live;
+	int		bf16_only;	/* the GEMM wrote the twin itself; the FP32 buffer holds nothing */
 } act_bf16_slot;
 static act_bf16_slot g_act_bf16[ACT_BF16_SLOTS];
 static int g_act_bf16_rr;
@@ -1679,13 +1683,14 @@ extern "C" int gpu_adam_seed_bf16_flat(void *bf16, const ann_real *fp32, int n)
 	return half_wt_convert(bf16, fp32, n, 1);
 }
 
-static void act_bf16_publish(const ann_real *fp32, int n)
+/* The slot for fp32 (existing, else a free one, else round robin) with a buffer of n elements; NULL on failure. */
+static act_bf16_slot *act_bf16_slot_for(const ann_real *fp32, int n)
 {
 	act_bf16_slot *e;
 	int i;
 
 	if (!fp32 || n <= 0 || g_compute_prec != GPU_PREC_BF16)
-		return;
+		return NULL;
 	e = NULL;
 	for (i = 0; i < ACT_BF16_SLOTS; i++) {
 		if (g_act_bf16[i].fp32 == fp32) {
@@ -1729,15 +1734,52 @@ static void act_bf16_publish(const ann_real *fp32, int n)
 	if (ensure_half_buf(&e->half, &e->cap, (size_t)n * 2) != 0) {
 		e->live = 0;
 		e->fp32 = NULL;
-		return;
+		return NULL;
 	}
+	e->fp32 = fp32;
+	e->n = n;
+	e->live = 0;
+	e->bf16_only = 0;
+	return e;
+}
+
+static void act_bf16_publish(const ann_real *fp32, int n)
+{
+	act_bf16_slot *e = act_bf16_slot_for(fp32, n);
+
+	if (!e)
+		return;
 	if (half_wt_convert(e->half, fp32, n, 1) != 0) {
 		e->live = 0;
 		return;
 	}
-	e->fp32 = fp32;
-	e->n = n;
 	e->live = 1;
+}
+
+/*
+** A twin buffer for fp32 that a GEMM writes directly (BF16 output): no
+** conversion, and the FP32 buffer stays unwritten (bf16_only). NULL when
+** no slot; the caller marks it live once the GEMM has run.
+*/
+static act_bf16_slot *act_bf16_reserve(const ann_real *fp32, int n)
+{
+	act_bf16_slot *e = act_bf16_slot_for(fp32, n);
+
+	if (e)
+		e->bf16_only = 1;
+	return e;
+}
+
+extern "C" int gpu_act_bf16_only(const mat *m)
+{
+	int i;
+
+	if (!m || !m->d_data)
+		return 0;
+	for (i = 0; i < ACT_BF16_SLOTS; i++)
+		if (g_act_bf16[i].fp32 == m->d_data && g_act_bf16[i].live)
+			return g_act_bf16[i].bf16_only;
+	return 0;
 }
 
 /*
@@ -1800,7 +1842,8 @@ static const void *act_bf16_get(const ann_real *fp32, int n)
 	for (i = 0; i < ACT_BF16_SLOTS; i++) {
 		if (g_act_bf16[i].live && g_act_bf16[i].fp32 == fp32
 		    && g_act_bf16[i].n == n) {
-			twin_check("act", g_act_bf16[i].half, fp32, (size_t)n, 1);
+			if (!g_act_bf16[i].bf16_only)
+				twin_check("act", g_act_bf16[i].half, fp32, (size_t)n, 1);
 			return g_act_bf16[i].half;
 		}
 	}
@@ -2101,7 +2144,7 @@ static int lt_bias_upload(const ann_real *bias_host, int N)
 */
 static int cublas_gemm_rm_epi_res(ann_real *dC, const ann_real *dA,
 	const ann_real *dB, int M, int N, int K, const ann_real *bias_host,
-	cublasLtEpilogue_t epi, const ann_real *res)
+	cublasLtEpilogue_t epi, const ann_real *res, int out_bf16)
 {
 	const ann_real alpha = 1.0f;
 	const ann_real beta = res ? 1.0f : 0.0f;
@@ -2119,6 +2162,14 @@ static int cublas_gemm_rm_epi_res(ann_real *dC, const ann_real *dA,
 	if (!bias_host && epi != CUBLASLT_EPILOGUE_DEFAULT)
 		return -1;
 	pthread_mutex_lock(&g_gemm_mu);
+	if (bias_host && out_bf16) {
+		/* The epilogue bias in BF16, as the BF16 output requires. */
+		if (ensure_half_buf(&g_lt_bias16, &g_lt_bias16_cap, (size_t)N * 2) != 0
+		    || half_wt_convert(g_lt_bias16, g_lt_bias_dev, N, 1) != 0) {
+			pthread_mutex_unlock(&g_gemm_mu);
+			return -1;
+		}
+	}
 	half_scratch_warm();
 	use_bf16 = (g_compute_prec == GPU_PREC_BF16);
 #if CUDART_VERSION < 11000
@@ -2156,7 +2207,8 @@ static int cublas_gemm_rm_epi_res(ann_real *dC, const ann_real *dA,
 	}
 	rc = cublas_lt_gemm_half(CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha,
 	    hB_use, N, hA_use, K, &beta, res ? (ann_real *)res : dC, N, 1, epi,
-	    bias_host ? g_lt_bias_dev : NULL, res ? dC : NULL, 0);
+	    bias_host ? (out_bf16 ? (const float *)g_lt_bias16 : g_lt_bias_dev) : NULL,
+	    res ? dC : NULL, out_bf16);
 	pthread_mutex_unlock(&g_gemm_mu);
 	return rc;
 }
@@ -2165,7 +2217,7 @@ static int cublas_gemm_rm_epi(ann_real *dC, const ann_real *dA,
 	const ann_real *dB, int M, int N, int K, const ann_real *bias_host,
 	cublasLtEpilogue_t epi)
 {
-	return cublas_gemm_rm_epi_res(dC, dA, dB, M, N, K, bias_host, epi, NULL);
+	return cublas_gemm_rm_epi_res(dC, dA, dB, M, N, K, bias_host, epi, NULL, 0);
 }
 
 static int cublas_gemm_rm_bias(ann_real *dC, const ann_real *dA,
@@ -4805,6 +4857,18 @@ extern "C" int gpu_ffn_w1_finish(ann_real *hidden, ann_real *pre,
 	return rc;
 }
 
+static int hid_bf16_on(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		const char *e = getenv("ANN_HID_BF16");
+
+		on = (e && e[0] == '0') ? 0 : 1;
+	}
+	return on;
+}
+
 static int gpu_mat_mul_epi(mat *c, const mat *a, const mat *b,
 	const ann_real *bias, int with_relu)
 {
@@ -4816,6 +4880,7 @@ static int gpu_mat_mul_epi(mat *c, const mat *a, const mat *b,
 	int ownB;
 	int ownC;
 	int rc;
+	int bf16_only_out = 0;
 
 	if (!c || !a || !b || !bias)
 		return -1;
@@ -4838,10 +4903,40 @@ static int gpu_mat_mul_epi(mat *c, const mat *a, const mat *b,
 		return -1;
 	}
 #ifdef ANN_CUBLAS
-	rc = with_relu
-	    ? cublas_gemm_rm_bias_relu(dC, dA, dB, a->rows, b->cols, a->cols,
-	    bias)
-	    : cublas_gemm_rm_bias(dC, dA, dB, a->rows, b->cols, a->cols, bias);
+	rc = -1;
+	/*
+	** Training (batch mode), BF16: ReLU(x W1 + b1) written once as the
+	** BF16 twin of c, which is all the W2 GEMM, its wgrad and the fused
+	** ReLU backward read; the FP32 c is never written (ANN_HID_BF16=0
+	** keeps the FP32 output plus a conversion).
+	*/
+	if (with_relu && !ownC && g_compute_prec == GPU_PREC_BF16
+	    && g_sync_mode != GPU_SYNC_EAGER && !stream_is_capturing()
+	    && hid_bf16_on()) {
+		act_bf16_slot *as = act_bf16_reserve(dC, a->rows * b->cols);
+
+		if (as) {
+			rc = cublas_gemm_rm_epi_res((ann_real *)as->half, dA, dB, a->rows,
+			    b->cols, a->cols, bias, CUBLASLT_EPILOGUE_RELU_BIAS, NULL, 1);
+			if (rc == 0) {
+				static int reported;
+
+				as->live = 1;
+				bf16_only_out = 1;
+				if (!reported++)
+					fprintf(stderr, "[ffn] W1: ReLU output written as its BF16 twin only\n");
+			} else {
+				as->live = 0;
+				as->bf16_only = 0;
+				(void)cudaGetLastError();
+			}
+		}
+	}
+	if (rc != 0)
+		rc = with_relu
+		    ? cublas_gemm_rm_bias_relu(dC, dA, dB, a->rows, b->cols, a->cols,
+		    bias)
+		    : cublas_gemm_rm_bias(dC, dA, dB, a->rows, b->cols, a->cols, bias);
 #else
 	(void)with_relu;
 	rc = -1;
@@ -4858,7 +4953,7 @@ static int gpu_mat_mul_epi(mat *c, const mat *a, const mat *b,
 	rc = -1;
 	if (launch_done() == 0 && finish_out(c, dC, ownC) == 0) {
 		rc = 0;
-		if (with_relu && c->d_data)
+		if (with_relu && c->d_data && !bf16_only_out)
 			act_bf16_publish(c->d_data, c->rows * c->cols);
 	}
 	if (ownA)
@@ -4919,7 +5014,7 @@ extern "C" int gpu_mat_mul_res(mat *d, const mat *a, const mat *b,
 		return -1;
 	}
 	rc = cublas_gemm_rm_epi_res(dD, dA, dB, a->rows, b->cols, a->cols, bias,
-	    bias ? CUBLASLT_EPILOGUE_BIAS : CUBLASLT_EPILOGUE_DEFAULT, dR);
+	    bias ? CUBLASLT_EPILOGUE_BIAS : CUBLASLT_EPILOGUE_DEFAULT, dR, 0);
 	if (rc == 0)
 		rc = (launch_done() == 0 && finish_out(d, dD, ownD) == 0) ? 0 : -1;
 	if (ownA)
@@ -7415,8 +7510,8 @@ extern "C" int gpu_relu_backward(ann_real *dx, const ann_real *x_pre_relu_or_mas
 ** atomic per column and slab (as col_sum_tiled_kernel). cols % 4 == 0.
 */
 __global__ static void relu_bwd_pack_colsum_kernel(__nv_bfloat16 *dst,
-	ann_real *acc, const ann_real *dh, const ann_real *hid, int rows,
-	int cols)
+	ann_real *acc, const ann_real *dh, const ann_real *hid,
+	const __nv_bfloat16 *hid16, int rows, int cols)
 {
 	const int c0 = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
 	const int r0 = blockIdx.y * COLSUM_SLAB;
@@ -7429,8 +7524,20 @@ __global__ static void relu_bwd_pack_colsum_kernel(__nv_bfloat16 *dst,
 	for (r = r0; r < r1; r++) {
 		const size_t off = (size_t)r * cols + c0;
 		float4 g = *(const float4 *)(dh + off);
-		const float4 h = *(const float4 *)(hid + off);
+		float4 h;
 
+		if (hid16) {
+			/* the twin the W2 GEMM used: half the bytes, same sign */
+			const uint2 u = *(const uint2 *)(hid16 + off);
+			const __nv_bfloat162 lo = *(const __nv_bfloat162 *)&u.x;
+			const __nv_bfloat162 hi = *(const __nv_bfloat162 *)&u.y;
+
+			h.x = __low2float(lo);
+			h.y = __high2float(lo);
+			h.z = __low2float(hi);
+			h.w = __high2float(hi);
+		} else
+			h = *(const float4 *)(hid + off);
 		g.x = h.x > 0.0f ? g.x : 0.0f;
 		g.y = h.y > 0.0f ? g.y : 0.0f;
 		g.z = h.z > 0.0f ? g.z : 0.0f;
@@ -7467,6 +7574,7 @@ extern "C" int gpu_ffn_relu_bwd_fused(mat *dh, const mat *hidden,
 	const ann_real *dhid;
 	colsum_acc *acc;
 	void *twin;
+	const void *hid16;
 	int rows, cols;
 	size_t n;
 
@@ -7486,6 +7594,7 @@ extern "C" int gpu_ffn_relu_bwd_fused(mat *dh, const mat *hidden,
 	dhid = hidden->d_data;
 	n = (size_t)rows * (size_t)cols;
 	pthread_mutex_lock(&g_gemm_mu);
+	hid16 = act_bf16_get(dhid, (int)n);	/* NULL: mask from the FP32 hidden */
 	twin = grad_twin_reserve(ddh, n);
 	pthread_mutex_unlock(&g_gemm_mu);
 	if (!twin)
@@ -7502,7 +7611,8 @@ extern "C" int gpu_ffn_relu_bwd_fused(mat *dh, const mat *hidden,
 		    (rows + COLSUM_SLAB - 1) / COLSUM_SLAB);
 
 		relu_bwd_pack_colsum_kernel<<<grid, EW_BLOCK>>>(
-		    (__nv_bfloat16 *)twin, acc->dev, ddh, dhid, rows, cols);
+		    (__nv_bfloat16 *)twin, acc->dev, ddh, dhid,
+		    (const __nv_bfloat16 *)hid16, rows, cols);
 	}
 	if (ew_launch_ok() != 0) {
 		pthread_mutex_unlock(&g_ew_mu);
