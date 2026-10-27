@@ -68,6 +68,26 @@ static void block_cache_drop_device(block_cache *bc)
 	}
 }
 
+/*
+** B4: no residual D2D copies (16 MB each at 4096 x 1024, 38 per microbatch).
+** Forward: each block writes its output straight into the next block's
+** cached x_in. Backward: the residual gradient is accumulated in place in
+** one buffer ("old + new", the same FP32 adds as copy-then-add) and handed
+** to the embedding scatter without a final copy. ANN_RESID_INPLACE=0
+** restores the copies.
+*/
+static int resid_inplace_on(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		const char *e = getenv("ANN_RESID_INPLACE");
+
+		on = (e && e[0] == '0') ? 0 : 1;
+	}
+	return on;
+}
+
 static void copy_mat(mat *dst, const mat *src)
 {
 	if (resid_copy(dst, src) == 0)
@@ -233,13 +253,9 @@ static void block_cache_repin(block_cache *bc)
 		mat_try_pin(bc->ln2c->x_hat);
 }
 
-int tblock_forward_cache(mat *x, tblock *b, block_cache *c)
+/* The block on c->x_in (already filled), output into out (not c->x_in). */
+static int tblock_forward_body(mat *out, tblock *b, block_cache *c)
 {
-	if (!x || !b || !c)
-		return -1;
-	/* After act-checkpoint drop_device, reattach twins before GEMMs. */
-	block_cache_repin(c);
-	copy_mat(c->x_in, x);
 	/* LN(in→out) and resid sum skip a full D2D copy each. */
 	if (layernorm_forward_into(c->ln1_out, c->x_in, b->ln1, c->ln1c) != 0)
 		return -1;
@@ -258,9 +274,20 @@ int tblock_forward_cache(mat *x, tblock *b, block_cache *c)
 	if (layernorm_forward_into(c->ln2_out, c->x_mid, b->ln2, c->ln2c) != 0)
 		return -1;
 	/* x = x_mid + FFN(ln2): residual fused into the W2 GEMM. */
-	if (ffn_forward_cache_res(x, c->ln2_out, b->ffn, c->ffnc, c->x_mid) != 0)
+	if (ffn_forward_cache_res(out, c->ln2_out, b->ffn, c->ffnc, c->x_mid)
+	    != 0)
 		return -1;
 	return 0;
+}
+
+int tblock_forward_cache(mat *x, tblock *b, block_cache *c)
+{
+	if (!x || !b || !c)
+		return -1;
+	/* After act-checkpoint drop_device, reattach twins before GEMMs. */
+	block_cache_repin(c);
+	copy_mat(c->x_in, x);
+	return tblock_forward_body(x, b, c);
 }
 
 int tblock_forward(mat *x, tblock *b)
@@ -278,7 +305,14 @@ int tblock_forward(mat *x, tblock *b)
 	return rc;
 }
 
-int tblock_backward(mat *dx, const mat *dout, tblock *b, const block_cache *c)
+/*
+** acc = 0: dx = d(block input) from dout, through the d_mid scratch.
+** acc = 1 (B4): dx is the accumulator: it receives dout (no copy when
+** dx == dout, the buffer then being overwritten in place) and both residual
+** adds land in it; dout must not be read by the caller afterwards.
+*/
+static int tblock_backward_impl(mat *dx, const mat *dout, tblock *b,
+	const block_cache *c, int acc)
 {
 	/* One shared pool for all blocks (backward is serial). */
 	static mat *s_d_ffn_in;
@@ -324,14 +358,21 @@ int tblock_backward(mat *dx, const mat *dout, tblock *b, const block_cache *c)
 	mat_try_pin(dx);
 
 	/* y = x_mid + ffn_out; dy splits to both */
-	copy_mat(d_mid, dout);
+	if (acc) {
+		d_mid = dx;
+		if (dx != dout)
+			copy_mat(dx, dout);
+	} else
+		copy_mat(d_mid, dout);
+	/* In place, ffn_backward reads dout before the LN2 add rewrites it. */
 	if (ffn_backward(d_ffn_in, dout, b->ffn, c->ffnc) != 0)
 		return -1;
 	if (layernorm_backward_add(d_mid, d_ffn_in, b->ln2, c->ln2c, tmp) != 0)
 		return -1;
 
-	/* x_mid = x_in + attn_out */
-	copy_mat(dx, d_mid);
+	/* x_mid = x_in + attn_out (in place: the attention reads d_mid first) */
+	if (!acc)
+		copy_mat(dx, d_mid);
 	if (c->attnpc) {
 		if (attn_mha_backward_packed(d_attn_out, d_mid, b->attn,
 		    c->attnpc) != 0)
@@ -341,6 +382,13 @@ int tblock_backward(mat *dx, const mat *dout, tblock *b, const block_cache *c)
 	if (layernorm_backward_add(dx, d_attn_out, b->ln1, c->ln1c, tmp) != 0)
 		return -1;
 	return 0;
+}
+
+int tblock_backward(mat *dx, const mat *dout, tblock *b, const block_cache *c)
+{
+	if (dx == dout)
+		return -1;
+	return tblock_backward_impl(dx, dout, b, c, resid_inplace_on());
 }
 
 transformer *transformer_create(void)
@@ -485,6 +533,22 @@ int transformer_forward_cache(mat *x, transformer *t, transformer_cache *c)
 
 	if (!x || !t || !c)
 		return -1;
+	if (resid_inplace_on() && t->n_blocks > 0) {
+		block_cache_repin(&c->bc[0]);
+		copy_mat(c->bc[0].x_in, x);
+		for (i = 0; i < t->n_blocks; i++) {
+			mat *out = i + 1 < t->n_blocks ? c->bc[i + 1].x_in : x;
+
+			if (i > 0)
+				block_cache_repin(&c->bc[i]);
+			mat_try_pin(out);
+			if (tblock_forward_body(out, &t->blocks[i], &c->bc[i]) != 0)
+				return -1;
+			if (block_ckpt_layer(i))
+				block_cache_drop_device(&c->bc[i]);
+		}
+		return 0;
+	}
 	for (i = 0; i < t->n_blocks; i++) {
 		if (tblock_forward_cache(x, &t->blocks[i], &c->bc[i]) != 0)
 			return -1;
@@ -510,8 +574,12 @@ int transformer_forward(mat *x, transformer *t)
 	return rc;
 }
 
-int transformer_backward(mat *dx, const mat *dout, transformer *t,
-	transformer_cache *c)
+/*
+** *dx_out = d(transformer input), in a buffer owned here (valid until the
+** next call). B4 path: one accumulator for every block, no final copy.
+*/
+int transformer_backward_ref(const mat **dx_out, const mat *dout,
+	transformer *t, transformer_cache *c)
 {
 	static mat *s_cur;
 	static mat *s_prev;
@@ -525,7 +593,7 @@ int transformer_backward(mat *dx, const mat *dout, transformer *t,
 	int i;
 	int want_scratch;
 
-	if (!dx || !dout || !t || !c)
+	if (!dx_out || !dout || !t || !c)
 		return -1;
 	want_scratch = g_act_checkpoint ? 1 : 0;
 	if (s_T != c->T || !s_cur || !s_prev
@@ -555,6 +623,27 @@ int transformer_backward(mat *dx, const mat *dout, transformer *t,
 	cur = s_cur;
 	prev = s_prev;
 	scratch = s_scratch;
+	if (resid_inplace_on()) {
+		/* The first block copies dout into cur (its d_mid copy). */
+		for (i = t->n_blocks - 1; i >= 0; i--) {
+			if (block_ckpt_layer(i)) {
+				copy_mat(scratch, c->bc[i].x_in);
+				if (tblock_forward_cache(scratch, &t->blocks[i],
+				    &c->bc[i]) != 0)
+					return -1;
+			}
+			if (tblock_backward_impl(cur,
+			    i == t->n_blocks - 1 ? dout : cur, &t->blocks[i],
+			    &c->bc[i], 1) != 0)
+				return -1;
+			if (block_ckpt_layer(i))
+				block_cache_drop_device(&c->bc[i]);
+		}
+		if (t->n_blocks <= 0)
+			copy_mat(cur, dout);
+		*dx_out = cur;
+		return 0;
+	}
 	copy_mat(cur, dout);
 	for (i = t->n_blocks - 1; i >= 0; i--) {
 		if (block_ckpt_layer(i)) {
@@ -572,6 +661,19 @@ int transformer_backward(mat *dx, const mat *dout, transformer *t,
 		cur = prev;
 		prev = swap;
 	}
-	copy_mat(dx, cur);
+	*dx_out = cur;
+	return 0;
+}
+
+int transformer_backward(mat *dx, const mat *dout, transformer *t,
+	transformer_cache *c)
+{
+	const mat *g;
+
+	if (!dx)
+		return -1;
+	if (transformer_backward_ref(&g, dout, t, c) != 0)
+		return -1;
+	copy_mat(dx, g);
 	return 0;
 }

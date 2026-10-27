@@ -1489,6 +1489,24 @@ static int g_grad_twin_rr;
 static long g_grad_twin_hit;
 static long g_grad_twin_miss;
 
+/*
+** Drop the pending twins of src other than keep: a new twin of the same
+** buffer supersedes them. The in-place residual gradient (block.c B4)
+** rewrites one buffer several times per block, and grad_twin_take serves
+** the first slot that matches, which could be an older, unconsumed twin.
+*/
+static void grad_twin_drop_src(const ann_real *src, const grad_twin_slot *keep)
+{
+	int i;
+
+	for (i = 0; i < GRAD_TWIN_SLOTS; i++)
+		if (i != GRAD_TWIN_INPLACE && &g_grad_twin[i] != keep
+		    && g_grad_twin[i].src == src) {
+			g_grad_twin[i].src = NULL;
+			g_grad_twin[i].n = 0;
+		}
+}
+
 /* Convert G into a one-shot twin slot (round robin); NULL on failure. */
 static void *grad_twin_put(const ann_real *src, size_t n)
 {
@@ -1524,6 +1542,7 @@ static void *grad_twin_put(const ann_real *src, size_t n)
 		e->n = 0;
 		return NULL;
 	}
+	grad_twin_drop_src(src, e);
 	e->src = src;
 	e->n = n;
 	e->ld = 0;
@@ -1565,6 +1584,7 @@ static void *grad_twin_reserve(const ann_real *src, size_t n)
 		e->n = 0;
 		return NULL;
 	}
+	grad_twin_drop_src(src, e);
 	e->src = src;
 	e->n = n;
 	e->ld = 0;
