@@ -280,13 +280,22 @@ attn_fa2_fwd_kernel(float *out, float *lse, const __nv_bfloat16 *q,
 ** tile in shared memory (transposed by ldmatrix) and FP32 atomics. dq must
 ** be zeroed by the caller; dk, dv are written. dq, dk, dv in the model
 ** layout [b][t][h*dh]; dvec[b,h,i] = <dO_i, O_i>.
+**
+** With of (the forward's FP32 O, model layout) non-NULL, dvec is not read:
+** each query tile's D_i is computed in the prologue from the BF16 dO tile
+** already in shared memory and the O tile staged through dSt in 32-column
+** chunks (coalesced loads), one thread per row accumulating
+** fma(dO[c], O[c], acc) for c = 0..dh-1 in order, exactly as
+** attn_fa_dvec16_kernel does. That replaces the separate dvec pass, whose
+** one-thread-per-row loads strided by 4 KB cost ~70 us per layer.
 */
 template <int DH>
 __global__ static void __launch_bounds__(128)
 attn_fa2_bwd_kernel(float *dq, float *dk, float *dv, const __nv_bfloat16 *q,
 	const __nv_bfloat16 *k, const __nv_bfloat16 *v, const __nv_bfloat16 *dO,
 	const float *lse, const float *dvec, int T, int H, float scale,
-	fa2_lay lq, fa2_lay lo, __nv_bfloat16 *dk16, __nv_bfloat16 *dv16)
+	fa2_lay lq, fa2_lay lo, __nv_bfloat16 *dk16, __nv_bfloat16 *dv16,
+	const float *of)
 {
 	const int NT = DH / 8;
 	const int KS = DH / 16;
@@ -348,7 +357,44 @@ attn_fa2_bwd_kernel(float *dq, float *dk, float *dv, const __nv_bfloat16 *q,
 		fa2_load_tile<DH>(dOs, dsrc + (long long)q0 * lo.ld, lo.ld);
 		if (threadIdx.x < FA2_BQ) {
 			ls[threadIdx.x] = lse[(size_t)bh * T + q0 + threadIdx.x];
-			dvs[threadIdx.x] = dvec[(size_t)bh * T + q0 + threadIdx.x];
+			if (!of)
+				dvs[threadIdx.x] = dvec[(size_t)bh * T + q0 + threadIdx.x];
+		}
+		if (of) {
+			/*
+			** D_q = <dO_q, O_q> for the tile's 64 queries. dSt is free
+			** until the dS^T stores below; it holds a 64 x 32 FP32 chunk
+			** of O (row stride 33 floats: thread t reads row t without
+			** bank conflicts). The chunk loop keeps the c order.
+			*/
+			float *ost = (float *)dSt;
+			const float *osrc = of + ((size_t)b * T + q0) * D + h * DH;
+			float acc = 0.0f;
+			int c0;
+
+			for (c0 = 0; c0 < DH; c0 += 32) {
+				const int w = DH - c0 < 32 ? DH - c0 : 32;
+				int j;
+
+				if (c0 > 0)
+					__syncthreads();	/* previous chunk consumed */
+				for (j = threadIdx.x; j < FA2_BQ * w; j += FA2_WARPS * 32) {
+					const int row = j / w;
+					const int col = j - row * w;
+
+					ost[row * 33 + col] = osrc[(size_t)row * D + c0 + col];
+				}
+				__syncthreads();	/* chunk (and, the first time, dOs) in place */
+				if (threadIdx.x < FA2_BQ) {
+					const __nv_bfloat16 *dr = dOs + threadIdx.x * LDS + c0;
+					const float *orow = ost + threadIdx.x * 33;
+
+					for (j = 0; j < w; j++)
+						acc = __fmaf_rn(__bfloat162float(dr[j]), orow[j], acc);
+				}
+			}
+			if (threadIdx.x < FA2_BQ)
+				dvs[threadIdx.x] = acc;
 		}
 		__syncthreads();
 		for (n = 0; n < 8; n++)
@@ -505,17 +551,18 @@ attn_fa2_bwd_kernel(float *dq, float *dk, float *dv, const __nv_bfloat16 *q,
 static int fa2_bwd_launch_lay(float *dq, float *dk, float *dv, const __nv_bfloat16 *q,
 	const __nv_bfloat16 *k, const __nv_bfloat16 *v, const __nv_bfloat16 *dO,
 	const float *lse, const float *dvec, int B, int T, int H, int dh, float scale,
-	fa2_lay lq, fa2_lay lo, __nv_bfloat16 *dk16, __nv_bfloat16 *dv16)
+	fa2_lay lq, fa2_lay lo, __nv_bfloat16 *dk16, __nv_bfloat16 *dv16,
+	const float *of)
 {
 	dim3 grid(B * H, T / FA2_BK);
 
 	if (!fa2_ok(T, dh))
 		return -1;
 	switch (dh) {
-	case 16: attn_fa2_bwd_kernel<16><<<grid, 32 * FA2_WARPS>>>(dq, dk, dv, q, k, v, dO, lse, dvec, T, H, scale, lq, lo, dk16, dv16); break;
-	case 32: attn_fa2_bwd_kernel<32><<<grid, 32 * FA2_WARPS>>>(dq, dk, dv, q, k, v, dO, lse, dvec, T, H, scale, lq, lo, dk16, dv16); break;
-	case 48: attn_fa2_bwd_kernel<48><<<grid, 32 * FA2_WARPS>>>(dq, dk, dv, q, k, v, dO, lse, dvec, T, H, scale, lq, lo, dk16, dv16); break;
-	default: attn_fa2_bwd_kernel<64><<<grid, 32 * FA2_WARPS>>>(dq, dk, dv, q, k, v, dO, lse, dvec, T, H, scale, lq, lo, dk16, dv16); break;
+	case 16: attn_fa2_bwd_kernel<16><<<grid, 32 * FA2_WARPS>>>(dq, dk, dv, q, k, v, dO, lse, dvec, T, H, scale, lq, lo, dk16, dv16, of); break;
+	case 32: attn_fa2_bwd_kernel<32><<<grid, 32 * FA2_WARPS>>>(dq, dk, dv, q, k, v, dO, lse, dvec, T, H, scale, lq, lo, dk16, dv16, of); break;
+	case 48: attn_fa2_bwd_kernel<48><<<grid, 32 * FA2_WARPS>>>(dq, dk, dv, q, k, v, dO, lse, dvec, T, H, scale, lq, lo, dk16, dv16, of); break;
+	default: attn_fa2_bwd_kernel<64><<<grid, 32 * FA2_WARPS>>>(dq, dk, dv, q, k, v, dO, lse, dvec, T, H, scale, lq, lo, dk16, dv16, of); break;
 	}
 	return 0;
 }
@@ -528,7 +575,7 @@ static int fa2_bwd_launch(float *dq, float *dk, float *dv, const __nv_bfloat16 *
 	fa2_lay l = fa2_lay_headmajor(T, H, dh);
 
 	return fa2_bwd_launch_lay(dq, dk, dv, q, k, v, dO, lse, dvec, B, T, H, dh,
-	    scale, l, l, NULL, NULL);
+	    scale, l, l, NULL, NULL, NULL);
 }
 
 /* Host launcher; q, k, v head-major [b][h][t][dh] BF16. */

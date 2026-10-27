@@ -6735,6 +6735,22 @@ fa_out:
 	return rc;
 }
 
+/*
+** ANN_FA2_DVEC=0: compute dvec with attn_fa_dvec16_kernel before the FA2
+** backward instead of inside its query-tile prologue (B5).
+*/
+static int fa2_dvec_fused_on(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		const char *e = getenv("ANN_FA2_DVEC");
+
+		on = (e && e[0] == '0') ? 0 : 1;
+	}
+	return on;
+}
+
 /* D_i = sum_c dO[i,c] O[i,c] per (b,h,i), one thread per row. */
 __global__ static void attn_fa_dvec_kernel(float *dvec, const ann_real *dO,
 	const ann_real *O, int nrows, int T, int H, int dh)
@@ -7110,6 +7126,7 @@ extern "C" int gpu_attn_fa_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat,
 				const int Dm = H * dh;
 
 				void *dk16 = NULL, *dv16 = NULL;
+				const float *fused_of = NULL;
 
 				qs->live = 0;
 				/* dK, dV also as BF16 twins: their wgrad and dgrad GEMMs then convert nothing. */
@@ -7123,7 +7140,10 @@ extern "C" int gpu_attn_fa_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat,
 					if (!dv16)
 						dk16 = NULL;
 				}
-				if (dO16) {
+				if (dO16 && fa2_dvec_fused_on()) {
+					/* dO's BF16 twin; the backward kernel computes dvec itself from it and O. */
+					fused_of = ptr[1];
+				} else if (dO16) {
 					/* dO's BF16 twin (written by the Wo dgrad GEMM), read strided; dvec from it. */
 					{ OpNest _n(OP_ATT_SMX_ID); attn_fa_dvec16_kernel<<<(unsigned)((nrows + 255) / 256), 256>>>(
 					    g_fa_dvec, dO16, ptr[1], (int)nrows, T, H, dh); }
@@ -7138,7 +7158,7 @@ extern "C" int gpu_attn_fa_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat,
 				    B, T, H, dh, (float)(1.0 / sqrt((double)dh)),
 				    fa2_lay_rows(T, 3 * Dm, dh),
 				    dO16 ? fa2_lay_rows(T, Dm, dh) : fa2_lay_headmajor(T, H, dh),
-				    (__nv_bfloat16 *)dk16, (__nv_bfloat16 *)dv16) != 0) {
+				    (__nv_bfloat16 *)dk16, (__nv_bfloat16 *)dv16, fused_of) != 0) {
 					if (dk16) {
 						grad_twin_forget(ptr[6]);
 						grad_twin_forget(a_dv);
