@@ -228,8 +228,24 @@ const ann_real *mat_compute_ptr_const(const mat *m)
 
 void mat_mark_device(mat *m)
 {
-	if (m && m->d_data)
+	if (m && m->d_data && m->on_device != MAT_DEV_ALIASED)
 		m->on_device = MAT_DEV_DEVICE;
+}
+
+/*
+** A kernel wrote through p = mat_compute_ptr(m). When p was the device twin
+** the device is authoritative; when it was the host pointer (CPU fallback
+** earlier in the step) the host is. Marking device unconditionally lost the
+** host result and served the stale twin.
+*/
+void mat_mark_written(mat *m, const ann_real *p)
+{
+	if (!m)
+		return;
+	if (p && p == m->d_data)
+		mat_mark_device(m);
+	else
+		mat_host_dirty(m);
 }
 
 ann_real mat_get(const mat *m, int row, int col)

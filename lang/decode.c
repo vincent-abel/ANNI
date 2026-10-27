@@ -24,7 +24,7 @@ lm_decoder *lm_decoder_create(lm *model)
 	tblock *b;
 	int i;
 
-	if (!model || !model->tr || !model->w_head || model->w_head_q
+	if (!model || !model->tr || !model->w_head
 	    || !gpu_available())
 		return NULL;
 	d = calloc(1, sizeof(*d));

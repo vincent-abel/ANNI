@@ -441,6 +441,8 @@ int attn_mha_forward_cache(mat *out, attn *a, const mat *x, int causal,
 			return -1;
 		write_head(c->concat, c->o_h[h], h, a->d_head);
 	}
+	/* Host wrote concat (mat_fill may have marked its twin current). */
+	mat_host_dirty(c->concat);
 	if (mat_mul(out, c->concat, a->wo) != 0)
 		return -1;
 	return 0;
@@ -565,12 +567,10 @@ int attn_mha_backward(mat *dx, const mat *dout, attn *a, const attn_cache *c)
 	/* dx = dq Wq^T + dk Wk^T + dv Wv^T */
 	if (mat_mul_wt(dx, dq, a->wq) != 0)
 		goto fail;
-	if (mat_mul_wt(tmp, dk, a->wk) != 0)
+	if (mat_mul_wt_add(dx, dk, a->wk, tmp) != 0)
 		goto fail;
-	mat_axpy(dx, 1.0, tmp);
-	if (mat_mul_wt(tmp, dv, a->wv) != 0)
+	if (mat_mul_wt_add(dx, dv, a->wv, tmp) != 0)
 		goto fail;
-	mat_axpy(dx, 1.0, tmp);
 
 	mat_free(&dconcat);
 	mat_free(&dq);
@@ -620,6 +620,32 @@ int attn_flash_enabled(void)
 	return g_flash_attn;
 }
 
+int attn_vram_lazy(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		const char *e = getenv("ANN_VRAM_LAZY");
+
+		on = !(e && e[0] == '0');
+	}
+	return on;
+}
+
+/*
+** K and V of the packed cache: with the fused FA2 QKV GEMM they only ever
+** live in the BF16 qkv slot, so the FP32 mats are headers without storage;
+** gpu_attn_qkv_fused allocates them on demand on any other path.
+*/
+static mat *pcache_kv_create(int n)
+{
+	mat *m = mat_create_dev(n, LM_D_MODEL);
+
+	if (m && attn_vram_lazy())
+		mat_device_free(m);
+	return m;
+}
+
 attn_pcache *attn_pcache_create(int B, int T, int n_heads, int d_head)
 {
 	attn_pcache *c;
@@ -640,8 +666,8 @@ attn_pcache *attn_pcache_create(int B, int T, int n_heads, int d_head)
 	c->d_head = d_head;
 	c->x_in = mat_create_dev(n, LM_D_MODEL);
 	c->q = mat_create_dev(n, LM_D_MODEL);
-	c->k = mat_create_dev(n, LM_D_MODEL);
-	c->v = mat_create_dev(n, LM_D_MODEL);
+	c->k = pcache_kv_create(n);
+	c->v = pcache_kv_create(n);
 	c->concat = mat_create_dev(n, LM_D_MODEL);
 	c->seq = calloc((size_t)B, sizeof(attn_cache *));
 	if (!c->x_in || !c->q || !c->k || !c->v || !c->concat || !c->seq) {
@@ -650,8 +676,10 @@ attn_pcache *attn_pcache_create(int B, int T, int n_heads, int d_head)
 	}
 	mat_try_pin(c->x_in);
 	mat_try_pin(c->q);
-	mat_try_pin(c->k);
-	mat_try_pin(c->v);
+	if (!attn_vram_lazy()) {
+		mat_try_pin(c->k);
+		mat_try_pin(c->v);
+	}
 	mat_try_pin(c->concat);
 	/*
 	** Per-layer causal logsumexp (B·H·T), not a shared global. The tiled
@@ -669,7 +697,9 @@ attn_pcache *attn_pcache_create(int B, int T, int n_heads, int d_head)
 	** saves VRAM for huge T but is slower than strided GemmEx here.
 	** When scores do not fit, leave w_all NULL and use tiled FA.
 	*/
-	if (gpu_available() && T <= 256) {
+	/* The fused FA2 path needs no score buffer: 67 MB per layer saved. */
+	if (gpu_available() && T <= 256
+	    && !(g_flash_attn && gpu_attn_fa_usable(T, d_head))) {
 		size_t sb = (size_t)B * (size_t)n_heads * (size_t)T
 		    * (size_t)T * sizeof(ann_real);
 
@@ -716,8 +746,10 @@ static int pcache_ensure_scratch(attn_pcache *c)
 		c->dk = mat_create_dev(c->n, LM_D_MODEL);
 		c->dv = mat_create_dev(c->n, LM_D_MODEL);
 		c->dconcat = mat_create_dev(c->n, LM_D_MODEL);
-		c->dtmp = mat_create_dev(c->n, LM_D_MODEL);
-		if (c->dq && c->dk && c->dv && c->dconcat && c->dtmp) {
+		/* dtmp only serves mat_mul_wt_add's fallback: see pcache_wt_add. */
+		if (!attn_vram_lazy())
+			c->dtmp = mat_create_dev(c->n, LM_D_MODEL);
+		if (c->dq && c->dk && c->dv && c->dconcat) {
 			mat_try_pin(c->dq);
 			mat_try_pin(c->dk);
 			mat_try_pin(c->dv);
@@ -725,7 +757,21 @@ static int pcache_ensure_scratch(attn_pcache *c)
 			mat_try_pin(c->dtmp);
 		}
 	}
-	return (c->dq && c->dk && c->dv && c->dconcat && c->dtmp) ? 0 : -1;
+	return (c->dq && c->dk && c->dv && c->dconcat) ? 0 : -1;
+}
+
+/* dx += g W^T: the cuBLAS accumulate needs no scratch; dtmp on first fallback. */
+static int pcache_wt_add(attn_pcache *c, mat *dx, const mat *g, const mat *w)
+{
+	if (!c->dtmp) {
+		if (gpu_mat_mul_bt_acc(dx, g, w) == 0)
+			return 0;
+		c->dtmp = mat_create_dev(c->n, LM_D_MODEL);
+		if (!c->dtmp)
+			return -1;
+		mat_try_pin(c->dtmp);
+	}
+	return mat_mul_wt_add(dx, g, w, c->dtmp);
 }
 
 void attn_pcache_free(attn_pcache **c)
@@ -734,7 +780,8 @@ void attn_pcache_free(attn_pcache **c)
 
 	if (!c || !*c)
 		return;
-	mat_free(&(*c)->x_in);
+	if (!(*c)->x_in_alias)
+		mat_free(&(*c)->x_in);
 	mat_free(&(*c)->q);
 	mat_free(&(*c)->k);
 	mat_free(&(*c)->v);
@@ -779,7 +826,27 @@ static void write_head_rows(mat *dst, const mat *src, int row0, int head,
 		    (size_t)d_head * sizeof(ann_real));
 }
 
+/* Output projection: out = concat Wo (+ res when given, fused on BF16). */
+static int attn_project_out(mat *out, attn *a, attn_pcache *c, const mat *res)
+{
+	if (res && gpu_mat_mul_res(out, c->concat, a->wo, NULL, res) == 0)
+		return 0;
+	if (mat_mul(out, c->concat, a->wo) != 0)
+		return -1;
+	return res ? resid_add(out, res) : 0;
+}
+
 int attn_mha_forward_packed(mat *out, attn *a, const mat *x, attn_pcache *c)
+{
+	return attn_mha_forward_packed_res(out, a, x, c, NULL);
+}
+
+/*
+** Packed forward with the block's residual folded into the output
+** projection: out = res + Attn(x) Wo (res may be NULL).
+*/
+int attn_mha_forward_packed_res(mat *out, attn *a, const mat *x,
+	attn_pcache *c, const mat *res)
 {
 	int i;
 	int T;
@@ -791,16 +858,41 @@ int attn_mha_forward_packed(mat *out, attn *a, const mat *x, attn_pcache *c)
 		return -1;
 	T = c->T;
 	nh = a->n_heads;
-	copy_mat(c->x_in, x);
-	/* Fat projections: one (B*T) x D GEMM each. */
+	/*
+	** x is the block's LayerNorm output, which lives in the block cache
+	** until the backward: keep a pointer instead of a 16 MB copy, so the
+	** weight gradients also reuse the BF16 twin the LayerNorm published.
+	*/
+	if (!c->x_in_alias)
+		mat_free(&c->x_in);
+	c->x_in = (mat *)x;
+	c->x_in_alias = 1;
+	/* Fat projections: one (B*T) x D GEMM each (one BF16 GEMM when the fused attention follows). */
+	if (g_flash_attn && c->lse && gpu_attn_fa_usable(T, a->d_head))
+		gpu_attn_qkv_bf16_hint(T, a->d_head);
 	if (attn_qkv_project(c->q, c->k, c->v, a, x) != 0)
 		return -1;
 	/*
-	** Prefer TC GemmEx when w_all fits (faster at T=64 meter; FA ~3×
-	** slower here). Else tiled FA under --flash-attn (no T×T HBM). Then
-	** legacy / host.
+	** Under --flash-attn in BF16 with T % 64 == 0 and no seqlens the FA2
+	** mma.sync kernels run first (no T x T scores in HBM); the lse they
+	** write feeds their backward. When they cannot run (ANN_FA2=0, QKV
+	** rows missing) the TC GemmEx path follows if w_all was allocated
+	** (it is not while FA2 is usable), else tiled FA, then legacy / host.
 	*/
 	c->fused = 0;
+	if (g_flash_attn && c->lse
+	    && gpu_attn_fa_fwd(c->concat, c->q, c->k, c->v, c->B, T, nh,
+	    a->d_head, c->lse) == 0) {
+		static int s_fa2_once;
+
+		c->fused = 5;
+		if (!s_fa2_once) {
+			s_fa2_once = 1;
+			fprintf(stderr, "[attn] fused tensor-core attention (FA2 mma.sync)\n");
+			fflush(stderr);
+		}
+		return attn_project_out(out, a, c, res);
+	}
 	if (c->w_all
 	    && gpu_attn_tc_fwd(c->concat, c->w_all, c->q, c->k, c->v, c->B, T,
 	    nh, a->d_head) == 0) {
@@ -812,7 +904,7 @@ int attn_mha_forward_packed(mat *out, attn *a, const mat *x, attn_pcache *c)
 			fprintf(stderr, "[attn] Tensor-Core strided QK/AV path\n");
 			fflush(stderr);
 		}
-		return mat_mul(out, c->concat, a->wo);
+		return attn_project_out(out, a, c, res);
 	}
 	if (g_flash_attn
 	    && gpu_attn_flash_fwd(c->concat, c->q, c->k, c->v, c->B, T, nh,
@@ -826,12 +918,12 @@ int attn_mha_forward_packed(mat *out, attn *a, const mat *x, attn_pcache *c)
 			    "[attn] tiled flash (logsumexp, no T×T HBM)\n");
 			fflush(stderr);
 		}
-		return mat_mul(out, c->concat, a->wo);
+		return attn_project_out(out, a, c, res);
 	}
 	if (c->w_all && gpu_attn_causal_fwd(c->concat, c->w_all, c->q, c->k,
 	    c->v, c->B, T, nh, a->d_head) == 0) {
 		c->fused = 1;
-		return mat_mul(out, c->concat, a->wo);
+		return attn_project_out(out, a, c, res);
 	}
 	if (pcache_ensure_seq(c) != 0)
 		return -1;
@@ -864,9 +956,7 @@ int attn_mha_forward_packed(mat *out, attn *a, const mat *x, attn_pcache *c)
 	if (fail)
 		return -1;
 	mat_host_dirty(c->concat);
-	if (mat_mul(out, c->concat, a->wo) != 0)
-		return -1;
-	return 0;
+	return attn_project_out(out, a, c, res);
 }
 
 int attn_mha_backward_packed(mat *dx, const mat *dout, attn *a,
@@ -877,7 +967,6 @@ int attn_mha_backward_packed(mat *dx, const mat *dout, attn *a,
 	mat *dq;
 	mat *dk;
 	mat *dv;
-	mat *tmp;
 	int T;
 	int nh;
 	int fail;
@@ -896,12 +985,22 @@ int attn_mha_backward_packed(mat *dx, const mat *dout, attn *a,
 	dq = c->dq;
 	dk = c->dk;
 	dv = c->dv;
-	tmp = c->dtmp;
 	/* Fat weight grads + dconcat over all B*T rows. */
 	if (mat_outer_add(a->dwo, c->concat, dout) != 0)
 		return -1;
-	if (mat_mul_wt(dconcat, dout, a->wo) != 0)
+	/*
+	** Fused attention backward: dconcat only as the BF16 twin the kernel
+	** reads strided (no FP32 write, no head packing); else the FP32 product.
+	*/
+	if (!(c->fused == 5 && gpu_mat_mul_bt_twin(dconcat, dout, a->wo) == 0)
+	    && mat_mul_wt(dconcat, dout, a->wo) != 0)
 		return -1;
+	if (c->fused == 5) {
+		if (gpu_attn_fa_bwd(dq, dk, dv, dconcat, c->concat, c->q, c->k,
+		    c->v, c->lse, c->B, T, nh, a->d_head) != 0)
+			return -1;
+		goto proj;
+	}
 	if (c->fused == 4) {
 		if (gpu_attn_tiled_bwd(dq, dk, dv, dconcat, c->concat, c->q,
 		    c->k, c->v, c->lse, c->B, T, nh, a->d_head) != 0)
@@ -912,20 +1011,6 @@ int attn_mha_backward_packed(mat *dx, const mat *dout, attn *a,
 		if (!c->w_all
 		    || gpu_attn_tc_bwd(dq, dk, dv, dconcat, c->w_all, c->q,
 		    c->k, c->v, c->B, T, nh, a->d_head) != 0)
-			return -1;
-		goto proj;
-	}
-	if (c->fused == 2) {
-		/*
-		** Slow path used to fill a B·H·T·T score tensor
-		** (gpu_attn_recompute_w) and then a second dS tensor.
-		** Recompute only the row logsumexp of the same causal
-		** softmax, then the tiled backward. T stays the train window.
-		*/
-		if (gpu_attn_recompute_w(c->lse, c->q, c->k, c->B, T, nh,
-		    a->d_head) != 0
-		    || gpu_attn_tiled_bwd(dq, dk, dv, dconcat, c->concat,
-		    c->q, c->k, c->v, c->lse, c->B, T, nh, a->d_head) != 0)
 			return -1;
 		goto proj;
 	}
@@ -1040,17 +1125,27 @@ int attn_mha_backward_packed(mat *dx, const mat *dout, attn *a,
 	mat_host_dirty(dk);
 	mat_host_dirty(dv);
 proj:
+	/*
+	** The FA2 backward may have left [dQ|dK|dV] as one BF16 row block
+	** (B3): one dgrad GEMM with K = 3 D and one batched wgrad. Its dK and
+	** dV then exist nowhere else, so a failure there is an error.
+	*/
+	if (c->fused == 5) {
+		int r = gpu_attn_qkv_bwd(dx, a->dwq, a->dwk, a->dwv, c->x_in, dq,
+		    a->wq, a->wk, a->wv);
+
+		if (r <= 0)
+			return r;
+	}
 	if (mat_outer_add(a->dwq, c->x_in, dq) != 0
 	    || mat_outer_add(a->dwk, c->x_in, dk) != 0
 	    || mat_outer_add(a->dwv, c->x_in, dv) != 0)
 		return -1;
 	if (mat_mul_wt(dx, dq, a->wq) != 0)
 		return -1;
-	if (mat_mul_wt(tmp, dk, a->wk) != 0)
+	if (pcache_wt_add(c, dx, dk, a->wk) != 0)
 		return -1;
-	mat_axpy(dx, 1.0, tmp);
-	if (mat_mul_wt(tmp, dv, a->wv) != 0)
+	if (pcache_wt_add(c, dx, dv, a->wv) != 0)
 		return -1;
-	mat_axpy(dx, 1.0, tmp);
 	return 0;
 }

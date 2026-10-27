@@ -108,7 +108,6 @@
 - [Device-fused CE (S1)](device-fused-ce.md)
 - [GPU positional encoding (S2)](gpu-posenc.md)
 - [GPU bias grad reduce (S3)](gpu-bias-grad-reduce.md)
-- [FP16 loss scaling (S5b)](fp16-loss-scaling.md)
 - [Speed stack bench (S6/S10/S15)](speed-stack-bench.md)
 - [Bench harness (`lm bench step|gemm|decode|sweep`)](bench-harness.md)
 - [Fused epilogues (S8)](fused-epilogues.md)
@@ -126,6 +125,12 @@
 - [Fused QKV + CE (40TF T3)](fused-qkv-ce-40tf.md)
 - [Variable-length packing (E8)](variable-length-packing.md)
 - [Compile profile (E12)](compile-profile.md)
+- [GPU training audit: stale caches and BF16](gpu-training-audit.md)
+- [FFN ReLU backward in one pass (80 TF)](ffn-relu-backward-fusion.md)
+- [Fused attention on mma.sync (93 TF)](attention-fa2-mma.md)
+- [BF16 outputs straight from the GEMMs (97 TF)](bf16-direct-outputs.md)
+- [Code audit: dead paths and remaining compute](code-audit-dead-paths-and-compute.md)
+- [Plan: proper 8-bit and 4-bit training](low-precision-plan.md)
 
 ### From toy LM → small LLM
 
@@ -156,6 +161,13 @@
 Full code checklists live in the root [`../README.md`](../README.md): **Capable local LLM (C1–C14)** and **Toward ChatGPT-class** (`ARCH*` / `TOK*` / `DAT*` / `DIST*` / `ALN*` / `EV*` / `SRV*` / `OPS*`). Research notes for those land here as each track starts.
 
 ---
+
+### Talking model (talk-170m)
+
+- [Talking model plan](talk-170m-plan.md)
+- [Talking model data](talk-170m-data.md)
+- [Talking model pretraining run](talk-170m-pretrain.md)
+- [Talking model chat fine-tune](talk-170m-chat.md)
 
 # How this neural network works
 
@@ -350,7 +362,7 @@ OpenMP splits mat_mul tiles and attention heads across cores. Each head keeps pr
 ann_dot picks AVX-512, AVX2, or scalar at compile time. Pass ARCH=-mavx2 when the CPU supports it. ann_simd_backend reports which path linked.
 
 ### [Quantization](quantization.md)
-Int8 qmat stores weights with one scale for cheaper inference GEMVs. lm_quantize_head packs the LM head; lm_logits_at uses it when present. Training remains full precision.
+Int8 qmat stores weights with one scale for cheaper inference GEMVs (the LM-head hook lm_quantize_head was removed: nothing called it). Training remains full precision.
 
 ### [Optimized inference](optimized-inference.md)
 A KV cache stores per-layer Keys and Values so generate attends only the new query. lm_generate_kv walks the prompt once then appends tokens. lm_generate prefers that path with a full-reforward fallback.
@@ -364,7 +376,7 @@ Default builds link a CPU GPU stub so make test needs no CUDA. make cuda swaps i
 Mats may own a CUDA d_data twin with H2D/D2H helpers. Attention and LM caches try to pin H/Q/K/V when a GPU is present. The CPU stub leaves pinning as a no-op.
 
 ### [CUDA GEMM backward](cuda-gemm-backward.md)
-gpu_mat_mul_backward forms dA and dB for C=AB on device. mat_mul_bt and mat_outer_add try GPU kernels then fall back to CPU. Stubs keep make test green without nvcc.
+gpu_mat_mul_bt and gpu_mat_mul_at form dA and dB for C=AB on device (the combined gpu_mat_mul_backward was removed). mat_mul_bt and mat_outer_add try GPU kernels then fall back to CPU. Stubs keep make test green without nvcc.
 
 ### [Attention backward on GPU](gpu-attention-backward.md)
 MHA backward uses mat_mul, mat_mul_bt, mat_mul_at, and outer_add so CUDA GEMMs apply. Softmax Jacobian rows stay on the host.
@@ -376,7 +388,7 @@ FFN backward is GEMM-shaped with a ReLU mask. LayerNorm tries a CUDA row kernel 
 CE delta updates dw_head via mat_outer_add so CUDA outer_add can run. dhidden accumulates W times delta on the host for the toy vocab.
 
 ### [Adam step on GPU](gpu-adam.md)
-lm_adam_step packs flat param/grad/m/v buffers and tries gpu_adam_step. CUDA Adam updates moments and weights then zeros grads; stubs keep the host loop.
+lm_adam_step packs flat param/grad/m/v buffers and runs gpu_adam_step_dev_bf16 on the device-resident flat buffers. CUDA Adam updates moments and weights then zeros grads; stubs keep the host loop.
 
 ### [KV-cache generate on GPU](gpu-kv-generate.md)
 Decode-step attention tries gpu_kv_attn_decode for QKV, K/V append, scores, and Wo. Softmax of the short score row stays on the host; sampling stays on the host.
@@ -432,3 +444,17 @@ Shards are read from disk, tokenized once, and yielded as shuffled window batche
 
 ### [Autotrain executable](autotrain.md)
 A second binary, `./autotrain`, picks Target-oriented defaults (BPE, stream, batch auto, safe LR), ensures data, trains, and smoke-generates. `./ann lm train` stays the explicit teaching CLI; phase 2 adds a light LR sweep.
+
+# Talking model docs
+
+### [Talking model plan](talk-170m-plan.md)
+Train the D=1024, 12-block shape (about 185M parameters) on about 3B tokens of FineWeb-Edu and permissive code, then fine-tune on chat. The note sizes the data, the tokenizer and the GPU time.
+
+### [Talking model data](talk-170m-data.md)
+3.81B training tokens (3.21B FineWeb-Edu, 0.60B permissive code) encoded with a 16k BPE retrained on the mix, a held-out split, and 150k chat conversations in User:/Assistant: form. Id files are memory-mapped and counted in a long.
+
+### [Talking model pretraining run](talk-170m-pretrain.md)
+Batch 16 × 32 accumulation at window 256, BF16 flash attention, 11.7 GB peak VRAM and about 34k tok/s, about 33 h. Checkpoints every 30 minutes resume at the window they reached; a tmux driver restarts the run after a crash.
+
+### [Talking model chat fine-tune](talk-170m-chat.md)
+Two epochs on 24M tokens of User:/Assistant: conversations from the pretrained checkpoint. User turns are stored as -(id+1) and masked out of the loss on the host and the GPU, so the model is trained only on its answers.

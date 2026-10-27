@@ -138,6 +138,7 @@ static int run_lm_train_core(int argc, char **argv, int use_tower)
 	bpe *chk;
 	text_split sp;
 	text_dataset *val_ds;
+	const char *val_data;
 	text_stream *tstream;
 	text_stream *vstream;
 	double val_nll;
@@ -191,6 +192,7 @@ static int run_lm_train_core(int argc, char **argv, int use_tower)
 	split_arg = arg_value(argc, argv, "--split", "doc");
 	split_seed = atoi(arg_value(argc, argv, "--split-seed", "1"));
 	stream = arg_flag(argc, argv, NULL, "--stream");
+	val_data = arg_value(argc, argv, "--val-data", NULL);
 	shuffle_buf = atoi(arg_value(argc, argv, "--shuffle-buf", "1024"));
 	stride = atoi(arg_value(argc, argv, "--stride", "0"));
 	if (epochs <= 0)
@@ -221,23 +223,17 @@ static int run_lm_train_core(int argc, char **argv, int use_tower)
 		    "--early-stop-patience", "0")));
 		lm_train_set_diverge_delta(atof(arg_value(argc, argv,
 		    "--diverge-delta", "0")));
+		lm_train_set_ckpt_minutes(atoi(arg_value(argc, argv,
+		    "--ckpt-minutes", "0")));
 		if (arg_flag(argc, argv, NULL, "--varlen"))
 			lm_train_set_varlen(1);
 		if (arg_flag(argc, argv, NULL, "--cuda-graphs"))
 			lm_train_set_cuda_graphs(1);
 		{
 			int bf16 = arg_flag(argc, argv, NULL, "--bf16");
-			int fp16 = arg_flag(argc, argv, NULL, "--fp16");
 
-			if (bf16 && fp16) {
-				fprintf(stderr,
-				    "lm train: use only one of --bf16 / --fp16\n");
-				return 1;
-			}
 			if (bf16)
 				lm_train_set_compute_prec(GPU_PREC_BF16);
-			else if (fp16)
-				lm_train_set_compute_prec(GPU_PREC_FP16);
 			/*
 			** --fp8: E4M3 forward + E5M2 dgrad GEMMs; wgrad stays
 			** BF16; FP32 Adam masters. Implies --fp8-dgrad.
@@ -424,6 +420,9 @@ static int run_lm_train_core(int argc, char **argv, int use_tower)
 		model = lm_create();
 		opt = model ? lm_adam_create(model) : NULL;
 	}
+	/* LM pretraining is steadier with beta2 0.95 than Adam's 0.999. */
+	if (opt && arg_value(argc, argv, "--adam-beta2", NULL))
+		opt->beta2 = atof(arg_value(argc, argv, "--adam-beta2", "0.999"));
 	train_dbg(debug, "loading dataset / tokenizing");
 	if (model && opt && stream) {
 		tstream = text_stream_open(data, window, model->bpe,
@@ -443,6 +442,16 @@ static int run_lm_train_core(int argc, char **argv, int use_tower)
 	/* Non-stream: --stride N (e.g. =window) for one pass over ids. */
 	if (ds && !stream && stride > 0)
 		text_dataset_set_stride(ds, stride);
+	/* --val-data: held-out file kept apart from --data (e.g. *_val_ids.bin). */
+	if (ds && !stream && !use_split && val_data) {
+		val_ds = text_dataset_load_tok(val_data, window, model->bpe);
+		if (!val_ds) {
+			fprintf(stderr, "lm train: cannot load --val-data %s\n",
+			    val_data);
+			text_dataset_free(&ds);
+		} else
+			text_dataset_set_stride(val_ds, window);
+	}
 	if (!model || !opt || (stream ? !tstream : !ds)) {
 		lm_free(&model);
 		text_dataset_free(&ds);
@@ -502,7 +511,7 @@ static int run_lm_train_core(int argc, char **argv, int use_tower)
 	} else {
 		nw = text_dataset_n_windows(ds);
 		snprintf(msg, sizeof(msg),
-		    "dataset ready: %d token ids, %d windows (len %d)",
+		    "dataset ready: %ld token ids, %d windows (len %d)",
 		    ds->n_ids, nw, window);
 		train_dbg(debug, msg);
 		if (nw <= 0) {
@@ -520,6 +529,9 @@ static int run_lm_train_core(int argc, char **argv, int use_tower)
 		}
 		train_dbg(debug, "running mini-batch corpus training");
 		total_epochs = prev_epoch + epochs;
+		lm_train_set_shuffle_seed((unsigned int)seed);
+		/* A mid-epoch checkpoint stores the window it reached. */
+		lm_train_set_resume_pos(prev_step);
 		loss = lm_train_corpus_val(model, ds, opt, epochs, batch, lr,
 		    debug, out, prev_epoch, eval_every, eval_windows, val_ds);
 	}
@@ -1327,7 +1339,9 @@ int main(int argc, char *argv[])
 		printf("                 [--vocab PATH]\n");
 		printf("       ./anni lm [phrase]\n");
 		printf("       ./anni lm train [--data PATH] [--epochs N] [--out PATH]\n");
-		printf("                 [--resume PATH] [--lr RATE] [--window N]\n");
+		printf("                 [--resume PATH] [--val-data PATH] [--ckpt-minutes M]\n");
+		printf("                 [--adam-beta2 B]\n");
+		printf("                 [--lr RATE] [--window N]\n");
 		printf("                 [--batch N|auto] [--grad-accum K] [--vram-frac F]\n");
 		printf("                 [--seed N] [--eval-every N]\n");
 		printf("                 [--eval-windows M] [-y|--force] [-d|--debug]\n");

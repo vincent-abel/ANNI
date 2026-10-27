@@ -75,6 +75,7 @@ typedef struct	attn_pcache {
 	mat		*dconcat;
 	mat		*dtmp;
 	int		fused;		/* last forward used gpu_attn_causal_fwd */
+	int		x_in_alias;	/* x_in points at the caller's input, not owned */
 	int		B;
 	int		T;		/* per-sequence length */
 	int		n;		/* B*T */
@@ -82,11 +83,17 @@ typedef struct	attn_pcache {
 	int		d_head;
 } attn_pcache;
 
+/* ANN_VRAM_LAZY=0 restores the eager allocation of never-touched buffers. */
+int		attn_vram_lazy(void);
+
 /* S7: skip storing B·H·T·T weights; recompute in backward. */
 void		attn_set_flash(int on);
 int		attn_flash_enabled(void);
 attn_pcache	*attn_pcache_create(int B, int T, int n_heads, int d_head);
 void		attn_pcache_free(attn_pcache **c);
+/* Same, with the block residual fused into the output projection (res may be NULL). */
+int		attn_mha_forward_packed_res(mat *out, attn *a, const mat *x,
+		attn_pcache *c, const mat *res);
 int		attn_mha_forward_packed(mat *out, attn *a, const mat *x,
 			attn_pcache *c);
 int		attn_mha_backward_packed(mat *dx, const mat *dout, attn *a,

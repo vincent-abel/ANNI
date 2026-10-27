@@ -27,6 +27,12 @@ void	chat_session_free(chat_session *s);
 int	chat_session_ctx_used(const chat_session *s);
 
 /*
+** End a generated reply where the model starts the next "User:" or
+** "Assistant:" turn, and drop trailing newlines and spaces.
+*/
+void	chat_reply_cut(char *reply);
+
+/*
 ** Append user turn, trim, generate. Writes assistant reply (NUL-terminated)
 ** into reply[reply_cap]. Returns 0 on success, -1 on failure.
 */

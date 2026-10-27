@@ -20,7 +20,7 @@ typedef struct	train_progress {
 	int		nw;
 	int		done_steps;
 	int		total_steps;
-	int		tokens_done;
+	long		tokens_done;
 	double		nll;
 	double		win_nll;
 	double		val_nll;

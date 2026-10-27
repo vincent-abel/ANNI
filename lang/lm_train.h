@@ -31,17 +31,27 @@ void	lm_train_set_tokens_per_step(int n);
 void	lm_train_set_early_stop(int patience);
 /* E16: abort if train/val NLL rises by more than delta vs best, or non-finite. */
 void	lm_train_set_diverge_delta(double delta);
+/*
+** Corpus training only: save the checkpoint every `minutes` of wall time
+** mid-epoch (0 = epoch ends only). The file stores the epoch and window
+** reached; lm_train_set_resume_pos(step) makes the next run continue there.
+*/
+void	lm_train_set_ckpt_minutes(int minutes);
+void	lm_train_set_resume_pos(int window_pos);
+/* Seed for the per-epoch window shuffle (from --seed). */
+void	lm_train_set_shuffle_seed(unsigned int seed);
+/* Fill order[0..nw) with the window order of absolute epoch epoch_num. */
+void	lm_train_epoch_order(int *order, int nw, int epoch_num);
 /* R9/S11: block activation checkpointing (recompute in bwd). */
 void	lm_train_set_act_checkpoint(int on);
 /* E8: emit/pad short EOF windows and mask pad positions in CE (+ fused attn). */
 void	lm_train_set_varlen(int on);
 /* S4/R12: capture/replay packed fwd+bwd when shapes are steady (0 = off). */
 void	lm_train_set_cuda_graphs(int on);
-/* S5a/S5b: GPU_PREC_*; FP16 enables dynamic loss scaling. */
+/* S5a/S5b: GPU_PREC_FP32 or GPU_PREC_BF16. */
 void	lm_train_set_compute_prec(int prec);
 void	lm_train_set_fp8(int on);
 void	lm_train_set_fp8_dgrad(int on);
-double	lm_train_loss_scale(void);	/* current scale (1.0 if not FP16) */
 /* S7: Flash-style attn (no persistent B·H·T·T weights). */
 void	lm_train_set_flash_attn(int on);
 /* S13: optional CPU offload of Adam m/v between steps. */
