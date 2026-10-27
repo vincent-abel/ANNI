@@ -48,11 +48,10 @@ void	lm_train_set_act_checkpoint(int on);
 void	lm_train_set_varlen(int on);
 /* S4/R12: capture/replay packed fwd+bwd when shapes are steady (0 = off). */
 void	lm_train_set_cuda_graphs(int on);
-/* S5a/S5b: GPU_PREC_*; FP16 enables dynamic loss scaling. */
+/* S5a/S5b: GPU_PREC_FP32 or GPU_PREC_BF16. */
 void	lm_train_set_compute_prec(int prec);
 void	lm_train_set_fp8(int on);
 void	lm_train_set_fp8_dgrad(int on);
-double	lm_train_loss_scale(void);	/* current scale (1.0 if not FP16) */
 /* S7: Flash-style attn (no persistent B·H·T·T weights). */
 void	lm_train_set_flash_attn(int on);
 /* S13: optional CPU offload of Adam m/v between steps. */

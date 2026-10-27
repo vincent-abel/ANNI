@@ -108,7 +108,6 @@
 - [Device-fused CE (S1)](device-fused-ce.md)
 - [GPU positional encoding (S2)](gpu-posenc.md)
 - [GPU bias grad reduce (S3)](gpu-bias-grad-reduce.md)
-- [FP16 loss scaling (S5b)](fp16-loss-scaling.md)
 - [Speed stack bench (S6/S10/S15)](speed-stack-bench.md)
 - [Fused epilogues (S8)](fused-epilogues.md)
 - [Multi-stream train (S9)](multi-stream-train.md)

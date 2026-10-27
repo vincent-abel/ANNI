@@ -210,7 +210,7 @@ Observed headroom on a 16 GB card at current toy scale (`D=256`, `LM_BATCH_AUT
 - [x] **R3** Lift `LM_BATCH_AUTO_MAX` (64 → **1024**) and relax `lm_packed_bytes` so `--batch auto` can target most of free VRAM (**huge B**); see [docs/huge-batch-vram.md](docs/huge-batch-vram.md)
 - [x] **R4** Large manual `--batch` (**128–1024+**) with OOM backoff (halve `B` on alloc fail); default/`-d` guidance for 16 GB cards
 - [x] **R12** **CUDA Graphs**: wired into `pack_run` via `--cuda-graphs` (**S4**); capture fails if host ops remain
-- [x] **R10** **Mixed precision**: TF32 on; **`--bf16` / `--fp16`** GemmEx + FP32 masters (**S5a/S5b**, C13)
+- [x] **R10** **Mixed precision**: TF32 on; **`--bf16`** GemmEx + FP32 masters (**S5a/S5b**, C13)
 
 **Speed stack wave 1 (glue → graphs → MP)**
 
@@ -219,7 +219,7 @@ Observed headroom on a 16 GB card at current toy scale (`D=256`, `LM_BATCH_AUT
 - [x] **S3** GPU FFN bias column-sum grads; see [docs/gpu-bias-grad-reduce.md](docs/gpu-bias-grad-reduce.md)
 - [x] **S4** Wire CUDA Graphs into packed train (finish R12); see [docs/cuda-graphs-train.md](docs/cuda-graphs-train.md)
 - [x] **S5a** BF16 GEMMs + FP32 masters (`--bf16`); see [docs/mixed-precision-train.md](docs/mixed-precision-train.md)
-- [x] **S5b** FP16 + dynamic loss scaling (`--fp16`); see [docs/fp16-loss-scaling.md](docs/fp16-loss-scaling.md)
+- [x] **S5b** FP16 + dynamic loss scaling (`--fp16`); removed again (the loss was never scaled, so the unscale was wrong; BF16 needs no scaling)
 - [x] **S6** Bench util / VRAM / ms/tok after S1–S5; see [docs/speed-stack-bench.md](docs/speed-stack-bench.md)
 
 **W1 gate:** Packed CE keeps logits/delta on device (no full D2H). Graphs wire via `--cuda-graphs` (skip varlen; CE malloc/D2H scalar can still fail capture). Remaining bound: launch tax + materialized/`recompute` `B·H·T·T` attn — Wave 2.

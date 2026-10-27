@@ -231,17 +231,9 @@ static int run_lm_train_core(int argc, char **argv, int use_tower)
 			lm_train_set_cuda_graphs(1);
 		{
 			int bf16 = arg_flag(argc, argv, NULL, "--bf16");
-			int fp16 = arg_flag(argc, argv, NULL, "--fp16");
 
-			if (bf16 && fp16) {
-				fprintf(stderr,
-				    "lm train: use only one of --bf16 / --fp16\n");
-				return 1;
-			}
 			if (bf16)
 				lm_train_set_compute_prec(GPU_PREC_BF16);
-			else if (fp16)
-				lm_train_set_compute_prec(GPU_PREC_FP16);
 			/*
 			** --fp8: E4M3 forward + E5M2 dgrad GEMMs; wgrad stays
 			** BF16; FP32 Adam masters. Implies --fp8-dgrad.
