@@ -1302,15 +1302,15 @@ static int g_act_bf16_rr;
 static int ensure_half_buf(void **buf, size_t *cap, size_t bytes);
 static int half_wt_convert(void *dst, const ann_real *src, int n, int bf16);
 
-#define GRAD_TWIN_SLOTS	10	/* 8 round robin (dq, dk, dv, the LN-backward outputs, dh...) + the big one + the in-place head delta */
-#define GRAD_TWIN_BIG	8	/* the slot for twins over GRAD_TWIN_BIG_N elements */
-#define GRAD_TWIN_BIG_N	((size_t)16 * 1024 * 1024)
+#define GRAD_TWIN_SLOTS	9	/* 8 round robin (dq, dk, dv, the LN-backward outputs, dh...) + the in-place head delta */
+#define GRAD_TWIN_RR	8	/* the round-robin slots */
+#define GRAD_TWIN_BIG_N	((size_t)16 * 1024 * 1024)	/* a twin above this (the head's delta) is refused */
 /*
 ** The head's BF16 delta written in place over its own FP32 logits rows by
 ** the fused softmax-CE kernel: half points into the logits buffer (borrowed,
 ** never allocated or freed through this slot) and ld is 2 V.
 */
-#define GRAD_TWIN_INPLACE	9
+#define GRAD_TWIN_INPLACE	8
 typedef struct {
 	void		*half;
 	size_t		cap;
@@ -1350,28 +1350,14 @@ static void *grad_twin_put(const ann_real *src, size_t n)
 
 	/*
 	** The head's delta (rows x vocab, 134 MB in BF16) would size every
-	** round-robin slot to it: it gets the one big slot instead, so its
-	** dgrad reuses the wgrad's conversion for 134 MB of VRAM.
+	** round-robin slot to it: it gets no twin here (the fused CE kernel
+	** writes it in place over the logits, GRAD_TWIN_INPLACE), which keeps
+	** the full run under the 85% VRAM line.
 	*/
-	if (n > GRAD_TWIN_BIG_N) {
-		/*
-		** Opt-in (ANN_GRAD_TWIN_BIG=1): the 134 MB put the full
-		** talk-170m run at 86% of the card, over its 85% line.
-		*/
-		static int big_on = -1;
-
-		if (big_on < 0) {
-			const char *ev = getenv("ANN_GRAD_TWIN_BIG");
-
-			big_on = (ev && ev[0] == '1') ? 1 : 0;
-		}
-		if (!big_on)
-			return NULL;
-		e = &g_grad_twin[GRAD_TWIN_BIG];
-	} else {
-		e = &g_grad_twin[g_grad_twin_rr % GRAD_TWIN_BIG];
-		g_grad_twin_rr++;
-	}
+	if (n > GRAD_TWIN_BIG_N)
+		return NULL;
+	e = &g_grad_twin[g_grad_twin_rr % GRAD_TWIN_RR];
+	g_grad_twin_rr++;
 	if (ensure_half_buf(&e->half, &e->cap, n * 2) != 0
 	    || half_wt_convert(e->half, src, (int)n, 1) != 0) {
 		e->src = NULL;
@@ -1412,7 +1398,7 @@ static void *grad_twin_take(const ann_real *src, size_t n, int dense_ld,
 */
 static void *grad_twin_reserve(const ann_real *src, size_t n)
 {
-	grad_twin_slot *e = &g_grad_twin[g_grad_twin_rr % GRAD_TWIN_BIG];
+	grad_twin_slot *e = &g_grad_twin[g_grad_twin_rr % GRAD_TWIN_RR];
 
 	g_grad_twin_rr++;
 	if (ensure_half_buf(&e->half, &e->cap, n * 2) != 0) {
@@ -1740,35 +1726,6 @@ static const void *act_bf16_get(const ann_real *fp32, int n)
 		}
 	}
 	return NULL;
-}
-
-/* Compat wrappers for LN→GEMM call sites. */
-static void ln_bf16_publish(const ann_real *fp32, int n, int bf16)
-{
-	if (bf16)
-		act_bf16_publish(fp32, n);
-}
-
-static const void *ln_bf16_consume(const ann_real *fp32, int n)
-{
-	return act_bf16_get(fp32, n);
-}
-
-extern "C" void gpu_half_wt_refresh_all(void)
-{
-	int i;
-	half_wt *e;
-
-	for (i = 0; i < HALF_WT_SLOTS; i++) {
-		e = &g_half_wt[i];
-		if (!e->fp32 || !e->half || e->n == 0)
-			continue;
-		if (half_wt_convert(e->half, e->fp32, (int)e->n, e->bf16) != 0)
-			e->valid = 0;
-		else
-			e->valid = 1;
-	}
-	g_wt_epoch++;
 }
 
 /*
@@ -6703,7 +6660,7 @@ extern "C" int gpu_attn_qkv_fused(mat *q, mat *k, mat *v, const mat *x,
 	use_bf16 = 0;
 #endif
 	{
-		const void *cached = use_bf16 ? ln_bf16_consume(dx, (int)nA)
+		const void *cached = use_bf16 ? act_bf16_get(dx, (int)nA)
 		    : NULL;
 		void *x_half;
 
@@ -7040,7 +6997,7 @@ extern "C" int gpu_layernorm_forward_ex(ann_real *y, const ann_real *x,
 	}
 	if (rc == 0 && y && T > 0 && d > 0
 	    && g_compute_prec == GPU_PREC_BF16)
-		ln_bf16_publish(y, T * d, 1);
+		act_bf16_publish(y, T * d);
 	return rc;
 }
 

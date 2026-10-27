@@ -66,8 +66,6 @@ void	gpu_host_forget(const void *host);
 const char	*gpu_debug_last_error(void);
 /* ANN_OP_PROF=1: print and reset the per-operation GPU time table (stderr). */
 void	gpu_op_prof_dump(void);
-/* Reconvert all cached weight twins in place (stable addresses; after Adam). */
-void	gpu_half_wt_refresh_all(void);
 /*
 ** Register a flat BF16 twin of Adam's d_param. half_wt_get serves slices from
 ** this buffer; Adam updates it in the same kernel as the FP32 master.
