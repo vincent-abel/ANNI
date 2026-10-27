@@ -70,6 +70,7 @@ Six worker agents implemented the audit's approved items on branches off candida
 | 21 | the audit's dead paths, the `--fp16` path, the FP8 no-ops and the WMMA attention set deleted (+404/-2329; `ANN_FA2=0` now means the Tensor-Core path) | neutral, loss same | 9049 MiB |
 | 22 | B3 one dgrad GEMM (K = 3D) and one batched wgrad for the QKV backward (only with the twins on), B6 split-K-1 variants timed in the cuBLASLt choice | neutral with twins off, loss same | 9034 MiB |
 | 23 | fixed-order (deterministic) gradient column sums and embedding scatter (`ANN_DET_SUM=1`), cuBLASLt algorithm cache keyed by the operands' alignment, CUDA-graph replay code (`--cuda-graphs`, off) | twins ON: 71.0k tok/s vs 64.9k for 22 (+9.3%), loss same | 9169 MiB |
+| 24 | cuBLASLt cache keyed on the leading dimensions too, 128 slots, a capture is refused rather than choosing an algorithm inside it (fixes the 6-of-8 replay count of check 8; `make test-gpu` all passed again) | 71.0k vs 70.5k, loss same. Graphs ON trial on the same binary: 70.4k tok/s, peak 10547 MiB, loss same: no gain at this size, so the driver keeps `--cuda-graphs` off | 9165 MiB |
 
 Live on candidate 20: 68.6k tok/s, ~103.6 TF on the meter, 8.8 GB.
 
