@@ -91,4 +91,28 @@ double	lm_nll_stream(const lm *model, text_stream *st, int max_windows);
 double	lm_nll_windows(const lm *model, const text_dataset *ds,
 		int max_windows);
 
+/*
+** lm bench step: one timed full train step on a fixed packed batch.
+** ms covers pack_run (fwd, fused CE, bwd) + Adam, device-synced at both ends.
+** Phase times are filled only under profile (else, and on graph replay, -1).
+** ce is the microbatch mean CE when sampled, else -1.
+*/
+typedef struct	lm_step_time {
+	double	ms;
+	double	fwd_ms;
+	double	loss_ms;
+	double	bwd_ms;
+	double	adam_ms;
+	double	ce;
+} lm_step_time;
+
+/*
+** Run warmup + steps packed train steps on ids[*B * T] (the same batch every
+** step) through the production pack_run path. *B shrinks if the packed working
+** set does not fit. Fills out[0..steps-1]; returns 0, or -1 on failure.
+*/
+int	lm_train_bench_packed(lm *model, lm_adam *opt, const int *ids, int *B,
+		int T, double lr, int warmup, int steps, int profile,
+		lm_step_time *out);
+
 #endif

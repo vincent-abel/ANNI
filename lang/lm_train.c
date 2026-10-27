@@ -80,6 +80,8 @@ static int g_act_checkpoint;
 static int g_varlen;
 static int g_cuda_graphs;
 static int g_compute_prec;
+static int g_bench_prof;		/* lm bench --profile */
+static double g_phase_ms[3];	/* fwd, loss, bwd of the last body */
 
 void lm_train_set_progress(train_progress_fn fn, void *userdata)
 {
@@ -708,6 +710,7 @@ static int pack_run_body(lm *model, pack_ctx *p, int b, double *mean_ce,
 	struct timeval tv2;
 	struct timeval tv3;
 	int rc;
+	int prof;
 
 	if (!s_prof_init) {
 		const char *e = getenv("ANN_STEP_PROF");
@@ -715,16 +718,18 @@ static int pack_run_body(lm *model, pack_ctx *p, int b, double *mean_ce,
 		s_prof_left = (e && e[0] == '1') ? 8 : 0;
 		s_prof_init = 1;
 	}
+	/* lm bench --profile: time every phase into g_phase_ms, no print. */
+	prof = s_prof_left > 0 || g_bench_prof;
 	/* Keep seqlens through transformer bwd (TC/FA masks). */
 	gpu_attn_set_seqlens(lens);
 	lm_loss_set_mask(p->mask);
-	if (s_prof_left > 0)
+	if (prof)
 		gettimeofday(&tv0, NULL);
 	if (lm_forward_cache_packed(model, p->ids, b, p->T, s->c) != 0) {
 		gpu_attn_set_seqlens(NULL);
 		return -1;
 	}
-	if (s_prof_left > 0) {
+	if (prof) {
 		gpu_device_sync();
 		gettimeofday(&tv1, NULL);
 	}
@@ -735,13 +740,13 @@ static int pack_run_body(lm *model, pack_ctx *p, int b, double *mean_ce,
 		gpu_attn_set_seqlens(NULL);
 		return -1;
 	}
-	if (s_prof_left > 0) {
+	if (prof) {
 		gpu_device_sync();
 		gettimeofday(&tv2, NULL);
 	}
 	rc = lm_backward_packed(model, s->dh, s->c);
 	gpu_attn_set_seqlens(NULL);
-	if (s_prof_left > 0) {
+	if (prof) {
 		double ms0;
 		double ms1;
 		double ms2;
@@ -754,10 +759,15 @@ static int pack_run_body(lm *model, pack_ctx *p, int b, double *mean_ce,
 		    + (tv2.tv_usec - tv1.tv_usec) / 1e3;
 		ms2 = (tv3.tv_sec - tv2.tv_sec) * 1e3
 		    + (tv3.tv_usec - tv2.tv_usec) / 1e3;
-		fprintf(stderr,
-		    "[stepprof] fwd=%.1fms loss=%.1fms bwd=%.1fms total=%.1fms\n",
-		    ms0, ms1, ms2, ms0 + ms1 + ms2);
-		s_prof_left--;
+		g_phase_ms[0] = ms0;
+		g_phase_ms[1] = ms1;
+		g_phase_ms[2] = ms2;
+		if (s_prof_left > 0) {
+			fprintf(stderr,
+			    "[stepprof] fwd=%.1fms loss=%.1fms bwd=%.1fms total=%.1fms\n",
+			    ms0, ms1, ms2, ms0 + ms1 + ms2);
+			s_prof_left--;
+		}
 	}
 	return rc;
 }
@@ -1991,4 +2001,82 @@ fail:
 	}
 	pack_ctx_free(&pk);
 	return -1.0;
+}
+
+/* ---- lm bench hook ------------------------------------------------------ */
+
+int lm_train_bench_packed(lm *model, lm_adam *opt, const int *ids, int *B,
+	int T, double lr, int warmup, int steps, int profile,
+	lm_step_time *out)
+{
+	pack_ctx pk;
+	lm_step_time *o;
+	double *ce_ptr;
+	double ce;
+	double t0;
+	double ta;
+	double t1;
+	int Bv;
+	int i;
+	int rc;
+
+	if (!model || !opt || !ids || !B || *B < 1 || T < 2 || T > LM_MAX_CTX
+	    || warmup < 0 || steps < 1 || lr <= 0.0 || !out)
+		return -1;
+	Bv = *B;
+	if (pack_ctx_init(&pk, &Bv, T, 0) != 0)
+		return -1;
+	*B = Bv;
+	memcpy(pk.ids, ids, (size_t)Bv * (size_t)T * sizeof(int));
+	for (i = 0; i < Bv; i++)
+		pk.lens[i] = T;
+	mat_try_pin(model->dw_head);
+	lm_weights_to_device(model);
+	lm_adam_invalidate(opt);
+	(void)gpu_copy_stream();
+	opt->weight_decay = g_weight_decay;
+	opt->grad_clip = g_grad_clip;
+	g_bench_prof = profile ? 1 : 0;
+	rc = -1;
+	for (i = 0; i < warmup + steps; i++) {
+		o = i >= warmup ? &out[i - warmup] : NULL;
+		/*
+		** Same pack_run + Adam as lm_train_corpus_val. CE is fetched on
+		** the first, last and every 8th timed step only, like the train
+		** meter, so the D2H read does not dominate small steps.
+		*/
+		ce = -1.0;
+		ce_ptr = (o && (i == warmup || i == warmup + steps - 1
+		    || ((i - warmup) & 7) == 0)) ? &ce : NULL;
+		g_phase_ms[0] = -1.0;
+		g_phase_ms[1] = -1.0;
+		g_phase_ms[2] = -1.0;
+		gpu_device_sync();
+		t0 = wall_sec();
+		vec_zero(model->db_head);
+		gpu_set_sync_mode(GPU_SYNC_BATCH);
+		if (pack_run(model, &pk, Bv, ce_ptr) != 0)
+			goto done;
+		if (profile)
+			gpu_device_sync();
+		ta = wall_sec();
+		lm_adam_step_scaled(opt, lr, 1.0 / (double)Bv);
+		gpu_device_sync();
+		t1 = wall_sec();
+		if (!o)
+			continue;
+		o->ms = 1000.0 * (t1 - t0);
+		/* Graph replay skips the timed body: phases stay -1. */
+		o->fwd_ms = g_phase_ms[0];
+		o->loss_ms = g_phase_ms[1];
+		o->bwd_ms = g_phase_ms[2];
+		o->adam_ms = profile ? 1000.0 * (t1 - ta) : -1.0;
+		o->ce = ce;
+	}
+	rc = 0;
+done:
+	g_bench_prof = 0;
+	gpu_set_sync_mode(GPU_SYNC_EAGER);
+	pack_ctx_free(&pk);
+	return rc;
 }
