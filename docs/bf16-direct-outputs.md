@@ -67,6 +67,7 @@ Six worker agents implemented the audit's approved items on branches off candida
 | 18 | batched validation probe (16 windows per forward, ~2 s instead of ~40 s), resume double-probe fix, chunked checkpoint write (same bytes) | 66.4k tok/s vs 65.6k, loss same | 9934 MiB |
 | 19 | B1 device bias caches, B2 head bias in the CE kernel, B4 in-place residual gradients, B8 no per-microbatch syncs | with 20 | |
 | 20 | A1 grid-stride grad norm, A3 float4 Adam, B5 dvec in the attention backward prologue, B9 no FP32 dK/dV stores, B11 concat twin from the attention forward, B12 x_hat recomputed | +5% over 18, loss same | 9047 MiB |
+| 21 | the audit's dead paths, the `--fp16` path, the FP8 no-ops and the WMMA attention set deleted (+404/-2329; `ANN_FA2=0` now means the Tensor-Core path) | neutral, loss same | 9049 MiB |
 
 Live on candidate 20: 68.6k tok/s, ~103.6 TF on the meter, 8.8 GB.
 
