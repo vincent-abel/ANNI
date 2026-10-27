@@ -6620,6 +6620,19 @@ extern "C" int gpu_attn_fa_usable(int T, int dh)
 ** Fused tensor-core causal attention forward (BF16 mode). Writes concat and
 ** lse; -1 = caller uses another path.
 */
+/* ANN_FA2_O16=0: concat's BF16 twin is converted after the FA2 forward instead of written by it. */
+static int fa2_o16_on(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		const char *e = getenv("ANN_FA2_O16");
+
+		on = (e && e[0] == '0') ? 0 : 1;
+	}
+	return on;
+}
+
 extern "C" int gpu_attn_fa_fwd(mat *concat, const mat *q, const mat *k,
 	const mat *v, int B, int T, int H, int dh, mat *lse)
 {
@@ -6627,6 +6640,7 @@ extern "C" int gpu_attn_fa_fwd(mat *concat, const mat *q, const mat *k,
 	ann_real *dq, *dk, *dv, *dc;
 	int oq, ok, ov, oc, rc = -1;
 	size_t smem;
+	act_bf16_slot *o16 = NULL;
 
 	if (!concat || !q || !k || !v || !lse || !lse->d_data
 	    || !att_args_ok(B, T, H, dh) || !fa_wmma_ok(T, dh)
@@ -6671,8 +6685,12 @@ extern "C" int gpu_attn_fa_fwd(mat *concat, const mat *q, const mat *k,
 			const __nv_bfloat16 *bq = (const __nv_bfloat16 *)qs->buf;
 			const int Dm = H * dh;
 
+			/* B11: the kernel writes concat's BF16 twin itself (ANN_FA2_O16=0: converted after). */
+			if (!oc && fa2_o16_on())
+				o16 = act_bf16_slot_for(dc, B * T * H * dh);
 			{ OpNest _n(OP_ATT_GEMM_ID); if (fa2_fwd_launch_lay(dc, lse->d_data, bq, bq + Dm, bq + 2 * Dm, B, T, H, dh,
-			    (float)(1.0 / sqrt((double)dh)), fa2_lay_rows(T, 3 * Dm, dh)) != 0)
+			    (float)(1.0 / sqrt((double)dh)), fa2_lay_rows(T, 3 * Dm, dh),
+			    o16 ? (__nv_bfloat16 *)o16->half : NULL) != 0)
 				goto fa_out; }
 			if (!reported++)
 				fprintf(stderr, "[attn] FA2 kernels on the fused BF16 QKV rows (no head packing)\n");
@@ -6719,7 +6737,9 @@ fa_launched:
 		lse->on_device = MAT_DEV_DEVICE;
 		rc = 0;
 		/* BF16 twin of concat for the Wo GEMM now and its wgrad later. */
-		if (!oc)
+		if (o16)
+			o16->live = 1;	/* written by the FA2 forward */
+		else if (!oc)
 			act_bf16_publish(dc, B * T * H * dh);
 	}
 fa_out:
