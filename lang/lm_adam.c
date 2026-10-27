@@ -2,13 +2,14 @@
 **	Adam optimizer over flat LM param/grad slots
 */
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include "gpu.h"
 #include "gradutil.h"
 #include "lm_adam.h"
 
 static void add_seg(lm_adam *opt, mat *w, mat *dw, vec *wv, vec *dwv,
-	int off, int n, int host_use)
+	int off, int n)
 {
 	lm_adam_seg *s;
 
@@ -19,10 +20,9 @@ static void add_seg(lm_adam *opt, mat *w, mat *dw, vec *wv, vec *dwv,
 	s->dwv = dwv;
 	s->off = off;
 	s->n = n;
-	s->host_use = host_use;
 }
 
-static void add_mat(lm_adam *opt, int *i, mat *w, mat *dw, int host_use)
+static void add_mat(lm_adam *opt, int *i, mat *w, mat *dw)
 {
 	int k;
 	int n;
@@ -30,7 +30,7 @@ static void add_mat(lm_adam *opt, int *i, mat *w, mat *dw, int host_use)
 	if (!w || !dw || !w->data || !dw->data)
 		return;
 	n = w->rows * w->cols;
-	add_seg(opt, w, dw, NULL, NULL, *i, n, host_use);
+	add_seg(opt, w, dw, NULL, NULL, *i, n);
 	for (k = 0; k < n; k++) {
 		opt->slots[*i].param = &w->data[k];
 		opt->slots[*i].grad = &dw->data[k];
@@ -46,7 +46,7 @@ static void add_vec(lm_adam *opt, int *i, vec *w, vec *dw)
 
 	if (!w || !dw || !w->data || !dw->data)
 		return;
-	add_seg(opt, NULL, NULL, w, dw, *i, w->n, 1);
+	add_seg(opt, NULL, NULL, w, dw, *i, w->n);
 	for (k = 0; k < w->n; k++) {
 		opt->slots[*i].param = &w->data[k];
 		opt->slots[*i].grad = &dw->data[k];
@@ -111,20 +111,21 @@ lm_adam *lm_adam_create(lm *model)
 	opt->eps = 1e-8;
 	opt->weight_decay = 0.0;
 	opt->grad_clip = 0.0;
+	opt->last_grad_norm = 0.0;
 	i = 0;
-	add_mat(opt, &i, model->w_head, model->dw_head, 0);
+	add_mat(opt, &i, model->w_head, model->dw_head);
 	add_vec(opt, &i, model->b_head, model->db_head);
-	/* Embedding lookup/scatter are host code: table/dtable stay host-used. */
-	add_mat(opt, &i, model->embed->table, model->embed->dtable, 0); /* R2 */
+	/* The embedding table is updated like every other matrix. */
+	add_mat(opt, &i, model->embed->table, model->embed->dtable); /* R2 */
 	for (n = 0; n < model->tr->n_blocks; n++) {
 		b = &model->tr->blocks[n];
-		add_mat(opt, &i, b->attn->wq, b->attn->dwq, 0);
-		add_mat(opt, &i, b->attn->wk, b->attn->dwk, 0);
-		add_mat(opt, &i, b->attn->wv, b->attn->dwv, 0);
-		add_mat(opt, &i, b->attn->wo, b->attn->dwo, 0);
-		add_mat(opt, &i, b->ffn->w1, b->ffn->dw1, 0);
+		add_mat(opt, &i, b->attn->wq, b->attn->dwq);
+		add_mat(opt, &i, b->attn->wk, b->attn->dwk);
+		add_mat(opt, &i, b->attn->wv, b->attn->dwv);
+		add_mat(opt, &i, b->attn->wo, b->attn->dwo);
+		add_mat(opt, &i, b->ffn->w1, b->ffn->dw1);
 		add_vec(opt, &i, b->ffn->b1, b->ffn->db1);
-		add_mat(opt, &i, b->ffn->w2, b->ffn->dw2, 0);
+		add_mat(opt, &i, b->ffn->w2, b->ffn->dw2);
 		add_vec(opt, &i, b->ffn->b2, b->ffn->db2);
 		add_vec(opt, &i, b->ln1->gamma, b->ln1->dgamma);
 		add_vec(opt, &i, b->ln1->beta, b->ln1->dbeta);
@@ -135,8 +136,35 @@ lm_adam *lm_adam_create(lm *model)
 	return opt;
 }
 
+/*
+** Weights / grads aliased into the flats must not keep pointing into them
+** once the flats are freed: pull the weights to host and detach the views,
+** so a later mat_free never cudaFree's a slice of the flat.
+*/
+static void unalias_segs(lm_adam *opt)
+{
+	int i;
+
+	for (i = 0; i < opt->n_segs; i++) {
+		lm_adam_seg *s = &opt->segs[i];
+
+		if (s->w && s->w->d_data && opt->d_param
+		    && s->w->d_data == opt->d_param + s->off) {
+			(void)mat_pull_host(s->w);
+			s->w->d_data = NULL;
+			s->w->on_device = MAT_DEV_HOST;
+		}
+		if (s->dw && s->dw->d_data && opt->d_grad
+		    && s->dw->d_data == opt->d_grad + s->off) {
+			s->dw->d_data = NULL;
+			s->dw->on_device = MAT_DEV_HOST;
+		}
+	}
+}
+
 static void release_gpu(lm_adam *opt)
 {
+	unalias_segs(opt);
 	gpu_adam_set_bf16_flat(NULL, NULL, 0);
 	gpu_free(opt->d_param);
 	gpu_free(opt->d_param_bf16);
@@ -216,7 +244,7 @@ static int gpu_buffers_init(lm_adam *opt)
 			ann_real *dp;
 			ann_real *dg;
 
-			if (!s->w || !s->dw || s->host_use)
+			if (!s->w || !s->dw)
 				continue;
 			nb = (size_t)s->n * sizeof(ann_real);
 			dp = opt->d_param + s->off;
@@ -233,10 +261,22 @@ static int gpu_buffers_init(lm_adam *opt)
 				continue;
 			s->w->d_data = dp;
 			s->w->on_device = MAT_DEV_ALIASED;
+			/*
+			** The first step's gradient already sits in the dW twin
+			** (or host): carry it into the flat. Zeroing here made
+			** step 1 a pure weight-decay step for every matrix.
+			*/
+			if (s->dw->d_data && s->dw->on_device != MAT_DEV_HOST) {
+				if (gpu_memcpy_d2d(dg, s->dw->d_data, nb) != 0)
+					return -1;
+			} else if (s->dw->data) {
+				if (gpu_memcpy_h2d(dg, s->dw->data, nb) != 0)
+					return -1;
+			} else
+				(void)gpu_memset(dg, 0, nb);
 			mat_device_free(s->dw);
 			s->dw->d_data = dg;
 			s->dw->on_device = MAT_DEV_ALIASED;
-			(void)gpu_memset(dg, 0, nb);
 		}
 		opt->params_valid = 1;
 		gpu_half_wt_invalidate(NULL);	/* old twin addrs are gone */
@@ -348,7 +388,7 @@ static int seg_gather(lm_adam *opt, const lm_adam_seg *s)
 	} else if (gpu_memcpy_h2d(dp, w->data, nb) != 0) {
 		return -1;	/* host is authoritative (or no twin) */
 	}
-	if (dw->d_data && !s->host_use && dw->on_device != MAT_DEV_HOST)
+	if (dw->d_data && dw->on_device != MAT_DEV_HOST)
 		return gpu_memcpy_d2d(dg, dw->d_data, nb) == 0 ? 0 : -1;
 	return gpu_memcpy_h2d(dg, dw->data, nb) == 0 ? 0 : -1;
 }
@@ -373,29 +413,16 @@ static int seg_scatter(lm_adam *opt, const lm_adam_seg *s)
 	w = s->w;
 	if (w->on_device == MAT_DEV_ALIASED && w->d_data == dp) {
 		/* In-place Adam already wrote w->d_data; flat d_grad zeroed once. */
-		if (s->host_use && w->data
-		    && gpu_memcpy_d2h(w->data, dp, nb) != 0)
-			return -1;
-		if (s->host_use)
-			mat_zero(s->dw);
 		return 0;
 	}
 	if (w->d_data && gpu_memcpy_d2d(w->d_data, dp, nb) == 0) {
-		if (!s->host_use)
-			w->on_device = MAT_DEV_DEVICE;	/* host stale until pulled */
-		else if (gpu_memcpy_d2h(w->data, dp, nb) == 0)
-			w->on_device = MAT_DEV_SYNCED;
-		else
-			return -1;
+		w->on_device = MAT_DEV_DEVICE;	/* host stale until pulled */
 	} else {
 		if (gpu_memcpy_d2h(w->data, dp, nb) != 0)
 			return -1;
 		mat_host_dirty(w);
 	}
-	if (s->host_use)
-		mat_zero(s->dw);
-	else
-		mat_zero_dev(s->dw);
+	mat_zero_dev(s->dw);
 	return 0;
 }
 
@@ -405,6 +432,21 @@ static int seg_scatter(lm_adam *opt, const lm_adam_seg *s)
 ** scattered D2D into each weight's d_data (no host pack/unpack, no D2H). Only
 ** host-consumed segments (embedding table, bias/LN vecs) cross PCIe.
 */
+/* ANN_GNORM_EVERY=N prints the grad norm every N steps (0 = never). */
+static int adam_gnorm_every(void)
+{
+	static int every = -1;
+	const char *e;
+
+	if (every < 0) {
+		e = getenv("ANN_GNORM_EVERY");
+		every = e ? atoi(e) : 0;
+		if (every < 0)
+			every = 0;
+	}
+	return every;
+}
+
 static int adam_step_gpu(lm_adam *opt, double lr, double grad_scale)
 {
 	int i;
@@ -418,6 +460,33 @@ static int adam_step_gpu(lm_adam *opt, double lr, double grad_scale)
 	for (i = 0; i < opt->n_segs; i++)
 		if (seg_gather(opt, &opt->segs[i]) != 0)
 			goto fail;
+	/* Same clip and decay as the host path below, on the device grads. */
+	if (opt->grad_clip > 0.0 || adam_gnorm_every() > 0) {
+		double ss;
+		double norm;
+
+		if (gpu_grad_sumsq(opt->d_grad, opt->n, &ss) != 0)
+			goto fail;
+		norm = sqrt(ss) * fabs(grad_scale);
+		opt->last_grad_norm = norm;
+		if (!isfinite(norm)) {
+			/* Skip a non-finite step instead of poisoning m/v. */
+			if (gpu_memset(opt->d_grad, 0, (size_t)opt->n
+			    * sizeof(ann_real)) != 0)
+				goto fail;
+			fprintf(stderr, "[adam] step %d skipped: grad norm %g\n",
+			    opt->t, norm);
+			opt->params_valid = 1;
+			return 0;
+		}
+		if (adam_gnorm_every() > 0 && opt->t % adam_gnorm_every() == 0)
+			fprintf(stderr, "[adam] step %d grad norm %.4g%s\n", opt->t,
+			    norm, opt->grad_clip > 0.0 && norm > opt->grad_clip
+			    ? " (clipped)" : "");
+		if (opt->grad_clip > 0.0 && norm > opt->grad_clip)
+			grad_scale *= opt->grad_clip / norm;
+	}
+	gpu_adam_set_weight_decay(opt->weight_decay);
 	if (gpu_adam_step_dev_bf16(opt->d_param, opt->d_param_bf16,
 	    opt->d_grad, opt->d_m, opt->d_v, opt->n, lr, opt->beta1, opt->beta2,
 	    opt->eps, opt->t, grad_scale) != 0)
@@ -460,8 +529,22 @@ void lm_adam_step_scaled(lm_adam *opt, double lr, double grad_scale)
 	if (!opt || lr <= 0.0)
 		return;
 	opt->t++;
-	if (gpu_available() && adam_step_gpu(opt, lr, grad_scale) == 0)
+	/*
+	** Batch mode leaves the FFN bias column sums (db1/db2) in device
+	** accumulators; the sync flushes them into the host grads that
+	** seg_gather uploads. Without it those grads are never applied.
+	*/
+	gpu_device_sync();
+	if (gpu_available() && adam_step_gpu(opt, lr, grad_scale) == 0) {
+		gpu_op_prof_dump();	/* ANN_OP_PROF=1 only */
+		/*
+		** Host bias / LN vectors were rewritten by the D2H scatter:
+		** drop their cached device copies so the next forward uploads
+		** the updated values instead of the ones cached at step 1.
+		*/
+		gpu_half_wt_invalidate(NULL);
 		return;
+	}
 	/* Host fallback: bring resident m/v, weights and grads back first. */
 	lm_adam_sync_host(opt);
 	for (i = 0; i < opt->n_segs; i++) {
@@ -509,4 +592,5 @@ void lm_adam_step_scaled(lm_adam *opt, double lr, double grad_scale)
 		if (opt->segs[i].dw)
 			mat_host_dirty(opt->segs[i].dw);
 	}
+	gpu_half_wt_invalidate(NULL);
 }

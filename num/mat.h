@@ -65,5 +65,7 @@ ann_real	*mat_compute_ptr(mat *m);
 const ann_real	*mat_compute_ptr_const(const mat *m);
 /* After an in-place device write through mat_compute_ptr / d_data. */
 void	mat_mark_device(mat *m);
+/* After a kernel wrote through p = mat_compute_ptr(m): device if p was the twin, else host. */
+void	mat_mark_written(mat *m, const ann_real *p);
 
 #endif

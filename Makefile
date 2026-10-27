@@ -97,7 +97,7 @@ ann: anni
 TEST_LM_FLAGS=-DLM_D_MODEL=64 -DLM_N_HEADS=4 -DLM_D_FF=256 -DLM_N_BLOCKS=2
 TEST_OBJDIR=$(OBJDIR)/test
 TEST_LIB_OBJ=$(patsubst $(OBJDIR)/%,$(TEST_OBJDIR)/%,$(LIB_OBJ))
-vpath %.c net num lang
+vpath %.c net num lang cli
 
 $(TEST_OBJDIR):
 	mkdir -p $(TEST_OBJDIR)
@@ -105,11 +105,33 @@ $(TEST_OBJDIR):
 $(TEST_OBJDIR)/%.o: %.c | $(TEST_OBJDIR)
 	$(CC) -o $@ -c $< $(CFLAGS) $(TEST_LM_FLAGS)
 
-$(TEST): tests/test_ann.c $(TEST_LIB_OBJ)
-	$(CC) $(CFLAGS) $(TEST_LM_FLAGS) -o $@ tests/test_ann.c $(TEST_LIB_OBJ) $(LDFLAGS)
+$(TEST): tests/test_ann.c $(TEST_LIB_OBJ) $(TEST_OBJDIR)/chat_session.o
+	$(CC) $(CFLAGS) $(TEST_LM_FLAGS) -o $@ tests/test_ann.c $(TEST_LIB_OBJ) \
+	    $(TEST_OBJDIR)/chat_session.o $(LDFLAGS)
 
 test: $(TEST)
 	./$(TEST)
+
+# GPU regression checks (small LM + real CUDA backend). Needs nvcc; < 1 GB VRAM.
+TEST_GPU=tests/test_gpu
+TEST_GPU_OBJDIR=$(OBJDIR)/test-gpu
+TEST_GPU_LIB_OBJ=$(patsubst $(OBJDIR)/%,$(TEST_GPU_OBJDIR)/%,$(filter-out $(OBJDIR)/gpu_stub.o,$(LIB_OBJ)))
+
+$(TEST_GPU_OBJDIR):
+	mkdir -p $(TEST_GPU_OBJDIR)
+
+$(TEST_GPU_OBJDIR)/%.o: %.c | $(TEST_GPU_OBJDIR)
+	$(CC) -o $@ -c $< $(CFLAGS) $(TEST_LM_FLAGS)
+
+$(TEST_GPU_OBJDIR)/gpu_cuda.o: num/gpu_cuda.cu | $(TEST_GPU_OBJDIR)
+	$(NVCC) $(CUDA_NVCC_FLAGS) $(TEST_LM_FLAGS) -c num/gpu_cuda.cu -o $@
+
+$(TEST_GPU): tests/test_gpu.c $(TEST_GPU_LIB_OBJ) $(TEST_GPU_OBJDIR)/gpu_cuda.o
+	$(CC) $(CFLAGS) $(TEST_LM_FLAGS) -o $@ tests/test_gpu.c $(TEST_GPU_LIB_OBJ) \
+	    $(TEST_GPU_OBJDIR)/gpu_cuda.o $(LDFLAGS) $(CUDA_LIBS) -lstdc++
+
+test-gpu: $(TEST_GPU)
+	./$(TEST_GPU)
 
 gui: $(GUI)
 
@@ -124,7 +146,7 @@ run-gui: gui
 data-wiki:
 	./scripts/fetch_wiki.sh
 
-.PHONY: clean mrproper test gui run-gui all cuda data-wiki autotrain \
+.PHONY: clean mrproper test test-gpu gui run-gui all cuda data-wiki autotrain \
 	autotrain-cpu cuda-autotrain
 
 # AT1: opinionated ./autotrain — CUDA by default (Target path is GPU-first).

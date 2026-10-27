@@ -25,6 +25,34 @@ int gpu_mem_info(size_t *free_bytes, size_t *total_bytes)
 	return -1;
 }
 
+int gpu_mat_mul_res(mat *d, const mat *a, const mat *b, const ann_real *bias,
+	const mat *res)
+{
+	(void)d; (void)a; (void)b; (void)bias; (void)res;
+	return -1;
+}
+
+int gpu_attn_fa_usable(int T, int dh)
+{
+	(void)T; (void)dh;
+	return 0;
+}
+
+int gpu_attn_fa_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat,
+	const mat *concat, const mat *q, const mat *k, const mat *v,
+	const mat *lse, int B, int T, int H, int dh)
+{
+	(void)dq; (void)dk; (void)dv; (void)dconcat; (void)concat; (void)q; (void)k; (void)v; (void)lse; (void)B; (void)T; (void)H; (void)dh;
+	return -1;
+}
+
+int gpu_attn_qkv_bwd(mat *dx, mat *dwq, mat *dwk, mat *dwv, const mat *x_in,
+	const mat *dq, const mat *wq, const mat *wk, const mat *wv)
+{
+	(void)dx; (void)dwq; (void)dwk; (void)dwv; (void)x_in; (void)dq; (void)wq; (void)wk; (void)wv;
+	return 1;
+}
+
 void gpu_set_sync_mode(int mode)
 {
 	g_sync_mode = mode;
@@ -99,6 +127,27 @@ void gpu_half_wt_invalidate(const ann_real *fp32_dev)
 	(void)fp32_dev;
 }
 
+void gpu_host_forget(const void *host)
+{
+	(void)host;
+}
+
+const char *gpu_debug_last_error(void)
+{
+	return "";
+}
+
+void gpu_op_prof_dump(void)
+{
+}
+
+int gpu_attn_fa_fwd(mat *concat, const mat *q, const mat *k, const mat *v,
+	int B, int T, int H, int dh, mat *lse)
+{
+	(void)concat; (void)q; (void)k; (void)v; (void)B; (void)T; (void)H; (void)dh; (void)lse;
+	return -1;
+}
+
 int gpu_memset(void *dst, int value, size_t nbytes)
 {
 	(void)dst;
@@ -110,17 +159,6 @@ int gpu_memset(void *dst, int value, size_t nbytes)
 int gpu_mat_mul(mat *c, const mat *a, const mat *b)
 {
 	(void)c;
-	(void)a;
-	(void)b;
-	return -1;
-}
-
-int gpu_mat_mul_backward(mat *da, mat *db, const mat *dc,
-	const mat *a, const mat *b)
-{
-	(void)da;
-	(void)db;
-	(void)dc;
 	(void)a;
 	(void)b;
 	return -1;
@@ -145,6 +183,72 @@ int gpu_mat_mul_at(mat *c, const mat *a, const mat *b)
 int gpu_mat_outer_add(mat *dw, const mat *a, const mat *b)
 {
 	(void)dw;
+	(void)a;
+	(void)b;
+	return -1;
+}
+
+int gpu_layernorm_backward_acc(mat *dx, const mat *dy, const ann_real *gamma,
+	const ann_real *x_hat, const ann_real *inv_std, int T, int d,
+	ann_real *dgamma, ann_real *dbeta)
+{
+	(void)dx;
+	(void)dy;
+	(void)gamma;
+	(void)x_hat;
+	(void)inv_std;
+	(void)T;
+	(void)d;
+	(void)dgamma;
+	(void)dbeta;
+	return -1;
+}
+
+int gpu_layernorm_backward_x(mat *dx, const mat *dy, const ann_real *gamma,
+	const ann_real *x, const ann_real *mean, const ann_real *inv_std,
+	int T, int d, ann_real *dgamma, ann_real *dbeta, int accumulate)
+{
+	(void)dx;
+	(void)dy;
+	(void)gamma;
+	(void)x;
+	(void)mean;
+	(void)inv_std;
+	(void)T;
+	(void)d;
+	(void)dgamma;
+	(void)dbeta;
+	(void)accumulate;
+	return -1;
+}
+
+int gpu_layernorm_xhat(ann_real *x_hat, const ann_real *x,
+	const ann_real *mean, const ann_real *inv_std, int T, int d)
+{
+	(void)x_hat;
+	(void)x;
+	(void)mean;
+	(void)inv_std;
+	(void)T;
+	(void)d;
+	return -1;
+}
+
+void gpu_grad_twins_clear(void)
+{
+}
+
+int gpu_mat_mul_bt_twin(mat *c, const mat *a, const mat *b)
+{
+	(void)c;
+	(void)a;
+	(void)b;
+	return -1;
+}
+
+int gpu_mat_mul_bt_acc(mat *c, const mat *a, const mat *b)
+{
+	(void)c;
 	(void)a;
 	(void)b;
 	return -1;
@@ -185,20 +289,6 @@ int gpu_softmax_bwd_rows(ann_real *dx, const ann_real *y, const ann_real *dy,
 	return -1;
 }
 
-int gpu_layernorm_forward(ann_real *y, const ann_real *x, const ann_real *gamma,
-	const ann_real *beta, ann_real *x_hat, ann_real *inv_std, int T, int d)
-{
-	(void)y;
-	(void)x;
-	(void)gamma;
-	(void)beta;
-	(void)x_hat;
-	(void)inv_std;
-	(void)T;
-	(void)d;
-	return -1;
-}
-
 int gpu_layernorm_forward_ex(ann_real *y, const ann_real *x,
 	const ann_real *gamma, const ann_real *beta, ann_real *x_hat,
 	ann_real *mean, ann_real *inv_std, int T, int d, double eps)
@@ -221,11 +311,6 @@ void gpu_set_compute_prec(int prec)
 	(void)prec;
 }
 
-int gpu_compute_prec(void)
-{
-	return GPU_PREC_FP32;
-}
-
 void gpu_set_fp8(int on)
 {
 	(void)on;
@@ -239,11 +324,6 @@ int gpu_fp8(void)
 void gpu_set_fp8_dgrad(int on)
 {
 	(void)on;
-}
-
-int gpu_fp8_dgrad(void)
-{
-	return 0;
 }
 
 int gpu_bias_row_add(ann_real *x, const ann_real *bias, int rows, int cols)
@@ -288,11 +368,6 @@ int gpu_attn_tiled_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat,
 	(void)H;
 	(void)dh;
 	return -1;
-}
-
-float gpu_attn_flash_bwd_ms(void)
-{
-	return -1.f;
 }
 
 int gpu_attn_tc_fwd(mat *concat, mat *w, const mat *q, const mat *k,
@@ -362,28 +437,6 @@ int gpu_unpack_seq_rows(ann_real *dst, const ann_real *src, int B, int T,
 	return -1;
 }
 
-int gpu_attn_recompute_w(mat *lse, const mat *q, const mat *k, int B, int T,
-	int H, int dh)
-{
-	(void)lse;
-	(void)q;
-	(void)k;
-	(void)B;
-	(void)T;
-	(void)H;
-	(void)dh;
-	return -1;
-}
-
-int gpu_bias_relu_forward(ann_real *x, const ann_real *bias, int rows, int cols)
-{
-	(void)x;
-	(void)bias;
-	(void)rows;
-	(void)cols;
-	return -1;
-}
-
 int gpu_ffn_w1_finish(ann_real *hidden, ann_real *pre, const ann_real *bias,
 	int rows, int cols)
 {
@@ -414,10 +467,6 @@ int gpu_mat_mul_bias_relu(mat *c, const mat *a, const mat *b,
 	return -1;
 }
 
-void gpu_half_wt_refresh_all(void)
-{
-}
-
 void gpu_adam_set_bf16_flat(void *bf16, const ann_real *fp32, int n)
 {
 	(void)bf16;
@@ -433,13 +482,36 @@ int gpu_adam_seed_bf16_flat(void *bf16, const ann_real *fp32, int n)
 	return -1;
 }
 
+void gpu_adam_set_weight_decay(double wd)
+{
+	(void)wd;
+}
+
+int gpu_grad_sumsq(const ann_real *d_x, int n, double *out)
+{
+	(void)d_x;
+	(void)n;
+	(void)out;
+	return -1;
+}
+
 int gpu_adam_step_dev_bf16(ann_real *d_param, void *d_param_bf16,
 	ann_real *d_grad, ann_real *d_m, ann_real *d_v, int n, double lr,
 	double beta1, double beta2, double eps, int t, double grad_scale)
 {
+	(void)d_param;
 	(void)d_param_bf16;
-	return gpu_adam_step_dev(d_param, d_grad, d_m, d_v, n, lr, beta1, beta2,
-	    eps, t, grad_scale);
+	(void)d_grad;
+	(void)d_m;
+	(void)d_v;
+	(void)n;
+	(void)lr;
+	(void)beta1;
+	(void)beta2;
+	(void)eps;
+	(void)t;
+	(void)grad_scale;
+	return -1;
 }
 
 int gpu_ce_fetch_mean(double *mean_ce, int rows)
@@ -461,6 +533,41 @@ int gpu_ce_delta_from_softmax(ann_real *probs, const int *tgt, int rows, int V,
 	return -1;
 }
 
+int gpu_ce_nll_rows(const ann_real *logits, const int *tgt, int rows, int V,
+	float *out)
+{
+	(void)logits;
+	(void)tgt;
+	(void)rows;
+	(void)V;
+	(void)out;
+	return -1;
+}
+
+int gpu_ce_bias_fused(void)
+{
+	return 0;
+}
+
+int gpu_ce_softmax_delta_bf16(ann_real *logits, const int *tgt, int rows,
+	int V, const ann_real *bias, ann_real *db_host, double *mean_ce)
+{
+	(void)logits;
+	(void)tgt;
+	(void)rows;
+	(void)V;
+	(void)bias;
+	(void)db_host;
+	(void)mean_ce;
+	return -1;
+}
+
+int gpu_ce_bf16_delta_done(const ann_real *logits)
+{
+	(void)logits;
+	return -1;
+}
+
 int gpu_posenc_add_packed(ann_real *x, int B, int T, int D)
 {
 	(void)x;
@@ -479,10 +586,23 @@ int gpu_mat_col_sum_add(ann_real *db_host, const ann_real *x, int rows, int cols
 	return -1;
 }
 
-int gpu_relu_forward(ann_real *x, int n)
+void gpu_attn_qkv_bf16_hint(int T, int dh)
 {
-	(void)x;
-	(void)n;
+	(void)T;
+	(void)dh;
+}
+
+int gpu_act_bf16_only(const mat *m)
+{
+	(void)m;
+	return 0;
+}
+
+int gpu_ffn_relu_bwd_fused(mat *dh, const mat *hidden, ann_real *db1_host)
+{
+	(void)dh;
+	(void)hidden;
+	(void)db1_host;
 	return -1;
 }
 
@@ -491,41 +611,6 @@ int gpu_relu_backward(ann_real *dx, const ann_real *x_pre_relu_or_mask, int n)
 	(void)dx;
 	(void)x_pre_relu_or_mask;
 	(void)n;
-	return -1;
-}
-
-int gpu_adam_step(ann_real *param, ann_real *grad, ann_real *m, ann_real *v, int n,
-	double lr, double beta1, double beta2, double eps, int t, double grad_scale)
-{
-	(void)param;
-	(void)grad;
-	(void)m;
-	(void)v;
-	(void)n;
-	(void)lr;
-	(void)beta1;
-	(void)beta2;
-	(void)eps;
-	(void)t;
-	(void)grad_scale;
-	return -1;
-}
-
-int gpu_adam_step_dev(ann_real *d_param, ann_real *d_grad, ann_real *d_m,
-	ann_real *d_v, int n, double lr, double beta1, double beta2, double eps,
-	int t, double grad_scale)
-{
-	(void)d_param;
-	(void)d_grad;
-	(void)d_m;
-	(void)d_v;
-	(void)n;
-	(void)lr;
-	(void)beta1;
-	(void)beta2;
-	(void)eps;
-	(void)t;
-	(void)grad_scale;
 	return -1;
 }
 
@@ -633,10 +718,6 @@ void *gpu_copy_stream(void)
 	return NULL;
 }
 
-void gpu_stream_sync_copy(void)
-{
-}
-
 int gpu_graph_begin(void)
 {
 	return -1;
@@ -652,8 +733,48 @@ int gpu_graph_replay(void)
 	return -1;
 }
 
+int gpu_graph_replayable(void)
+{
+	return 0;
+}
+
 void gpu_graph_destroy(void)
 {
+}
+
+void gpu_graph_set_mode(int on)
+{
+	(void)on;
+}
+
+int gpu_graph_supported(void)
+{
+	return 0;
+}
+
+unsigned gpu_param_epoch(void)
+{
+	return 0;
+}
+
+int gpu_ids_stage(const int *ids, const int *alias, int n)
+{
+	(void)ids;
+	(void)alias;
+	(void)n;
+	return -1;
+}
+
+void gpu_ids_unstage(void)
+{
+}
+
+const int *gpu_ce_targets_staged(const int *ids, int B, int T)
+{
+	(void)ids;
+	(void)B;
+	(void)T;
+	return NULL;
 }
 
 gpu_dec *gpu_dec_create(int n_layers, int d_model, int d_ff, int vocab,

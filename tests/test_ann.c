@@ -2,8 +2,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
+#include <limits.h>
 #include <time.h>
 #include "../main.h"
+#include "quant.h"
 
 static void test_mse_known(void)
 {
@@ -679,6 +681,60 @@ static double lm_grad_abs_sum(lm *model)
 }
 
 /* Packed B=3 (fat GEMMs, per-sequence causal attention) == 3 sequential steps. */
+/* Chat fine-tune: masked positions add no loss and no hidden gradient. */
+static void test_lm_loss_mask(void)
+{
+	enum { NB = 2, TT = 8 };
+	lm *model;
+	lm_cache *cp;
+	mat *dh;
+	int ids[NB * TT];
+	unsigned char mask[NB * TT];
+	double ce_all;
+	double ce_ones;
+	double ce_some;
+	double row;
+	int i;
+	int d;
+
+	srand(22);
+	model = lm_create();
+	cp = lm_cache_create_packed(NB, TT);
+	dh = mat_create(NB * TT, LM_D_MODEL);
+	assert(model && cp && dh);
+	for (i = 0; i < NB * TT; i++)
+		ids[i] = 'a' + (rand() % 20);
+	assert(lm_forward_cache_packed(model, ids, NB, TT, cp) == 0);
+	lm_zero_grad(model);
+	assert(lm_loss_backward_packed(model, cp, ids, NB, TT, dh, &ce_all) == 0);
+	memset(mask, 1, sizeof(mask));
+	lm_loss_set_mask(mask);
+	lm_zero_grad(model);
+	assert(lm_loss_backward_packed(model, cp, ids, NB, TT, dh, &ce_ones) == 0);
+	assert(fabs(ce_all - ce_ones) < 1e-5);
+	/* Keep only the targets at t = 2 and 5 of each sequence. */
+	memset(mask, 0, sizeof(mask));
+	mask[2] = mask[5] = mask[TT + 2] = mask[TT + 5] = 1;
+	lm_zero_grad(model);
+	assert(lm_loss_backward_packed(model, cp, ids, NB, TT, dh, &ce_some) == 0);
+	lm_loss_set_mask(NULL);
+	assert(ce_some > 0.0 && fabs(ce_some - ce_all) > 1e-6);
+	(void)mat_ensure_host(dh);
+	for (i = 0; i < NB * TT; i++) {
+		row = 0.0;
+		for (d = 0; d < LM_D_MODEL; d++)
+			row += fabs(dh->data[(size_t)i * LM_D_MODEL + d]);
+		/* Hidden row t predicts token t + 1. */
+		if (i % TT == 1 || i % TT == 4)
+			assert(row > 0.0);
+		else
+			assert(row == 0.0);
+	}
+	mat_free(&dh);
+	lm_cache_free(&cp);
+	lm_free(&model);
+}
+
 static void test_lm_packed_matches_sequential(void)
 {
 	enum { NB = 3, TT = 8 };
@@ -832,6 +888,111 @@ static void test_lm_checkpoint_resume(void)
 	lm_free(&b);
 }
 
+/* Mid-epoch checkpoint: same window order on resume, position kept. */
+static void test_lm_mid_epoch_resume(void)
+{
+	int a[64];
+	int b[64];
+	int seen[64];
+	int i;
+	int same;
+	lm *m;
+	lm *m2;
+	lm_adam *o;
+	lm_adam *o2;
+	text_dataset *ds;
+	int epoch;
+	int step;
+	FILE *fp;
+
+	lm_train_set_shuffle_seed(7);
+	lm_train_epoch_order(a, 64, 3);
+	lm_train_epoch_order(b, 64, 3);
+	assert(memcmp(a, b, sizeof(a)) == 0);
+	memset(seen, 0, sizeof(seen));
+	for (i = 0; i < 64; i++) {
+		assert(a[i] >= 0 && a[i] < 64 && !seen[a[i]]);
+		seen[a[i]] = 1;
+	}
+	lm_train_epoch_order(b, 64, 4);
+	same = memcmp(a, b, sizeof(a)) == 0;
+	assert(!same);
+
+	srand(15);
+	m = lm_create();
+	o = m ? lm_adam_create(m) : NULL;
+	ds = text_dataset_load("data/toy_micro.txt", 8);
+	assert(m && o && ds);
+	assert(lm_save_checkpoint(m, o, 2, 5, "objects/test_mid.bin") == 0);
+	fp = fopen("objects/test_mid.bin.tmp", "rb");
+	assert(!fp);
+	m2 = lm_load_checkpoint("objects/test_mid.bin", &o2, &epoch, &step);
+	assert(m2 && o2 && epoch == 2 && step == 5);
+	/* Resume near the end: only the last windows of the epoch run. */
+	lm_train_set_resume_pos(text_dataset_n_windows(ds) - 2);
+	assert(lm_train_corpus(m2, ds, o2, 1, 2, 0.01, 0, NULL, epoch, 0, 0)
+	    > 0.0);
+	lm_adam_free(&o);
+	lm_adam_free(&o2);
+	text_dataset_free(&ds);
+	lm_free(&m);
+	lm_free(&m2);
+	remove("objects/test_mid.bin");
+}
+
+/* Mid-epoch resume rebuilds the same window order from seed and epoch. */
+static void test_lm_epoch_order(void)
+{
+	int a[100];
+	int b[100];
+	int seen[100];
+	int i;
+	int same;
+
+	lm_train_set_shuffle_seed(7);
+	lm_train_epoch_order(a, 100, 3);
+	lm_train_epoch_order(b, 100, 3);
+	memset(seen, 0, sizeof(seen));
+	for (i = 0; i < 100; i++) {
+		assert(a[i] == b[i]);
+		assert(a[i] >= 0 && a[i] < 100 && !seen[a[i]]);
+		seen[a[i]] = 1;
+	}
+	lm_train_epoch_order(b, 100, 4);
+	same = 0;
+	for (i = 0; i < 100; i++)
+		same += a[i] == b[i];
+	assert(same < 100);
+	lm_train_set_shuffle_seed(1);
+}
+
+/* A checkpoint keeps the epoch and window it reached; no .tmp is left. */
+static void test_lm_checkpoint_mid_epoch(void)
+{
+	lm *a;
+	lm *b;
+	lm_adam *oa;
+	lm_adam *ob;
+	FILE *fp;
+	int epoch;
+	int step;
+
+	srand(15);
+	a = lm_create();
+	oa = lm_adam_create(a);
+	assert(a && oa);
+	assert(lm_save_checkpoint(a, oa, 2, 1234, "objects/test_mid.bin") == 0);
+	fp = fopen("objects/test_mid.bin.tmp", "rb");
+	assert(!fp);
+	b = lm_load_checkpoint("objects/test_mid.bin", &ob, &epoch, &step);
+	assert(b && ob && epoch == 2 && step == 1234);
+	remove("objects/test_mid.bin");
+	lm_adam_free(&oa);
+	lm_adam_free(&ob);
+	lm_free(&a);
+	lm_free(&b);
+}
+
 static void test_lm_perplexity(void)
 {
 	lm *model;
@@ -891,6 +1052,84 @@ static void test_text_dataset(void)
 	assert(text_dataset_window(ds, 0, ids, &n) == 0);
 	assert(n == 8);
 	text_dataset_free(&ds);
+}
+
+/* Pretokenized id files load (mapped on POSIX) and slice into windows. */
+static void test_text_dataset_ids_file(void)
+{
+	text_dataset *ds;
+	FILE *fp;
+	int vals[40];
+	int ids[LM_MAX_CTX];
+	int n;
+	int i;
+
+	for (i = 0; i < 40; i++)
+		vals[i] = 300 + i;
+	fp = fopen("objects/test_ids.bin", "wb");
+	assert(fp && fwrite(vals, sizeof(int), 40, fp) == 40);
+	fclose(fp);
+	ds = text_dataset_load_ids("objects/test_ids.bin", 8);
+	assert(ds && ds->n_ids == 40);
+	text_dataset_set_stride(ds, 8);
+	assert(text_dataset_n_windows(ds) == 5);
+	assert(text_dataset_window(ds, 4, ids, &n) == 0);
+	assert(n == 8 && ids[0] == 332 && ids[7] == 339);
+	text_dataset_free(&ds);
+	assert(!ds);
+	remove("objects/test_ids.bin");
+}
+
+/* *_mids.bin: negative ids decode to -(v+1) and come back masked. */
+static void test_text_dataset_masked_ids(void)
+{
+	text_dataset *ds;
+	FILE *fp;
+	int vals[8] = { 10, -12, -13, 14, 15, -17, 18, 19 };
+	int ids[LM_MAX_CTX];
+	unsigned char loss[LM_MAX_CTX];
+	int n;
+
+	fp = fopen("objects/test_chat_mids.bin", "wb");
+	assert(fp && fwrite(vals, sizeof(int), 8, fp) == 8);
+	fclose(fp);
+	ds = text_dataset_load_tok("objects/test_chat_mids.bin", 8, NULL);
+	assert(ds && ds->masked);
+	assert(text_dataset_window_mask(ds, 0, ids, loss, &n) == 0 && n == 8);
+	assert(ids[0] == 10 && ids[1] == 11 && ids[2] == 12 && ids[5] == 16);
+	assert(loss[0] == 1 && loss[1] == 0 && loss[2] == 0 && loss[3] == 1);
+	assert(loss[5] == 0 && loss[7] == 1);
+	assert(text_dataset_head(ds, ids, 4) == 4 && ids[1] == 11);
+	text_dataset_free(&ds);
+	remove("objects/test_chat_mids.bin");
+}
+
+/* Pretokenized mixes pass 2^31 ids: window count must not overflow. */
+static void test_text_dataset_huge_ids(void)
+{
+	text_dataset ds;
+
+	memset(&ds, 0, sizeof(ds));
+	ds.n_ids = 3000000000L;
+	ds.window = 256;
+	ds.stride = 256;
+	assert(text_dataset_n_windows(&ds) == 11718750);
+	ds.stride = 1;
+	assert(text_dataset_n_windows(&ds) == INT_MAX);
+}
+
+static void test_chat_reply_cut(void)
+{
+	char a[] = " Paris is the capital.\nUser: and Spain?\nAssistant: Madrid";
+	char b[] = "def f(x):\n    return x\n\nAssistant: more";
+	char c[] = "plain answer \n\n";
+
+	chat_reply_cut(a);
+	assert(strcmp(a, " Paris is the capital.") == 0);
+	chat_reply_cut(b);
+	assert(strcmp(b, "def f(x):\n    return x") == 0);
+	chat_reply_cut(c);
+	assert(strcmp(c, "plain answer") == 0);
 }
 
 static const char bpe_sample[] =
@@ -1178,20 +1417,30 @@ static void test_gpu_gemm_bwd_stub(void)
 	da = mat_create(2, 2);
 	db = mat_create(2, 2);
 	assert(a && b && c && da && db);
-	assert(gpu_mat_mul_backward(da, db, c, a, b) != 0);
 	assert(gpu_mat_mul_bt(c, a, b) != 0);
 	assert(gpu_mat_mul_at(c, a, b) != 0);
 	assert(gpu_mat_outer_add(da, a, b) != 0);
-	assert(gpu_adam_step(a->data, b->data, c->data, da->data, 4,
-	    0.01, 0.9, 0.999, 1e-8, 1, 1.0) != 0);
-	assert(gpu_adam_step_dev(a->data, b->data, c->data, da->data, 4,
-	    0.01, 0.9, 0.999, 1e-8, 1, 1.0) != 0);
 	assert(gpu_dec_create(1, 2, 2, 2, 2, 1) == NULL);
 	mat_free(&a);
 	mat_free(&b);
 	mat_free(&c);
 	mat_free(&da);
 	mat_free(&db);
+}
+
+/* mat_mark_written: host pointer means the host wrote; no twin on CPU. */
+static void test_mat_mark_written_cpu(void)
+{
+	mat *m = mat_create(2, 2);
+
+	assert(m);
+	mat_mark_written(m, m->data);
+	assert(m->on_device == MAT_DEV_HOST);
+	mat_mark_written(m, NULL);
+	assert(m->on_device == MAT_DEV_HOST);
+	mat_mark_device(m);			/* no d_data: stays host */
+	assert(m->on_device == MAT_DEV_HOST);
+	mat_free(&m);
 }
 
 static void test_mat_device_pin_cpu(void)
@@ -1426,14 +1675,22 @@ int main(void)
 	test_lm_generate_smoke();
 	test_lm_backprop_head();
 	test_text_dataset();
+	test_text_dataset_ids_file();
+	test_text_dataset_masked_ids();
+	test_text_dataset_huge_ids();
+	test_chat_reply_cut();
 	test_bpe_roundtrip();
 	test_bpe_lm_checkpoint();
 	test_split_and_stream();
 	test_lm_train_corpus();
 	test_lm_packed_matches_sequential();
+	test_lm_loss_mask();
 	test_lm_serialize_roundtrip();
 	test_lm_merge_average();
 	test_lm_checkpoint_resume();
+	test_lm_epoch_order();
+	test_lm_checkpoint_mid_epoch();
+	test_lm_mid_epoch_resume();
 	test_lm_rejects_double_magic();
 	test_lm_perplexity();
 	test_lm_generate_from_checkpoint();
@@ -1444,6 +1701,7 @@ int main(void)
 	test_qmat_roundtrip();
 	test_lm_decoder_cpu();
 	test_gpu_stub();
+	test_mat_mark_written_cpu();
 	test_mat_device_pin_cpu();
 	test_gpu_gemm_bwd_stub();
 	{

@@ -8,7 +8,6 @@
 #include "bpe.h"
 #include "embed.h"
 #include "mat.h"
-#include "quant.h"
 #include "vocab.h"
 
 typedef struct	lm {
@@ -20,7 +19,6 @@ typedef struct	lm {
 	vec		*b_head;
 	mat		*dw_head;
 	vec		*db_head;
-	qmat		*w_head_q;	/* optional int8 head for inference */
 	int		vocab_size;
 } lm;
 
@@ -74,12 +72,15 @@ void	lm_wgrads_zero_device(lm *model);
 int	lm_forward(mat *hidden, const lm *model, const int *ids, int n);
 int	lm_forward_cache(lm *model, const int *ids, int n, lm_cache *c);
 int	lm_logits_at(vec *logits, const lm *model, const mat *hidden, int t);
-int	lm_quantize_head(lm *model);
 /* mean_ce may be NULL; otherwise receives mean softmax CE over predicting rows. */
 int	lm_loss_backward(lm *model, const lm_cache *c, const int *ids, int n,
 		mat *dhidden, double *mean_ce);
 int	lm_backward(lm *model, const mat *dhidden, const lm_cache *c);
 double	lm_nll(const lm *model, const int *ids, int n);
+/* Probe loss of B packed windows (one forward, one head GEMM); win_nll[B].
+** -1 when not applicable (caller falls back to lm_nll per window). */
+int	lm_nll_packed(lm *model, lm_cache *c, const int *ids, int B, int T,
+		double *win_nll);
 double	lm_perplexity(const lm *model, const int *ids, int n);
 double	lm_train_steps(lm *model, const char *text, int steps, double lr);
 
@@ -106,6 +107,22 @@ int	lm_loss_backward_packed_lens(lm *model, const lm_cache *c,
 		const int *ids, int B, int T, const int *lens, mat *dhidden,
 		double *mean_ce);
 int	lm_backward_packed(lm *model, const mat *dhidden, const lm_cache *c);
+/*
+** One packed microbatch (forward, CE, backward) of B sequences of T ids;
+** with lm_graph_enable(1) a steady microbatch is a CUDA-graph replay (see
+** lm.c). No loss mask, no varlen. lm_graph_replays counts the replays.
+*/
+int	lm_graph_step(lm *model, lm_cache *c, mat *dh, const int *ids, int B,
+	    int T, double *mean_ce);
+void	lm_graph_enable(int on);
+long	lm_graph_replays(void);
+void	lm_graph_invalidate(void);
+/*
+** Loss mask for the packed loss: mask[b*T+t] = 0 drops the loss of
+** predicting token t of sequence b (chat fine-tune: user turns). The
+** pointer is kept until the next call; NULL restores loss on every token.
+*/
+void	lm_loss_set_mask(const unsigned char *mask);
 
 /*
 ** Estimated working-set bytes of one packed step (activation caches, backward

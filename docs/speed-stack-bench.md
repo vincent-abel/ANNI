@@ -12,7 +12,7 @@ Record util / VRAM / ms/step (and packed ms/tok) after each speed-stack wave.
 |------|--------|
 | `./anni lm train --bench-gpu --tokens 32 --steps 15` | mean **~257–540 ms/step** (B=1 synthetic; variance by load) |
 | Packed wiki train (pre-stack, B=128, T=128) | ~**0.23–0.36 ms/tok** live progress |
-| Flags to A/B | `--cuda-graphs`, `--bf16`, `--fp16` |
+| Flags to A/B | `--cuda-graphs`, `--bf16` |
 
 ## Wave 2 (S10) — this machine (RTX 5070 Ti)
 

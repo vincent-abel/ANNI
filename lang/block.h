@@ -69,6 +69,9 @@ int		transformer_forward_cache(mat *x, transformer *t,
 			transformer_cache *c);
 int		transformer_backward(mat *dx, const mat *dout, transformer *t,
 			transformer_cache *c);
+/* As transformer_backward, the gradient left in an internal buffer. */
+int		transformer_backward_ref(const mat **dx_out, const mat *dout,
+			transformer *t, transformer_cache *c);
 
 transformer_cache	*transformer_cache_create(int T, const transformer *t);
 transformer_cache	*transformer_cache_create_packed(int B, int T,

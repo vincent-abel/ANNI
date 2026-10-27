@@ -22,16 +22,13 @@ int	gpu_sync_mode(void);
 /* S5: compute dtype for cuBLAS GemmEx (weights/Adam masters stay FP32). */
 #define GPU_PREC_FP32	0
 #define GPU_PREC_BF16	1
-#define GPU_PREC_FP16	2
-void	gpu_set_compute_prec(int prec);	/* FP32/BF16/FP16 */
-int	gpu_compute_prec(void);
+void	gpu_set_compute_prec(int prec);	/* FP32/BF16 */
 /*
 ** Mixed FP8: E4M3 forward, E5M2 dgrad, BF16 wgrad, FP32 Adam. gpu_set_fp8(1)
 ** also enables dgrad. Wgrad never uses FP8 (outer-product underflow).
 */
 void	gpu_set_fp8(int on);
 void	gpu_set_fp8_dgrad(int on);
-int	gpu_fp8_dgrad(void);
 int	gpu_fp8(void);
 /*
 ** Block until all queued device work finishes. In GPU_SYNC_BATCH mode the
@@ -50,10 +47,23 @@ int	gpu_memcpy_d2h_async(void *dst, const void *src, size_t nbytes);
 int	gpu_stream_sync(void);
 int	gpu_memcpy_d2d(void *dst, const void *src, size_t nbytes);
 int	gpu_memset(void *dst, int value, size_t nbytes);
-/* Drop cached BF16/FP16 twin after an in-place FP32 weight write (Adam). */
+/*
+** Drop cached BF16/FP16 twin after an in-place FP32 weight write (Adam).
+** NULL drops every twin and also marks the cached device copies of host
+** bias / LayerNorm vectors stale, so the next launch re-uploads them: call
+** it after every optimizer step and whenever host code rewrites weights.
+*/
 void	gpu_half_wt_invalidate(const ann_real *fp32_dev);
-/* Reconvert all cached weight twins in place (stable addresses; after Adam). */
-void	gpu_half_wt_refresh_all(void);
+/*
+** A host vector (bias, LN gamma/beta, their grads) is being freed: drop its
+** cached device copy and any pending column-sum accumulator so a later
+** allocation at the same address never inherits them. No-op on the stub.
+*/
+void	gpu_host_forget(const void *host);
+/* Debug: pending CUDA error string (cleared by the call); "" when none. */
+const char	*gpu_debug_last_error(void);
+/* ANN_OP_PROF=1: print and reset the per-operation GPU time table (stderr). */
+void	gpu_op_prof_dump(void);
 /*
 ** Register a flat BF16 twin of Adam's d_param. half_wt_get serves slices from
 ** this buffer; Adam updates it in the same kernel as the FP32 master.
@@ -72,13 +82,19 @@ int	gpu_mat_mul(mat *c, const mat *a, const mat *b);
 /* c = a b + bias (bias length = c->cols); cuBLASLt BIAS epilogue when BF16. */
 int	gpu_mat_mul_bias(mat *c, const mat *a, const mat *b,
 		const ann_real *bias);
+/* d = a b (+ bias, may be NULL) + res, one cuBLASLt call (BF16 mode); -1 = do it in steps. */
+int	gpu_mat_mul_res(mat *d, const mat *a, const mat *b, const ann_real *bias,
+		const mat *res);
 /* c = ReLU(a b + bias); cuBLASLt RELU_BIAS. Publishes BF16 twin of c. */
 int	gpu_mat_mul_bias_relu(mat *c, const mat *a, const mat *b,
 		const ann_real *bias);
-/* dA = dC * B^T, dB = A^T * dC (NULL skips that output). */
-int	gpu_mat_mul_backward(mat *da, mat *db, const mat *dc,
-		const mat *a, const mat *b);
+/* End of a microbatch backward: forget every pending BF16 gradient twin. */
+void	gpu_grad_twins_clear(void);
 int	gpu_mat_mul_bt(mat *c, const mat *a, const mat *b);
+/* c += a b^T (cuBLAS beta = 1); -1 = do c = a b^T into a scratch and add. */
+int	gpu_mat_mul_bt_acc(mat *c, const mat *a, const mat *b);
+/* c = a b^T as c's BF16 gradient twin only (BF16 training); the FP32 c stays unwritten. -1 = use gpu_mat_mul_bt. */
+int	gpu_mat_mul_bt_twin(mat *c, const mat *a, const mat *b);
 /* c = a^T b (a: T x m, b: T x n -> c: m x n); cuBLAS OP_T when built in. */
 int	gpu_mat_mul_at(mat *c, const mat *a, const mat *b);
 int	gpu_mat_outer_add(mat *dw, const mat *a, const mat *b);
@@ -86,23 +102,30 @@ int	gpu_mat_outer_add(mat *dw, const mat *a, const mat *b);
 int	gpu_layernorm_backward(mat *dx, const mat *dy, const ann_real *gamma,
 		const ann_real *x_hat, const ann_real *inv_std, int T, int d,
 		ann_real *dgamma, ann_real *dbeta);
+/* dx += LayerNorm backward (dx must be device-resident); -1 = use the above + add. */
+int	gpu_layernorm_backward_acc(mat *dx, const mat *dy, const ann_real *gamma,
+		const ann_real *x_hat, const ann_real *inv_std, int T, int d,
+		ann_real *dgamma, ann_real *dbeta);
 /*
-** Flat Adam step on host buffers (param/grad/m/v length n); uploads, runs,
-** downloads. grad is scaled by grad_scale before the moment update.
-** Updates param/m/v in place; zeros grad. Returns 0 on success, -1 = CPU.
+** Same with x_hat recomputed from the LayerNorm input x and the row means
+** the forward stored (accumulate: dx +=). -1 = materialise x_hat with
+** gpu_layernorm_xhat and use the above.
 */
-int	gpu_adam_step(ann_real *param, ann_real *grad, ann_real *m, ann_real *v, int n,
-		double lr, double beta1, double beta2, double eps, int t,
-		double grad_scale);
+int	gpu_layernorm_backward_x(mat *dx, const mat *dy, const ann_real *gamma,
+		const ann_real *x, const ann_real *mean, const ann_real *inv_std,
+		int T, int d, ann_real *dgamma, ann_real *dbeta, int accumulate);
+/* x_hat = (x - mean) * inv_std per row, as the forward computes it. */
+int	gpu_layernorm_xhat(ann_real *x_hat, const ann_real *x,
+		const ann_real *mean, const ann_real *inv_std, int T, int d);
+/* Decoupled weight decay applied by the device Adam kernels (0 = off). */
+void	gpu_adam_set_weight_decay(double wd);
+/* *out = sum of d_x[i]^2 over n device floats (grad-norm clipping). */
+int	gpu_grad_sumsq(const ann_real *d_x, int n, double *out);
 /*
-** Same update on device pointers (no copies): d_param/d_grad/d_m/d_v are
-** gpu_malloc'd length n. g = grad_scale * d_grad; d_grad is zeroed after.
-** Returns 0 on success, -1 = CPU (stub or invalid args).
+** Flat Adam step on device pointers (gpu_malloc'd, length n): g = grad_scale *
+** d_grad, d_grad is zeroed after; when d_param_bf16 is non-NULL and the
+** precision is BF16 the BF16 twins are written too. 0 = done, -1 = CPU.
 */
-int	gpu_adam_step_dev(ann_real *d_param, ann_real *d_grad, ann_real *d_m,
-		ann_real *d_v, int n, double lr, double beta1, double beta2,
-		double eps, int t, double grad_scale);
-/* Like gpu_adam_step_dev; when d_param_bf16 non-NULL and BF16 prec, writes twins. */
 int	gpu_adam_step_dev_bf16(ann_real *d_param, void *d_param_bf16,
 		ann_real *d_grad, ann_real *d_m, ann_real *d_v, int n,
 		double lr, double beta1, double beta2, double eps, int t,
@@ -125,13 +148,9 @@ int	gpu_softmax_bwd_rows(ann_real *dx, const ann_real *y,
 		const ann_real *dy, int n_rows, int n_cols);
 /*
 ** Row LayerNorm forward over T x d: x_hat = (x-mean)*inv_std,
-** y = x_hat*gamma + beta. y may alias x. x_hat / inv_std may be NULL.
-** Uses eps = 1e-5; gpu_layernorm_forward_ex takes eps and also stores the
-** per-row mean (mean may be NULL).
+** y = x_hat*gamma + beta. y may alias x. x_hat / inv_std may be NULL; the
+** per-row mean is stored too (mean may be NULL).
 */
-int	gpu_layernorm_forward(ann_real *y, const ann_real *x,
-		const ann_real *gamma, const ann_real *beta,
-		ann_real *x_hat, ann_real *inv_std, int T, int d);
 int	gpu_layernorm_forward_ex(ann_real *y, const ann_real *x,
 		const ann_real *gamma, const ann_real *beta,
 		ann_real *x_hat, ann_real *mean, ann_real *inv_std,
@@ -146,6 +165,29 @@ int	gpu_bias_row_add(ann_real *x, const ann_real *bias, int rows, int cols);
 int	gpu_ce_delta_from_softmax(ann_real *probs, const int *tgt, int rows,
 		int V, ann_real *db_host, double *mean_ce);
 /*
+** BF16 batch training: logits (device, rows x V) -> softmax, CE and db_host
+** as gpu_ce_delta_from_softmax, with delta = p - onehot written only as BF16
+** in place over the logits and served to the head's wgrad / dgrad GEMMs as
+** their gradient twin. 0 = done (the FP32 buffer no longer holds logits nor
+** delta); -1 = not applicable, logits intact; -2 = failed, logits lost.
+** gpu_ce_bf16_delta_done(logits) after both GEMMs: 0 when both consumed it.
+*/
+int	gpu_ce_softmax_delta_bf16(ann_real *logits, const int *tgt, int rows,
+		int V, const ann_real *bias, ann_real *db_host, double *mean_ce);
+/*
+** 1 when the head bias goes into gpu_ce_softmax_delta_bf16 (bias argument)
+** instead of a separate gpu_bias_row_add pass (ANN_CE_BIAS=0: 0).
+*/
+int	gpu_ce_bias_fused(void);
+int	gpu_ce_bf16_delta_done(const ann_real *logits);
+/*
+** Probe loss: out[r] = logsumexp(logits[r]) - logits[r][tgt[r]] in FP32 for
+** rows x V device logits (left intact). out is host, rows floats. -1 = not
+** applicable (host logits, no GPU).
+*/
+int	gpu_ce_nll_rows(const ann_real *logits, const int *tgt, int rows, int V,
+		float *out);
+/*
 ** S2: Add sinusoidal posenc in place to packed (B*T) x D; position t restarts
 ** each sequence. x may be device-resident.
 */
@@ -155,14 +197,21 @@ int	gpu_posenc_add_packed(ann_real *x, int B, int T, int D);
 */
 int	gpu_mat_col_sum_add(ann_real *db_host, const ann_real *x, int rows,
 		int cols);
-/* x[i] = max(x[i], 0) in place over n elements. */
-int	gpu_relu_forward(ann_real *x, int n);
 /*
 ** ReLU backward in place: dx[i] = 0 where ref[i] <= 0, else unchanged.
 ** Mask convention: ref is the pre-activation (z) or the post-ReLU output /
 ** a 0-1 mask -- all three agree because z > 0 <=> relu(z) > 0 <=> mask != 0.
 */
 int	gpu_relu_backward(ann_real *dx, const ann_real *x_pre_relu_or_mask, int n);
+/*
+** FFN backward (BF16 mode): ReLU backward of dh by hidden > 0, the BF16 twin
+** of the masked dh for the following W1 GEMMs, and db1_host += column sums
+** (accumulated like gpu_mat_col_sum_add), one kernel. dh and hidden must be
+** device-resident; the FP32 dh stays unmasked. -1 = do it in steps.
+*/
+int	gpu_ffn_relu_bwd_fused(mat *dh, const mat *hidden, ann_real *db1_host);
+/* 1 when m's device buffer was never written and only its BF16 twin holds it (BF16-only ReLU output). */
+int	gpu_act_bf16_only(const mat *m);
 
 /*
 ** M1: fused causal MHA over B packed sequences (B*T) x (H*dh), one launch per
@@ -180,18 +229,32 @@ int	gpu_attn_causal_fwd(mat *concat, mat *w, const mat *q, const mat *k,
 */
 int	gpu_attn_flash_fwd(mat *concat, const mat *q, const mat *k,
 		const mat *v, int B, int T, int H, int dh, mat *lse);
+/*
+** Fused tensor-core causal attention (BF16 mma.sync, FP32 accumulate): same
+** outputs as gpu_attn_flash_fwd (concat + lse). -1 = use another path
+** (needs T % 64 == 0, dh in {16,32,48,64}, BF16 mode, no seqlens, the
+** fused QKV rows of gpu_attn_qkv_fused, ANN_FA2 not 0).
+*/
+int	gpu_attn_fa_fwd(mat *concat, const mat *q, const mat *k,
+		const mat *v, int B, int T, int H, int dh, mat *lse);
+/* 1 when gpu_attn_fa_fwd will take this shape (so no T x T scores are needed). */
+int	gpu_attn_fa_usable(int T, int dh);
+int	gpu_attn_fa_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat,
+		const mat *concat, const mat *q, const mat *k, const mat *v,
+		const mat *lse, int B, int T, int H, int dh);
+/*
+** Q/K/V projection backward from the merged BF16 [dQ|dK|dV] rows that
+** gpu_attn_fa_bwd left for dq (ANN_QKV_BWD): dx = [dQ|dK|dV] [Wq|Wk|Wv]^T
+** in one GEMM, dWq/dWk/dWv += x_in^T [dQ|dK|dV]. 1 = none pending (run the
+** separate GEMMs), 0 = done, -1 = error (dK/dV existed only there).
+*/
+int	gpu_attn_qkv_bwd(mat *dx, mat *dwq, mat *dwk, mat *dwv,
+		const mat *x_in, const mat *dq, const mat *wq, const mat *wk,
+		const mat *wv);
 /* FA-2 tiled bwd: P = exp(S - L) from this forward's lse. No T×T buffer. */
 int	gpu_attn_tiled_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat,
 		const mat *concat, const mat *q, const mat *k, const mat *v,
 		const mat *lse, int B, int T, int H, int dh);
-/* Recompute that causal logsumexp into lse. Does not write a score tensor. */
-int	gpu_attn_recompute_w(mat *lse, const mat *q, const mat *k, int B, int T,
-		int H, int dh);
-/*
-** Milliseconds of one tiled flash backward, or -1 if not measured yet.
-** Timed once, outside CUDA graph capture. This is not a cuDNN SDPA launch.
-*/
-float	gpu_attn_flash_bwd_ms(void);
 int	gpu_attn_causal_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat,
 		const mat *w, const mat *q, const mat *k, const mat *v,
 		int B, int T, int H, int dh);
@@ -205,6 +268,8 @@ int	gpu_attn_tc_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat,
 		mat *w, const mat *q, const mat *k, const mat *v,
 		int B, int T, int H, int dh);
 /* One GEMM X@ [Wq|Wk|Wv] then split into q,k,v (D x D weights). */
+/* Next gpu_attn_qkv_fused feeds the fused attention at (T, dh): it may write BF16 rows only. */
+void	gpu_attn_qkv_bf16_hint(int T, int dh);
 int	gpu_attn_qkv_fused(mat *q, mat *k, mat *v, const mat *x,
 		const mat *wq, const mat *wk, const mat *wv);
 /* Pack CE gather: dst[b*(T-1)+t] = src[b*T+t] for t in [0,T-1). */
@@ -212,9 +277,6 @@ int	gpu_pack_seq_rows(ann_real *dst, const ann_real *src, int B, int T,
 		int D);
 int	gpu_unpack_seq_rows(ann_real *dst, const ann_real *src, int B, int T,
 		int D);
-/* S8: x += bias then ReLU in one launch (rows x cols). */
-int	gpu_bias_relu_forward(ann_real *x, const ann_real *bias, int rows,
-		int cols);
 /*
 ** FFN W1 finish: optional bias into pre, hidden = ReLU(pre), publish BF16
 ** twin of hidden for the W2 GEMM. bias NULL means pre already includes bias.
@@ -249,17 +311,39 @@ void	gpu_host_free(void *p);
 
 /* R8/E6: secondary copy stream (NULL/0 = default). */
 void	*gpu_copy_stream(void);
-void	gpu_stream_sync_copy(void);
 
 /*
-** R12: capture/replay helpers for a fixed microbatch. begin/end wrap the
-** default stream; replay returns -1 if no graph. Capture fails if host ops
-** remain in the region (expected until full residency).
+** R12: CUDA-graph capture / replay of one training microbatch (lm_graph_step).
+** begin/end capture the compute stream; replay launches the graph and
+** returns -1 when there is none or it may no longer be replayed (a device
+** buffer it uses was freed, or one of its temporaries is held by someone
+** else: gpu_graph_replayable). end fails if anything inside the capture
+** allocated, freed or synchronised.
+**
+** gpu_graph_set_mode(1) switches on what a replayed microbatch needs, all
+** of it outside the default path: gpu_malloc / gpu_free recycle exact-size
+** blocks (so a steady microbatch allocates nothing), the head bias gradient
+** accumulates on the device until gpu_device_sync, and the gradient twin
+** round robin restarts every microbatch.
+**
+** gpu_ids_stage copies the n token ids into a page-locked ring and from
+** there, on the compute stream, into one fixed device buffer; until
+** gpu_ids_unstage, embedding lookup / scatter calls with ids or alias read
+** that buffer and gpu_ce_targets_staged(ids, B, T) builds the next-token
+** targets from it on the device (no host target array at all).
+** gpu_param_epoch changes at every optimizer step (weight twins rebuilt).
 */
 int	gpu_graph_begin(void);
 int	gpu_graph_end(void);
 int	gpu_graph_replay(void);
+int	gpu_graph_replayable(void);
 void	gpu_graph_destroy(void);
+void	gpu_graph_set_mode(int on);
+int	gpu_graph_supported(void);
+unsigned	gpu_param_epoch(void);
+int	gpu_ids_stage(const int *ids, const int *alias, int n);
+void	gpu_ids_unstage(void);
+const int	*gpu_ce_targets_staged(const int *ids, int B, int T);
 
 /*
 ** Single-stream decode. Weight mats are device twins (row-major Din x Dout);

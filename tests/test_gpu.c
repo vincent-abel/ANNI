@@ -1,0 +1,709 @@
+/*
+**	GPU regression checks on the small test LM (make test-gpu, needs CUDA).
+**	Each check is a bug that make test (CPU stub) cannot see:
+**	  1. forward determinism and no cross-batch state (stale CE targets)
+**	  2. first Adam step applies the weight gradients (flat alias setup)
+**	  3. bias / LN vectors trained and refreshed on the device
+**	  4. a freed model leaves no pending CUDA error (aliased dW frees)
+**	  5. BF16 gradients track FP32 from step 1 (cuBLASLt timing loop)
+**	  7. the batched validation probe matches lm_nll window by window
+**	  8. CUDA-graph replay gives the losses and gradients of the plain run
+**	  9. the same training repeated gives the same gradients (run-to-run)
+*/
+#define _POSIX_C_SOURCE 200112L
+#include <assert.h>
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "attn.h"
+#include "gpu.h"
+#include "gradutil.h"
+#include "lm.h"
+#include "lm_adam.h"
+#include "lm_serialize.h"
+
+#define B 4
+#define T 64	/* multiple of 64: exercises the fused FA2 attention */
+#define ACC 2
+#define STEPS 4
+#define NT 64
+/* Pseudo precision for rig_open: BF16 GEMMs with the FP8 fwd/dgrad stack. */
+#define PREC_FP8 99
+/* Attention path used by rig_open: 1 = tiled flash, 0 = Tensor-Core scores. */
+static int g_flash = 1;
+
+static void fill_ids(int *ids, unsigned x)
+{
+	int j;
+
+	for (j = 0; j < B * T; j++) {
+		x = x * 1103515245u + 12345u;
+		ids[j] = (int)((x >> 16) % 256u);
+	}
+}
+
+static double abs_sum_vec(const vec *v)
+{
+	int i;
+	double s = 0.0;
+
+	for (i = 0; i < v->n; i++)
+		s += fabs((double)v->data[i]);
+	return s;
+}
+
+typedef struct {
+	lm		*m;
+	lm_adam		*opt;
+	lm_cache	*c;
+	mat		*dh;
+} rig;
+
+static void rig_open(rig *r, int prec)
+{
+	srand(1234);
+	r->m = lm_create();
+	r->opt = lm_adam_create(r->m);
+	assert(r->m && r->opt);
+	r->opt->beta2 = 0.95;
+	r->opt->grad_clip = 1.0;
+	r->opt->weight_decay = 0.1;
+	gpu_set_fp8(prec == PREC_FP8);
+	gpu_set_compute_prec(prec == PREC_FP8 ? GPU_PREC_BF16 : prec);
+	attn_set_flash(g_flash);
+	lm_weights_to_device(r->m);
+	r->c = lm_cache_create_packed(B, T);
+	r->dh = mat_create(B * T, LM_D_MODEL);
+	assert(r->c && r->dh);
+	gpu_set_sync_mode(GPU_SYNC_BATCH);
+}
+
+static void rig_close(rig *r)
+{
+	gpu_set_sync_mode(GPU_SYNC_EAGER);
+	gpu_set_fp8(0);
+	lm_weights_ensure_host(r->m);
+	lm_adam_free(&r->opt);
+	lm_cache_free(&r->c);
+	mat_free(&r->dh);
+	lm_free(&r->m);
+}
+
+/* Forward + loss (+ backward) of one microbatch; returns mean CE. */
+static double microbatch(rig *r, unsigned seed, int bwd)
+{
+	int ids[B * T];
+	double ce = -1.0;
+
+	fill_ids(ids, seed);
+	assert(lm_forward_cache_packed(r->m, ids, B, T, r->c) == 0);
+	assert(lm_loss_backward_packed(r->m, r->c, ids, B, T, r->dh, &ce) == 0);
+	if (bwd)
+		assert(lm_backward_packed(r->m, r->dh, r->c) == 0);
+	gpu_device_sync();
+	return ce;
+}
+
+static int collect(lm *m, mat **g, char names[][16])
+{
+	int n = 0;
+	int i;
+
+	strcpy(names[n], "dw_head");
+	g[n++] = m->dw_head;
+	strcpy(names[n], "dtable");
+	g[n++] = m->embed->dtable;
+	for (i = 0; i < m->tr->n_blocks; i++) {
+		tblock *b = &m->tr->blocks[i];
+
+		sprintf(names[n], "b%d.dwq", i);
+		g[n++] = b->attn->dwq;
+		sprintf(names[n], "b%d.dwk", i);
+		g[n++] = b->attn->dwk;
+		sprintf(names[n], "b%d.dwv", i);
+		g[n++] = b->attn->dwv;
+		sprintf(names[n], "b%d.dwo", i);
+		g[n++] = b->attn->dwo;
+		sprintf(names[n], "b%d.dw1", i);
+		g[n++] = b->ffn->dw1;
+		sprintf(names[n], "b%d.dw2", i);
+		g[n++] = b->ffn->dw2;
+	}
+	return n;
+}
+
+/* STEPS Adam steps; snapshots[s][t] = host copy of grad tensor t before step s. */
+static void train(int prec, float **snaps, double *loss, int *nt, int *sizes,
+	char names[][16])
+{
+	rig r;
+	mat *g[NT];
+	int s;
+	int a;
+	int i;
+
+	rig_open(&r, prec);
+	*nt = collect(r.m, g, names);
+	for (i = 0; i < *nt; i++)
+		sizes[i] = g[i]->rows * g[i]->cols;
+	for (s = 0; s < STEPS; s++) {
+		double ce_sum = 0.0;
+
+		lm_adam_zero_grad(r.m);
+		vec_zero(r.m->db_head);
+		for (a = 0; a < ACC; a++)
+			ce_sum += microbatch(&r, 777u + 1000u * s + 10u * a, 1);
+		loss[s] = ce_sum / ACC;
+		for (i = 0; i < *nt; i++) {
+			size_t nb = (size_t)sizes[i] * sizeof(float);
+
+			snaps[s * NT + i] = malloc(nb);
+			assert(snaps[s * NT + i]);
+			/* dtable is device-authoritative too: pull every tensor. */
+			if (mat_pull_host(g[i]) != 0) {
+				printf("  pull %s failed: CUDA '%s'\n", names[i],
+				    gpu_debug_last_error());
+				assert(0);
+			}
+			memcpy(snaps[s * NT + i], g[i]->data, nb);
+		}
+		lm_adam_step_scaled(r.opt, 1e-3, 1.0 / (double)(B * (T - 1)));
+	}
+	rig_close(&r);
+}
+
+/* 1. Same model, same batch -> same loss; a new batch must not inherit the
+** previous batch's targets; a fresh model sees the same first loss. */
+static void test_forward_no_cross_batch_state(void)
+{
+	rig r;
+	double a;
+	double b;
+	double c;
+	double d;
+
+	rig_open(&r, GPU_PREC_FP32);
+	a = microbatch(&r, 777u, 0);
+	b = microbatch(&r, 777u, 0);
+	c = microbatch(&r, 999u, 0);
+	rig_close(&r);
+	rig_open(&r, GPU_PREC_FP32);
+	d = microbatch(&r, 999u, 0);
+	rig_close(&r);
+	printf("  forward: %.6f %.6f | other batch %.6f fresh %.6f\n", a, b, c, d);
+	assert(fabs(a - b) < 1e-5);
+	assert(fabs(c - a) > 1e-3);		/* targets were stale if equal */
+	assert(fabs(c - d) < 1e-5);
+}
+
+/* 2 + 3. After one Adam step: matrices moved by more than weight decay, FFN
+** biases and LN vectors moved, and the next forward sees the new vectors. */
+static void test_first_step_updates_everything(void)
+{
+	rig r;
+	float *w0;
+	double dw;
+	double b1_0;
+	double b1_1;
+	double g0;
+	double g1;
+	double l_before;
+	double l_after;
+	double l_refresh;
+	tblock *blk;
+
+	rig_open(&r, GPU_PREC_FP32);
+	blk = &r.m->tr->blocks[0];
+	{
+		size_t nb = (size_t)r.m->w_head->rows * r.m->w_head->cols
+		    * sizeof(float);
+
+		w0 = malloc(nb);
+		assert(w0);
+		mat_pull_host(r.m->w_head);
+		memcpy(w0, r.m->w_head->data, nb);
+	}
+	b1_0 = abs_sum_vec(blk->ffn->b1);
+	g0 = abs_sum_vec(blk->ln1->gamma);
+	lm_adam_zero_grad(r.m);
+	vec_zero(r.m->db_head);
+	l_before = microbatch(&r, 777u, 1);
+	lm_adam_step_scaled(r.opt, 1e-3, 1.0 / (double)(B * (T - 1)));
+	{
+		size_t i;
+		size_t n = (size_t)r.m->w_head->rows * r.m->w_head->cols;
+
+		mat_pull_host(r.m->w_head);
+		dw = 0.0;
+		for (i = 0; i < n; i++)
+			dw += fabs((double)r.m->w_head->data[i] - (double)w0[i]);
+		free(w0);
+	}
+	b1_1 = abs_sum_vec(blk->ffn->b1);
+	g1 = abs_sum_vec(blk->ln1->gamma);
+	printf("  step1: |dW_head|_1 %.4f, b1 %.4f -> %.4f, gamma %.4f -> %.4f\n",
+	    dw, b1_0, b1_1, g0, g1);
+	/*
+	** Adam's first step moves every weight by about lr (sign-like), so
+	** |dW|_1 is about lr * n = 16; weight decay alone gives 1e-4 * |W|_1,
+	** under 0.05. A dropped first-step gradient fails this.
+	*/
+	assert(dw > 1.0);
+	assert(b1_1 > 0.01);
+	assert(fabs(g1 - g0) > 1e-3);
+	/* The next forward must use the updated vectors: forcing a refresh of
+	** every cached device vector must not change its loss. */
+	lm_adam_zero_grad(r.m);
+	l_after = microbatch(&r, 777u, 0);
+	gpu_half_wt_invalidate(NULL);
+	l_refresh = microbatch(&r, 777u, 0);
+	printf("  loss before %.6f after %.6f refreshed %.6f\n", l_before, l_after,
+	    l_refresh);
+	assert(fabs(l_after - l_refresh) < 1e-5);
+	assert(l_after < l_before);
+	rig_close(&r);
+}
+
+/* 4. Train, free, and make sure no CUDA error is left pending. */
+static void test_free_leaves_no_cuda_error(void)
+{
+	rig r;
+	const char *err;
+
+	(void)gpu_debug_last_error();
+	rig_open(&r, GPU_PREC_FP32);
+	lm_adam_zero_grad(r.m);
+	microbatch(&r, 777u, 1);
+	lm_adam_step_scaled(r.opt, 1e-3, 1.0 / (double)(B * (T - 1)));
+	microbatch(&r, 787u, 1);
+	rig_close(&r);
+	err = gpu_debug_last_error();
+	printf("  pending CUDA error after free: '%s'\n", err);
+	assert(err[0] == '\0');
+}
+
+/*
+** 5. Reduced-precision training tracks FP32: loss trajectory within
+** loss_tol and every weight gradient within rel_tol relative error and
+** ratio_tol in norm, from step 1 on (step 1 catches the GEMM-level bugs:
+** timing loop, scale saturation; later steps the trajectory).
+*/
+static void check_tracks_fp32(const char *tag, int prec, double loss_tol,
+	double rel_tol, double ratio_tol)
+{
+	static float *s32[STEPS * NT];
+	static float *s16[STEPS * NT];
+	double l32[STEPS];
+	double l16[STEPS];
+	int sizes[NT];
+	char names[NT][16];
+	int nt;
+	int s;
+	int i;
+	int j;
+	int bad = 0;
+
+	train(GPU_PREC_FP32, s32, l32, &nt, sizes, names);
+	train(prec, s16, l16, &nt, sizes, names);
+	for (s = 0; s < STEPS; s++) {
+		printf("  step %d loss fp32 %.5f %s %.5f\n", s + 1, l32[s], tag,
+		    l16[s]);
+		if (fabs(l32[s] - l16[s]) > loss_tol)
+			bad = 1;
+		for (i = 0; i < nt; i++) {
+			double num = 0.0;
+			double den = 0.0;
+			double n16 = 0.0;
+			double rel;
+			double ratio;
+
+			for (j = 0; j < sizes[i]; j++) {
+				double d = s32[s * NT + i][j] - s16[s * NT + i][j];
+
+				num += d * d;
+				den += (double)s32[s * NT + i][j] * s32[s * NT + i][j];
+				n16 += (double)s16[s * NT + i][j] * s16[s * NT + i][j];
+			}
+			rel = sqrt(num / (den + 1e-30));
+			ratio = sqrt(n16 / (den + 1e-30));
+			if (rel > rel_tol || ratio > 1.0 + ratio_tol
+			    || ratio < 1.0 - ratio_tol) {
+				printf("    %s: rel_err %.3f ratio %.3f\n", names[i], rel,
+				    ratio);
+				bad = 1;
+			}
+			free(s32[s * NT + i]);
+			free(s16[s * NT + i]);
+		}
+	}
+	assert(!bad);
+}
+
+/*
+** 6. Save / load round trip: a checkpoint written after training must
+** evaluate to the same loss once loaded into a fresh model, on the packed
+** path and on the single-window lm_nll path (the resume "start NLL").
+*/
+static void test_checkpoint_round_trip(void)
+{
+	rig r;
+	lm *m2;
+	lm_adam *opt2;
+	lm_cache *c2;
+	mat *dh2;
+	int ids[B * T];
+	double l_before;
+	double l_after;
+	double n_before;
+	double n_after;
+	double n_after2;
+	const char *path = "/tmp/test_gpu_ckpt.bin";
+	int ep = 0;
+	int st = 0;
+
+	rig_open(&r, GPU_PREC_BF16);
+	lm_adam_zero_grad(r.m);
+	microbatch(&r, 777u, 1);
+	lm_adam_step_scaled(r.opt, 1e-3, 1.0 / (double)(B * (T - 1)));
+	lm_adam_zero_grad(r.m);
+	microbatch(&r, 787u, 1);
+	lm_adam_step_scaled(r.opt, 1e-3, 1.0 / (double)(B * (T - 1)));
+	lm_adam_zero_grad(r.m);
+	l_before = microbatch(&r, 999u, 0);
+	fill_ids(ids, 999u);
+	n_before = lm_nll(r.m, ids, T);
+	lm_weights_ensure_host(r.m);
+	assert(lm_save_checkpoint(r.m, r.opt, 1, 2, path) == 0);
+	/* B7: the chunked m/v writer must emit the per-value writer's bytes. */
+	{
+		const char *p2 = "/tmp/test_gpu_ckpt_ref.bin";
+		FILE *f1;
+		FILE *f2;
+		int c1;
+		int c2b;
+
+		setenv("ANN_CKPT_CHUNKED", "0", 1);
+		assert(lm_save_checkpoint(r.m, r.opt, 1, 2, p2) == 0);
+		unsetenv("ANN_CKPT_CHUNKED");
+		f1 = fopen(path, "rb");
+		f2 = fopen(p2, "rb");
+		assert(f1 && f2);
+		do {
+			c1 = fgetc(f1);
+			c2b = fgetc(f2);
+			assert(c1 == c2b);
+		} while (c1 != EOF);
+		fclose(f1);
+		fclose(f2);
+		remove(p2);
+		printf("  checkpoint: chunked and per-value writes identical\n");
+	}
+	rig_close(&r);
+	m2 = lm_load_checkpoint(path, &opt2, &ep, &st);
+	assert(m2 && opt2);
+	/* Evaluate exactly as a resumed run does: before any device upload. */
+	n_after = lm_nll(m2, ids, T);
+	c2 = lm_cache_create_packed(B, T);
+	dh2 = mat_create(B * T, LM_D_MODEL);
+	assert(c2 && dh2);
+	lm_weights_to_device(m2);
+	gpu_set_sync_mode(GPU_SYNC_BATCH);
+	{
+		double ce = -1.0;
+
+		assert(lm_forward_cache_packed(m2, ids, B, T, c2) == 0);
+		assert(lm_loss_backward_packed(m2, c2, ids, B, T, dh2, &ce) == 0);
+		gpu_device_sync();
+		l_after = ce;
+	}
+	gpu_set_sync_mode(GPU_SYNC_EAGER);
+	n_after2 = lm_nll(m2, ids, T);
+	printf("  round trip: packed %.6f -> %.6f, lm_nll %.6f -> %.6f (after upload %.6f)\n",
+	    l_before, l_after, n_before, n_after, n_after2);
+	assert(fabs(l_before - l_after) < 1e-4);
+	assert(fabs(n_before - n_after) < 1e-4);
+	assert(fabs(n_before - n_after2) < 1e-4);
+	lm_adam_free(&opt2);
+	lm_cache_free(&c2);
+	mat_free(&dh2);
+	lm_free(&m2);
+	remove(path);
+}
+
+/*
+** 7. Batched validation probe: lm_nll_packed (one forward, one head GEMM,
+** FP32 device CE) must match the per-window lm_nll within the BF16 head's
+** rounding, window by window.
+*/
+static void test_probe_packed(void)
+{
+	rig r;
+	int ids[B * T];
+	double wn[B];
+	double worst;
+	int b;
+
+	rig_open(&r, GPU_PREC_BF16);
+	lm_adam_zero_grad(r.m);
+	microbatch(&r, 777u, 1);
+	lm_adam_step_scaled(r.opt, 1e-3, 1.0 / (double)(B * (T - 1)));
+	lm_adam_zero_grad(r.m);
+	fill_ids(ids, 4242u);
+	assert(lm_nll_packed(r.m, r.c, ids, B, T, wn) == 0);
+	worst = 0.0;
+	for (b = 0; b < B; b++) {
+		double ref = lm_nll(r.m, ids + b * T, T);
+
+		printf("  probe window %d: packed %.6f lm_nll %.6f\n", b, wn[b], ref);
+		if (fabs(wn[b] - ref) > worst)
+			worst = fabs(wn[b] - ref);
+	}
+	/* The second call must not depend on state left by the first. */
+	{
+		double wn2[B];
+
+		assert(lm_nll_packed(r.m, r.c, ids, B, T, wn2) == 0);
+		for (b = 0; b < B; b++)
+			assert(wn2[b] == wn[b]);
+	}
+	printf("  probe: worst |packed - lm_nll| = %.2e\n", worst);
+	assert(worst < 2e-2);
+	rig_close(&r);
+}
+
+/*
+** 8. --cuda-graphs: GACC microbatches per Adam step, so each step has an
+** uncaptured microbatch, then a captured one (step 1) or replays. Losses
+** and every gradient (weights, embedding, head bias, FFN / LN vectors)
+** must match the plain run; the replay count proves the graph ran.
+** The column sums and the embedding scatter add in a fixed order
+** (ANN_DET_SUM), so the gradients of two plain runs agree; only the CE sum
+** (the loss value, not its gradient) still uses float atomics. The third
+** run measures plain against plain and is held to the same bounds; a stale
+** id, target or bias in a replay moves them by 1e-3 and more.
+*/
+#define GACC 3
+#define GVEC 4	/* db_head, b0.db1, b0.ln1.dgamma, last block db2 */
+
+static void train_graphs(int graphs, int prec, double *loss, float **snaps,
+	int *nt, int *sizes, char names[][16], long *replays)
+{
+	static int ids[B * T];
+	rig r;
+	mat *g[NT];
+	vec *v[GVEC];
+	int s;
+	int a;
+	int i;
+
+	rig_open(&r, prec);
+	lm_graph_enable(graphs);
+	*nt = collect(r.m, g, names);
+	v[0] = r.m->db_head;
+	v[1] = r.m->tr->blocks[0].ffn->db1;
+	v[2] = r.m->tr->blocks[0].ln1->dgamma;
+	v[3] = r.m->tr->blocks[r.m->tr->n_blocks - 1].ffn->db2;
+	for (i = 0; i < *nt; i++)
+		sizes[i] = g[i]->rows * g[i]->cols;
+	for (i = 0; i < GVEC; i++) {
+		sprintf(names[*nt + i], "vec%d", i);
+		sizes[*nt + i] = v[i]->n;
+	}
+	for (s = 0; s < STEPS; s++) {
+		lm_adam_zero_grad(r.m);
+		vec_zero(r.m->db_head);
+		for (a = 0; a < GACC; a++) {
+			double ce = -1.0;
+
+			fill_ids(ids, 555u + 1000u * s + 10u * a);
+			assert(lm_graph_step(r.m, r.c, r.dh, ids, B, T, &ce) == 0);
+			loss[s * GACC + a] = ce;
+		}
+		gpu_device_sync();
+		for (i = 0; i < *nt + GVEC; i++) {
+			size_t nb = (size_t)sizes[i] * sizeof(float);
+
+			snaps[s * NT + i] = malloc(nb);
+			assert(snaps[s * NT + i]);
+			if (i < *nt) {
+				assert(mat_pull_host(g[i]) == 0);
+				memcpy(snaps[s * NT + i], g[i]->data, nb);
+			} else
+				memcpy(snaps[s * NT + i], v[i - *nt]->data, nb);
+		}
+		lm_adam_step_scaled(r.opt, 1e-3,
+		    1.0 / (double)(GACC * B * (T - 1)));
+	}
+	*replays = lm_graph_replays();
+	lm_graph_enable(0);
+	rig_close(&r);
+}
+
+static double max_rel_diff(const float *a, const float *b, int n)
+{
+	double num = 0.0;
+	double den = 0.0;
+	int j;
+
+	for (j = 0; j < n; j++) {
+		double d = (double)a[j] - (double)b[j];
+
+		num += d * d;
+		den += (double)a[j] * a[j];
+	}
+	return sqrt(num / (den + 1e-30));
+}
+
+/* Largest loss gap and gradient relative error between two runs; frees b. */
+static void graphs_diff(const double *la, const double *lb, float **sa,
+	float **sb, int nv, const int *sizes, char names[][16], double grad_tol,
+	double *lworst, double *gworst)
+{
+	int s;
+	int i;
+
+	*lworst = 0.0;
+	*gworst = 0.0;
+	for (i = 0; i < STEPS * GACC; i++)
+		if (fabs(la[i] - lb[i]) > *lworst)
+			*lworst = fabs(la[i] - lb[i]);
+	for (s = 0; s < STEPS; s++)
+		for (i = 0; i < nv; i++) {
+			double d = max_rel_diff(sa[s * NT + i], sb[s * NT + i],
+			    sizes[i]);
+
+			if (d > grad_tol)
+				printf("    step %d %s: rel diff %.3g\n", s + 1,
+				    names[i], d);
+			if (d > *gworst)
+				*gworst = d;
+			free(sb[s * NT + i]);
+			sb[s * NT + i] = NULL;
+		}
+}
+
+static void check_graphs_match(const char *tag, int prec, double loss_tol,
+	double grad_tol)
+{
+	static float *s0[STEPS * NT];
+	static float *s1[STEPS * NT];
+	static float *s2[STEPS * NT];
+	double l0[STEPS * GACC];
+	double l1[STEPS * GACC];
+	double l2[STEPS * GACC];
+	int sizes[NT];
+	char names[NT][16];
+	long rep0;
+	long rep1;
+	long rep2;
+	double lg, gg, ln, gn;
+	int nt;
+	int i;
+
+	assert(NT >= 16 + GVEC);
+	train_graphs(0, prec, l0, s0, &nt, sizes, names, &rep0);
+	train_graphs(1, prec, l1, s1, &nt, sizes, names, &rep1);
+	train_graphs(0, prec, l2, s2, &nt, sizes, names, &rep2);
+	graphs_diff(l0, l1, s0, s1, nt + GVEC, sizes, names, grad_tol, &lg, &gg);
+	graphs_diff(l0, l2, s0, s2, nt + GVEC, sizes, names, 1.0, &ln, &gn);
+	for (i = 0; i < STEPS * NT; i++) {
+		free(s0[i]);
+		s0[i] = NULL;
+	}
+	printf("  %s: losses %.6f..%.6f; graphs vs plain: max |dloss| %.3g, "
+	    "max grad rel diff %.3g (plain vs plain %.3g, %.3g); replays %ld\n",
+	    tag, l1[0], l1[STEPS * GACC - 1], lg, gg, ln, gn, rep1);
+	assert(rep0 == 0 && rep2 == 0);
+	assert(rep1 == STEPS * (GACC - 1));
+	assert(lg <= loss_tol);
+	assert(gg <= grad_tol);
+	assert(ln <= loss_tol);
+	assert(gn <= grad_tol);
+}
+
+/*
+** 9. The plain training repeated NREP times must give the same gradients
+** at every step (relative error <= grad_tol). Float atomics in the column
+** sums (bias, LayerNorm, head bias, embedding scatter) let the last bit of
+** a gradient change from run to run; in this model Adam and a ReLU mask
+** grew that bit into a 2% gradient gap two steps later in about half of
+** the repeats (ANN_DET_SUM=0 brings it back). One repeat in two failing,
+** NREP = 8 misses a regression with probability 1 / 128.
+*/
+#define NREP 8
+
+static void check_repeatable(const char *tag, int prec, double loss_tol,
+	double grad_tol)
+{
+	static float *s0[STEPS * NT];
+	static float *s1[STEPS * NT];
+	double l0[STEPS * GACC];
+	double l1[STEPS * GACC];
+	int sizes[NT];
+	char names[NT][16];
+	long rep;
+	double lw = 0.0;
+	double gw = 0.0;
+	int nt;
+	int k;
+	int i;
+
+	train_graphs(0, prec, l0, s0, &nt, sizes, names, &rep);
+	for (k = 1; k < NREP; k++) {
+		double lk;
+		double gk;
+
+		train_graphs(0, prec, l1, s1, &nt, sizes, names, &rep);
+		graphs_diff(l0, l1, s0, s1, nt + GVEC, sizes, names, grad_tol,
+		    &lk, &gk);
+		if (lk > lw)
+			lw = lk;
+		if (gk > gw)
+			gw = gk;
+	}
+	for (i = 0; i < STEPS * NT; i++) {
+		free(s0[i]);
+		s0[i] = NULL;
+	}
+	printf("  %s: %d repeats, max |dloss| %.3g, max grad rel diff %.3g\n",
+	    tag, NREP, lw, gw);
+	assert(lw <= loss_tol);
+	assert(gw <= grad_tol);
+}
+
+int main(void)
+{
+	if (!gpu_available()) {
+		printf("test_gpu: no GPU backend (%s), skipping\n",
+		    gpu_backend_name());
+		return 0;
+	}
+	setvbuf(stdout, NULL, _IONBF, 0);
+	if (getenv("ANN_TEST_FLASH"))
+		g_flash = atoi(getenv("ANN_TEST_FLASH"));
+	/* Load-independent cuBLASLt algo choice: BF16 rounding then repeats. */
+	setenv("ANN_LT_HEURISTIC", "1", 1);
+	printf("test_gpu on %s\n", gpu_backend_name());
+	test_forward_no_cross_batch_state();
+	test_first_step_updates_everything();
+	test_free_leaves_no_cuda_error();
+	test_checkpoint_round_trip();
+	test_probe_packed();
+	printf("bf16 vs fp32\n");
+	check_tracks_fp32("bf16", GPU_PREC_BF16, 2e-3, 0.2, 0.1);
+	printf("fp8 (E4M3 fwd, E5M2 dgrad) vs fp32\n");
+	check_tracks_fp32("fp8", PREC_FP8, 3e-2, 0.6, 0.3);
+	g_flash = 0;
+	printf("Tensor-Core attention path: bf16 vs fp32\n");
+	check_tracks_fp32("bf16-tc", GPU_PREC_BF16, 2e-3, 0.2, 0.1);
+	g_flash = 1;
+	printf("cuda graphs vs plain run\n");
+	check_graphs_match("bf16", GPU_PREC_BF16, 2e-5, 1e-6);
+	check_graphs_match("fp32", GPU_PREC_FP32, 2e-5, 1e-6);
+	printf("repeated training (run-to-run determinism)\n");
+	check_repeatable("bf16", GPU_PREC_BF16, 2e-5, 1e-6);
+	check_repeatable("fp32", GPU_PREC_FP32, 2e-5, 1e-6);
+	printf("test_gpu: all passed\n");
+	return 0;
+}

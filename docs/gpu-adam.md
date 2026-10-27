@@ -2,7 +2,7 @@
 
 ## Abstract
 
-[`lm_adam_step`](../lang/lm_adam.c) packs scattered param/grad/moment slots into contiguous host arrays, then calls [`gpu_adam_step`](../num/gpu.h). The CUDA kernel updates \(m,v,\theta\) and zeros grads in one pass. Stubs return `-1` so the existing host Adam loop remains the default.
+[`lm_adam_step`](../lang/lm_adam.c) packs scattered param/grad/moment slots into contiguous host arrays, then called a one-shot `gpu_adam_step` (since removed; the device-resident path uses [`gpu_adam_step_dev_bf16`](../num/gpu.h)). The CUDA kernel updates \(m,v,\theta\) and zeros grads in one pass. Stubs return `-1` so the existing host Adam loop remains the default.
 
 ## What problem it solves (plain language)
 
@@ -33,12 +33,12 @@ v_t=\beta_2 v_{t-1}+(1-\beta_2)g^2
 
 ## How it shows up in this repo
 
-- [`num/gpu.h`](../num/gpu.h), [`gpu_stub.c`](../num/gpu_stub.c), [`gpu_cuda.cu`](../num/gpu_cuda.cu): `gpu_adam_step` / `adam_kernel`
+- [`num/gpu.h`](../num/gpu.h), [`gpu_stub.c`](../num/gpu_stub.c), [`gpu_cuda.cu`](../num/gpu_cuda.cu): `gpu_adam_step_dev_bf16` / `adam_kernel`
 - [`lang/lm_adam.c`](../lang/lm_adam.c): pack → try GPU → unpack; else host loop
 
 ## Worked example
 
-On CPU builds `gpu_adam_step` returns `-1` and `lm_adam_step` uses the host loop. With `make cuda`, the same call runs the device kernel and matches host moments within double noise on tiny \(n\).
+On CPU builds `gpu_adam_step_dev_bf16` returns `-1` and `lm_adam_step` uses the host loop. With `make cuda`, the same call runs the device kernel and matches host moments within double noise on tiny \(n\).
 
 ## What next
 

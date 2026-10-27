@@ -369,14 +369,14 @@ static text_dataset *accum_finish(accum *a, int window)
 		free(a->starts);
 		return NULL;
 	}
-	ds = malloc(sizeof(text_dataset));
+	ds = calloc(1, sizeof(text_dataset));
 	if (!ds) {
 		free(a->ids);
 		free(a->starts);
 		return NULL;
 	}
 	ds->ids = a->ids;
-	ds->n_ids = (int)a->n;
+	ds->n_ids = (long)a->n;
 	ds->window = window;
 	ds->starts = a->starts;
 	ds->n_starts = (int)a->ns;

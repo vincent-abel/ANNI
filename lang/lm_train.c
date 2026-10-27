@@ -21,7 +21,7 @@
 #include "mat.h"
 
 /* E10: tokens/sec, rough TFLOP/s, VRAM used (MB). */
-static void fill_throughput(train_progress *tp, int tokens_done, double elapsed)
+static void fill_throughput(train_progress *tp, long tokens_done, double elapsed)
 {
 	size_t fr;
 	size_t tot;
@@ -72,16 +72,14 @@ static int g_grad_accum = 1;
 static double g_vram_frac = 0.85;
 static int g_early_stop_patience;
 static double g_diverge_delta;
+/* Mid-epoch checkpoints: minutes between saves, window to resume at. */
+static int g_ckpt_minutes;
+static int g_resume_pos;
+static unsigned int g_shuffle_seed = 1;
 static int g_act_checkpoint;
 static int g_varlen;
 static int g_cuda_graphs;
-static int g_graph_B;
-static int g_graph_T;
-static int g_graph_ready;
-static int g_graph_warmed;
 static int g_compute_prec;
-static double g_loss_scale = 1.0;
-static int g_loss_scale_good;
 static int g_bench_prof;		/* lm bench --profile */
 static double g_phase_ms[3];	/* fwd, loss, bwd of the last body */
 
@@ -242,7 +240,7 @@ static void dbg_fmt_eta(char *out, size_t out_n, double sec)
 /* Single in-place progress line (\\r). Close it before any stamp/log line. */
 static void dbg_progress(int ep, int epochs, int done, int total,
 	int epoch_done, int nw, double nll, double win_nll, double t0,
-	int tokens_done, int force)
+	long tokens_done, int force)
 {
 	int width;
 	int filled;
@@ -262,9 +260,9 @@ static void dbg_progress(int ep, int epochs, int done, int total,
 	size_t tot;
 	static double last_print;
 	static double last_tok_t;
-	static int last_tok_n;
+	static long last_tok_n;
 	double interval_ts;
-	int dtok;
+	long dtok;
 	double dt;
 
 	now = wall_sec();
@@ -428,6 +426,49 @@ void lm_train_set_diverge_delta(double delta)
 	g_diverge_delta = delta > 0.0 ? delta : 0.0;
 }
 
+void lm_train_set_ckpt_minutes(int minutes)
+{
+	g_ckpt_minutes = minutes > 0 ? minutes : 0;
+}
+
+void lm_train_set_resume_pos(int window_pos)
+{
+	g_resume_pos = window_pos > 0 ? window_pos : 0;
+}
+
+void lm_train_set_shuffle_seed(unsigned int seed)
+{
+	g_shuffle_seed = seed ? seed : 1;
+}
+
+/*
+** Epoch shuffle from its own xorshift32 stream, seeded by --seed and the
+** absolute epoch number, so a mid-epoch resume rebuilds the same order.
+*/
+void lm_train_epoch_order(int *order, int nw, int epoch_num)
+{
+	unsigned int s;
+	int j;
+	int r;
+	int tmp;
+
+	for (j = 0; j < nw; j++)
+		order[j] = j;
+	s = g_shuffle_seed * 2654435761u ^ (unsigned int)(epoch_num + 1)
+	    * 40503u;
+	if (!s)
+		s = 1;
+	for (j = nw - 1; j > 0; j--) {
+		s ^= s << 13;
+		s ^= s >> 17;
+		s ^= s << 5;
+		r = (int)(s % (unsigned int)(j + 1));
+		tmp = order[j];
+		order[j] = order[r];
+		order[r] = tmp;
+	}
+}
+
 void lm_train_set_act_checkpoint(int on)
 {
 	g_act_checkpoint = on ? 1 : 0;
@@ -455,21 +496,15 @@ void lm_train_set_varlen(int on)
 void lm_train_set_cuda_graphs(int on)
 {
 	g_cuda_graphs = on ? 1 : 0;
-	g_graph_ready = 0;
-	g_graph_warmed = 0;
-	g_graph_B = 0;
-	g_graph_T = 0;
-	gpu_graph_destroy();
+	lm_graph_enable(g_cuda_graphs);
 }
 
 void lm_train_set_compute_prec(int prec)
 {
-	if (prec != GPU_PREC_BF16 && prec != GPU_PREC_FP16)
+	if (prec != GPU_PREC_BF16)
 		prec = GPU_PREC_FP32;
 	g_compute_prec = prec;
 	gpu_set_compute_prec(prec);
-	g_loss_scale = (prec == GPU_PREC_FP16) ? 1024.0 : 1.0;
-	g_loss_scale_good = 0;
 	/* Dtype change invalidates captured graphs. */
 	if (g_cuda_graphs)
 		lm_train_set_cuda_graphs(1);
@@ -488,33 +523,6 @@ void lm_train_set_fp8_dgrad(int on)
 	gpu_set_fp8_dgrad(on);
 	if (g_cuda_graphs)
 		lm_train_set_cuda_graphs(1);
-}
-
-double lm_train_loss_scale(void)
-{
-	return g_loss_scale > 0.0 ? g_loss_scale : 1.0;
-}
-
-/* Unscale factor for Adam; update dynamic loss scale for FP16. */
-static double train_grad_unscale(int step_ok)
-{
-	if (g_compute_prec != GPU_PREC_FP16)
-		return 1.0;
-	if (!step_ok) {
-		g_loss_scale *= 0.5;
-		if (g_loss_scale < 1.0)
-			g_loss_scale = 1.0;
-		g_loss_scale_good = 0;
-		return 0.0;	/* caller skips Adam */
-	}
-	g_loss_scale_good++;
-	if (g_loss_scale_good >= 2000) {
-		g_loss_scale *= 2.0;
-		if (g_loss_scale > 65536.0)
-			g_loss_scale = 65536.0;
-		g_loss_scale_good = 0;
-	}
-	return 1.0 / g_loss_scale;
 }
 
 static void apply_tokens_per_step(int B, int T)
@@ -550,6 +558,7 @@ typedef struct	pack_ctx {
 	int		ids_pinned;	/* E5: cudaHostAlloc */
 	int		next_bb;	/* E3: windows waiting in ids_next */
 	int		next_done;	/* E3: stream exhausted while prefetching */
+	unsigned char	*mask;		/* Bmax * T loss mask (masked data only) */
 	pack_slot	slot[2];	/* [0] = Bmax, [1] = tail */
 } pack_ctx;
 
@@ -578,6 +587,8 @@ static void pack_ctx_free(pack_ctx *p)
 	}
 	free(p->lens);
 	free(p->lens_next);
+	free(p->mask);
+	p->mask = NULL;
 	p->ids = NULL;
 	p->ids_next = NULL;
 	p->lens = NULL;
@@ -688,7 +699,7 @@ static int train_mid_val_due(int done, int total, int *next_pct)
 
 /* Forward + loss + backward for the first b sequences already in p->ids.
 ** mean_ce may be NULL; otherwise receives mean CE over predicting rows.
-** S4: optional CUDA Graph capture/replay when B,T steady and no varlen lens. */
+** --cuda-graphs batches go through lm_graph_step instead (pack_run). */
 static int pack_run_body(lm *model, pack_ctx *p, int b, double *mean_ce,
 	pack_slot *s, const int *lens)
 {
@@ -711,6 +722,7 @@ static int pack_run_body(lm *model, pack_ctx *p, int b, double *mean_ce,
 	prof = s_prof_left > 0 || g_bench_prof;
 	/* Keep seqlens through transformer bwd (TC/FA masks). */
 	gpu_attn_set_seqlens(lens);
+	lm_loss_set_mask(p->mask);
 	if (prof)
 		gettimeofday(&tv0, NULL);
 	if (lm_forward_cache_packed(model, p->ids, b, p->T, s->c) != 0) {
@@ -721,8 +733,10 @@ static int pack_run_body(lm *model, pack_ctx *p, int b, double *mean_ce,
 		gpu_device_sync();
 		gettimeofday(&tv1, NULL);
 	}
-	if (lm_loss_backward_packed_lens(model, s->c, p->ids, b, p->T, lens,
-	    s->dh, mean_ce) != 0) {
+	rc = lm_loss_backward_packed_lens(model, s->c, p->ids, b, p->T, lens,
+	    s->dh, mean_ce);
+	lm_loss_set_mask(NULL);
+	if (rc != 0) {
 		gpu_attn_set_seqlens(NULL);
 		return -1;
 	}
@@ -789,57 +803,15 @@ static int pack_run(lm *model, pack_ctx *p, int b, double *mean_ce)
 			lens = p->lens;
 	}
 	/*
-	** Graphs need fixed device addresses and no host ops in the region.
-	** Skip when varlen seqlens change the mask, or B/T changes.
+	** Graphs (lm_graph_step): the loss mask and varlen seqlens are host
+	** data read while building targets / masks, so those batches never
+	** take the graph path.
 	*/
-	/* Graph capture includes CE→pinned D2H; fetch mean after replay. */
-	if (g_cuda_graphs && gpu_available() && !lens) {
-		if (g_graph_ready && g_graph_B == b && g_graph_T == p->T) {
-			if (gpu_graph_replay() == 0) {
-				if (mean_ce) {
-					int rows = b * (p->T > 1 ? p->T - 1 : 1);
-
-					if (gpu_ce_fetch_mean(mean_ce, rows) != 0)
-						*mean_ce = -1.0;
-				}
-				return 0;
-			}
-			g_graph_ready = 0;
-			gpu_graph_destroy();
-		}
-		/*
-		** Warm one uncaptured step so cudaMalloc/scratch resize happen
-		** outside BeginCapture (malloc during capture segfaults).
-		*/
-		if (!g_graph_warmed || g_graph_B != b || g_graph_T != p->T) {
-			int rc;
-
-			rc = pack_run_body(model, p, b, mean_ce, s, NULL);
-			g_graph_warmed = 1;
-			g_graph_B = b;
-			g_graph_T = p->T;
-			g_graph_ready = 0;
-			return rc;
-		}
-		if (gpu_graph_begin() == 0) {
-			int body_rc = pack_run_body(model, p, b, NULL, s, NULL);
-
-			if (body_rc == 0 && gpu_graph_end() == 0) {
-				g_graph_ready = 1;
-				if (mean_ce) {
-					int rows = b * (p->T > 1 ? p->T - 1 : 1);
-
-					if (gpu_ce_fetch_mean(mean_ce, rows) != 0)
-						*mean_ce = -1.0;
-				}
-				return 0;
-			}
-			/* Must leave capture mode even when body fails. */
-			if (body_rc != 0)
-				(void)gpu_graph_end();
-			gpu_graph_destroy();
-			g_graph_ready = 0;
-		}
+	if (g_cuda_graphs && !lens && !p->mask) {
+		gpu_attn_set_seqlens(NULL);
+		lm_loss_set_mask(NULL);
+		return lm_graph_step(model, s->c, s->dh, p->ids, b, p->T,
+		    mean_ce);
 	}
 	return pack_run_body(model, p, b, mean_ce, s, lens);
 }
@@ -896,7 +868,8 @@ static int resolve_batch(int batch_size, int T, int vocab, int max_b,
 	return B;
 }
 
-double lm_nll_windows(const lm *model, const text_dataset *ds, int max_windows)
+static double nll_windows_seq(const lm *model, const text_dataset *ds,
+	int max_windows)
 {
 	int ids[LM_MAX_CTX];
 	int n;
@@ -922,6 +895,115 @@ double lm_nll_windows(const lm *model, const text_dataset *ds, int max_windows)
 	return sum / (double)lim;
 }
 
+/*
+** Validation probe on the training's packed cache: Bmax windows per forward
+** and one head GEMM, per-row CE on the device in FP32 (lm_nll_packed). The
+** value differs from the per-window FP64 path by ~1e-5 (FP32 log-sum-exp,
+** head GEMM in the training precision). ANN_PROBE_BATCH=0 restores the
+** per-window path; a short tail and any unsupported case use lm_nll.
+*/
+static double probe_windows(lm *model, const text_dataset *ds,
+	int max_windows, pack_ctx *pk)
+{
+	static int on = -1;
+	int ids[LM_MAX_CTX];
+	int *buf;
+	double wn[256];
+	double sum;
+	int nw;
+	int lim;
+	int i;
+	int j;
+	int n;
+	int B;
+	int done;
+
+	if (on < 0) {
+		const char *e = getenv("ANN_PROBE_BATCH");
+
+		on = (e && e[0] == '0') ? 0 : 1;
+	}
+	nw = text_dataset_n_windows(ds);
+	if (!on || !pk || !model || nw <= 0 || ds->window != pk->T
+	    || pk->Bmax < 2 || pk->Bmax > 256)
+		return nll_windows_seq(model, ds, max_windows);
+	lim = nw;
+	if (max_windows > 0 && max_windows < lim)
+		lim = max_windows;
+	B = pk->Bmax;
+	if (lim < B)
+		return nll_windows_seq(model, ds, max_windows);
+	/* One live packed slot only (see pack_run). */
+	if (pk->slot[1].B)
+		pack_slot_free(&pk->slot[1]);
+	if (pack_slot_get(&pk->slot[0], B, pk->T) != 0)
+		return nll_windows_seq(model, ds, max_windows);
+	buf = pk->ids_next;	/* pinned (B*T) staging; the prefetch is idle here */
+	if (pk->next_bb > 0) {
+		/* A prefetched batch is waiting in ids_next: do not clobber. */
+		buf = malloc((size_t)B * (size_t)pk->T * sizeof(int));
+		if (!buf)
+			return nll_windows_seq(model, ds, max_windows);
+	}
+	sum = 0.0;
+	done = 0;
+	while (done + B <= lim) {
+		for (j = 0; j < B; j++) {
+			if (text_dataset_window(ds, done + j,
+			    &buf[(size_t)j * pk->T], &n) != 0 || n != pk->T)
+				goto bail;
+		}
+		if (lm_nll_packed(model, pk->slot[0].c, buf, B, pk->T, wn) != 0)
+			goto bail;
+		for (j = 0; j < B; j++)
+			sum += wn[j];
+		done += B;
+	}
+	for (i = done; i < lim; i++) {
+		if (text_dataset_window(ds, i, ids, &n) != 0)
+			goto bail;
+		sum += lm_nll(model, ids, n);
+	}
+	if (buf != pk->ids_next)
+		free(buf);
+	/* The probe reused the training cache buffers: recapture the graph. */
+	lm_graph_invalidate();
+	return sum / (double)lim;
+bail:
+	if (buf != pk->ids_next)
+		free(buf);
+	lm_graph_invalidate();
+	return nll_windows_seq(model, ds, max_windows);
+}
+
+/*
+** Standalone probe (lm info / eval): a throwaway packed cache of up to
+** PROBE_B windows. Falls back to the per-window path when it cannot be
+** allocated.
+*/
+#define PROBE_B	8
+
+double lm_nll_windows(const lm *model, const text_dataset *ds, int max_windows)
+{
+	pack_ctx tmp;
+	double v;
+	int nw;
+	int lim;
+	int b;
+
+	if (!model || !ds)
+		return -1.0;
+	nw = text_dataset_n_windows(ds);
+	lim = (max_windows > 0 && max_windows < nw) ? max_windows : nw;
+	b = lim < PROBE_B ? lim : PROBE_B;
+	if (b < 2 || ds->window < 2 || ds->window > LM_MAX_CTX
+	    || pack_ctx_init_once(&tmp, b, ds->window) != 0)
+		return nll_windows_seq(model, ds, max_windows);
+	v = probe_windows((lm *)model, ds, max_windows, &tmp);
+	pack_ctx_free(&tmp);
+	return v;
+}
+
 double lm_train_corpus(lm *model, text_dataset *ds, lm_adam *opt,
 	int epochs, int batch_size, double lr, int debug,
 	const char *ckpt_path, int epoch_base,
@@ -943,12 +1025,10 @@ double lm_train_corpus_val(lm *model, text_dataset *ds, lm_adam *opt,
 	int n;
 	int total_steps;
 	int done_steps;
-	int tokens_done;
+	long tokens_done;
 	int epoch_num;
 	int *order;
-	int tmp;
 	int j;
-	int r;
 	int k;
 	int bb;
 	int win_tot;
@@ -957,6 +1037,7 @@ double lm_train_corpus_val(lm *model, text_dataset *ds, lm_adam *opt,
 	double last;
 	double win;
 	double t0;
+	double last_ckpt;
 	char msg[192];
 
 	if (!model || !ds || !opt || epochs <= 0 || lr <= 0.0)
@@ -975,6 +1056,14 @@ double lm_train_corpus_val(lm *model, text_dataset *ds, lm_adam *opt,
 		free(order);
 		return -1.0;
 	}
+	if (ds->masked) {
+		pk.mask = calloc((size_t)batch_size * (size_t)ds->window, 1);
+		if (!pk.mask) {
+			free(order);
+			pack_ctx_free(&pk);
+			return -1.0;
+		}
+	}
 	for (j = 0; j < nw; j++)
 		order[j] = j;
 	mat_try_pin(model->dw_head);
@@ -990,8 +1079,12 @@ double lm_train_corpus_val(lm *model, text_dataset *ds, lm_adam *opt,
 		eval_windows = 0;
 	if (debug && !g_progress_fn)
 		dbg_stamp("computing start NLL");
-	last = lm_nll(model, ds->ids,
-	    ds->n_ids < LM_MAX_CTX ? ds->n_ids : LM_MAX_CTX);
+	{
+		int head[LM_MAX_CTX];
+		int nh = (int)text_dataset_head(ds, head, LM_MAX_CTX);
+
+		last = lm_nll(model, head, nh);
+	}
 	win = -1.0;
 	if (eval_every > 0) {
 		if (debug && !g_progress_fn) {
@@ -1000,9 +1093,10 @@ double lm_train_corpus_val(lm *model, text_dataset *ds, lm_adam *opt,
 			    eval_windows);
 			dbg_stamp(msg);
 		}
-		win = lm_nll_windows(model, val ? val : ds, eval_windows);
+		win = probe_windows(model, val ? val : ds, eval_windows, &pk);
 	}
 	t0 = wall_sec();
+	last_ckpt = t0;
 	{
 		train_progress tp;
 		double best_val = -1.0;
@@ -1051,14 +1145,25 @@ double lm_train_corpus_val(lm *model, text_dataset *ds, lm_adam *opt,
 				    ep + 1, epochs);
 				dbg_stamp(msg);
 			}
-			/* Seeded shuffle so parallel --seed runs diverge after resume. */
-			for (j = nw - 1; j > 0; j--) {
-				r = rand() % (j + 1);
-				tmp = order[j];
-				order[j] = order[r];
-				order[r] = tmp;
-			}
+			lm_train_epoch_order(order, nw, epoch_base + ep);
 			idx = 0;
+			/* Mid-epoch resume: skip windows the checkpoint covered. */
+			if (ep == 0 && g_resume_pos > 0 && g_resume_pos < nw) {
+				idx = g_resume_pos;
+				/*
+				** The start probe just ran: do not fire the
+				** mid-epoch probe of the percentage already
+				** passed right after it.
+				*/
+				(void)train_mid_val_due(idx, nw, &next_mid_pct);
+				if (debug && !g_progress_fn) {
+					snprintf(msg, sizeof(msg),
+					    "resuming epoch %d at window %d/%d",
+					    epoch_base + 1, idx, nw);
+					dbg_stamp(msg);
+				}
+			}
+			g_resume_pos = 0;
 			while (idx < nw) {
 				double step_lr;
 				double elapsed;
@@ -1120,9 +1225,11 @@ double lm_train_corpus_val(lm *model, text_dataset *ds, lm_adam *opt,
 						    ? nw - idx : batch_size;
 						ts = wall_sec();
 						for (j = 0; j < bb; j++) {
-							if (text_dataset_window(ds,
+							if (text_dataset_window_mask(ds,
 							    order[idx + j],
 							    &pk.ids[j * ds->window],
+							    pk.mask ? &pk.mask[j
+							    * ds->window] : NULL,
 							    &n) != 0
 							    || n != ds->window) {
 								ok = 0;
@@ -1183,6 +1290,8 @@ double lm_train_corpus_val(lm *model, text_dataset *ds, lm_adam *opt,
 					pack_ctx_free(&pk);
 					tp.event = TRAIN_EV_FAIL;
 					tp.msg = "train step failed";
+					fprintf(stderr, "train step failed: CUDA '%s'\n",
+					    gpu_debug_last_error());
 					emit_progress(&tp);
 					return -1.0;
 				}
@@ -1206,26 +1315,25 @@ double lm_train_corpus_val(lm *model, text_dataset *ds, lm_adam *opt,
 				opt->weight_decay = g_weight_decay;
 				opt->grad_clip = g_grad_clip;
 				{
-					double us = train_grad_unscale(
-					    isfinite(last));
+					double ta = wall_sec();
+					static int s_adam_log = 6;
+					const char *pe = getenv("ANN_STEP_PROF");
 
-					if (us > 0.0) {
-						double ta = wall_sec();
-						static int s_adam_log = 6;
-						const char *pe = getenv(
-						    "ANN_STEP_PROF");
-
-						lm_adam_step_scaled(opt, step_lr,
-						    us / (double)b);
-						if (s_adam_log > 0 && pe
-						    && pe[0] == '1') {
-							fprintf(stderr,
-							    "[adam] %.1fms\n",
-							    (wall_sec() - ta) * 1e3);
-							s_adam_log--;
-						}
-					} else
-						lm_adam_zero_grad(model);
+					/*
+					** Mean over predicted tokens, so
+					** --grad-clip bounds the usual
+					** per-token gradient norm.
+					*/
+					lm_adam_step_scaled(opt, step_lr,
+					    1.0 / ((double)b
+					    * (double)(ds->window - 1)));
+					if (s_adam_log > 0 && pe
+					    && pe[0] == '1') {
+						fprintf(stderr,
+						    "[adam] %.1fms\n",
+						    (wall_sec() - ta) * 1e3);
+						s_adam_log--;
+					}
 				}
 				/* Stay BATCH into the next microbatch. */
 				elapsed = wall_sec() - t0;
@@ -1239,7 +1347,7 @@ double lm_train_corpus_val(lm *model, text_dataset *ds, lm_adam *opt,
 					int pct = (int)(100.0 * (double)idx
 					    / (double)nw);
 
-					v = lm_nll_windows(model, val, mid_wins);
+					v = probe_windows(model, val, mid_wins, &pk);
 					if (v >= 0.0)
 						win = v;
 					if (debug && !g_progress_fn) {
@@ -1268,6 +1376,24 @@ double lm_train_corpus_val(lm *model, text_dataset *ds, lm_adam *opt,
 					dbg_progress(ep, epochs, done_steps,
 					    total_steps, idx, nw, last, win, t0,
 					    tokens_done, 0);
+				if (ckpt_path && g_ckpt_minutes > 0
+				    && wall_sec() - last_ckpt
+				    >= 60.0 * (double)g_ckpt_minutes) {
+					/* Epoch not finished: store it with its window. */
+					last_ckpt = wall_sec();
+					if (lm_save_checkpoint(model, opt,
+					    epoch_base + ep, idx, ckpt_path) == 0)
+						snprintf(msg, sizeof(msg),
+						    "saved checkpoint %s (epoch %d, "
+						    "window %d/%d)", ckpt_path,
+						    epoch_base + ep + 1, idx, nw);
+					else
+						snprintf(msg, sizeof(msg),
+						    "mid-epoch checkpoint save failed "
+						    "(%s)", ckpt_path);
+					if (debug && !g_progress_fn)
+						dbg_stamp(msg);
+				}
 				if (g_train_ctl && g_train_ctl->quit_save) {
 					quit = 1;
 					break;
@@ -1278,9 +1404,10 @@ double lm_train_corpus_val(lm *model, text_dataset *ds, lm_adam *opt,
 			** long-ctx lm_nll is a separate probe (do not clobber).
 			*/
 			{
-				double ctx_nll = lm_nll(model, ds->ids,
-				    ds->n_ids < LM_MAX_CTX ? ds->n_ids
-				    : LM_MAX_CTX);
+				int head[LM_MAX_CTX];
+				int nh = (int)text_dataset_head(ds, head,
+				    LM_MAX_CTX);
+				double ctx_nll = lm_nll(model, head, nh);
 
 				if (debug && !g_progress_fn && ctx_nll >= 0.0) {
 					snprintf(msg, sizeof(msg),
@@ -1290,8 +1417,8 @@ double lm_train_corpus_val(lm *model, text_dataset *ds, lm_adam *opt,
 				}
 			}
 			if (eval_every > 0 && ((ep + 1) % eval_every) == 0)
-				win = lm_nll_windows(model, val ? val : ds,
-				    eval_windows);
+				win = probe_windows(model, val ? val : ds,
+				    eval_windows, &pk);
 			epoch_num = epoch_base + ep + 1;
 			if (ckpt_path) {
 				if (lm_save_checkpoint(model, opt, epoch_num, 0,
@@ -1544,7 +1671,7 @@ double lm_train_stream(lm *model, text_stream *train, lm_adam *opt,
 						tp.nw = tp.epoch_done;
 				}
 				tp.done_steps = (int)steps;
-				tp.tokens_done = (int)tokens;
+				tp.tokens_done = (long)tokens;
 				tp.nll = last;
 				tp.win_nll = win;
 				tp.val_nll = val ? win : -1.0;
@@ -1710,24 +1837,19 @@ double lm_train_stream(lm *model, text_stream *train, lm_adam *opt,
 				opt->weight_decay = g_weight_decay;
 				opt->grad_clip = g_grad_clip;
 				{
-					double us = train_grad_unscale(
-					    isfinite(last));
+					double ta = wall_sec();
+					static int s_adam_log = 6;
+					const char *pe = getenv("ANN_STEP_PROF");
 
-					if (us > 0.0) {
-						double ta = wall_sec();
-						static int s_adam_log = 6;
-						const char *pe = getenv("ANN_STEP_PROF");
-
-						lm_adam_step_scaled(opt, step_lr,
-						    us / (double)b);
-						if (s_adam_log > 0 && pe && pe[0] == '1') {
-							fprintf(stderr,
-							    "[adam] %.1fms\n",
-							    (wall_sec() - ta) * 1e3);
-							s_adam_log--;
-						}
-					} else
-						lm_adam_zero_grad(model);
+					/* Mean over predicted tokens (see corpus path). */
+					lm_adam_step_scaled(opt, step_lr,
+					    1.0 / ((double)b * (double)(T - 1)));
+					if (s_adam_log > 0 && pe && pe[0] == '1') {
+						fprintf(stderr,
+						    "[adam] %.1fms\n",
+						    (wall_sec() - ta) * 1e3);
+						s_adam_log--;
+					}
 				}
 				gpu_set_sync_mode(GPU_SYNC_EAGER);
 				steps++;
@@ -1742,7 +1864,7 @@ double lm_train_stream(lm *model, text_stream *train, lm_adam *opt,
 						tp.nw = tp.epoch_done;
 				}
 				tp.done_steps = (int)steps;
-				tp.tokens_done = (int)tokens;
+				tp.tokens_done = (long)tokens;
 				/*
 				** Mid-epoch val subsample every ~5% (cheap vs train;
 				** ~1–2% wall with M=32). Skip 100% — epoch-end does it.
@@ -1820,7 +1942,7 @@ double lm_train_stream(lm *model, text_stream *train, lm_adam *opt,
 			tp.nll = last;
 			tp.win_nll = win;
 			tp.val_nll = val ? win : -1.0;
-			tp.tokens_done = (int)tokens;
+			tp.tokens_done = (long)tokens;
 			tp.done_steps = (int)steps;
 			tp.epoch_done = (int)text_stream_count(train);
 			{

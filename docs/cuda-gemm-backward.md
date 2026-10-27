@@ -2,7 +2,7 @@
 
 ## Abstract
 
-For \(C = AB\), gradients are \(dA = dC\,B^\top\) and \(dB = A^\top\,dC\). [`gpu_mat_mul_backward`](../num/gpu.h) computes them on device when CUDA is linked. [`gpu_mat_mul_bt`](../num/gpu.h) and [`gpu_mat_outer_add`](../num/gpu.h) cover \(AB^\top\) and weight outer products used by LM backward. CPU stubs return `-1` so [`gradutil`](../lang/gradutil.c) / [`mat_mul_bt`](../num/mat.c) fall back to host loops.
+For \(C = AB\), gradients are \(dA = dC\,B^\top\) and \(dB = A^\top\,dC\). [`gpu_mat_mul_bt`](../num/gpu.h) and [`gpu_mat_mul_at`](../num/gpu.h) compute them on device when CUDA is linked (the combined `gpu_mat_mul_backward` was removed). [`gpu_mat_mul_bt`](../num/gpu.h) and [`gpu_mat_outer_add`](../num/gpu.h) cover \(AB^\top\) and weight outer products used by LM backward. CPU stubs return `-1` so [`gradutil`](../lang/gradutil.c) / [`mat_mul_bt`](../num/mat.c) fall back to host loops.
 
 ## What problem it solves (plain language)
 
@@ -37,7 +37,7 @@ dW \mathrel{+}= A^\top B \quad\text{(outer_add)}
 
 ## Worked example
 
-On CPU builds, `gpu_mat_mul_backward` returns `-1` and outer_add uses the host loop. With `make cuda`, the same call runs device kernels and matches CPU within float noise on tiny mats.
+On CPU builds, `gpu_mat_mul_bt` returns `-1` and outer_add uses the host loop. With `make cuda`, the same call runs device kernels and matches CPU within float noise on tiny mats.
 
 ## What next
 

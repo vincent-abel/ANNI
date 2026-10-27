@@ -88,7 +88,6 @@ static lm *lm_create_with(vocab *v, bpe *tok)
 	model->b_head = vec_create(model->vocab_size);
 	model->dw_head = mat_create(LM_D_MODEL, model->vocab_size);
 	model->db_head = vec_create(model->vocab_size);
-	model->w_head_q = NULL;
 	if (!model->embed || !model->tr || !model->w_head || !model->b_head
 	    || !model->dw_head || !model->db_head) {
 		model->bpe = NULL;	/* caller keeps ownership on failure */
@@ -170,19 +169,8 @@ void lm_free(lm **model)
 	vec_free(&(*model)->b_head);
 	mat_free(&(*model)->dw_head);
 	vec_free(&(*model)->db_head);
-	qmat_free(&(*model)->w_head_q);
 	free(*model);
 	*model = NULL;
-}
-
-int lm_quantize_head(lm *model)
-{
-	if (!model || !model->w_head)
-		return -1;
-	qmat_free(&model->w_head_q);
-	(void)mat_pull_host(model->w_head);
-	model->w_head_q = qmat_from_mat(model->w_head);
-	return model->w_head_q ? 0 : -1;
 }
 
 void lm_zero_grad(lm *model)
@@ -239,6 +227,8 @@ static void lm_each_wgrad(lm *model, int mode)
 void lm_weights_to_device(lm *model)
 {
 	lm_each_wgrad(model, 0);
+	/* Bias / LN vectors: drop device copies cached from an older model. */
+	gpu_half_wt_invalidate(NULL);
 }
 
 void lm_weights_host_dirty(lm *model)
@@ -246,6 +236,7 @@ void lm_weights_host_dirty(lm *model)
 	lm_each_wgrad(model, 1);
 	if (model && model->embed)
 		mat_host_dirty(model->embed->table);
+	gpu_half_wt_invalidate(NULL);
 }
 
 void lm_weights_ensure_host(lm *model)
@@ -357,10 +348,7 @@ int lm_logits_at(vec *logits, const lm *model, const mat *hidden, int t)
 	if (logits->n != model->vocab_size)
 		return -1;
 	h = &hidden->data[t * hidden->cols];
-	if (model->w_head_q) {
-		if (qmat_gemv_t(logits, model->w_head_q, h) != 0)
-			return -1;
-	} else {
+	{
 		/* Stack row views start host-only. The GEMM may pin a twin. */
 		hrow.data = (ann_real *)h;
 		hrow.d_data = NULL;
@@ -396,16 +384,39 @@ int lm_logits_at(vec *logits, const lm *model, const mat *hidden, int t)
 **   db_head += column sums of delta
 ** The T x V logits/delta matrix is built once and reused in place.
 */
+/* logits += b_head on every row (GPU pass, host loop otherwise). */
+static void head_bias_add(lm *model, mat *delta, int rows)
+{
+	ann_real *dp;
+	ann_real *row;
+	int V;
+	int t;
+	int v;
+
+	V = model->vocab_size;
+	dp = mat_compute_ptr(delta);
+	if (dp && gpu_bias_row_add(dp, model->b_head->data, rows, V) == 0)
+		mat_mark_written(delta, dp);
+	else {
+		(void)mat_ensure_host(delta);
+		for (t = 0; t < rows; t++) {
+			row = &delta->data[(size_t)t * V];
+			for (v = 0; v < V; v++)
+				row[v] += model->b_head->data[v];
+		}
+		mat_host_dirty(delta);
+	}
+}
+
 /*
 ** Shared CE core: hv is rows x D (hidden of the predicting positions), tgt[t]
 ** the target of row t. Fills dhv (rows x D, host view) with dL/dhidden and
 ** accumulates dW_head / db_head. Also used by the packed path with gathered rows.
 */
 static int ce_rows_backward(lm *model, const mat *hv, const int *tgt, int rows,
-	mat *dhv, double *mean_ce_out)
+	mat *dhv, double *mean_ce_out, int tgt_dev)
 {
 	mat *delta;
-	vec lrow;
 	ann_real *tmp;
 	ann_real *row;
 	double ce_sum;
@@ -413,42 +424,71 @@ static int ce_rows_backward(lm *model, const mat *hv, const int *tgt, int rows,
 	int V;
 	int t;
 	int v;
+	int n_valid;	/* rows with a target; tgt -1 = masked (no loss) */
+	ann_real *ce_dp;	/* fused: logits buffer now holding the BF16 delta */
+	int bias_pending;	/* head bias left to the fused CE kernel */
+	int rc;
 
+	ce_dp = NULL;
+	bias_pending = 0;
 	V = model->vocab_size;
-	for (t = 0; t < rows; t++)
-		if (tgt[t] < 0 || tgt[t] >= V)
+	n_valid = 0;
+	/*
+	** tgt_dev: device targets (gpu_ce_targets_staged), every row has one
+	** and only the device CE below can read them.
+	*/
+	if (tgt_dev)
+		n_valid = rows;
+	for (t = 0; !tgt_dev && t < rows; t++) {
+		if (tgt[t] < -1 || tgt[t] >= V)
 			return -1;
+		n_valid += tgt[t] >= 0;
+	}
 	delta = reuse_mat(&g_ce_delta, rows, V);
 	if (!delta)
 		return -1;
 	mat_try_pin(dhv);
 
 	/* 1. logits for every position. */
-	if (model->w_head_q) {
-		for (t = 0; t < rows; t++) {
-			lrow.data = &delta->data[(size_t)t * V];
-			lrow.n = V;
-			if (lm_logits_at(&lrow, model, hv, t) != 0)
-				goto fail;
-		}
-		mat_host_dirty(delta);
-	} else {
-		ann_real *dp;
-
+	{
 		if (mat_mul(delta, hv, model->w_head) != 0)
 			goto fail;
-		dp = mat_compute_ptr(delta);
-		if (dp && gpu_bias_row_add(dp, model->b_head->data, rows, V) == 0)
-			mat_mark_device(delta);
-		else {
-			(void)mat_ensure_host(delta);
-			for (t = 0; t < rows; t++) {
-				row = &delta->data[(size_t)t * V];
-				for (v = 0; v < V; v++)
-					row[v] += model->b_head->data[v];
-			}
-			mat_host_dirty(delta);
+		/*
+		** The fused CE kernel below adds the bias at its load (same
+		** FP32 add, one 268 MB pass fewer); added here when it is off
+		** and before the FP32 steps when it does not apply.
+		*/
+		bias_pending = gpu_ce_bias_fused();
+		if (!bias_pending)
+			head_bias_add(model, delta, rows);
+	}
+
+	/*
+	** 2+3 in one kernel for BF16 batch training: softmax, CE, db_head and
+	** the delta as BF16 only, in place over the logits, for the two GEMMs
+	** below (gpu_ce_softmax_delta_bf16). The FP32 delta is never formed.
+	*/
+	{
+		ann_real *dp = mat_compute_ptr(delta);
+
+		ce_sum = -1.0;
+		rc = dp && dp == delta->d_data
+		    ? gpu_ce_softmax_delta_bf16(dp, tgt, rows, V,
+		    bias_pending ? model->b_head->data : NULL,
+		    model->db_head->data, mean_ce_out ? &ce_sum : NULL) : -1;
+		if (rc == -2)
+			goto fail;
+		if (rc == 0) {
+			ce_dp = dp;
+			mat_mark_written(delta, dp);
+			if (mean_ce_out)
+				*mean_ce_out = n_valid > 0 && ce_sum >= 0.0
+				    ? ce_sum * (double)rows / (double)n_valid
+				    : -1.0;
+			goto gemms;
 		}
+		if (bias_pending)
+			head_bias_add(model, delta, rows);
 	}
 
 	/* 2. softmax rows (GPU first, host rows otherwise). */
@@ -456,7 +496,7 @@ static int ce_rows_backward(lm *model, const mat *hv, const int *tgt, int rows,
 		ann_real *dp = mat_compute_ptr(delta);
 
 		if (dp && gpu_softmax_rows(dp, rows, V) == 0)
-			mat_mark_device(delta);
+			mat_mark_written(delta, dp);
 		else {
 			(void)mat_ensure_host(delta);
 			if (gpu_softmax_rows(delta->data, rows, V) != 0) {
@@ -483,14 +523,23 @@ static int ce_rows_backward(lm *model, const mat *hv, const int *tgt, int rows,
 		if (dp
 		    && gpu_ce_delta_from_softmax(dp, tgt, rows, V,
 		    model->db_head->data, mean_ce_out ? &ce_sum : NULL) == 0) {
-			mat_mark_device(delta);
+			mat_mark_written(delta, dp);
+			/* Device mean is over all rows; rescale to target rows. */
 			if (mean_ce_out)
-				*mean_ce_out = ce_sum;
-		} else {
+				*mean_ce_out = n_valid > 0 && ce_sum >= 0.0
+				    ? ce_sum * (double)rows / (double)n_valid
+				    : -1.0;
+		} else if (tgt_dev)
+			goto fail;
+		else {
 			(void)mat_ensure_host(delta);
 			ce_sum = 0.0;
 			for (t = 0; t < rows; t++) {
 				row = &delta->data[(size_t)t * V];
+				if (tgt[t] < 0) {
+					memset(row, 0, (size_t)V * sizeof(ann_real));
+					continue;
+				}
 				p = (double)row[tgt[t]];
 				if (p < 1e-12)
 					p = 1e-12;
@@ -500,12 +549,13 @@ static int ce_rows_backward(lm *model, const mat *hv, const int *tgt, int rows,
 					model->db_head->data[v] += row[v];
 			}
 			if (mean_ce_out)
-				*mean_ce_out = rows > 0
-				    ? ce_sum / (double)rows : -1.0;
+				*mean_ce_out = n_valid > 0
+				    ? ce_sum / (double)n_valid : -1.0;
 			mat_host_dirty(delta);
 		}
 	}
 
+gemms:
 	/* 4. dW_head += H^T delta. */
 	if (mat_outer_add(model->dw_head, hv, delta) != 0)
 		goto fail;
@@ -513,8 +563,13 @@ static int ce_rows_backward(lm *model, const mat *hv, const int *tgt, int rows,
 	/* 5. dhv = delta W_head^T. */
 	if (mat_mul_wt(dhv, delta, model->w_head) != 0)
 		goto fail;
+	/* Fused: both GEMMs must have read the BF16 delta, not the FP32 buffer. */
+	if (ce_dp && gpu_ce_bf16_delta_done(ce_dp) != 0)
+		return -1;
 	return 0;
 fail:
+	if (ce_dp)
+		(void)gpu_ce_bf16_delta_done(ce_dp);
 	/* Keep g_ce_delta for reuse; caller sees failure. */
 	return -1;
 }
@@ -554,10 +609,28 @@ int lm_loss_backward(lm *model, const lm_cache *c, const int *ids, int n,
 	dhv.on_device = MAT_DEV_HOST;
 	dhv.rows = rows;
 	dhv.cols = LM_D_MODEL;
-	if (ce_rows_backward(model, &hv, ids + 1, rows, &dhv, mean_ce) != 0)
+	if (ce_rows_backward(model, &hv, ids + 1, rows, &dhv, mean_ce, 0) != 0)
 		return -1;
 	mat_host_dirty(dhidden);
 	return 0;
+}
+
+/*
+** B8: the input gradient stays in transformer_backward's own device buffer
+** and goes straight to the embedding scatter: no 16 MB host dx created,
+** uploaded and freed (cudaFree synchronises the device) per microbatch.
+** ANN_MB_NOSYNC=0 restores the copy.
+*/
+static int lm_mb_nosync_on(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		const char *e = getenv("ANN_MB_NOSYNC");
+
+		on = (e && e[0] == '0') ? 0 : 1;
+	}
+	return on;
 }
 
 int lm_backward(lm *model, const mat *dhidden, const lm_cache *c)
@@ -566,6 +639,14 @@ int lm_backward(lm *model, const mat *dhidden, const lm_cache *c)
 
 	if (!model || !dhidden || !c || !c->trc)
 		return -1;
+	if (lm_mb_nosync_on()) {
+		const mat *g;
+
+		if (transformer_backward_ref(&g, dhidden, model->tr, c->trc) != 0)
+			return -1;
+		/* posenc is constant add — gradient passes through unchanged */
+		return embed_backward(model->embed, g, c->ids, c->n);
+	}
 	dx = mat_create(c->n, LM_D_MODEL);
 	if (!dx)
 		return -1;
@@ -648,7 +729,7 @@ int lm_forward_cache_packed(lm *model, const int *ids, int B, int T,
 					    t);
 			mat_host_dirty(c->hidden);
 		} else
-			mat_mark_device(c->hidden);
+			mat_mark_written(c->hidden, hp);
 	}
 	return transformer_forward_cache(c->hidden, model->tr, c->trc);
 }
@@ -665,12 +746,29 @@ int lm_loss_backward_packed(lm *model, const lm_cache *c, const int *ids,
 	    mean_ce);
 }
 
+/* Chat fine-tune: per-position loss mask (B*T bytes), NULL = every token. */
+static const unsigned char *g_loss_mask;
+
+void lm_loss_set_mask(const unsigned char *mask)
+{
+	g_loss_mask = mask;
+}
+
+/* Target of input position i: -1 when the next token is masked. */
+static int packed_target(const int *ids, int i)
+{
+	if (g_loss_mask && !g_loss_mask[i + 1])
+		return -1;
+	return ids[i + 1];
+}
+
 int lm_loss_backward_packed_lens(lm *model, const lm_cache *c, const int *ids,
 	int B, int T, const int *lens, mat *dhidden, double *mean_ce)
 {
 	mat *hc;
 	mat *dhc;
 	int *tgt;
+	const int *dtgt;
 	int rows;
 	int b;
 	int t;
@@ -682,55 +780,43 @@ int lm_loss_backward_packed_lens(lm *model, const lm_cache *c, const int *ids,
 	    || c->T != T || !c->hidden || dhidden->rows < B * T
 	    || dhidden->cols != LM_D_MODEL)
 		return -1;
-	if (B == 1 && (!lens || lens[0] >= T))
+	if (B == 1 && (!lens || lens[0] >= T) && !g_loss_mask)
 		return lm_loss_backward(model, c, ids, T, dhidden, mean_ce);
 	rows = B * (T - 1);
 	rb = (size_t)LM_D_MODEL * sizeof(ann_real);
 	hc = reuse_mat(&g_pack_hc, rows, LM_D_MODEL);
 	dhc = reuse_mat(&g_pack_dhc, rows, LM_D_MODEL);
-	tgt = malloc((size_t)rows * sizeof(int));
-	if (!hc || !dhc || !tgt) {
+	/* Staged ids (graph mode): the targets are built on the device. */
+	dtgt = !lens && !g_loss_mask ? gpu_ce_targets_staged(ids, B, T) : NULL;
+	tgt = dtgt ? NULL : malloc((size_t)rows * sizeof(int));
+	if (!hc || !dhc || (!tgt && !dtgt)) {
 		free(tgt);
 		return -1;
 	}
 	mat_try_pin(dhidden);
-	/* Gather: prefer one kernel; else B× D2D; else host. */
+	/* Gather: one kernel on the device; else host. */
 	if (c->hidden->d_data && c->hidden->on_device != MAT_DEV_HOST
 	    && hc->d_data && gpu_available()
 	    && gpu_pack_seq_rows(hc->d_data, c->hidden->d_data, B, T,
 	    LM_D_MODEL) == 0) {
-		for (b = 0; b < B; b++)
+		for (b = 0; tgt && b < B; b++)
 			for (t = 0; t < T - 1; t++)
-				tgt[b * (T - 1) + t] = ids[b * T + t + 1];
+				tgt[b * (T - 1) + t] = packed_target(ids, b * T + t);
 		hc->on_device = MAT_DEV_DEVICE;
 		goto gather_done;
 	}
-	if (c->hidden->d_data && c->hidden->on_device != MAT_DEV_HOST
-	    && hc->d_data && gpu_available()) {
-		for (b = 0; b < B; b++) {
-			if (gpu_memcpy_d2d(
-			    hc->d_data + (size_t)b * (T - 1) * LM_D_MODEL,
-			    c->hidden->d_data + (size_t)b * T * LM_D_MODEL,
-			    (size_t)(T - 1) * rb) != 0)
-				goto gather_host;
-			for (t = 0; t < T - 1; t++)
-				tgt[b * (T - 1) + t] = ids[b * T + t + 1];
-		}
-		hc->on_device = MAT_DEV_DEVICE;
-		goto gather_done;
-	}
-gather_host:
 	(void)mat_ensure_host(c->hidden);
 	for (b = 0; b < B; b++) {
 		memcpy(&hc->data[(size_t)b * (T - 1) * LM_D_MODEL],
 		    &c->hidden->data[(size_t)b * T * LM_D_MODEL],
 		    (size_t)(T - 1) * rb);
-		for (t = 0; t < T - 1; t++)
-			tgt[b * (T - 1) + t] = ids[b * T + t + 1];
+		for (t = 0; tgt && t < T - 1; t++)
+			tgt[b * (T - 1) + t] = packed_target(ids, b * T + t);
 	}
 	mat_host_dirty(hc);
 gather_done:
-	rc = ce_rows_backward(model, hc, tgt, rows, dhc, mean_ce);
+	rc = ce_rows_backward(model, hc, dtgt ? dtgt : tgt, rows, dhc, mean_ce,
+	    dtgt != NULL);
 	if (rc == 0) {
 		mat_zero_dev(dhidden);
 		if (dhc->d_data && dhc->on_device != MAT_DEV_HOST
@@ -738,18 +824,7 @@ gather_done:
 		    && gpu_unpack_seq_rows(dhidden->d_data, dhc->d_data, B, T,
 		    LM_D_MODEL) == 0) {
 			dhidden->on_device = MAT_DEV_DEVICE;
-		} else if (dhc->d_data && dhc->on_device != MAT_DEV_HOST
-		    && dhidden->d_data && gpu_available()) {
-			for (b = 0; b < B; b++) {
-				if (gpu_memcpy_d2d(
-				    dhidden->d_data + (size_t)b * T * LM_D_MODEL,
-				    dhc->d_data + (size_t)b * (T - 1) * LM_D_MODEL,
-				    (size_t)(T - 1) * rb) != 0)
-					goto scatter_host;
-			}
-			dhidden->on_device = MAT_DEV_DEVICE;
 		} else {
-scatter_host:
 			(void)mat_ensure_host(dhc);
 			(void)mat_ensure_host(dhidden);
 			for (b = 0; b < B; b++)
@@ -784,7 +859,125 @@ int lm_backward_packed(lm *model, const mat *dhidden, const lm_cache *c)
 	if (!model || !dhidden || !c || !c->trc || dhidden->rows != c->n)
 		return -1;
 	/* c->n = B*T rows: transformer_backward / embed_backward are row-wise. */
-	return lm_backward(model, dhidden, c);
+	{
+		int rc = lm_backward(model, dhidden, c);
+
+		gpu_grad_twins_clear();	/* no BF16 gradient twin outlives its microbatch */
+		return rc;
+	}
+}
+
+/*
+** S4: CUDA-graph microbatch (--cuda-graphs). The first microbatch after
+** every optimizer step runs uncaptured: it rebuilds the BF16 weight twins
+** and re-uploads the biases, and leaves every lazily sized buffer and pool
+** block in place. The next one with the same B and T is captured once
+** (the capture only records; the graph is then launched) and every later
+** one replays it: the same kernels on the same addresses, with the new
+** token ids staged into the graph's fixed device buffer beforehand.
+** Replay is refused (and the graph captured again) whenever an address it
+** holds may have changed owner (gpu_graph_replayable); a capture that
+** needed anything illegal is dropped, and after LM_GRAPH_MAX_FAILS of those
+** the run goes on uncaptured.
+*/
+#define LM_GRAPH_MAX_FAILS	3
+
+static struct {
+	int		on;
+	int		B;
+	int		T;
+	int		warm;		/* an uncaptured microbatch ran in epoch */
+	unsigned	epoch;
+	int		ready;
+	int		fails;
+	long		replays;
+} g_graph;
+
+void lm_graph_enable(int on)
+{
+	memset(&g_graph, 0, sizeof(g_graph));
+	g_graph.on = on ? 1 : 0;
+	gpu_graph_set_mode(g_graph.on);
+}
+
+/* Drop the captured graph (its buffers were reused): the next steady microbatch captures again. */
+void lm_graph_invalidate(void)
+{
+	if (!g_graph.ready)
+		return;
+	g_graph.ready = 0;
+	gpu_graph_destroy();
+}
+
+long lm_graph_replays(void)
+{
+	return g_graph.replays;
+}
+
+static int graph_body(lm *model, lm_cache *c, mat *dh, const int *ids, int B,
+	int T, double *mean_ce)
+{
+	if (lm_forward_cache_packed(model, ids, B, T, c) != 0
+	    || lm_loss_backward_packed(model, c, ids, B, T, dh, mean_ce) != 0)
+		return -1;
+	return lm_backward_packed(model, dh, c);
+}
+
+int lm_graph_step(lm *model, lm_cache *c, mat *dh, const int *ids, int B,
+	int T, double *mean_ce)
+{
+	int steady;
+	int rc;
+
+	if (!model || !c || !dh || !ids)
+		return -1;
+	if (!g_graph.on || B < 2 || g_loss_mask || !gpu_graph_supported()
+	    || gpu_ids_stage(ids, c->ids, B * T) != 0)
+		return graph_body(model, c, dh, ids, B, T, mean_ce);
+	if (g_graph.B != B || g_graph.T != T) {
+		gpu_graph_destroy();
+		g_graph.ready = 0;
+		g_graph.warm = 0;
+		g_graph.B = B;
+		g_graph.T = T;
+	}
+	steady = g_graph.warm && g_graph.epoch == gpu_param_epoch();
+	if (steady && g_graph.ready && gpu_graph_replay() == 0)
+		goto replayed;
+	g_graph.ready = 0;
+	if (steady && g_graph.fails < LM_GRAPH_MAX_FAILS
+	    && gpu_graph_begin() == 0) {
+		rc = graph_body(model, c, dh, ids, B, T, NULL);
+		if (gpu_graph_end() == 0 && rc == 0 && gpu_graph_replay() == 0) {
+			static int said;
+
+			if (!said++)
+				fprintf(stderr, "[graph] training microbatch captured "
+				    "(B=%d T=%d): steady microbatches replay it\n", B, T);
+			g_graph.ready = 1;
+			goto replayed;
+		}
+		/* Nothing of the capture ran: do the microbatch for real. */
+		gpu_graph_destroy();
+		gpu_grad_twins_clear();
+		if (++g_graph.fails == LM_GRAPH_MAX_FAILS)
+			fprintf(stderr, "cuda graphs: capture failed %d times, "
+			    "training on without graphs (ANN_GRAPH_DEBUG=1 says why)\n",
+			    LM_GRAPH_MAX_FAILS);
+	}
+	rc = graph_body(model, c, dh, ids, B, T, mean_ce);
+	gpu_ids_unstage();
+	g_graph.warm = 1;
+	g_graph.epoch = gpu_param_epoch();
+	return rc;
+replayed:
+	gpu_ids_unstage();
+	/* Host-only state the replay did not touch. */
+	gpu_grad_twins_clear();
+	g_graph.replays++;
+	if (mean_ce && gpu_ce_fetch_mean(mean_ce, B * (T - 1)) != 0)
+		*mean_ce = -1.0;
+	return 0;
 }
 
 /*
@@ -852,6 +1045,76 @@ int lm_batch_auto(int T, int vocab_size, size_t free_bytes, double frac,
 		if ((double)lm_packed_bytes(b + 1, T, vocab_size) >= budget)
 			break;
 	return b;
+}
+
+/*
+** Probe loss of B packed windows in one forward and one head GEMM (the
+** per-window lm_nll built a cache, ran a GEMV and a host FP64 softmax per
+** row). logits are never softmaxed in place: gpu_ce_nll_rows writes the FP32
+** log-sum-exp - target logit of each row; the host sums them in FP64.
+** win_nll[b] = mean CE over the T-1 predicting rows of window b. -1 = not
+** applicable (host head, no GPU, B == 1): use lm_nll.
+*/
+int lm_nll_packed(lm *model, lm_cache *c, const int *ids, int B, int T,
+	double *win_nll)
+{
+	mat *hc;
+	mat *lg;
+	float *per;
+	int *tgt;
+	ann_real *dp;
+	int rows;
+	int V;
+	int b;
+	int t;
+	int rc;
+
+	if (!model || !c || !ids || !win_nll || B <= 1 || T < 2 || c->B != B
+	    || c->T != T || !gpu_available())
+		return -1;
+	V = model->vocab_size;
+	rows = B * (T - 1);
+	hc = mat_create_dev(rows, LM_D_MODEL);
+	lg = mat_create_dev(rows, V);
+	per = malloc((size_t)rows * sizeof(float));
+	tgt = malloc((size_t)rows * sizeof(int));
+	rc = -1;
+	if (!hc || !lg || !per || !tgt)
+		goto out;
+	if (lm_forward_cache_packed(model, ids, B, T, c) != 0)
+		goto out;
+	if (!c->hidden->d_data || c->hidden->on_device == MAT_DEV_HOST
+	    || !hc->d_data
+	    || gpu_pack_seq_rows(hc->d_data, c->hidden->d_data, B, T,
+	    LM_D_MODEL) != 0)
+		goto out;
+	hc->on_device = MAT_DEV_DEVICE;
+	for (b = 0; b < B; b++)
+		for (t = 0; t < T - 1; t++)
+			tgt[b * (T - 1) + t] = ids[b * T + t + 1];
+	if (mat_mul(lg, hc, model->w_head) != 0)
+		goto out;
+	dp = mat_compute_ptr(lg);
+	if (!dp || dp != lg->d_data
+	    || gpu_bias_row_add(dp, model->b_head->data, rows, V) != 0)
+		goto out;
+	mat_mark_written(lg, dp);
+	if (gpu_ce_nll_rows(dp, tgt, rows, V, per) != 0)
+		goto out;
+	for (b = 0; b < B; b++) {
+		double s = 0.0;
+
+		for (t = 0; t < T - 1; t++)
+			s += (double)per[b * (T - 1) + t];
+		win_nll[b] = s / (double)(T - 1);
+	}
+	rc = 0;
+out:
+	mat_free(&hc);
+	mat_free(&lg);
+	free(per);
+	free(tgt);
+	return rc;
 }
 
 double lm_nll(const lm *model, const int *ids, int n)

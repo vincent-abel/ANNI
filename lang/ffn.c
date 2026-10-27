@@ -112,23 +112,35 @@ ffn_cache *ffn_cache_create(int T)
 		return NULL;
 	c->T = T;
 	c->x_in = mat_create_dev(T, LM_D_MODEL);
-	c->pre_act = mat_create_dev(T, LM_D_FF);
+	/* pre_act only serves the non-fused paths: allocated on first use (64 MB per layer at T=4096). */
+	c->pre_act = NULL;
 	c->hidden = mat_create_dev(T, LM_D_FF);
-	if (!c->x_in || !c->pre_act || !c->hidden) {
+	if (!c->x_in || !c->hidden) {
 		ffn_cache_free(&c);
 		return NULL;
 	}
 	mat_try_pin(c->x_in);
-	mat_try_pin(c->pre_act);
 	mat_try_pin(c->hidden);
 	return c;
+}
+
+/* The pre-activation buffer of the fallback paths, created on demand. */
+static mat *ffn_pre_act(ffn_cache *c)
+{
+	if (!c->pre_act) {
+		c->pre_act = mat_create_dev(c->T, LM_D_FF);
+		if (c->pre_act)
+			mat_try_pin(c->pre_act);
+	}
+	return c->pre_act;
 }
 
 void ffn_cache_free(ffn_cache **c)
 {
 	if (!c || !*c)
 		return;
-	mat_free(&(*c)->x_in);
+	if (!(*c)->x_in_alias)
+		mat_free(&(*c)->x_in);
 	mat_free(&(*c)->pre_act);
 	mat_free(&(*c)->hidden);
 	free(*c);
@@ -136,6 +148,13 @@ void ffn_cache_free(ffn_cache **c)
 }
 
 int ffn_forward_cache(mat *out, const mat *x, ffn *f, ffn_cache *c)
+{
+	return ffn_forward_cache_res(out, x, f, c, NULL);
+}
+
+/* out = res + FFN(x) with the residual fused into the W2 GEMM (res may be NULL). */
+int ffn_forward_cache_res(mat *out, const mat *x, ffn *f, ffn_cache *c,
+	const mat *res)
 {
 	int t;
 	int j;
@@ -149,8 +168,13 @@ int ffn_forward_cache(mat *out, const mat *x, ffn *f, ffn_cache *c)
 	if (x->cols != LM_D_MODEL || c->T != x->rows)
 		return -1;
 	T = x->rows;
-	copy_mat(c->x_in, x);
-	mat_try_pin(c->pre_act);
+	/* Alias the block's LN output (see attn_mha_forward_packed). */
+	if (!c->x_in_alias)
+		mat_free(&c->x_in);
+	c->x_in = (mat *)x;
+	c->x_in_alias = 1;
+	if (c->pre_act)
+		mat_try_pin(c->pre_act);
 	mat_try_pin(c->hidden);
 	mat_try_pin(out);
 	/*
@@ -163,6 +187,8 @@ int ffn_forward_cache(mat *out, const mat *x, ffn *f, ffn_cache *c)
 	} else {
 		int bias_fused;
 
+		if (!ffn_pre_act(c))
+			return -1;
 		bias_fused = (gpu_mat_mul_bias(c->pre_act, x, f->w1,
 		    f->b1->data) == 0);
 		if (!bias_fused && mat_mul(c->pre_act, x, f->w1) != 0)
@@ -172,33 +198,8 @@ int ffn_forward_cache(mat *out, const mat *x, ffn *f, ffn_cache *c)
 		if (pre && hid
 		    && gpu_ffn_w1_finish(hid, pre,
 		    bias_fused ? NULL : f->b1->data, T, LM_D_FF) == 0) {
-			mat_mark_device(c->pre_act);
-			mat_mark_device(c->hidden);
-		} else if (!bias_fused && pre
-		    && resid_copy(c->hidden, c->pre_act) == 0
-		    && (hid = mat_compute_ptr(c->hidden))
-		    && gpu_bias_relu_forward(hid, f->b1->data, T, LM_D_FF)
-		    == 0) {
-			mat_mark_device(c->hidden);
-			if (gpu_bias_row_add(pre, f->b1->data, T, LM_D_FF)
-			    == 0)
-				mat_mark_device(c->pre_act);
-		} else if (!bias_fused && pre
-		    && gpu_bias_row_add(pre, f->b1->data, T, LM_D_FF) == 0) {
-			mat_mark_device(c->pre_act);
-			if (resid_copy(c->hidden, c->pre_act) != 0)
-				copy_mat(c->hidden, c->pre_act);
-			hid = mat_compute_ptr(c->hidden);
-			if (hid && gpu_relu_forward(hid, T * LM_D_FF) == 0)
-				mat_mark_device(c->hidden);
-			else {
-				(void)mat_ensure_host(c->hidden);
-				for (t = 0; t < T; t++)
-					for (j = 0; j < LM_D_FF; j++)
-						mat_set(c->hidden, t, j,
-						    ffn_relu(mat_get(
-						    c->hidden, t, j)));
-			}
+			mat_mark_written(c->pre_act, pre);
+			mat_mark_written(c->hidden, hid);
 		} else if (!bias_fused) {
 			(void)mat_ensure_host(c->pre_act);
 			for (t = 0; t < T; t++) {
@@ -214,14 +215,17 @@ int ffn_forward_cache(mat *out, const mat *x, ffn *f, ffn_cache *c)
 		} else
 			return -1;
 	}
+	if (res && !gpu_fp8()
+	    && gpu_mat_mul_res(out, c->hidden, f->w2, f->b2->data, res) == 0)
+		return 0;
 	if (!gpu_fp8()
 	    && gpu_mat_mul_bias(out, c->hidden, f->w2, f->b2->data) == 0)
-		return 0;
+		return res ? resid_add(out, res) : 0;
 	if (mat_mul(out, c->hidden, f->w2) != 0)
 		return -1;
 	op = mat_compute_ptr(out);
 	if (op && gpu_bias_row_add(op, f->b2->data, T, LM_D_MODEL) == 0)
-		mat_mark_device(out);
+		mat_mark_written(out, op);
 	else {
 		(void)mat_ensure_host(out);
 		for (t = 0; t < T; t++) {
@@ -230,7 +234,7 @@ int ffn_forward_cache(mat *out, const mat *x, ffn *f, ffn_cache *c)
 				    mat_get(out, t, j) + f->b2->data[j]);
 		}
 	}
-	return 0;
+	return res ? resid_add(out, res) : 0;
 }
 
 int ffn_forward(mat *x, const ffn *f)
@@ -266,6 +270,7 @@ int ffn_backward(mat *dx, const mat *dout, ffn *f, const ffn_cache *c)
 	int T;
 	ann_real *dhp;
 	const ann_real *prep;
+	int fused_relu = 0;
 
 	if (!dx || !dout || !f || !c)
 		return -1;
@@ -303,15 +308,33 @@ int ffn_backward(mat *dx, const mat *dout, ffn *f, const ffn_cache *c)
 	/* dh = dout * W2^T then ReLU mask (GEMM may use GPU). */
 	if (mat_mul_wt(dh, dout, f->w2) != 0)
 		return -1;
-	dhp = mat_compute_ptr(dh);
-	/* hidden>0 ⟺ pre>0 after ReLU; prefer hidden (Lt RELU_BIAS path). */
-	prep = mat_compute_ptr_const(c->hidden);
-	if (!prep)
-		prep = mat_compute_ptr_const(c->pre_act);
-	if (!dhp || !prep
+	/*
+	** BF16 mode: ReLU mask, BF16 twin of dh for the W1 GEMMs and db1 in
+	** one kernel (the FP32 dh stays unmasked, no GEMM reads it then).
+	*/
+	if (!gpu_fp8()
+	    && gpu_ffn_relu_bwd_fused(dh, c->hidden, f->db1->data) == 0) {
+		fused_relu = 1;
+		dhp = NULL;
+		prep = NULL;
+	} else if (gpu_act_bf16_only(c->hidden)) {
+		/* The FP32 hidden was never written: no mask for the fallback. */
+		return -1;
+	} else {
+		dhp = mat_compute_ptr(dh);
+		/* hidden>0 ⟺ pre>0 after ReLU; prefer hidden (Lt RELU_BIAS path). */
+		prep = mat_compute_ptr_const(c->hidden);
+		if (!prep)
+			prep = mat_compute_ptr_const(c->pre_act);
+	}
+	if (fused_relu)
+		;
+	else if (!dhp || !prep
 	    || gpu_relu_backward(dhp, prep, T * LM_D_FF) != 0) {
 		const mat *mask = c->hidden->data ? c->hidden : c->pre_act;
 
+		if (!mask)
+			return -1;
 		(void)mat_ensure_host(dh);
 		(void)mat_ensure_host((mat *)mask);
 		for (t = 0; t < T; t++) {
@@ -322,10 +345,10 @@ int ffn_backward(mat *dx, const mat *dout, ffn *f, const ffn_cache *c)
 		}
 		mat_host_dirty(dh);
 	} else
-		mat_mark_device(dh);
+		mat_mark_written(dh, dhp);
 	if (mat_outer_add(f->dw1, c->x_in, dh) != 0)
 		return -1;
-	{
+	if (!fused_relu) {
 		ann_real *dhptr = mat_compute_ptr(dh);
 
 		if (!dhptr

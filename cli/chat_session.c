@@ -33,6 +33,24 @@ static void chat_trim_hist(lm *model, char *hist, size_t *hist_len, int budget)
 	}
 }
 
+void chat_reply_cut(char *reply)
+{
+	char *cut;
+	size_t n;
+
+	if (!reply)
+		return;
+	cut = strstr(reply, "\nUser:");
+	if (cut)
+		*cut = '\0';
+	cut = strstr(reply, "\nAssistant:");
+	if (cut)
+		*cut = '\0';
+	n = strlen(reply);
+	while (n > 0 && (reply[n - 1] == '\n' || reply[n - 1] == ' '))
+		reply[--n] = '\0';
+}
+
 static int hist_grow(chat_session *s, size_t need)
 {
 	char *grown;
@@ -139,6 +157,7 @@ int chat_session_turn(chat_session *s, const char *user_line,
 	while (*r == ' ' || *r == '\n')
 		r++;
 	snprintf(reply, (size_t)reply_cap, "%s", r);
+	chat_reply_cut(reply);
 
 	need = s->hist_len + strlen(reply) + 2;
 	if (hist_grow(s, need) != 0)
