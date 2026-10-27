@@ -113,9 +113,9 @@ finetune() {
 # after the GPU audit (docs/gpu-training-audit.md). Empty = FP32.
 PREC_FLAGS=${PREC_FLAGS:-"--bf16"}
 # Runtime switches for the trainer (tmux does not pass the caller's env):
-# ANN_TWIN_EMIT=0 keeps the producer-written gradient twins off until the
-# rare 2% gradient mismatch seen in tests/test_gpu check 7 is fixed.
-TRAIN_ENV=${TRAIN_ENV:-"ANN_TWIN_EMIT=0"}
+# ANN_TWIN_EMIT=1: the producer-written gradient twins are on again; the 2%
+# mismatch was float-atomic column-sum ordering, fixed by ANN_DET_SUM (candidate 23).
+TRAIN_ENV=${TRAIN_ENV:-"ANN_TWIN_EMIT=1"}
 # Checkpoint cadence in minutes (27 tonight so a save lands just after 01:00 CET).
 CKPT_MIN=${CKPT_MIN:-27}
 
