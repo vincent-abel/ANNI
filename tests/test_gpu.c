@@ -372,6 +372,30 @@ static void test_checkpoint_round_trip(void)
 	n_before = lm_nll(r.m, ids, T);
 	lm_weights_ensure_host(r.m);
 	assert(lm_save_checkpoint(r.m, r.opt, 1, 2, path) == 0);
+	/* B7: the chunked m/v writer must emit the per-value writer's bytes. */
+	{
+		const char *p2 = "/tmp/test_gpu_ckpt_ref.bin";
+		FILE *f1;
+		FILE *f2;
+		int c1;
+		int c2b;
+
+		setenv("ANN_CKPT_CHUNKED", "0", 1);
+		assert(lm_save_checkpoint(r.m, r.opt, 1, 2, p2) == 0);
+		unsetenv("ANN_CKPT_CHUNKED");
+		f1 = fopen(path, "rb");
+		f2 = fopen(p2, "rb");
+		assert(f1 && f2);
+		do {
+			c1 = fgetc(f1);
+			c2b = fgetc(f2);
+			assert(c1 == c2b);
+		} while (c1 != EOF);
+		fclose(f1);
+		fclose(f2);
+		remove(p2);
+		printf("  checkpoint: chunked and per-value writes identical\n");
+	}
 	rig_close(&r);
 	m2 = lm_load_checkpoint(path, &opt2, &ep, &st);
 	assert(m2 && opt2);
@@ -404,6 +428,47 @@ static void test_checkpoint_round_trip(void)
 	remove(path);
 }
 
+/*
+** 7. Batched validation probe: lm_nll_packed (one forward, one head GEMM,
+** FP32 device CE) must match the per-window lm_nll within the BF16 head's
+** rounding, window by window.
+*/
+static void test_probe_packed(void)
+{
+	rig r;
+	int ids[B * T];
+	double wn[B];
+	double worst;
+	int b;
+
+	rig_open(&r, GPU_PREC_BF16);
+	lm_adam_zero_grad(r.m);
+	microbatch(&r, 777u, 1);
+	lm_adam_step_scaled(r.opt, 1e-3, 1.0 / (double)(B * (T - 1)));
+	lm_adam_zero_grad(r.m);
+	fill_ids(ids, 4242u);
+	assert(lm_nll_packed(r.m, r.c, ids, B, T, wn) == 0);
+	worst = 0.0;
+	for (b = 0; b < B; b++) {
+		double ref = lm_nll(r.m, ids + b * T, T);
+
+		printf("  probe window %d: packed %.6f lm_nll %.6f\n", b, wn[b], ref);
+		if (fabs(wn[b] - ref) > worst)
+			worst = fabs(wn[b] - ref);
+	}
+	/* The second call must not depend on state left by the first. */
+	{
+		double wn2[B];
+
+		assert(lm_nll_packed(r.m, r.c, ids, B, T, wn2) == 0);
+		for (b = 0; b < B; b++)
+			assert(wn2[b] == wn[b]);
+	}
+	printf("  probe: worst |packed - lm_nll| = %.2e\n", worst);
+	assert(worst < 2e-2);
+	rig_close(&r);
+}
+
 int main(void)
 {
 	if (!gpu_available()) {
@@ -421,6 +486,7 @@ int main(void)
 	test_first_step_updates_everything();
 	test_free_leaves_no_cuda_error();
 	test_checkpoint_round_trip();
+	test_probe_packed();
 	printf("bf16 vs fp32\n");
 	check_tracks_fp32("bf16", GPU_PREC_BF16, 2e-3, 0.2, 0.1);
 	printf("fp8 (E4M3 fwd, E5M2 dgrad) vs fp32\n");

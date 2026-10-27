@@ -189,6 +189,13 @@ int	gpu_ce_softmax_delta_bf16(ann_real *logits, const int *tgt, int rows,
 		int V, ann_real *db_host, double *mean_ce);
 int	gpu_ce_bf16_delta_done(const ann_real *logits);
 /*
+** Probe loss: out[r] = logsumexp(logits[r]) - logits[r][tgt[r]] in FP32 for
+** rows x V device logits (left intact). out is host, rows floats. -1 = not
+** applicable (host logits, no GPU).
+*/
+int	gpu_ce_nll_rows(const ann_real *logits, const int *tgt, int rows, int V,
+		float *out);
+/*
 ** S2: Add sinusoidal posenc in place to packed (B*T) x D; position t restarts
 ** each sequence. x may be device-resident.
 */

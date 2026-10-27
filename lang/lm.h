@@ -78,6 +78,10 @@ int	lm_loss_backward(lm *model, const lm_cache *c, const int *ids, int n,
 		mat *dhidden, double *mean_ce);
 int	lm_backward(lm *model, const mat *dhidden, const lm_cache *c);
 double	lm_nll(const lm *model, const int *ids, int n);
+/* Probe loss of B packed windows (one forward, one head GEMM); win_nll[B].
+** -1 when not applicable (caller falls back to lm_nll per window). */
+int	lm_nll_packed(lm *model, lm_cache *c, const int *ids, int B, int T,
+		double *win_nll);
 double	lm_perplexity(const lm *model, const int *ids, int n);
 double	lm_train_steps(lm *model, const char *text, int steps, double lr);
 

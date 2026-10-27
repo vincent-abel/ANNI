@@ -9441,6 +9441,63 @@ extern "C" int gpu_ce_bf16_delta_done(const ann_real *logits)
 	return ok ? 0 : -1;
 }
 
+/*
+** Probe loss: one block per row, FP32 log-sum-exp minus the target logit.
+** Read-only on the logits (no softmax in place, no db_head, no delta), so the
+** validation probe batches B windows through one head GEMM.
+*/
+__global__ static void ce_nll_rows_kernel(const ann_real *logits,
+	const int *tgt, int V, float *out)
+{
+	__shared__ ann_real sh[EW_BLOCK];
+	const ann_real *row = logits + (size_t)blockIdx.x * (size_t)V;
+	ann_real m = -INFINITY;
+	ann_real s = 0.0f;
+	int j;
+
+	for (j = threadIdx.x; j < V; j += blockDim.x)
+		if (row[j] > m)
+			m = row[j];
+	m = ew_block_max(m, sh);
+	for (j = threadIdx.x; j < V; j += blockDim.x)
+		s += expf(row[j] - m);
+	s = ew_block_sum(s, sh);
+	if (threadIdx.x == 0)
+		out[blockIdx.x] = (m + logf(s)) - row[tgt[blockIdx.x]];
+}
+
+extern "C" int gpu_ce_nll_rows(const ann_real *logits, const int *tgt,
+	int rows, int V, float *out)
+{
+	OpScope _op(OP_CE);
+	ew_ref rl;
+	ew_ref rt;
+	ew_ref ro;
+	int rc;
+
+	if (!logits || !tgt || !out || rows <= 0 || V <= 0 || !gpu_available()
+	    || !ew_is_dev(logits))
+		return -1;
+	pthread_mutex_lock(&g_ew_mu);
+	if (ew_acquire(&rl, 0, logits, (size_t)rows * (size_t)V
+	    * sizeof(ann_real), 0, 0) != 0
+	    || ew_acquire(&rt, 1, tgt, (size_t)rows * sizeof(int), 1, 0) != 0
+	    || ew_acquire(&ro, 2, out, (size_t)rows * sizeof(float), 0, 1) != 0)
+		goto fail;
+	ce_nll_rows_kernel<<<rows, ew_block_for(V)>>>(rl.dev,
+	    (const int *)rt.dev, V, (float *)ro.dev);
+	if (ew_launch_ok() != 0)
+		goto fail;
+	rc = ew_release(&ro);	/* synchronising D2H of the per-row losses */
+	if (rc < 0)
+		goto fail;
+	pthread_mutex_unlock(&g_ew_mu);
+	return 0;
+fail:
+	pthread_mutex_unlock(&g_ew_mu);
+	return -1;
+}
+
 extern "C" int gpu_ce_fetch_mean(double *mean_ce, int rows)
 {
 	if (!mean_ce || rows <= 0 || !g_ce_host_pinned || g_ce_last_rows <= 0)

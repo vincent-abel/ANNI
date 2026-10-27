@@ -940,7 +940,8 @@ static int resolve_batch(int batch_size, int T, int vocab, int max_b,
 	return B;
 }
 
-double lm_nll_windows(const lm *model, const text_dataset *ds, int max_windows)
+static double nll_windows_seq(const lm *model, const text_dataset *ds,
+	int max_windows)
 {
 	int ids[LM_MAX_CTX];
 	int n;
@@ -964,6 +965,121 @@ double lm_nll_windows(const lm *model, const text_dataset *ds, int max_windows)
 		sum += lm_nll(model, ids, n);
 	}
 	return sum / (double)lim;
+}
+
+/*
+** Validation probe on the training's packed cache: Bmax windows per forward
+** and one head GEMM, per-row CE on the device in FP32 (lm_nll_packed). The
+** value differs from the per-window FP64 path by ~1e-5 (FP32 log-sum-exp,
+** head GEMM in the training precision). ANN_PROBE_BATCH=0 restores the
+** per-window path; a short tail and any unsupported case use lm_nll.
+*/
+static double probe_windows(lm *model, const text_dataset *ds,
+	int max_windows, pack_ctx *pk)
+{
+	static int on = -1;
+	int ids[LM_MAX_CTX];
+	int *buf;
+	double wn[256];
+	double sum;
+	int nw;
+	int lim;
+	int i;
+	int j;
+	int n;
+	int B;
+	int done;
+
+	if (on < 0) {
+		const char *e = getenv("ANN_PROBE_BATCH");
+
+		on = (e && e[0] == '0') ? 0 : 1;
+	}
+	nw = text_dataset_n_windows(ds);
+	if (!on || !pk || !model || nw <= 0 || ds->window != pk->T
+	    || pk->Bmax < 2 || pk->Bmax > 256)
+		return nll_windows_seq(model, ds, max_windows);
+	lim = nw;
+	if (max_windows > 0 && max_windows < lim)
+		lim = max_windows;
+	B = pk->Bmax;
+	if (lim < B)
+		return nll_windows_seq(model, ds, max_windows);
+	/* One live packed slot only (see pack_run). */
+	if (pk->slot[1].B)
+		pack_slot_free(&pk->slot[1]);
+	if (pack_slot_get(&pk->slot[0], B, pk->T) != 0)
+		return nll_windows_seq(model, ds, max_windows);
+	buf = pk->ids_next;	/* pinned (B*T) staging; the prefetch is idle here */
+	if (pk->next_bb > 0) {
+		/* A prefetched batch is waiting in ids_next: do not clobber. */
+		buf = malloc((size_t)B * (size_t)pk->T * sizeof(int));
+		if (!buf)
+			return nll_windows_seq(model, ds, max_windows);
+	}
+	sum = 0.0;
+	done = 0;
+	while (done + B <= lim) {
+		for (j = 0; j < B; j++) {
+			if (text_dataset_window(ds, done + j,
+			    &buf[(size_t)j * pk->T], &n) != 0 || n != pk->T)
+				goto bail;
+		}
+		if (lm_nll_packed(model, pk->slot[0].c, buf, B, pk->T, wn) != 0)
+			goto bail;
+		for (j = 0; j < B; j++)
+			sum += wn[j];
+		done += B;
+	}
+	for (i = done; i < lim; i++) {
+		if (text_dataset_window(ds, i, ids, &n) != 0)
+			goto bail;
+		sum += lm_nll(model, ids, n);
+	}
+	if (buf != pk->ids_next)
+		free(buf);
+	/* The probe reused the training cache buffers: recapture the graph. */
+	if (g_graph_ready) {
+		g_graph_ready = 0;
+		gpu_graph_destroy();
+	}
+	return sum / (double)lim;
+bail:
+	if (buf != pk->ids_next)
+		free(buf);
+	if (g_graph_ready) {
+		g_graph_ready = 0;
+		gpu_graph_destroy();
+	}
+	return nll_windows_seq(model, ds, max_windows);
+}
+
+/*
+** Standalone probe (lm info / eval): a throwaway packed cache of up to
+** PROBE_B windows. Falls back to the per-window path when it cannot be
+** allocated.
+*/
+#define PROBE_B	8
+
+double lm_nll_windows(const lm *model, const text_dataset *ds, int max_windows)
+{
+	pack_ctx tmp;
+	double v;
+	int nw;
+	int lim;
+	int b;
+
+	if (!model || !ds)
+		return -1.0;
+	nw = text_dataset_n_windows(ds);
+	lim = (max_windows > 0 && max_windows < nw) ? max_windows : nw;
+	b = lim < PROBE_B ? lim : PROBE_B;
+	if (b < 2 || ds->window < 2 || ds->window > LM_MAX_CTX
+	    || pack_ctx_init_once(&tmp, b, ds->window) != 0)
+		return nll_windows_seq(model, ds, max_windows);
+	v = probe_windows((lm *)model, ds, max_windows, &tmp);
+	pack_ctx_free(&tmp);
+	return v;
 }
 
 double lm_train_corpus(lm *model, text_dataset *ds, lm_adam *opt,
@@ -1055,7 +1171,7 @@ double lm_train_corpus_val(lm *model, text_dataset *ds, lm_adam *opt,
 			    eval_windows);
 			dbg_stamp(msg);
 		}
-		win = lm_nll_windows(model, val ? val : ds, eval_windows);
+		win = probe_windows(model, val ? val : ds, eval_windows, &pk);
 	}
 	t0 = wall_sec();
 	last_ckpt = t0;
@@ -1112,6 +1228,12 @@ double lm_train_corpus_val(lm *model, text_dataset *ds, lm_adam *opt,
 			/* Mid-epoch resume: skip windows the checkpoint covered. */
 			if (ep == 0 && g_resume_pos > 0 && g_resume_pos < nw) {
 				idx = g_resume_pos;
+				/*
+				** The start probe just ran: do not fire the
+				** mid-epoch probe of the percentage already
+				** passed right after it.
+				*/
+				(void)train_mid_val_due(idx, nw, &next_mid_pct);
 				if (debug && !g_progress_fn) {
 					snprintf(msg, sizeof(msg),
 					    "resuming epoch %d at window %d/%d",
@@ -1310,7 +1432,7 @@ double lm_train_corpus_val(lm *model, text_dataset *ds, lm_adam *opt,
 					int pct = (int)(100.0 * (double)idx
 					    / (double)nw);
 
-					v = lm_nll_windows(model, val, mid_wins);
+					v = probe_windows(model, val, mid_wins, &pk);
 					if (v >= 0.0)
 						win = v;
 					if (debug && !g_progress_fn) {
@@ -1380,8 +1502,8 @@ double lm_train_corpus_val(lm *model, text_dataset *ds, lm_adam *opt,
 				}
 			}
 			if (eval_every > 0 && ((ep + 1) % eval_every) == 0)
-				win = lm_nll_windows(model, val ? val : ds,
-				    eval_windows);
+				win = probe_windows(model, val ? val : ds,
+				    eval_windows, &pk);
 			epoch_num = epoch_base + ep + 1;
 			if (ckpt_path) {
 				if (lm_save_checkpoint(model, opt, epoch_num, 0,

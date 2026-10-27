@@ -246,6 +246,49 @@ lm *lm_load(const char *path)
 }
 
 /*
+** m and v interleaved per slot, as 4-byte pairs. One fwrite per value cost
+** 370 M calls (7-10 s with the GPU idle): the same bytes go out through a
+** 16 MB staging buffer instead. ANN_CKPT_CHUNKED=0 restores the per-value
+** writes (used to check the bytes are identical).
+*/
+#define ADAM_CHUNK	(1 << 21)	/* slots per fwrite */
+
+static int write_adam_slots(FILE *fp, const lm_adam *opt)
+{
+	const char *e = getenv("ANN_CKPT_CHUNKED");
+	ann_real *buf;
+	int i;
+	int k;
+	int n;
+
+	if (e && e[0] == '0') {
+		for (i = 0; i < opt->n; i++) {
+			if (write_real(fp, opt->slots[i].m) != 0
+			    || write_real(fp, opt->slots[i].v) != 0)
+				return -1;
+		}
+		return 0;
+	}
+	buf = malloc((size_t)ADAM_CHUNK * 2 * sizeof(ann_real));
+	if (!buf)
+		return -1;
+	for (i = 0; i < opt->n; i += n) {
+		n = opt->n - i < ADAM_CHUNK ? opt->n - i : ADAM_CHUNK;
+		for (k = 0; k < n; k++) {
+			buf[2 * k] = opt->slots[i + k].m;
+			buf[2 * k + 1] = opt->slots[i + k].v;
+		}
+		if (fwrite(buf, sizeof(ann_real), (size_t)n * 2, fp)
+		    != (size_t)n * 2) {
+			free(buf);
+			return -1;
+		}
+	}
+	free(buf);
+	return 0;
+}
+
+/*
 ** Written to PATH.tmp and renamed over PATH, so a crash mid-save leaves the
 ** previous checkpoint intact.
 */
@@ -253,7 +296,6 @@ int lm_save_checkpoint(const lm *model, const lm_adam *opt, int epoch, int step,
 	const char *path)
 {
 	FILE *fp;
-	int i;
 	int bad;
 	char tmp[1024];
 
@@ -270,11 +312,8 @@ int lm_save_checkpoint(const lm *model, const lm_adam *opt, int epoch, int step,
 	    || write_i32(fp, opt->n) != 0;
 	if (!bad)
 		lm_adam_sync_host((lm_adam *)opt);
-	for (i = 0; !bad && i < opt->n; i++) {
-		if (write_real(fp, opt->slots[i].m) != 0
-		    || write_real(fp, opt->slots[i].v) != 0)
-			bad = 1;
-	}
+	if (!bad && write_adam_slots(fp, opt) != 0)
+		bad = 1;
 	if (fclose(fp) != 0)
 		bad = 1;
 	if (bad || rename(tmp, path) != 0) {
