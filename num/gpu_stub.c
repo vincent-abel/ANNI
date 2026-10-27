@@ -495,10 +495,6 @@ int gpu_mat_mul_bias_relu(mat *c, const mat *a, const mat *b,
 	return -1;
 }
 
-void gpu_half_wt_refresh_all(void)
-{
-}
-
 void gpu_adam_set_bf16_flat(void *bf16, const ann_real *fp32, int n)
 {
 	(void)bf16;
