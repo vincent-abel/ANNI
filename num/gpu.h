@@ -23,14 +23,12 @@ int	gpu_sync_mode(void);
 #define GPU_PREC_FP32	0
 #define GPU_PREC_BF16	1
 void	gpu_set_compute_prec(int prec);	/* FP32/BF16 */
-int	gpu_compute_prec(void);
 /*
 ** Mixed FP8: E4M3 forward, E5M2 dgrad, BF16 wgrad, FP32 Adam. gpu_set_fp8(1)
 ** also enables dgrad. Wgrad never uses FP8 (outer-product underflow).
 */
 void	gpu_set_fp8(int on);
 void	gpu_set_fp8_dgrad(int on);
-int	gpu_fp8_dgrad(void);
 int	gpu_fp8(void);
 /*
 ** Block until all queued device work finishes. In GPU_SYNC_BATCH mode the
