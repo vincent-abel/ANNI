@@ -208,6 +208,36 @@ int gpu_layernorm_backward_acc(mat *dx, const mat *dy, const ann_real *gamma,
 	return -1;
 }
 
+int gpu_layernorm_backward_x(mat *dx, const mat *dy, const ann_real *gamma,
+	const ann_real *x, const ann_real *mean, const ann_real *inv_std,
+	int T, int d, ann_real *dgamma, ann_real *dbeta, int accumulate)
+{
+	(void)dx;
+	(void)dy;
+	(void)gamma;
+	(void)x;
+	(void)mean;
+	(void)inv_std;
+	(void)T;
+	(void)d;
+	(void)dgamma;
+	(void)dbeta;
+	(void)accumulate;
+	return -1;
+}
+
+int gpu_layernorm_xhat(ann_real *x_hat, const ann_real *x,
+	const ann_real *mean, const ann_real *inv_std, int T, int d)
+{
+	(void)x_hat;
+	(void)x;
+	(void)mean;
+	(void)inv_std;
+	(void)T;
+	(void)d;
+	return -1;
+}
+
 void gpu_grad_twins_clear(void)
 {
 }

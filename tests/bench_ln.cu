@@ -129,7 +129,7 @@ int main(int argc, char **argv)
 		col_sum_tiled_kernel<<<grid, EW_BLOCK>>>(db1, dy, NULL, T, d);
 		col_sum_tiled_kernel<<<grid, EW_BLOCK>>>(dg1, dy, xh1, T, d);
 	};
-	auto bwd_new = [&]() { ln_bwd_fast_launch(dx2, dy, g, xh1, i1, dg2, db2, T, d, 1, dx16b); };
+	auto bwd_new = [&]() { ln_bwd_fast_launch(dx2, dy, g, xh1, i1, dg2, db2, T, d, 1, dx16b, NULL, NULL); };
 	CK(cudaMemset(dg1, 0, d * 4)); CK(cudaMemset(db1, 0, d * 4));
 	CK(cudaMemset(dg2, 0, d * 4)); CK(cudaMemset(db2, 0, d * 4));
 	CK(cudaMemcpy(dx1, hdx0.data(), n * 4, cudaMemcpyHostToDevice));
@@ -141,5 +141,41 @@ int main(int argc, char **argv)
 	printf("     (dgamma max %.3g)\n", ({ auto v = cp(dg1, d); double m = 0; for (float f : v) m = fmax(m, fabs(f)); m; }));
 	printf("bwd  old %.4f ms   new %.4f ms\n", timeit(bwd_old, iters), timeit(bwd_new, iters));
 	printf("bwd  cold old %.4f ms   new %.4f ms\n", timeit_min(bwd_old, 300, 1), timeit_min(bwd_new, 300, 1));
+
+	/*
+	** B12: the warp backward with x_hat recomputed from x and the fast
+	** forward's mean / inv_std (m2, i2) against the same kernel reading the
+	** stored x_hat (xh2). dx and dx16 must match bit for bit.
+	*/
+	{
+		auto bwd_xh = [&]() { ln_bwd_fast_launch(dx1, dy, g, xh2, i2, dg1, db1, T, d, 1, dx16a, NULL, NULL); };
+		auto bwd_rc = [&]() { ln_bwd_fast_launch(dx2, dy, g, NULL, i2, dg2, db2, T, d, 1, dx16b, x, m2); };
+		std::vector<float> a, bb;
+		std::vector<__nv_bfloat16> a16(n), b16(n);
+
+		ln_fwd_fast_launch(y2, x, g, b, xh2, m2, i2, T, d, 1e-5f, NULL);
+		CK(cudaMemset(dg1, 0, d * 4)); CK(cudaMemset(db1, 0, d * 4));
+		CK(cudaMemset(dg2, 0, d * 4)); CK(cudaMemset(db2, 0, d * 4));
+		CK(cudaMemcpy(dx1, hdx0.data(), n * 4, cudaMemcpyHostToDevice));
+		CK(cudaMemcpy(dx2, hdx0.data(), n * 4, cudaMemcpyHostToDevice));
+		bwd_xh(); bwd_rc(); CK(cudaDeviceSynchronize());
+		a = cp(dx1, n); bb = cp(dx2, n);
+		CK(cudaMemcpy(a16.data(), dx16a, n * 2, cudaMemcpyDeviceToHost));
+		CK(cudaMemcpy(b16.data(), dx16b, n * 2, cudaMemcpyDeviceToHost));
+		printf("B12  dx bitwise %s  dx16 bitwise %s  dgamma %.3g  dbeta %.3g\n",
+		    memcmp(a.data(), bb.data(), n * 4) ? "DIFF" : "equal",
+		    memcmp(a16.data(), b16.data(), n * 2) ? "DIFF" : "equal",
+		    maxdiff(cp(dg1, d), cp(dg2, d), &mx), maxdiff(cp(db1, d), cp(db2, d), &mx));
+		{
+			/* the xhat fallback kernel against the forward's x_hat */
+			ln_xhat_kernel<<<(unsigned)((n + 255) / 256), 256>>>(xh1, x, m2, i2, T, d);
+			CK(cudaDeviceSynchronize());
+			a = cp(xh1, n); bb = cp(xh2, n);
+			printf("B12  ln_xhat_kernel vs forward x_hat bitwise %s\n",
+			    memcmp(a.data(), bb.data(), n * 4) ? "DIFF" : "equal");
+		}
+		printf("B12  bwd stored x_hat %.4f ms   recomputed %.4f ms\n",
+		    timeit_min(bwd_xh, 300, 1), timeit_min(bwd_rc, 300, 1));
+	}
 	return 0;
 }
