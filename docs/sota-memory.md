@@ -14,7 +14,7 @@ Fit larger **B** (microbatch) on one GPU without abandoning FP32 masters: shrink
 | Flash-style attn | `--flash-attn` | `attn.c`, `gpu_attn_flash_fwd` / `gpu_attn_tiled_bwd` in `gpu_cuda.cu` | Drops persistent `B·H·T·T` per layer |
 | Block act checkpoint | `--act-checkpoint` | `block.c` (`block_cache_drop_device`), `lm_train_set_act_checkpoint` | ~2 live blocks vs `LM_N_BLOCKS` in estimate |
 | Adam m/v offload | `--adam-offload` | `lm_adam.c` (`adam_offload_mv`, `offload_mv`) | Frees `d_m`/`d_v` between steps |
-| Mixed GEMM prec | `--bf16` / `--fp16` | `gpu.h`, `gpu_set_compute_prec` | Lower GEMM footprint; **m/v still FP32** |
+| Mixed GEMM prec | `--bf16` | `gpu.h`, `gpu_set_compute_prec` | Lower GEMM footprint; **m/v still FP32** |
 | Buffer reuse | (always on) | `lm.c` S12 mats; `pack_ctx` in `lm_train.c` | Less alloc churn; estimate uses 1.35× safety |
 
 Recommended VRAM-bound combo (see `docs/speed-stack-bench.md`): `--flash-attn --act-checkpoint --batch auto`; add `--adam-offload` when params+m/v dominate after acts shrink.
@@ -64,7 +64,7 @@ DeepSpeed ZeRO shards optimizer state, grads, and optionally weights across rank
 
 **Checkpoint:** new sidecar or LMCF section for scales + quantized blobs; `lm_adam_sync_host` must dequant before save unless format stores quant natively.
 
-**Risk:** small models + high lr — monitor with existing `grad_clip` / loss scaling (`docs/fp16-loss-scaling.md`).
+**Risk:** small models + high lr — monitor with existing `grad_clip`.
 
 ---
 

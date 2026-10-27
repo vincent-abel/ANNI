@@ -22,8 +22,7 @@ int	gpu_sync_mode(void);
 /* S5: compute dtype for cuBLAS GemmEx (weights/Adam masters stay FP32). */
 #define GPU_PREC_FP32	0
 #define GPU_PREC_BF16	1
-#define GPU_PREC_FP16	2
-void	gpu_set_compute_prec(int prec);	/* FP32/BF16/FP16 */
+void	gpu_set_compute_prec(int prec);	/* FP32/BF16 */
 int	gpu_compute_prec(void);
 /*
 ** Mixed FP8: E4M3 forward, E5M2 dgrad, BF16 wgrad, FP32 Adam. gpu_set_fp8(1)

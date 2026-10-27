@@ -84,8 +84,6 @@ static int g_graph_T;
 static int g_graph_ready;
 static int g_graph_warmed;
 static int g_compute_prec;
-static double g_loss_scale = 1.0;
-static int g_loss_scale_good;
 
 void lm_train_set_progress(train_progress_fn fn, void *userdata)
 {
@@ -509,12 +507,10 @@ void lm_train_set_cuda_graphs(int on)
 
 void lm_train_set_compute_prec(int prec)
 {
-	if (prec != GPU_PREC_BF16 && prec != GPU_PREC_FP16)
+	if (prec != GPU_PREC_BF16)
 		prec = GPU_PREC_FP32;
 	g_compute_prec = prec;
 	gpu_set_compute_prec(prec);
-	g_loss_scale = (prec == GPU_PREC_FP16) ? 1024.0 : 1.0;
-	g_loss_scale_good = 0;
 	/* Dtype change invalidates captured graphs. */
 	if (g_cuda_graphs)
 		lm_train_set_cuda_graphs(1);
@@ -533,33 +529,6 @@ void lm_train_set_fp8_dgrad(int on)
 	gpu_set_fp8_dgrad(on);
 	if (g_cuda_graphs)
 		lm_train_set_cuda_graphs(1);
-}
-
-double lm_train_loss_scale(void)
-{
-	return g_loss_scale > 0.0 ? g_loss_scale : 1.0;
-}
-
-/* Unscale factor for Adam; update dynamic loss scale for FP16. */
-static double train_grad_unscale(int step_ok)
-{
-	if (g_compute_prec != GPU_PREC_FP16)
-		return 1.0;
-	if (!step_ok) {
-		g_loss_scale *= 0.5;
-		if (g_loss_scale < 1.0)
-			g_loss_scale = 1.0;
-		g_loss_scale_good = 0;
-		return 0.0;	/* caller skips Adam */
-	}
-	g_loss_scale_good++;
-	if (g_loss_scale_good >= 2000) {
-		g_loss_scale *= 2.0;
-		if (g_loss_scale > 65536.0)
-			g_loss_scale = 65536.0;
-		g_loss_scale_good = 0;
-	}
-	return 1.0 / g_loss_scale;
 }
 
 static void apply_tokens_per_step(int B, int T)
@@ -1393,32 +1362,25 @@ double lm_train_corpus_val(lm *model, text_dataset *ds, lm_adam *opt,
 				opt->weight_decay = g_weight_decay;
 				opt->grad_clip = g_grad_clip;
 				{
-					double us = train_grad_unscale(
-					    isfinite(last));
+					double ta = wall_sec();
+					static int s_adam_log = 6;
+					const char *pe = getenv("ANN_STEP_PROF");
 
-					if (us > 0.0) {
-						double ta = wall_sec();
-						static int s_adam_log = 6;
-						const char *pe = getenv(
-						    "ANN_STEP_PROF");
-
-						/*
-						** Mean over predicted tokens, so
-						** --grad-clip bounds the usual
-						** per-token gradient norm.
-						*/
-						lm_adam_step_scaled(opt, step_lr,
-						    us / ((double)b
-						    * (double)(ds->window - 1)));
-						if (s_adam_log > 0 && pe
-						    && pe[0] == '1') {
-							fprintf(stderr,
-							    "[adam] %.1fms\n",
-							    (wall_sec() - ta) * 1e3);
-							s_adam_log--;
-						}
-					} else
-						lm_adam_zero_grad(model);
+					/*
+					** Mean over predicted tokens, so
+					** --grad-clip bounds the usual
+					** per-token gradient norm.
+					*/
+					lm_adam_step_scaled(opt, step_lr,
+					    1.0 / ((double)b
+					    * (double)(ds->window - 1)));
+					if (s_adam_log > 0 && pe
+					    && pe[0] == '1') {
+						fprintf(stderr,
+						    "[adam] %.1fms\n",
+						    (wall_sec() - ta) * 1e3);
+						s_adam_log--;
+					}
 				}
 				/* Stay BATCH into the next microbatch. */
 				elapsed = wall_sec() - t0;
@@ -1922,25 +1884,19 @@ double lm_train_stream(lm *model, text_stream *train, lm_adam *opt,
 				opt->weight_decay = g_weight_decay;
 				opt->grad_clip = g_grad_clip;
 				{
-					double us = train_grad_unscale(
-					    isfinite(last));
+					double ta = wall_sec();
+					static int s_adam_log = 6;
+					const char *pe = getenv("ANN_STEP_PROF");
 
-					if (us > 0.0) {
-						double ta = wall_sec();
-						static int s_adam_log = 6;
-						const char *pe = getenv("ANN_STEP_PROF");
-
-						/* Mean over predicted tokens (see corpus path). */
-						lm_adam_step_scaled(opt, step_lr,
-						    us / ((double)b * (double)(T - 1)));
-						if (s_adam_log > 0 && pe && pe[0] == '1') {
-							fprintf(stderr,
-							    "[adam] %.1fms\n",
-							    (wall_sec() - ta) * 1e3);
-							s_adam_log--;
-						}
-					} else
-						lm_adam_zero_grad(model);
+					/* Mean over predicted tokens (see corpus path). */
+					lm_adam_step_scaled(opt, step_lr,
+					    1.0 / ((double)b * (double)(T - 1)));
+					if (s_adam_log > 0 && pe && pe[0] == '1') {
+						fprintf(stderr,
+						    "[adam] %.1fms\n",
+						    (wall_sec() - ta) * 1e3);
+						s_adam_log--;
+					}
 				}
 				gpu_set_sync_mode(GPU_SYNC_EAGER);
 				steps++;

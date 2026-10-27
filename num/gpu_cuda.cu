@@ -41,7 +41,7 @@ static int g_graph_ok;
 
 extern "C" void gpu_set_compute_prec(int prec)
 {
-	if (prec != GPU_PREC_BF16 && prec != GPU_PREC_FP16)
+	if (prec != GPU_PREC_BF16)
 		prec = GPU_PREC_FP32;
 	g_compute_prec = prec;
 }
@@ -201,7 +201,7 @@ static int lt_heuristic_only(void)
 }
 
 /*
-** cuBLASLt BF16/FP16 GEMM with cached heuristic. Falls back to GemmEx.
+** cuBLASLt BF16 GEMM with cached heuristic. Falls back to GemmEx.
 ** Column-major dims match existing GemmEx callers (N,M,K with opa/opb).
 ** epi/bias_dev: optional Lt epilogue (BIAS / RELU_BIAS); bias length = N.
 */
@@ -230,7 +230,9 @@ static int cublas_lt_gemm_half(cublasOperation_t opa, cublasOperation_t opb,
 	    && (epi & CUBLASLT_EPILOGUE_BIAS))
 		return -1;
 	epi_i = (int)epi;
-	dt = bf16 ? CUDA_R_16BF : CUDA_R_16F;
+	if (!bf16)
+		return -1;	/* FP16 was removed */
+	dt = CUDA_R_16BF;
 	for (i = 0; i < LT_ALGO_CACHE; i++) {
 		e = &g_lt_algo[i];
 		if (e->valid && e->M == M && e->N == N && e->K == K
@@ -280,9 +282,7 @@ static int cublas_lt_gemm_half(cublasOperation_t opa, cublasOperation_t opb,
 	** a slow SIMT path on some Blackwell shapes.
 	*/
 	{
-		cublasComputeType_t cterm = bf16
-		    ? CUBLAS_COMPUTE_32F_FAST_16BF
-		    : CUBLAS_COMPUTE_32F_FAST_16F;
+		cublasComputeType_t cterm = CUBLAS_COMPUTE_32F_FAST_16BF;
 
 		if (cublasLtMatmulDescCreate(&op, cterm, CUDA_R_32F)
 		    != CUBLAS_STATUS_SUCCESS
@@ -480,47 +480,23 @@ static int cublas_lt_gemm_half(cublasOperation_t opa, cublasOperation_t opb,
 
 #if CUDART_VERSION >= 12000 && defined(ANN_CUBLAS)
 /*
-** FP8 mixed stack: E4M3 forward, E4M3×E5M2 dgrad, E4M3×E5M2 wgrad, FP32 accum.
+** FP8 mixed stack: E4M3 forward, E4M3×E5M2 dgrad, BF16 wgrad, FP32 accum.
 ** Note: on sm_89/sm_120 Tensor Cores, cuBLASLt FP8 ONLY supports (OP_T, OP_N)
 ** and rejects E5M2×E5M2. So:
 **   - Forward (C = A * B): B [K, N] is cached transposed as [N, K] E4M3 so
 **     cuBLASLt sees layoutA=[K,N] col-major with OP_T and layoutB=A [K,M] OP_N.
 **   - Dgrad (dX = dY * W^T): W [N, K] is cached as [N, K] E4M3 (layoutA=[K,N]
 **     col-major with OP_T) and dY [M, K] is quantized to E5M2 (OP_N).
-**   - Wgrad (dW += X^T * dY): dY [T, N] is quantized to E5M2 (layoutA=[N,T]
-**     col-major -> transposed to [T,N] col-major for OP_T, or X transposed).
 */
 static void *g_fp8_A;
-static void *g_fp8_B;
 static size_t g_fp8_A_cap;
-static size_t g_fp8_B_cap;
-static float *g_fp8_scale_A;
-static float *g_fp8_scale_B;
-static float *g_fp8_scale_A_next;	/* delayed act scale (fwd) */
-static float *g_fp8_scale_B_next;	/* delayed grad scale (bwd) */
-static float *g_fp8_scale_WA;		/* wgrad A, not the fwd act scale */
-static float *g_fp8_scale_WB;
-static float *g_fp8_scale_WA_next;
-static float *g_fp8_scale_WB_next;
 static float *g_fp8_amax_buf;
 /* LN one-pass writes E4M3 here; the next GEMM on that pointer skips quant. */
 static void *g_fp8_hot_buf;
 static size_t g_fp8_hot_cap;
-static float *g_fp8_hot_quant;		/* scale the next LN quantizes with */
-static float *g_fp8_hot_buf_scale;	/* scale that matches g_fp8_hot_buf */
 static float *g_fp8_hot_amax;
 static const ann_real *g_fp8_hot_src;
 static int g_fp8_hot_n;
-/* FP8 Adam master + E4M3 moments (group 128). FP32 param stays the numeric copy. */
-static __nv_fp8_storage_t *g_fp8_master;
-static __nv_fp8_storage_t *g_fp8_adam_m;
-static __nv_fp8_storage_t *g_fp8_adam_v;
-static float *g_fp8_master_scale;
-static float *g_fp8_adam_m_scale;
-static float *g_fp8_adam_v_scale;
-static int g_fp8_adam_n;
-static int g_fp8_mv_live;
-static int g_fp8_scale_ready;
 static int g_fp8_dgrad_fail;		/* soft-disable after repeated Lt misses */
 #define FP8_WT_SLOTS	320
 typedef struct {
@@ -682,51 +658,6 @@ __global__ static void f32_transpose_to_fp8_kernel(__nv_fp8_storage_t *dst,
 	}
 }
 
-/* Fused 32x32 transpose + FP8 quantize + block amax for delayed scaling. */
-__global__ static void f32_transpose_to_fp8_delayed_kernel(
-	__nv_fp8_storage_t *dst, float *amax, const float *src, int rows,
-	int cols, const float *scale_dev, int e5m2)
-{
-	__shared__ __nv_fp8_storage_t tile[32][33];
-	__shared__ float smax[8];
-	int x = blockIdx.x * 32 + threadIdx.x;
-	int y = blockIdx.y * 32 + threadIdx.y;
-	int tid = threadIdx.y * 32 + threadIdx.x;
-	float scale = scale_dev ? scale_dev[0] : 1.f;
-	float inv = (scale > 0.f) ? (1.f / scale) : 0.f;
-	float vmax = 0.0f;
-	__nv_fp8_interpretation_t fmt = e5m2 ? __NV_E5M2 : __NV_E4M3;
-
-	for (int j = 0; j < 32; j += 8) {
-		if (x < cols && (y + j) < rows) {
-			float v = src[(size_t)(y + j) * (size_t)cols + (size_t)x];
-			vmax = fmaxf(vmax, fabsf(v));
-			tile[threadIdx.y + j][threadIdx.x] =
-			    __nv_cvt_float_to_fp8(v * inv, __NV_SATFINITE, fmt);
-		}
-	}
-	for (int mask = 16; mask > 0; mask >>= 1)
-		vmax = fmaxf(vmax, __shfl_xor_sync(0xffffffffu, vmax, mask));
-	if ((tid & 31) == 0)
-		smax[tid >> 5] = vmax;
-	__syncthreads();
-	if (tid < 8) {
-		vmax = smax[tid];
-		for (int mask = 4; mask > 0; mask >>= 1)
-			vmax = fmaxf(vmax, __shfl_xor_sync(0xffu, vmax, mask));
-		if (tid == 0 && vmax > 0.0f)
-			atomicMax((int *)amax, __float_as_int(vmax));
-	}
-	x = blockIdx.y * 32 + threadIdx.x;
-	y = blockIdx.x * 32 + threadIdx.y;
-	for (int j = 0; j < 32; j += 8) {
-		if (x < rows && (y + j) < cols) {
-			dst[(size_t)(y + j) * (size_t)rows + (size_t)x] =
-			    tile[threadIdx.x][threadIdx.y + j];
-		}
-	}
-}
-
 /* amax → scale = max(amax/max_fp8, 1e-12). E4M3:448 E5M2:57344. */
 __global__ static void amax_to_scale_kernel(float *scale, const float *amax,
 	float max_fp8)
@@ -759,72 +690,12 @@ static int ensure_fp8_buf(void **buf, size_t *cap, size_t bytes)
 
 static int fp8_scales_ensure(void)
 {
-	float one = 1.f;
-
 	if (!g_fp8_amax_buf
 	    && cudaMalloc((void **)&g_fp8_amax_buf, sizeof(float)) != cudaSuccess)
-		return -1;
-	if (!g_fp8_scale_A
-	    && cudaMalloc((void **)&g_fp8_scale_A, sizeof(float)) != cudaSuccess)
-		return -1;
-	if (!g_fp8_scale_B
-	    && cudaMalloc((void **)&g_fp8_scale_B, sizeof(float)) != cudaSuccess)
-		return -1;
-	if (!g_fp8_scale_A_next
-	    && cudaMalloc((void **)&g_fp8_scale_A_next, sizeof(float))
-	    != cudaSuccess)
-		return -1;
-	if (!g_fp8_scale_B_next
-	    && cudaMalloc((void **)&g_fp8_scale_B_next, sizeof(float))
-	    != cudaSuccess)
-		return -1;
-	if (!g_fp8_scale_WA
-	    && cudaMalloc((void **)&g_fp8_scale_WA, sizeof(float)) != cudaSuccess)
-		return -1;
-	if (!g_fp8_scale_WB
-	    && cudaMalloc((void **)&g_fp8_scale_WB, sizeof(float)) != cudaSuccess)
-		return -1;
-	if (!g_fp8_scale_WA_next
-	    && cudaMalloc((void **)&g_fp8_scale_WA_next, sizeof(float))
-	    != cudaSuccess)
-		return -1;
-	if (!g_fp8_scale_WB_next
-	    && cudaMalloc((void **)&g_fp8_scale_WB_next, sizeof(float))
-	    != cudaSuccess)
-		return -1;
-	if (!g_fp8_hot_quant
-	    && cudaMalloc((void **)&g_fp8_hot_quant, sizeof(float)) != cudaSuccess)
-		return -1;
-	if (!g_fp8_hot_buf_scale
-	    && cudaMalloc((void **)&g_fp8_hot_buf_scale, sizeof(float))
-	    != cudaSuccess)
 		return -1;
 	if (!g_fp8_hot_amax
 	    && cudaMalloc((void **)&g_fp8_hot_amax, sizeof(float)) != cudaSuccess)
 		return -1;
-	if (!g_fp8_scale_ready) {
-		(void)cudaMemcpy(g_fp8_scale_A, &one, sizeof(float),
-		    cudaMemcpyHostToDevice);
-		(void)cudaMemcpy(g_fp8_scale_B, &one, sizeof(float),
-		    cudaMemcpyHostToDevice);
-		(void)cudaMemcpy(g_fp8_scale_A_next, &one, sizeof(float),
-		    cudaMemcpyHostToDevice);
-		(void)cudaMemcpy(g_fp8_scale_B_next, &one, sizeof(float),
-		    cudaMemcpyHostToDevice);
-		(void)cudaMemcpy(g_fp8_scale_WA, &one, sizeof(float),
-		    cudaMemcpyHostToDevice);
-		(void)cudaMemcpy(g_fp8_scale_WB, &one, sizeof(float),
-		    cudaMemcpyHostToDevice);
-		(void)cudaMemcpy(g_fp8_scale_WA_next, &one, sizeof(float),
-		    cudaMemcpyHostToDevice);
-		(void)cudaMemcpy(g_fp8_scale_WB_next, &one, sizeof(float),
-		    cudaMemcpyHostToDevice);
-		(void)cudaMemcpy(g_fp8_hot_quant, &one, sizeof(float),
-		    cudaMemcpyHostToDevice);
-		(void)cudaMemcpy(g_fp8_hot_buf_scale, &one, sizeof(float),
-		    cudaMemcpyHostToDevice);
-		g_fp8_scale_ready = 1;
-	}
 	return 0;
 }
 
@@ -1038,25 +909,6 @@ static void fp8_act_scale_commit(float *scale, int e5m2)
 	    fp8_max_finite(e5m2));
 }
 
-static int fp8_quant_transpose_tensor(void *dst_fp8, float *scale_dev,
-	float *scale_next, const float *src, int rows, int cols, int e5m2)
-{
-	dim3 grid((cols + 31) / 32, (rows + 31) / 32, 1);
-	dim3 block(32, 8, 1);
-
-	if (!dst_fp8 || !scale_dev || !scale_next || !src || rows <= 0 || cols <= 0)
-		return -1;
-	if (fp8_scales_ensure() != 0)
-		return -1;
-	cudaMemsetAsync(g_fp8_amax_buf, 0, sizeof(float), 0);
-	f32_transpose_to_fp8_delayed_kernel<<<grid, block>>>(
-	    (__nv_fp8_storage_t *)dst_fp8, g_fp8_amax_buf, src, rows, cols,
-	    scale_dev, e5m2);
-	amax_to_scale_kernel<<<1, 1>>>(scale_next, g_fp8_amax_buf,
-	    fp8_max_finite(e5m2));
-	return cudaGetLastError() == cudaSuccess ? 0 : -1;
-}
-
 static void fp8_wt_invalidate(const ann_real *fp32)
 {
 	int i;
@@ -1145,12 +997,6 @@ static int fp8_wt_get_ex(const ann_real *fp32, int rows, int cols,
 	*out_fp8 = e->fp8;
 	*out_scale = e->scale;
 	return 0;
-}
-
-static int fp8_wt_get(const ann_real *fp32, size_t n, int e5m2, void **out_fp8,
-	float **out_scale)
-{
-	return fp8_wt_get_ex(fp32, (int)n, 1, 0, e5m2, out_fp8, out_scale);
 }
 
 /*
@@ -1382,14 +1228,6 @@ static int cublas_lt_gemm_fp8_ex(cublasOperation_t opa, cublasOperation_t opb,
 	return st == CUBLAS_STATUS_SUCCESS ? 0 : -1;
 }
 #endif /* CUDART>=12000 FP8 */
-
-__global__ static void f32_to_f16_kernel(half *dst, const float *src, int n)
-{
-	int i = blockIdx.x * blockDim.x + threadIdx.x;
-
-	if (i < n)
-		dst[i] = __float2half(src[i]);
-}
 
 #if CUDART_VERSION >= 11000
 __global__ static void f32_to_bf16_kernel(__nv_bfloat16 *dst, const float *src,
@@ -1723,9 +1561,9 @@ static int half_wt_convert(void *dst, const ann_real *src, int n, int bf16)
 #else
 	(void)bf16;
 #endif
-	f32_to_f16_kernel<<<(n + threads - 1) / threads, threads>>>(
-	    (half *)dst, src, n);
-	rc = cudaGetLastError() == cudaSuccess ? 0 : -1;
+	/* FP16 was removed: only the BF16 conversion exists. */
+	(void)dst; (void)src; (void)n; (void)threads; (void)blocks;
+	rc = -1;
 	op_end(prof);
 	return rc;
 }
@@ -2014,25 +1852,6 @@ static void *half_wt_get(const ann_real *fp32, size_t n, int bf16)
 	return e->half;
 }
 
-static int cublas_gemm_ex_f16(cublasOperation_t opa, cublasOperation_t opb,
-	int N, int M, int K, const float *alpha, const void *B, int ldb,
-	const void *A, int lda, const float *beta, float *C, int ldc)
-{
-	if (cublas_lt_gemm_half(opa, opb, N, M, K, alpha, B, ldb, A, lda, beta,
-	    C, ldc, 0, CUBLASLT_EPILOGUE_DEFAULT, NULL, NULL, 0) == 0)
-		return 0;
-#if CUDART_VERSION >= 11000
-	return cublasGemmEx(g_cublas, opa, opb, N, M, K, alpha, B, CUDA_R_16F,
-	    ldb, A, CUDA_R_16F, lda, beta, C, CUDA_R_32F, ldc,
-	    CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP)
-	    == CUBLAS_STATUS_SUCCESS ? 0 : -1;
-#else
-	return cublasGemmEx(g_cublas, opa, opb, N, M, K, alpha, B, CUDA_R_16F,
-	    ldb, A, CUDA_R_16F, lda, beta, C, CUDA_R_32F, ldc, CUDA_R_32F,
-	    CUBLAS_GEMM_DEFAULT) == CUBLAS_STATUS_SUCCESS ? 0 : -1;
-#endif
-}
-
 #if CUDART_VERSION >= 11000
 static int cublas_gemm_ex_bf16(cublasOperation_t opa, cublasOperation_t opb,
 	int N, int M, int K, const float *alpha, const void *B, int ldb,
@@ -2150,14 +1969,8 @@ static int cublas_gemm_rm_ha(ann_real *dC, const ann_real *dA, const ann_real *d
 		}
 		hB_use = g_half_B;
 	}
-#if CUDART_VERSION >= 11000
-	if (use_bf16)
-		rc = cublas_gemm_ex_bf16(CUBLAS_OP_N, CUBLAS_OP_N, N, M, K,
-		    &alpha, hB_use, N, hA_use, K, &beta, dC, N);
-	else
-#endif
-		rc = cublas_gemm_ex_f16(CUBLAS_OP_N, CUBLAS_OP_N, N, M, K,
-		    &alpha, hB_use, N, hA_use, K, &beta, dC, N);
+	rc = cublas_gemm_ex_bf16(CUBLAS_OP_N, CUBLAS_OP_N, N, M, K,
+	    &alpha, hB_use, N, hA_use, K, &beta, dC, N);
 	pthread_mutex_unlock(&g_gemm_mu);
 	return rc;
 }
@@ -2316,7 +2129,6 @@ static int cublas_gemm_rm_bt_ex(ann_real *dC, const ann_real *dA,
 	const ann_real beta = accumulate ? 1.0f : 0.0f;
 	size_t nA;
 	size_t nB;
-	int threads = 256;
 	int rc;
 
 	if (cublas_ensure() != 0)
@@ -2335,7 +2147,7 @@ static int cublas_gemm_rm_bt_ex(ann_real *dC, const ann_real *dA,
 	/*
 	** FP8 dgrad: E4M3 weight × E5M2 dY with OP_T on weight (per-tensor
 	** scale is transpose-safe; sm_89/sm_120 rejects E5M2×E5M2). Delayed
-	** scale on dY via g_fp8_scale_B / g_fp8_scale_B_next.
+	** scale on dY via its fp8_act_slot.
 	*/
 	if (g_fp8_dgrad && g_fp8_dgrad_fail < 8 && !accumulate
 	    && (K & 15) == 0 && (N & 15) == 0 && (M & 15) == 0) {
@@ -2416,16 +2228,8 @@ static int cublas_gemm_rm_bt_ex(ann_real *dC, const ann_real *dA,
 			return rc;
 		}
 #endif
-		if (ensure_half_buf(&g_half_A, &g_half_A_cap, nA * 2) != 0) {
-			pthread_mutex_unlock(&g_gemm_mu);
-			return -1;
-		}
-		f32_to_f16_kernel<<<(int)((nA + threads - 1) / threads),
-		    threads>>>((half *)g_half_A, dA, (int)nA);
-		rc = cublas_gemm_ex_f16(CUBLAS_OP_T, CUBLAS_OP_N, N, M, K,
-		    &alpha, hB_use, K, g_half_A, K, &beta, dC, N);
 		pthread_mutex_unlock(&g_gemm_mu);
-		return rc;
+		return -1;
 	}
 }
 
@@ -2440,7 +2244,6 @@ static int cublas_gemm_rm_at(ann_real *dC, const ann_real *dA,
 	const ann_real beta = accumulate ? 1.0f : 0.0f;
 	size_t nA;
 	size_t nB;
-	int threads = 256;
 	int rc;
 
 	if (cublas_ensure() != 0)
@@ -2455,54 +2258,6 @@ static int cublas_gemm_rm_at(ann_real *dC, const ann_real *dA,
 	}
 	nA = (size_t)T * (size_t)M;
 	nB = (size_t)T * (size_t)N;
-#if CUDART_VERSION >= 12000
-	/*
-	** FP8 wgrad: C [M, N] (+)= A^T [M, T] * B [T, N].
-	** In col-major, C^T [N, M] (+)= B^T [N, T] * A [T, M].
-	** To satisfy sm_89/sm_120 (OP_T, OP_N) with K=T (must be %16==0):
-	**   - Transpose+quantize B [T, N] row-major -> g_fp8_B [N, T] row-major
-	**     (= [T, N] col-major, ldb = T) so OP_T yields [N, T].
-	**   - Transpose+quantize A [T, M] row-major -> g_fp8_A [M, T] row-major
-	**     (= [T, M] col-major, lda = T) so OP_N yields [T, M].
-	*/
-	/*
-	** FP8 wgrad needs two layout transposes. On sm_120 that costs more than
-	** the GEMM saves, so it stays off unless ANN_FP8_WGRAD=1.
-	*/
-	{
-		static int s_wgrad = -1;
-
-		if (s_wgrad < 0) {
-			const char *e = getenv("ANN_FP8_WGRAD");
-
-			s_wgrad = (e && e[0] == '1') ? 1 : 0;
-		}
-		if (!s_wgrad)
-			goto fp8_wgrad_skip;
-	}
-	if (g_fp8_dgrad && (T & 15) == 0 && (M & 15) == 0 && (N & 15) == 0) {
-		fp8_act_slot *wa = fp8_act_scale(dA, 0);
-		fp8_act_slot *wb = fp8_act_scale(dB, 1);
-
-		if (wa && wb && fp8_scales_ensure() == 0
-		    && ensure_fp8_buf(&g_fp8_A, &g_fp8_A_cap, nA) == 0
-		    && ensure_fp8_buf(&g_fp8_B, &g_fp8_B_cap, nB) == 0
-		    && fp8_quant_transpose_tensor(g_fp8_A, FP8_SCALE_CUR(wa),
-		    FP8_SCALE_NEXT(wa), dA, T, M, 0) == 0
-		    && fp8_quant_transpose_tensor(g_fp8_B, FP8_SCALE_CUR(wb),
-		    FP8_SCALE_NEXT(wb), dB, T, N, 1) == 0
-		    && cublas_lt_gemm_fp8_ex(CUBLAS_OP_T, CUBLAS_OP_N, N, M, T,
-		    &alpha, g_fp8_B, T, FP8_SCALE_CUR(wb), CUDA_R_8F_E5M2,
-		    g_fp8_A, T, FP8_SCALE_CUR(wa), CUDA_R_8F_E4M3, &beta, dC, N)
-		    == 0) {
-			wa->cur ^= 1;
-			wb->cur ^= 1;
-			pthread_mutex_unlock(&g_gemm_mu);
-			return 0;
-		}
-	}
-#endif
-fp8_wgrad_skip:
 #if CUDART_VERSION >= 11000
 	if (g_compute_prec == GPU_PREC_BF16) {
 		const void *hA_use = act_bf16_get(dA, (int)nA);
@@ -2546,19 +2301,8 @@ fp8_wgrad_skip:
 		return rc;
 	}
 #endif
-	if (ensure_half_buf(&g_half_A, &g_half_A_cap, nA * 2) != 0
-	    || ensure_half_buf(&g_half_B, &g_half_B_cap, nB * 2) != 0) {
-		pthread_mutex_unlock(&g_gemm_mu);
-		return -1;
-	}
-	f32_to_f16_kernel<<<(int)((nA + threads - 1) / threads), threads>>>(
-	    (half *)g_half_A, dA, (int)nA);
-	f32_to_f16_kernel<<<(int)((nB + threads - 1) / threads), threads>>>(
-	    (half *)g_half_B, dB, (int)nB);
-	rc = cublas_gemm_ex_f16(CUBLAS_OP_N, CUBLAS_OP_T, N, M, T, &alpha,
-	    g_half_B, N, g_half_A, M, &beta, dC, N);
 	pthread_mutex_unlock(&g_gemm_mu);
-	return rc;
+	return -1;
 }
 #endif
 
@@ -5831,8 +5575,8 @@ static int tc_ensure_dp(size_t bytes)
 }
 
 #ifdef ANN_CUBLAS
-/* QK from already-packed BF16/FP16 twins in g_tc_half_{q,k}. */
-static int tc_gemm_qk_half(ann_real *scores, int T, int dh, int batch, int bf16)
+/* QK from already-packed BF16 twins in g_tc_half_{q,k}. */
+static int tc_gemm_qk_half(ann_real *scores, int T, int dh, int batch)
 {
 	const float alpha = 1.0f;
 	const float beta = 0.0f;
@@ -5842,25 +5586,18 @@ static int tc_gemm_qk_half(ann_real *scores, int T, int dh, int batch, int bf16)
 	if (cublas_ensure() != 0)
 		return -1;
 #if CUDART_VERSION >= 11000
-	if (bf16)
-		return cublasGemmStridedBatchedEx(g_cublas, CUBLAS_OP_T,
-		    CUBLAS_OP_N, T, T, dh, &alpha, g_tc_half_k, CUDA_R_16BF,
-		    dh, stride, g_tc_half_q, CUDA_R_16BF, dh, stride, &beta,
-		    scores, CUDA_R_32F, T, stride_s, batch,
-		    CUBLAS_COMPUTE_32F_FAST_16BF,
-		    CUBLAS_GEMM_DEFAULT_TENSOR_OP) == CUBLAS_STATUS_SUCCESS
-		    ? 0 : -1;
-	return cublasGemmStridedBatchedEx(g_cublas, CUBLAS_OP_T, CUBLAS_OP_N,
-	    T, T, dh, &alpha, g_tc_half_k, CUDA_R_16F, dh, stride, g_tc_half_q,
-	    CUDA_R_16F, dh, stride, &beta, scores, CUDA_R_32F, T, stride_s,
-	    batch, CUBLAS_COMPUTE_32F_FAST_16F, CUBLAS_GEMM_DEFAULT_TENSOR_OP)
-	    == CUBLAS_STATUS_SUCCESS ? 0 : -1;
+	return cublasGemmStridedBatchedEx(g_cublas, CUBLAS_OP_T,
+	    CUBLAS_OP_N, T, T, dh, &alpha, g_tc_half_k, CUDA_R_16BF,
+	    dh, stride, g_tc_half_q, CUDA_R_16BF, dh, stride, &beta,
+	    scores, CUDA_R_32F, T, stride_s, batch,
+	    CUBLAS_COMPUTE_32F_FAST_16BF,
+	    CUBLAS_GEMM_DEFAULT_TENSOR_OP) == CUBLAS_STATUS_SUCCESS
+	    ? 0 : -1;
 #else
 	(void)scores;
 	(void)T;
 	(void)dh;
 	(void)batch;
-	(void)bf16;
 	return -1;
 #endif
 }
@@ -5899,15 +5636,11 @@ static int tc_gemm_qk_batched(ann_real *scores, const ann_real *Q,
 		    (__nv_bfloat16 *)g_tc_half_q, Q, (int)n);
 		f32_to_bf16_kernel<<<blocks, threads>>>(
 		    (__nv_bfloat16 *)g_tc_half_k, K, (int)n);
-		return tc_gemm_qk_half(scores, T, dh, batch, 1);
+		return tc_gemm_qk_half(scores, T, dh, batch);
 	}
 #endif
-	f32_to_f16_kernel<<<(int)((n + threads - 1) / threads), threads>>>(
-	    (half *)g_tc_half_q, Q, (int)n);
-	f32_to_f16_kernel<<<(int)((n + threads - 1) / threads), threads>>>(
-	    (half *)g_tc_half_k, K, (int)n);
 #if CUDART_VERSION >= 11000
-	return tc_gemm_qk_half(scores, T, dh, batch, 0);
+	return -1;
 #else
 	return cublasSgemmStridedBatched(g_cublas, CUBLAS_OP_T, CUBLAS_OP_N,
 	    T, T, dh, &alpha, K, dh, stride, Q, dh, stride, &beta, scores, T,
@@ -6588,7 +6321,7 @@ extern "C" int gpu_attn_tc_fwd(mat *concat, mat *w, const mat *q, const mat *k,
 		    threads>>>((__nv_bfloat16 *)g_tc_half_k, dk, B, T, H, dh); }
 		{ OpNest _n(OP_ATT_PACK_ID); attn_pack_heads_bf16_kernel<<<(npack + threads - 1) / threads,
 		    threads>>>((__nv_bfloat16 *)g_tc_half_v, dv, B, T, H, dh); }
-		if (OpNest(OP_ATT_GEMM_ID), tc_gemm_qk_half(dw, T, dh, batch, 1) != 0)
+		if (OpNest(OP_ATT_GEMM_ID), tc_gemm_qk_half(dw, T, dh, batch) != 0)
 			goto tc_fwd_out;
 	} else
 #endif
@@ -6751,7 +6484,7 @@ extern "C" int gpu_attn_tc_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat,
 		{ OpNest _n(OP_ATT_PACK_ID); attn_pack_heads_bf16_kernel<<<(npack + threads - 1) / threads,
 		    threads>>>((__nv_bfloat16 *)g_tc_half_do, a_dc, B, T, H, dh); }
 		/* S = Q K^T (recomputed), P = softmax(S) in FP32 + BF16. */
-		if (OpNest(OP_ATT_GEMM_ID), tc_gemm_qk_half(dw, T, dh, batch, 1) != 0)
+		if (OpNest(OP_ATT_GEMM_ID), tc_gemm_qk_half(dw, T, dh, batch) != 0)
 			goto tc_bwd_out;
 		{ OpNest _n(OP_ATT_SMX_ID); attn_tc_softmax_kernel<<<sgrid, nth>>>(dw,
 		    (__nv_bfloat16 *)g_tc_half_p, T, H, (ann_real)scale,
@@ -8125,142 +7858,6 @@ static int adam_v4_on(void)
 	return on;
 }
 
-/* Group-128 E4M3 moments and an E4M3 master of the updated weight. */
-#define ADAM_FP8_GROUP	128
-
-__device__ static float adam_grp_max(float v)
-{
-	__shared__ float s[ADAM_FP8_GROUP];
-	int m;
-
-	s[threadIdx.x] = v;
-	__syncthreads();
-	for (m = ADAM_FP8_GROUP >> 1; m > 0; m >>= 1) {
-		if ((int)threadIdx.x < m && s[threadIdx.x + m] > s[threadIdx.x])
-			s[threadIdx.x] = s[threadIdx.x + m];
-		__syncthreads();
-	}
-	v = s[0];
-	__syncthreads();
-	return v;
-}
-
-__device__ static float adam_fp8_load(__nv_fp8_storage_t q, float scale)
-{
-	__half_raw h = __nv_cvt_fp8_to_halfraw(q, __NV_E4M3);
-
-	return __half2float(h) * scale;
-}
-
-__global__ static void adam_kernel_fp8(ann_real *param,
-	__nv_bfloat16 *param_bf16, ann_real *grad, ann_real *m, ann_real *v,
-	__nv_fp8_storage_t *p8, __nv_fp8_storage_t *m8, __nv_fp8_storage_t *v8,
-	float *ps, float *ms, float *vs, int n, int live, ann_real lr,
-	ann_real beta1, ann_real beta2, ann_real eps, ann_real bc1, ann_real bc2,
-	ann_real gscale)
-{
-	int i = (int)blockIdx.x * ADAM_FP8_GROUP + (int)threadIdx.x;
-	int on = i < n;
-	ann_real mold = 0.0f;
-	ann_real vold = 0.0f;
-	ann_real newm = 0.0f;
-	ann_real newv = 0.0f;
-	ann_real p = 0.0f;
-	ann_real am;
-	ann_real av;
-	ann_real ap;
-	__shared__ float sm;
-	__shared__ float sv;
-	__shared__ float sp;
-
-	if (on) {
-		ann_real g;
-		ann_real mhat;
-		ann_real vhat;
-
-		if (live) {
-			mold = adam_fp8_load(m8[i], ms[blockIdx.x]);
-			vold = adam_fp8_load(v8[i], vs[blockIdx.x]);
-		} else {
-			mold = m[i];
-			vold = v[i];
-		}
-		g = grad[i] * gscale;
-		newm = beta1 * mold + (1.0f - beta1) * g;
-		newv = beta2 * vold + (1.0f - beta2) * g * g;
-		mhat = newm / bc1;
-		vhat = newv / bc2;
-		p = param[i] - lr * mhat / (sqrtf(vhat) + eps);
-		param[i] = p;
-		if (param_bf16)
-			param_bf16[i] = __float2bfloat16(p);
-		m[i] = newm;
-		v[i] = newv;
-		grad[i] = 0.0f;
-	}
-	am = adam_grp_max(on ? fabsf(newm) : 0.0f);
-	av = adam_grp_max(on ? fabsf(newv) : 0.0f);
-	ap = adam_grp_max(on ? fabsf(p) : 0.0f);
-	if (threadIdx.x == 0) {
-		sm = am / 448.f;
-		sv = av / 448.f;
-		sp = ap / 448.f;
-		if (sm < 1e-12f)
-			sm = 1e-12f;
-		if (sv < 1e-12f)
-			sv = 1e-12f;
-		if (sp < 1e-12f)
-			sp = 1e-12f;
-		ms[blockIdx.x] = sm;
-		vs[blockIdx.x] = sv;
-		ps[blockIdx.x] = sp;
-	}
-	__syncthreads();
-	if (on) {
-		m8[i] = __nv_cvt_float_to_fp8(newm / sm, __NV_SATFINITE, __NV_E4M3);
-		v8[i] = __nv_cvt_float_to_fp8(newv / sv, __NV_SATFINITE, __NV_E4M3);
-		p8[i] = __nv_cvt_float_to_fp8(p / sp, __NV_SATFINITE, __NV_E4M3);
-	}
-}
-
-static int fp8_adam_ensure(int n)
-{
-	int ng;
-
-	if (n <= 0)
-		return -1;
-	if (g_fp8_adam_n == n && g_fp8_master && g_fp8_adam_m && g_fp8_adam_v)
-		return 0;
-	if (g_fp8_master)
-		cudaFree(g_fp8_master);
-	if (g_fp8_adam_m)
-		cudaFree(g_fp8_adam_m);
-	if (g_fp8_adam_v)
-		cudaFree(g_fp8_adam_v);
-	if (g_fp8_master_scale)
-		cudaFree(g_fp8_master_scale);
-	if (g_fp8_adam_m_scale)
-		cudaFree(g_fp8_adam_m_scale);
-	if (g_fp8_adam_v_scale)
-		cudaFree(g_fp8_adam_v_scale);
-	g_fp8_master = g_fp8_adam_m = g_fp8_adam_v = NULL;
-	g_fp8_master_scale = g_fp8_adam_m_scale = g_fp8_adam_v_scale = NULL;
-	g_fp8_adam_n = 0;
-	g_fp8_mv_live = 0;
-	ng = (n + ADAM_FP8_GROUP - 1) / ADAM_FP8_GROUP;
-	if (cudaMalloc(&g_fp8_master, (size_t)n) != cudaSuccess
-	    || cudaMalloc(&g_fp8_adam_m, (size_t)n) != cudaSuccess
-	    || cudaMalloc(&g_fp8_adam_v, (size_t)n) != cudaSuccess
-	    || cudaMalloc(&g_fp8_master_scale, (size_t)ng * sizeof(float))
-	    != cudaSuccess
-	    || cudaMalloc(&g_fp8_adam_m_scale, (size_t)ng * sizeof(float))
-	    != cudaSuccess
-	    || cudaMalloc(&g_fp8_adam_v_scale, (size_t)ng * sizeof(float))
-	    != cudaSuccess)
-		return -1;
-	g_fp8_adam_n = n;
-	return 0;
-}
 #endif
 
 extern "C" int gpu_adam_step_dev(ann_real *d_p, ann_real *d_g, ann_real *d_m,
@@ -8290,34 +7887,6 @@ extern "C" int gpu_adam_step_dev_bf16(ann_real *d_p, void *d_p_bf16,
 #if CUDART_VERSION >= 12000 && defined(ANN_CUBLAS)
 	if (g_fp8_fwd || g_fp8_dgrad)
 		fp8_wt_invalidate(NULL);
-#endif
-#if CUDART_VERSION >= 12000 && defined(ANN_CUBLAS)
-	/*
-	** Group-128 E4M3 moments underflow (one large v sets the scale, the
-	** rest quantize to 0) and the step explodes. Default off. ANN_FP8_ADAM=1
-	** opts into that kernel; GEMM weights still come from the FP32 param.
-	*/
-	{
-		static int s_adam = -1;
-
-		if (s_adam < 0) {
-			const char *e = getenv("ANN_FP8_ADAM");
-
-			s_adam = (e && e[0] == '1') ? 1 : 0;
-		}
-		if (s_adam && g_fp8_fwd && d_p_bf16 && fp8_adam_ensure(n) == 0) {
-			int live = g_fp8_mv_live;
-
-			adam_kernel_fp8<<<(n + ADAM_FP8_GROUP - 1) / ADAM_FP8_GROUP,
-			    ADAM_FP8_GROUP>>>(d_p, (__nv_bfloat16 *)d_p_bf16, d_g,
-			    d_m, d_v, g_fp8_master, g_fp8_adam_m, g_fp8_adam_v,
-			    g_fp8_master_scale, g_fp8_adam_m_scale,
-			    g_fp8_adam_v_scale, n, live, lr, beta1, beta2, eps,
-			    bc1, bc2, (ann_real)grad_scale);
-			g_fp8_mv_live = 1;
-			return cudaGetLastError() == cudaSuccess ? 0 : -1;
-		}
-	}
 #endif
 #if CUDART_VERSION >= 11000
 	if (d_p_bf16 && g_compute_prec == GPU_PREC_BF16 && adam_v4_on()
