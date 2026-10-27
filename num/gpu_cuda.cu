@@ -8632,6 +8632,91 @@ __global__ static void adam_kernel_bf16(ann_real *param, __nv_bfloat16 *param_bf
 	grad[i] = 0.0f;
 }
 
+/*
+** A3: the same per-element update as adam_kernel_bf16, four values per thread
+** with float4 loads/stores and one 8-byte BF16 store. The statements are the
+** kernel's own, in the same order, so every value is bit-identical; only the
+** memory transactions get wider (34 bytes per parameter, bandwidth bound).
+*/
+__device__ __forceinline__ static ann_real adam_bf16_elem(ann_real p,
+	ann_real *gr, ann_real *mm, ann_real *vv, ann_real lr, ann_real beta1,
+	ann_real beta2, ann_real eps, ann_real bc1, ann_real bc2,
+	ann_real gscale, ann_real wd)
+{
+	ann_real g;
+	ann_real mhat;
+	ann_real vhat;
+
+	/*
+	** The moment updates spell out the contraction nvcc picks for
+	** adam_kernel_bf16 (fma(b1, m, (1-b1) g) and fma(g, (1-b2) g, b2 v));
+	** left to itself it fuses the other product here and m drifts by an ulp.
+	*/
+	g = *gr * gscale;
+	*mm = __fmaf_rn(beta1, *mm, __fmul_rn(1.0f - beta1, g));
+	*vv = __fmaf_rn(g, __fmul_rn(1.0f - beta2, g), __fmul_rn(beta2, *vv));
+	mhat = *mm / bc1;
+	vhat = *vv / bc2;
+	p = p - lr * mhat / (sqrtf(vhat) + eps);
+	p -= lr * wd * p;
+	*gr = 0.0f;
+	return p;
+}
+
+__global__ static void adam_kernel_bf16_v4(float4 *param, uint2 *param_bf16,
+	float4 *grad, float4 *m, float4 *v, int n4, ann_real lr,
+	ann_real beta1, ann_real beta2, ann_real eps, ann_real bc1, ann_real bc2,
+	ann_real gscale, ann_real wd)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	float4 p;
+	float4 g;
+	float4 mm;
+	float4 vv;
+	__nv_bfloat162 lo;
+	__nv_bfloat162 hi;
+	uint2 out;
+
+	if (i >= n4)
+		return;
+	p = param[i];
+	g = grad[i];
+	mm = m[i];
+	vv = v[i];
+	p.x = adam_bf16_elem(p.x, &g.x, &mm.x, &vv.x, lr, beta1, beta2, eps,
+	    bc1, bc2, gscale, wd);
+	p.y = adam_bf16_elem(p.y, &g.y, &mm.y, &vv.y, lr, beta1, beta2, eps,
+	    bc1, bc2, gscale, wd);
+	p.z = adam_bf16_elem(p.z, &g.z, &mm.z, &vv.z, lr, beta1, beta2, eps,
+	    bc1, bc2, gscale, wd);
+	p.w = adam_bf16_elem(p.w, &g.w, &mm.w, &vv.w, lr, beta1, beta2, eps,
+	    bc1, bc2, gscale, wd);
+	m[i] = mm;
+	v[i] = vv;
+	param[i] = p;
+	lo.x = __float2bfloat16(p.x);
+	lo.y = __float2bfloat16(p.y);
+	hi.x = __float2bfloat16(p.z);
+	hi.y = __float2bfloat16(p.w);
+	out.x = *(unsigned int *)&lo;
+	out.y = *(unsigned int *)&hi;
+	param_bf16[i] = out;
+	grad[i] = g;
+}
+
+/* ANN_ADAM_V4=0: back to the scalar adam_kernel_bf16. */
+static int adam_v4_on(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		const char *e = getenv("ANN_ADAM_V4");
+
+		on = (e && e[0] == '0') ? 0 : 1;
+	}
+	return on;
+}
+
 /* Group-128 E4M3 moments and an E4M3 master of the updated weight. */
 #define ADAM_FP8_GROUP	128
 
@@ -8827,7 +8912,24 @@ extern "C" int gpu_adam_step_dev_bf16(ann_real *d_p, void *d_p_bf16,
 	}
 #endif
 #if CUDART_VERSION >= 11000
-	if (d_p_bf16 && g_compute_prec == GPU_PREC_BF16) {
+	if (d_p_bf16 && g_compute_prec == GPU_PREC_BF16 && adam_v4_on()
+	    && (((uintptr_t)d_p | (uintptr_t)d_g | (uintptr_t)d_m
+	    | (uintptr_t)d_v) & 15) == 0 && ((uintptr_t)d_p_bf16 & 7) == 0) {
+		int n4 = n >> 2;
+		int done = n4 << 2;
+
+		if (n4 > 0)
+			adam_kernel_bf16_v4<<<(n4 + 255) / 256, 256>>>(
+			    (float4 *)d_p, (uint2 *)d_p_bf16, (float4 *)d_g,
+			    (float4 *)d_m, (float4 *)d_v, n4, lr, beta1, beta2,
+			    eps, bc1, bc2, (ann_real)grad_scale, g_adam_wd);
+		/* The n % 4 tail (none at the production sizes) stays scalar. */
+		if (done < n)
+			adam_kernel_bf16<<<1, 256>>>(d_p + done,
+			    (__nv_bfloat16 *)d_p_bf16 + done, d_g + done,
+			    d_m + done, d_v + done, n - done, lr, beta1, beta2,
+			    eps, bc1, bc2, (ann_real)grad_scale, g_adam_wd);
+	} else if (d_p_bf16 && g_compute_prec == GPU_PREC_BF16) {
 		adam_kernel_bf16<<<(n + 255) / 256, 256>>>(d_p,
 		    (__nv_bfloat16 *)d_p_bf16, d_g, d_m, d_v, n, lr, beta1,
 		    beta2, eps, bc1, bc2, (ann_real)grad_scale, g_adam_wd);
