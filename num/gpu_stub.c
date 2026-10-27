@@ -46,6 +46,13 @@ int gpu_attn_fa_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat,
 	return -1;
 }
 
+int gpu_attn_qkv_bwd(mat *dx, mat *dwq, mat *dwk, mat *dwv, const mat *x_in,
+	const mat *dq, const mat *wq, const mat *wk, const mat *wv)
+{
+	(void)dx; (void)dwq; (void)dwk; (void)dwv; (void)x_in; (void)dq; (void)wq; (void)wk; (void)wv;
+	return 1;
+}
+
 void gpu_set_sync_mode(int mode)
 {
 	g_sync_mode = mode;

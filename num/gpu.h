@@ -242,6 +242,15 @@ int	gpu_attn_fa_usable(int T, int dh);
 int	gpu_attn_fa_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat,
 		const mat *concat, const mat *q, const mat *k, const mat *v,
 		const mat *lse, int B, int T, int H, int dh);
+/*
+** Q/K/V projection backward from the merged BF16 [dQ|dK|dV] rows that
+** gpu_attn_fa_bwd left for dq (ANN_QKV_BWD): dx = [dQ|dK|dV] [Wq|Wk|Wv]^T
+** in one GEMM, dWq/dWk/dWv += x_in^T [dQ|dK|dV]. 1 = none pending (run the
+** separate GEMMs), 0 = done, -1 = error (dK/dV existed only there).
+*/
+int	gpu_attn_qkv_bwd(mat *dx, mat *dwq, mat *dwk, mat *dwv,
+		const mat *x_in, const mat *dq, const mat *wq, const mat *wk,
+		const mat *wv);
 /* FA-2 tiled bwd: P = exp(S - L) from this forward's lse. No T×T buffer. */
 int	gpu_attn_tiled_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat,
 		const mat *concat, const mat *q, const mat *k, const mat *v,
