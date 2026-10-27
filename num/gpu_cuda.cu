@@ -174,6 +174,26 @@ static int cublas_gemm_ex_bf16_h(cublasHandle_t h, int N, int M, int K,
 	    == CUBLAS_STATUS_SUCCESS ? 0 : -1;
 }
 
+/*
+** ANN_LT_SPLIT1=0: time only the heuristic's own candidates. By default
+** each split-K candidate is also timed with split-K 1 (B6): the W2 forward
+** at 4096 x 1024 x 4096 got split-K 2, whose reduction + bias + residual
+** runs as a separate cuBLASLt pass (66 us per layer), and the heuristic
+** list held no unsplit version of the same tile to compare against.
+** ANN_LT_LOG=1 prints the shapes where such a variant won.
+*/
+static int lt_split1_on(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		const char *e = getenv("ANN_LT_SPLIT1");
+
+		on = (e && e[0] == '0') ? 0 : 1;
+	}
+	return on;
+}
+
 static int lt_heuristic_only(void)
 {
 	static int on = -1;
@@ -338,6 +358,9 @@ static int cublas_lt_gemm_half(cublasOperation_t opa, cublasOperation_t opb,
 	    || e->opa != (int)opa || e->opb != (int)opb || e->bf16 != bf16
 	    || e->fp8 != 0 || e->epi != epi_i || e->obf != out_bf16) {
 		cublasLtMatmulHeuristicResult_t heurs[16];
+		cublasLtMatmulHeuristicResult_t alt_best;
+		int alt_won = 0;
+		float heur_ms = 1e30f;
 		int hi;
 		int best_i;
 		float best_ms;
@@ -412,6 +435,57 @@ static int cublas_lt_gemm_half(cublasOperation_t opa, cublasOperation_t opb,
 					best_i = hi;
 				}
 			}
+			heur_ms = best_ms;
+			/*
+			** B6: the split-K 1 version of every split-K candidate
+			** (same tile, stages, swizzle), validated by AlgoCheck.
+			*/
+			for (hi = 0; hi < returned && best_i >= 0 && lt_split1_on(); hi++) {
+				cublasLtMatmulHeuristicResult_t alt;
+				int32_t sk = 1;
+				uint32_t red = CUBLASLT_REDUCTION_SCHEME_NONE;
+				size_t wr = 0;
+				float ms;
+				int r;
+
+				if (heurs[hi].workspaceSize > g_lt_workspace_bytes
+				    || cublasLtMatmulAlgoConfigGetAttribute(&heurs[hi].algo,
+				    CUBLASLT_ALGO_CONFIG_SPLITK_NUM, &sk, sizeof(sk), &wr)
+				    != CUBLAS_STATUS_SUCCESS || sk <= 1)
+					continue;
+				alt = heurs[hi];
+				sk = 1;
+				if (cublasLtMatmulAlgoConfigSetAttribute(&alt.algo,
+				    CUBLASLT_ALGO_CONFIG_SPLITK_NUM, &sk, sizeof(sk))
+				    != CUBLAS_STATUS_SUCCESS
+				    || cublasLtMatmulAlgoConfigSetAttribute(&alt.algo,
+				    CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME, &red, sizeof(red))
+				    != CUBLAS_STATUS_SUCCESS
+				    || cublasLtMatmulAlgoCheck(g_cublaslt, op, layoutA,
+				    layoutB, layoutC, layoutC, &alt.algo, &alt)
+				    != CUBLAS_STATUS_SUCCESS
+				    || alt.workspaceSize > g_lt_workspace_bytes) {
+					(void)cudaGetLastError();
+					continue;
+				}
+				(void)cudaEventRecord(ev0, 0);
+				r = cublasLtMatmul(g_cublaslt, op, alpha, B,
+				    layoutA, A, layoutB, beta, C, layoutC,
+				    time_D, layoutC, &alt.algo, g_lt_workspace,
+				    alt.workspaceSize > 0 ? alt.workspaceSize
+				    : g_lt_workspace_bytes, 0);
+				(void)cudaEventRecord(ev1, 0);
+				if (r != CUBLAS_STATUS_SUCCESS)
+					continue;
+				(void)cudaEventSynchronize(ev1);
+				if (cudaEventElapsedTime(&ms, ev0, ev1) != cudaSuccess)
+					continue;
+				if (ms < best_ms) {
+					best_ms = ms;
+					alt_best = alt;
+					alt_won = 1;
+				}
+			}
 			cudaEventDestroy(ev0);
 			cudaEventDestroy(ev1);
 		}
@@ -435,6 +509,19 @@ static int cublas_lt_gemm_half(cublasOperation_t opa, cublasOperation_t opb,
 			return -1;
 		}
 		heur = heurs[best_i];
+		if (alt_won) {
+			static int log_on = -1;
+
+			if (log_on < 0) {
+				const char *le = getenv("ANN_LT_LOG");
+
+				log_on = (le && le[0] == '1') ? 1 : 0;
+			}
+			if (log_on)
+				fprintf(stderr, "[lt] %d x %d x %d epi %d: split-K 1 variant "
+				    "%.3f ms vs %.3f ms\n", M, N, K, epi_i, best_ms, heur_ms);
+			heur = alt_best;
+		}
 		e->algo = heur.algo;
 		e->ws = heur.workspaceSize;
 		e->M = M;
