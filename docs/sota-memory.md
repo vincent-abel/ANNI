@@ -11,7 +11,7 @@ Fit larger **B** (microbatch) on one GPU without abandoning FP32 masters: shrink
 | Lever | CLI / API | Primary files | VRAM effect |
 |-------|-----------|---------------|-------------|
 | Auto batch | `--batch auto`, `--vram-frac F` | `main.c`, `lm_batch_auto`, `lm_packed_bytes` in `lang/lm.c` | Picks max B from estimate |
-| Flash-style attn | `--flash-attn` | `attn.c`, `gpu_attn_flash_fwd` / `gpu_attn_recompute_w` in `gpu_cuda.cu` | Drops persistent `B·H·T·T` per layer |
+| Flash-style attn | `--flash-attn` | `attn.c`, `gpu_attn_flash_fwd` / `gpu_attn_tiled_bwd` in `gpu_cuda.cu` | Drops persistent `B·H·T·T` per layer |
 | Block act checkpoint | `--act-checkpoint` | `block.c` (`block_cache_drop_device`), `lm_train_set_act_checkpoint` | ~2 live blocks vs `LM_N_BLOCKS` in estimate |
 | Adam m/v offload | `--adam-offload` | `lm_adam.c` (`adam_offload_mv`, `offload_mv`) | Frees `d_m`/`d_v` between steps |
 | Mixed GEMM prec | `--bf16` / `--fp16` | `gpu.h`, `gpu_set_compute_prec` | Lower GEMM footprint; **m/v still FP32** |

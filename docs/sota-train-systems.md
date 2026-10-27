@@ -19,7 +19,7 @@ Goal of this note: map **FlashAttention-3**, **compiler-style fusion**, and **gr
 - **Low-precision inner attention**: FP8/BF16 tensor cores with FP32 softmax stats; optional descale vectors per block.
 - **Split-K / sequence-parallel** for long `T` (future if `ATT_BLOCK` rises).
 
-**Gap vs AnnI today:** flash path still **materializes full `B·H·T·T` in bwd** (`gpu_attn_recompute_w`); fwd kernel is monolithic, not multi-stage pipelined.
+**Gap vs AnnI today:** flash path still **materializes full `B·H·T·T` in bwd** (the tiled backward); fwd kernel is monolithic, not multi-stage pipelined.
 
 | Next step | Files | Notes |
 |-----------|--------|--------|

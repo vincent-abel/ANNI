@@ -5,7 +5,6 @@
 #include <cuda_fp16.h>
 #if CUDART_VERSION >= 11000
 #include <cuda_bf16.h>
-#include <mma.h>
 #endif
 #if CUDART_VERSION >= 12000
 #include <cuda_fp8.h>
@@ -30,7 +29,6 @@ extern "C" {
 
 static int g_sync_mode;
 static void devvec_forget(const void *host);
-static void fa_pack_forget(const void *p);
 static void qkv_bf16_forget(const void *p);
 static int twin_emit_on(void);
 static int g_compute_prec;
@@ -2658,7 +2656,6 @@ static void twins_forget_dev(const void *p)
 	fp8_wt_invalidate((const ann_real *)p);
 	fp8_act_forget(p);
 #endif
-	fa_pack_forget(p);
 }
 
 extern "C" void gpu_free(void *p)
@@ -4754,67 +4751,6 @@ __global__ static void attn_fwd_kernel(ann_real *concat, ann_real *w,
 }
 
 /*
-** Same causal softmax as attn_fwd_kernel: S_ij = -inf when j > i or the
-** position is outside seqlens. Writes L = m + log(sum exp(S-m)) only.
-** The row lives in SRAM. No T×T score tensor in HBM.
-*/
-__global__ static void attn_lse_kernel(ann_real *Lstat, const ann_real *q,
-	const ann_real *k, int T, int H, int dh, ann_real scale,
-	const int *seqlens)
-{
-	extern __shared__ ann_real sm[];
-	__shared__ ann_real red[ATT_BLOCK];
-	ann_real *qi = sm;
-	ann_real *sc = sm + dh;
-	int i = blockIdx.x % T;
-	int bh = blockIdx.x / T;
-	int h = bh % H;
-	int b = bh / H;
-	int D = H * dh;
-	size_t row0 = (size_t)b * T;
-	int L = seqlens ? seqlens[b] : T;
-	int j;
-	int c;
-	ann_real mx;
-	ann_real sum;
-	ann_real acc;
-
-	if (L < 1)
-		L = 1;
-	if (L > T)
-		L = T;
-	for (c = threadIdx.x; c < dh; c += blockDim.x)
-		qi[c] = q[(row0 + i) * D + h * dh + c];
-	__syncthreads();
-	mx = -1e30f;
-	for (j = threadIdx.x; j < T; j += blockDim.x) {
-		acc = 0.0f;
-		if (i < L && j <= i && j < L) {
-			const ann_real *kj = k + (row0 + j) * D + h * dh;
-			for (c = 0; c < dh; c++)
-				acc += qi[c] * kj[c];
-			acc *= scale;
-		} else
-			acc = -1e30f;
-		sc[j] = acc;
-		if (acc > mx)
-			mx = acc;
-	}
-	mx = att_max(mx, red);
-	sum = 0.0f;
-	for (j = threadIdx.x; j < T; j += blockDim.x) {
-		acc = (i < L && j <= i && j < L) ? __expf(sc[j] - mx) : 0.0f;
-		sc[j] = acc;
-		sum += acc;
-	}
-	sum = att_sum(sum, red);
-	if (sum < 1e-20f)
-		sum = 1.0f;
-	if (threadIdx.x == 0)
-		Lstat[blockIdx.x] = mx + __logf(sum);
-}
-
-/*
 ** Backward phase 1: per (bh, i): dA_j = do_i . v_j, dS_ij = A_ij (dA_j - sum)
 ** * scale (zero for j > i), written to ds; dQ_i = sum_j dS_ij k_j.
 */
@@ -4903,62 +4839,6 @@ __global__ static void attn_bwd_cols_kernel(ann_real *dk, ann_real *dv,
 static pthread_mutex_t g_att_mu = PTHREAD_MUTEX_INITIALIZER;
 static ann_real *g_att_ds;
 static size_t g_att_ds_cap;
-/*
-** One-shot wall clock of the tiled flash backward. -1 until measured.
-** Not recorded inside CUDA graph capture (a sync there is illegal, and
-** autotune stays outside the timed window).
-*/
-static float g_fa_bwd_ms = -1.f;
-static int g_fa_time_done;
-static cudaEvent_t g_fa_ev0;
-static cudaEvent_t g_fa_ev1;
-static int g_fa_ev_ok;
-
-static int fa_time_begin(void)
-{
-	cudaStreamCaptureStatus cap;
-
-	if (g_fa_time_done)
-		return 0;
-	cap = cudaStreamCaptureStatusNone;
-	if (cudaStreamIsCapturing(0, &cap) != cudaSuccess
-	    || cap != cudaStreamCaptureStatusNone)
-		return 0;
-	if (!g_fa_ev_ok) {
-		if (cudaEventCreate(&g_fa_ev0) != cudaSuccess
-		    || cudaEventCreate(&g_fa_ev1) != cudaSuccess) {
-			g_fa_time_done = 1;
-			return 0;
-		}
-		g_fa_ev_ok = 1;
-	}
-	if (cudaEventRecord(g_fa_ev0, 0) != cudaSuccess)
-		return 0;
-	return 1;
-}
-
-static void fa_time_end(int timing)
-{
-	if (!timing)
-		return;
-	g_fa_time_done = 1;
-	if (cudaEventRecord(g_fa_ev1, 0) != cudaSuccess)
-		return;
-	if (cudaEventSynchronize(g_fa_ev1) != cudaSuccess)
-		return;
-	if (cudaEventElapsedTime(&g_fa_bwd_ms, g_fa_ev0, g_fa_ev1)
-	    != cudaSuccess) {
-		g_fa_bwd_ms = -1.f;
-		return;
-	}
-	fprintf(stderr, "[attn] flash bwd %.3f ms\n", g_fa_bwd_ms);
-}
-
-extern "C" float gpu_attn_flash_bwd_ms(void)
-{
-	return g_fa_bwd_ms;
-}
-
 #define FA_BC	32	/* KV tile width for tiled bwd */
 
 static int att_args_ok(int B, int T, int H, int dh)
@@ -5120,10 +5000,8 @@ flash_out:
 ** A cuDNN SDPA forward is a different softmax unless it uses this mask,
 ** this scale, and this L. Pairing it with this backward would make
 ** dQ/dK/dV the gradient of another function than the O the forward
-** wrote. gpu_attn_flash_bwd_ms() records this kernel's wall clock once,
-** outside graph capture; consult that before any SDPA port. Attention
-** is about 1% of FLOPs at T=64, which only orders the work. T is not
-** shortened and causal masking stays.
+** wrote. Attention is about 1% of FLOPs at T=64, which only orders the
+** work. T is not shortened and causal masking stays.
 */
 __global__ static void attn_tiled_bwd_kernel(ann_real *dq, ann_real *dk,
 	ann_real *dv, const ann_real *dO, const ann_real *O, const ann_real *q,
@@ -5248,7 +5126,6 @@ extern "C" int gpu_attn_tiled_bwd(mat *dq, mat *dk, mat *dv,
 	int o[8];
 	ann_real *ptr[8];
 	int oL;
-	int timing;
 	int i;
 	int rc;
 
@@ -5264,7 +5141,6 @@ extern "C" int gpu_attn_tiled_bwd(mat *dq, mat *dk, mat *dv,
 	rc = -1;
 	oL = 0;
 	a_L = NULL;
-	timing = 0;
 	for (i = 0; i < 8; i++) {
 		o[i] = 0;
 		ptr[i] = NULL;
@@ -5292,12 +5168,10 @@ extern "C" int gpu_attn_tiled_bwd(mat *dq, mat *dk, mat *dv,
 	    || cudaMemset(a_dv, 0, nbytes) != cudaSuccess)
 		goto tiled_bwd_out;
 	smem = (size_t)(4 * dh + 2 * FA_BC * dh) * sizeof(ann_real);
-	timing = fa_time_begin();
 	attn_tiled_bwd_kernel<<<B * H * T, ATT_BLOCK, smem>>>(a_dq, a_dk, a_dv,
 	    a_dc, a_o, a_q, a_k, a_v, a_L, T, H, dh,
 	    (ann_real)(1.0 / sqrt((double)dh)),
 	    g_att_seqlens_host ? g_att_seqlens_dev : NULL);
-	fa_time_end(timing);
 	if (launch_done() == 0 && finish_out(dq, a_dq, o[5]) == 0
 	    && finish_out(dk, a_dk, o[6]) == 0
 	    && finish_out(dv, a_dv, o[7]) == 0)
@@ -5308,49 +5182,6 @@ tiled_bwd_out:
 			gpu_free(ptr[i]);
 	if (oL && a_L)
 		gpu_free(a_L);
-	pthread_mutex_unlock(&g_att_mu);
-	return rc;
-}
-
-extern "C" int gpu_attn_recompute_w(mat *lse, const mat *q, const mat *k,
-	int B, int T, int H, int dh)
-{
-	ann_real *dq;
-	ann_real *dk;
-	ann_real *dL;
-	int oq;
-	int ok;
-	int oL;
-	int rc;
-	size_t smem;
-
-	if (!lse || !q || !k || !att_args_ok(B, T, H, dh) || !lse->d_data)
-		return -1;
-	if (q->rows != B * T || lse->rows != B * H * T || lse->cols != 1)
-		return -1;
-	pthread_mutex_lock(&g_att_mu);
-	rc = -1;
-	oq = ok = oL = 0;
-	dq = dk = dL = NULL;
-	if (ensure_dev(q, &dq, &oq) != 0)
-		goto rec_out;
-	if (ensure_dev(k, &dk, &ok) != 0)
-		goto rec_out;
-	if (ensure_dev_out(lse, &dL, &oL) != 0)
-		goto rec_out;
-	smem = (size_t)(dh + T) * sizeof(ann_real);
-	attn_lse_kernel<<<B * H * T, ATT_BLOCK, smem>>>(dL, dq, dk, T, H, dh,
-	    (ann_real)(1.0 / sqrt((double)dh)),
-	    g_att_seqlens_host ? g_att_seqlens_dev : NULL);
-	if (launch_done() == 0 && finish_out(lse, dL, oL) == 0)
-		rc = 0;
-rec_out:
-	if (oq && dq)
-		gpu_free(dq);
-	if (ok && dk)
-		gpu_free(dk);
-	if (oL && dL)
-		gpu_free(dL);
 	pthread_mutex_unlock(&g_att_mu);
 	return rc;
 }
@@ -5840,37 +5671,13 @@ __global__ static void attn_unpack_heads_kernel(ann_real *out,
 }
 
 /* One block per (b,h,i) row: causal scale+softmax (parallel reduce; T<=256). */
-static __nv_fp8_storage_t *g_tc_fp8_w;
-static size_t g_tc_fp8_w_cap;
-
-/* E4M3 copy of attention probabilities. NULL when --fp8 is off. */
-static __nv_fp8_storage_t *tc_fp8_softmax_buf(int batch, int T)
-{
-	size_t n;
-
-	if (!g_fp8_fwd || batch <= 0 || T <= 0)
-		return NULL;
-	n = (size_t)batch * (size_t)T * (size_t)T;
-	if (g_tc_fp8_w_cap < n) {
-		if (g_tc_fp8_w)
-			cudaFree(g_tc_fp8_w);
-		g_tc_fp8_w = NULL;
-		g_tc_fp8_w_cap = 0;
-		if (cudaMalloc(&g_tc_fp8_w, n) != cudaSuccess)
-			return NULL;
-		g_tc_fp8_w_cap = n;
-	}
-	return g_tc_fp8_w;
-}
-
 __global__ static void attn_tc_softmax_kernel(ann_real *w,
 #if CUDART_VERSION >= 11000
 	__nv_bfloat16 *w_bf16,
 #else
 	void *w_bf16,
 #endif
-	int T, int H, ann_real scale, const int *seqlens,
-	__nv_fp8_storage_t *w8)
+	int T, int H, ann_real scale, const int *seqlens)
 {
 	__shared__ ann_real red[ATT_BLOCK];
 	int bh = blockIdx.x;
@@ -5882,7 +5689,6 @@ __global__ static void attn_tc_softmax_kernel(ann_real *w,
 	ann_real sum;
 	size_t base = (size_t)bh * T * T + (size_t)i * T;
 	ann_real *wr = w + base;
-	__nv_fp8_storage_t *w8r = w8 ? (w8 + base) : NULL;
 #if CUDART_VERSION >= 11000
 	__nv_bfloat16 *wbr = w_bf16 ? (w_bf16 + base) : NULL;
 #endif
@@ -5920,9 +5726,6 @@ __global__ static void attn_tc_softmax_kernel(ann_real *w,
 	for (j = (int)threadIdx.x; j < T; j += (int)blockDim.x) {
 		ann_real p = wr[j] / sum;
 		wr[j] = p;
-		/* E4M3 holds [0,1] probabilities; 1.0 is exact. PV stays FP32. */
-		if (w8r)
-			w8r[j] = __nv_cvt_float_to_fp8(p, __NV_SATFINITE, __NV_E4M3);
 #if CUDART_VERSION >= 11000
 		if (wbr)
 			wbr[j] = __float2bfloat16(p);
@@ -6232,25 +6035,16 @@ static int tc_upload_seqlens(int B)
 
 
 /*
-** ---- Fused causal attention on tensor cores (BF16 WMMA, FP32 accumulate) --
+** ---- Fused causal attention on tensor cores (BF16 mma.sync, FP32 accumulate) --
 **
-** FlashAttention-style: one block per (b, h, 64-query tile), four warps of
-** 16 query rows each. Keys stream through shared memory in 64-wide tiles up
-** to the causal diagonal; the score matrix is never written to HBM. Two
-** passes over the keys (row max / sum first, then P V) keep the output in
-** WMMA accumulators without per-row rescaling; QK^T is recomputed (cheap on
-** tensor cores). Writes lse[b,h,i] = m_i + log l_i for the backward.
-** Requirements: dh in {16,32,48,64}, T % 64 == 0, no seqlens.
+** FlashAttention-2 structure, kernels in attn_fa2.cuh: one block per (b, h,
+** 64-query tile), keys stream through shared memory in 64-wide tiles up to
+** the causal diagonal; the score matrix is never written to HBM. Writes
+** lse[b,h,i] = m_i + log l_i for the backward. Requirements: dh in
+** {16,32,48,64}, T % 64 == 0, no seqlens. Q, K, V are read strided from
+** the BF16 [B*T][3D] rows of the fused QKV GEMM; ANN_FA2=0 turns the whole
+** set off and the TC strided GemmEx path runs instead.
 */
-#define FA_BQ	64		/* forward query tile (4 warps x 16 rows) */
-#define FA_FBK	32		/* forward key tile: 30 KB smem, 3 blocks/SM */
-#define FA_BBQ	32		/* backward query tile: 42 KB smem, 2 blocks/SM */
-#define FA_BK	64		/* backward key tile (4 warps x 16 rows) */
-#define FA_WARPS	4
-#define FA_SPAD	8		/* fp32 score row pad (bank spread) */
-#define FA_BPAD	4		/* backward pad: keeps 2 x 50.4 KB under the 100 KB SM */
-
-/* mma.sync / ldmatrix rewrite of the two kernels below (ANN_FA2=0 keeps WMMA). */
 #include "attn_fa2.cuh"
 
 static int fa2_on(void)
@@ -6406,241 +6200,21 @@ static void *qkv_wt_get(const void *hwq, const void *hwk, const void *hwv, int D
 	return e->buf;
 }
 
-__global__ static void attn_fa_wmma_fwd_kernel(ann_real *out, ann_real *lse,
-	const __nv_bfloat16 *q, const __nv_bfloat16 *k, const __nv_bfloat16 *v,
-	int T, int H, int dh, float scale)
-{
-	using namespace nvcuda;
-	extern __shared__ unsigned char fa_sm[];
-	__nv_bfloat16 *Qs = (__nv_bfloat16 *)fa_sm;			/* BQ x dh */
-	__nv_bfloat16 *Ks = Qs + FA_BQ * dh;				/* BK x dh */
-	__nv_bfloat16 *Vs = Ks + FA_FBK * dh;				/* BK x dh */
-	__nv_bfloat16 *Ps = Vs + FA_FBK * dh;				/* BQ x BK */
-	float *Ss = (float *)(Ps + FA_BQ * FA_FBK);			/* BQ x (BK+pad) */
-	float *rm = Ss + FA_BQ * (FA_FBK + FA_SPAD);			/* BQ: running max */
-	float *rl = rm + FA_BQ;						/* BQ: running sum */
-	float *ra = rl + FA_BQ;						/* BQ: rescale of this tile */
-	const int bh = blockIdx.x;
-	const int b = bh / H;
-	const int h = bh % H;
-	const int qt = blockIdx.y;
-	const int warp = threadIdx.x >> 5;
-	const int lane = threadIdx.x & 31;
-	const int D = H * dh;
-	const int SLD = FA_FBK + FA_SPAD;
-	const int HC = FA_FBK / 2;		/* keys per lane in the row loops */
-	const size_t row0 = (size_t)b * T;
-	const int q0 = qt * FA_BQ;
-	const int nkt = (q0 + FA_BQ) / FA_FBK;	/* causal: tiles up to the diagonal */
-	const int ndt = dh / 16;
-	/*
-	** Accumulator element -> row map of the 16x16 FP32 WMMA fragment on
-	** sm_80+ (two 8-row halves, element pairs): element i of lane l sits
-	** in row (l >> 2) + 8 * ((i >> 1) & 1). Verified against the CPU
-	** reference by tests/test_gpu and the probe; used only for the
-	** per-row rescale of the online softmax.
-	*/
-	const int frow0 = warp * 16 + (lane >> 2);
-	wmma::fragment<wmma::accumulator, 16, 16, 16, float> oacc[4];
-	int i, kt, kk, nt, c;
-
-	{
-		const __nv_bfloat16 *qsrc = q + ((size_t)bh * T + q0) * dh;
-
-		for (i = threadIdx.x; i < FA_BQ * dh; i += blockDim.x)
-			Qs[i] = qsrc[i];
-	}
-	if (threadIdx.x < FA_BQ) {
-		rm[threadIdx.x] = -1e30f;
-		rl[threadIdx.x] = 0.0f;
-		ra[threadIdx.x] = 1.0f;
-	}
-	for (nt = 0; nt < ndt; nt++)
-		wmma::fill_fragment(oacc[nt], 0.0f);
-	__syncthreads();
-
-	/* One pass: S tile, online max/sum, rescale O, O += P V. */
-	for (kt = 0; kt < nkt; kt++) {
-		const int k0 = kt * FA_FBK;
-
-		{
-			const __nv_bfloat16 *ksrc = k + ((size_t)bh * T + k0) * dh;
-			const __nv_bfloat16 *vsrc = v + ((size_t)bh * T + k0) * dh;
-
-			for (i = threadIdx.x; i < FA_FBK * dh; i += blockDim.x) {
-				Ks[i] = ksrc[i];
-				Vs[i] = vsrc[i];
-			}
-		}
-		__syncthreads();
-		for (nt = 0; nt < FA_FBK / 16; nt++) {
-			wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
-			wmma::fill_fragment(acc, 0.0f);
-			for (kk = 0; kk < dh; kk += 16) {
-				wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a;
-				wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> bfr;
-				wmma::load_matrix_sync(a, Qs + warp * 16 * dh + kk, dh);
-				wmma::load_matrix_sync(bfr, Ks + nt * 16 * dh + kk, dh);
-				wmma::mma_sync(acc, a, bfr, acc);
-			}
-			wmma::store_matrix_sync(Ss + warp * 16 * SLD + nt * 16, acc,
-			    SLD, wmma::mem_row_major);
-		}
-		__syncwarp();
-		/* Row stats: lane -> row lane/2, half lane&1 of the BK keys. */
-		{
-			const int r = warp * 16 + (lane >> 1);
-			const int qi = q0 + r;
-			const float *srow = Ss + r * SLD + (lane & 1) * HC;
-			__nv_bfloat16 *prow = Ps + r * FA_FBK + (lane & 1) * HC;
-			float tmax = -1e30f, tsum, mold, mnew;
-
-			for (c = 0; c < HC; c++) {
-				int kj = k0 + (lane & 1) * HC + c;
-				float sv = kj <= qi ? srow[c] * scale : -1e30f;
-				tmax = fmaxf(tmax, sv);
-			}
-			tmax = fmaxf(tmax, __shfl_xor_sync(0xffffffffu, tmax, 1));
-			mold = rm[r];
-			mnew = fmaxf(mold, tmax);
-			tsum = 0.0f;
-			for (c = 0; c < HC; c++) {
-				int kj = k0 + (lane & 1) * HC + c;
-				float pv = kj <= qi ? __expf(srow[c] * scale - mnew) : 0.0f;
-				prow[c] = __float2bfloat16(pv);
-				tsum += pv;
-			}
-			tsum += __shfl_xor_sync(0xffffffffu, tsum, 1);
-			if ((lane & 1) == 0) {
-				float alpha = __expf(mold - mnew);
-
-				rl[r] = rl[r] * alpha + tsum;
-				rm[r] = mnew;
-				ra[r] = alpha;
-			}
-		}
-		__syncwarp();
-		/* Rescale O_w rows by alpha, then O_w += P_w V. */
-		{
-			const float a0 = ra[frow0];
-			const float a1 = ra[frow0 + 8];
-
-			for (nt = 0; nt < ndt; nt++)
-				for (i = 0; i < oacc[nt].num_elements; i++)
-					oacc[nt].x[i] *= ((i >> 1) & 1) ? a1 : a0;
-		}
-		for (kk = 0; kk < FA_FBK; kk += 16) {
-			wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a;
-			wmma::load_matrix_sync(a, Ps + warp * 16 * FA_FBK + kk, FA_FBK);
-			for (nt = 0; nt < ndt; nt++) {
-				wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> bfr;
-				wmma::load_matrix_sync(bfr, Vs + kk * dh + nt * 16, dh);
-				wmma::mma_sync(oacc[nt], a, bfr, oacc[nt]);
-			}
-		}
-		__syncthreads();
-	}
-	/* O = O / l per row, written straight from the fragments. */
-	{
-		const float i0 = 1.0f / rl[frow0];
-		const float i1 = 1.0f / rl[frow0 + 8];
-
-		for (nt = 0; nt < ndt; nt++) {
-			for (i = 0; i < oacc[nt].num_elements; i++)
-				oacc[nt].x[i] *= ((i >> 1) & 1) ? i1 : i0;
-			wmma::store_matrix_sync(out + (row0 + q0 + warp * 16) * D
-			    + h * dh + nt * 16, oacc[nt], D, wmma::mem_row_major);
-		}
-	}
-	if (threadIdx.x < FA_BQ)
-		lse[(size_t)bh * T + q0 + threadIdx.x] =
-		    rm[threadIdx.x] + __logf(rl[threadIdx.x]);
-}
-
-static size_t fa_wmma_smem(int dh)
-{
-	return (size_t)(FA_BQ * dh + 2 * FA_FBK * dh + FA_BQ * FA_FBK) * 2
-	    + (size_t)(FA_BQ * (FA_FBK + FA_SPAD) + 3 * FA_BQ) * sizeof(float);
-}
-
-static int fa_wmma_ok(int T, int dh)
-{
-	return (T % FA_BQ) == 0 && dh >= 16 && dh <= 64 && (dh % 16) == 0
-	    && !g_att_seqlens_host;
-}
-
 /*
-** Packed BF16 Q, K, V of each layer's forward, kept for that layer's
-** backward (keyed on the FP32 q pointer: the per-layer cache mats are
-** stable). 36 slots cover 12 layers; 24 MB per slot at B=16, T=256.
+** 1 when the FA2 attention will take this shape in BF16 mode. ANN_FA2=0
+** answers 0, so the callers allocate the score buffer and run the TC path.
 */
-#define FA_PACK_SLOTS	36
-typedef struct {
-	const ann_real	*q;
-	void		*qkv;		/* 3 x n BF16: q, k, v head-major */
-	size_t		cap;
-	size_t		n;
-	int		live;
-} fa_pack_slot;
-static fa_pack_slot g_fa_pack[FA_PACK_SLOTS];
-static int g_fa_pack_rr;
-
-static fa_pack_slot *fa_pack_get(const ann_real *q, size_t n, int create)
-{
-	int i;
-	int free_slot = -1;
-	fa_pack_slot *e;
-
-	for (i = 0; i < FA_PACK_SLOTS; i++) {
-		if (g_fa_pack[i].q == q && g_fa_pack[i].n == n)
-			return &g_fa_pack[i];
-		if (free_slot < 0 && !g_fa_pack[i].q)
-			free_slot = i;
-	}
-	if (!create)
-		return NULL;
-	if (free_slot < 0)
-		free_slot = (g_fa_pack_rr++) % FA_PACK_SLOTS;
-	e = &g_fa_pack[free_slot];
-	if (e->cap < n * 6) {
-		if (e->qkv)
-			cudaFree(e->qkv);
-		e->qkv = NULL;
-		e->cap = 0;
-		if (cudaMalloc(&e->qkv, n * 6) != cudaSuccess) {
-			e->qkv = NULL;
-			e->q = NULL;
-			return NULL;
-		}
-		e->cap = n * 6;
-	}
-	e->q = q;
-	e->n = n;
-	e->live = 0;
-	return e;
-}
-
-static void fa_pack_forget(const void *p)
-{
-	int i;
-
-	for (i = 0; i < FA_PACK_SLOTS; i++)
-		if (g_fa_pack[i].q == (const ann_real *)p) {
-			g_fa_pack[i].q = NULL;
-			g_fa_pack[i].live = 0;
-		}
-}
-
-/* 1 when the fused tensor-core attention will take this shape in BF16 mode. */
 extern "C" int gpu_attn_fa_usable(int T, int dh)
 {
 	return gpu_available() && g_compute_prec == GPU_PREC_BF16
-	    && (T % FA_BQ) == 0 && dh >= 16 && dh <= 64 && (dh % 16) == 0;
+	    && fa2_on() && fa2_ok(T, dh);
 }
 
 /*
-** Fused tensor-core causal attention forward (BF16 mode). Writes concat and
-** lse; -1 = caller uses another path.
+** Fused tensor-core causal attention forward (BF16 mode, FA2 kernels). It
+** reads the BF16 [B*T][3D] rows the fused QKV GEMM left in the layer's qkv
+** slot (gpu_attn_qkv_fused). Writes concat and lse; -1 = no such slot (QKV
+** GEMM failed, graph capture, ANN_FA2=0) and the caller uses another path.
 */
 /* ANN_FA2_O16=0: concat's BF16 twin is converted after the FA2 forward instead of written by it. */
 static int fa2_o16_on(void)
@@ -6661,30 +6235,14 @@ extern "C" int gpu_attn_fa_fwd(mat *concat, const mat *q, const mat *k,
 	OpScope _op(OP_ATTN_FWD);
 	ann_real *dq, *dk, *dv, *dc;
 	int oq, ok, ov, oc, rc = -1;
-	size_t smem;
 	act_bf16_slot *o16 = NULL;
 
 	if (!concat || !q || !k || !v || !lse || !lse->d_data
-	    || !att_args_ok(B, T, H, dh) || !fa_wmma_ok(T, dh)
-	    || g_compute_prec != GPU_PREC_BF16)
+	    || !att_args_ok(B, T, H, dh) || !fa2_ok(T, dh) || !fa2_on()
+	    || g_att_seqlens_host || g_compute_prec != GPU_PREC_BF16)
 		return -1;
 	if (q->rows != B * T || q->cols != H * dh || lse->rows != B * H * T)
 		return -1;
-	smem = fa_wmma_smem(dh);
-	{
-		static int attr_done;
-
-		if (!attr_done) {
-			/* Once, for the largest head size (dh = 64: 51 KB). */
-			if (cudaFuncSetAttribute(attn_fa_wmma_fwd_kernel,
-			    cudaFuncAttributeMaxDynamicSharedMemorySize,
-			    (int)fa_wmma_smem(64)) != cudaSuccess) {
-				(void)cudaGetLastError();
-				return -1;
-			}
-			attr_done = 1;
-		}
-	}
 	pthread_mutex_lock(&g_att_mu);
 	oq = ok = ov = oc = 0;
 	if (ensure_dev(q, &dq, &oq) != 0 || ensure_dev_kv(k, &dk, &ok) != 0
@@ -6692,69 +6250,24 @@ extern "C" int gpu_attn_fa_fwd(mat *concat, const mat *q, const mat *k,
 	    || ensure_dev_out(concat, &dc, &oc) != 0)
 		goto fa_out;
 	{
-		dim3 grid(B * H, T / FA_BQ);
-		size_t npack = (size_t)B * H * T * dh;
-		int threads = 256;
-		int blocks = (int)((npack + threads - 1) / threads);
-
 		qkv_bf16_slot *qs = oq ? NULL : qkv_bf16_get(dq, B * T, H * dh, 0);
-		fa_pack_slot *ps = NULL;
-		__nv_bfloat16 *hq, *hk, *hv;
+		static int reported;
+		const __nv_bfloat16 *bq;
+		const int Dm = H * dh;
 
-		if (qs && qs->live && fa2_on()) {
-			/* The fused QKV GEMM's BF16 [B*T][3D] rows, read strided. */
-			static int reported;
-			const __nv_bfloat16 *bq = (const __nv_bfloat16 *)qs->buf;
-			const int Dm = H * dh;
-
-			/* B11: the kernel writes concat's BF16 twin itself (ANN_FA2_O16=0: converted after). */
-			if (!oc && fa2_o16_on())
-				o16 = act_bf16_slot_for(dc, B * T * H * dh);
-			{ OpNest _n(OP_ATT_GEMM_ID); if (fa2_fwd_launch_lay(dc, lse->d_data, bq, bq + Dm, bq + 2 * Dm, B, T, H, dh,
-			    (float)(1.0 / sqrt((double)dh)), fa2_lay_rows(T, 3 * Dm, dh),
-			    o16 ? (__nv_bfloat16 *)o16->half : NULL) != 0)
-				goto fa_out; }
-			if (!reported++)
-				fprintf(stderr, "[attn] FA2 kernels on the fused BF16 QKV rows (no head packing)\n");
-			goto fa_launched;
-		}
-		if (!dk || !dv)
-			goto fa_out;	/* lazy K/V: only the strided FA2 path above can run */
-		ps = oq ? NULL : fa_pack_get(dq, npack, 1);
-		/* Operands once as head-major BF16, kept for the backward. */
-		if (ps) {
-			hq = (__nv_bfloat16 *)ps->qkv;
-			hk = hq + npack;
-			hv = hk + npack;
-		} else {
-			if (ensure_half_buf(&g_tc_half_q, &g_tc_half_q_cap, npack * 2) != 0
-			    || ensure_half_buf(&g_tc_half_k, &g_tc_half_k_cap, npack * 2) != 0
-			    || ensure_half_buf(&g_tc_half_v, &g_tc_half_v_cap, npack * 2) != 0)
-				goto fa_out;
-			hq = (__nv_bfloat16 *)g_tc_half_q;
-			hk = (__nv_bfloat16 *)g_tc_half_k;
-			hv = (__nv_bfloat16 *)g_tc_half_v;
-		}
-		{ OpNest _n(OP_ATT_PACK_ID); attn_pack_heads_bf16_kernel<<<blocks, threads>>>(hq, dq, B, T, H, dh); }
-		{ OpNest _n(OP_ATT_PACK_ID); attn_pack_heads_bf16_kernel<<<blocks, threads>>>(hk, dk, B, T, H, dh); }
-		{ OpNest _n(OP_ATT_PACK_ID); attn_pack_heads_bf16_kernel<<<blocks, threads>>>(hv, dv, B, T, H, dh); }
-		{
-			OpNest _n(OP_ATT_GEMM_ID);
-			static int reported;
-
-			if (fa2_on() && fa2_fwd_launch(dc, lse->d_data, hq, hk, hv, B, T, H, dh,
-			    (float)(1.0 / sqrt((double)dh))) == 0) {
-				if (!reported++)
-					fprintf(stderr, "[attn] FA2 mma.sync attention kernels\n");
-			} else
-				attn_fa_wmma_fwd_kernel<<<grid, 32 * FA_WARPS, smem>>>(dc,
-				    lse->d_data, hq, hk, hv, T, H, dh,
-				    (float)(1.0 / sqrt((double)dh)));
-		}
-		if (ps)
-			ps->live = 1;
+		if (!qs || !qs->live)
+			goto fa_out;
+		bq = (const __nv_bfloat16 *)qs->buf;
+		/* B11: the kernel writes concat's BF16 twin itself (ANN_FA2_O16=0: converted after). */
+		if (!oc && fa2_o16_on())
+			o16 = act_bf16_slot_for(dc, B * T * H * dh);
+		{ OpNest _n(OP_ATT_GEMM_ID); if (fa2_fwd_launch_lay(dc, lse->d_data, bq, bq + Dm, bq + 2 * Dm, B, T, H, dh,
+		    (float)(1.0 / sqrt((double)dh)), fa2_lay_rows(T, 3 * Dm, dh),
+		    o16 ? (__nv_bfloat16 *)o16->half : NULL) != 0)
+			goto fa_out; }
+		if (!reported++)
+			fprintf(stderr, "[attn] FA2 mma.sync attention on the fused BF16 QKV rows\n");
 	}
-fa_launched:
 	if (launch_done() == 0 && finish_out(concat, dc, oc) == 0) {
 		lse->on_device = MAT_DEV_DEVICE;
 		rc = 0;
@@ -6850,222 +6363,14 @@ __global__ static void attn_fa_dvec16_kernel(float *dvec, const __nv_bfloat16 *d
 	dvec[idx] = acc;
 }
 
-/* Head-major BF16 pack from a BF16 model-layout matrix (dO twin on the fallback path). */
-__global__ static void attn_pack_heads_bf16_from16_kernel(__nv_bfloat16 *out,
-	const __nv_bfloat16 *in, int B, int T, int H, int dh)
-{
-	size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-	size_t n = (size_t)B * H * T * dh;
-	int c, t, h, b;
-
-	if (idx >= n)
-		return;
-	c = (int)(idx % dh);
-	t = (int)((idx / dh) % T);
-	h = (int)((idx / ((size_t)dh * T)) % H);
-	b = (int)(idx / ((size_t)dh * T * H));
-	out[idx] = in[((size_t)b * T + t) * (size_t)H * dh + (size_t)h * dh + c];
-}
-
-/*
-** Fused causal attention backward (FA-2 order): one block per (b, h,
-** 64-key tile), four warps of 16 key rows. Query tiles from the diagonal
-** on stream through shared memory; P^T is recomputed from lse, dV and dK
-** accumulate in WMMA fragments, dQ contributions are atomically added
-** (FP32) per query tile. No score matrix in HBM.
-*/
-__global__ static void attn_fa_wmma_bwd_kernel(ann_real *dq, ann_real *dk,
-	ann_real *dv, const __nv_bfloat16 *q, const __nv_bfloat16 *k,
-	const __nv_bfloat16 *v, const __nv_bfloat16 *dO, const float *lse,
-	const float *dvec, int T, int H, int dh, float scale)
-{
-	using namespace nvcuda;
-	extern __shared__ unsigned char fa_sm[];
-	__nv_bfloat16 *Ks = (__nv_bfloat16 *)fa_sm;			/* 64 x dh */
-	__nv_bfloat16 *Vs = Ks + FA_BK * dh;				/* 64 x dh */
-	__nv_bfloat16 *Qs = Vs + FA_BK * dh;				/* BQ x dh */
-	__nv_bfloat16 *dOs = Qs + FA_BBQ * dh;				/* BQ x dh */
-	__nv_bfloat16 *Pt = dOs + FA_BBQ * dh;				/* BK keys x BQ queries */
-	__nv_bfloat16 *dSt = Pt + FA_BK * FA_BBQ;			/* BK x BQ */
-	float *Ss = (float *)(dSt + FA_BK * FA_BBQ);			/* BK x (BQ+pad) */
-	float *ls = Ss + FA_BK * (FA_BBQ + FA_BPAD);			/* BQ */
-	float *dvs = ls + FA_BBQ;					/* BQ */
-	float *dqs = dvs + FA_BBQ;					/* 4 warps x 16 x 16 */
-	const int bh = blockIdx.x;
-	const int b = bh / H;
-	const int h = bh % H;
-	const int kt = blockIdx.y;
-	const int warp = threadIdx.x >> 5;
-	const int lane = threadIdx.x & 31;
-	const int D = H * dh;
-	const int SLD = FA_BBQ + FA_BPAD;
-	const int HC = FA_BBQ / 2;		/* queries per lane in the row loops */
-	const size_t row0 = (size_t)b * T;
-	const int k0 = kt * FA_BK;
-	const int ndt = dh / 16;
-	wmma::fragment<wmma::accumulator, 16, 16, 16, float> dkacc[4];
-	wmma::fragment<wmma::accumulator, 16, 16, 16, float> dvacc[4];
-	int i, qt, kk, nt, c;
-
-	for (nt = 0; nt < ndt; nt++) {
-		wmma::fill_fragment(dkacc[nt], 0.0f);
-		wmma::fill_fragment(dvacc[nt], 0.0f);
-	}
-	{
-		const __nv_bfloat16 *ksrc = k + ((size_t)bh * T + k0) * dh;
-		const __nv_bfloat16 *vsrc = v + ((size_t)bh * T + k0) * dh;
-
-		for (i = threadIdx.x; i < FA_BK * dh; i += blockDim.x) {
-			Ks[i] = ksrc[i];
-			Vs[i] = vsrc[i];
-		}
-	}
-	__syncthreads();
-	for (qt = k0 / FA_BBQ; qt < T / FA_BBQ; qt++) {
-		const int q0 = qt * FA_BBQ;
-		const __nv_bfloat16 *qsrc = q + ((size_t)bh * T + q0) * dh;
-		const __nv_bfloat16 *dsrc = dO + ((size_t)bh * T + q0) * dh;
-
-		for (i = threadIdx.x; i < FA_BBQ * dh; i += blockDim.x) {
-			Qs[i] = qsrc[i];
-			dOs[i] = dsrc[i];
-		}
-		if (threadIdx.x < FA_BBQ) {
-			ls[threadIdx.x] = lse[(size_t)bh * T + q0 + threadIdx.x];
-			dvs[threadIdx.x] = dvec[(size_t)bh * T + q0 + threadIdx.x];
-		}
-		__syncthreads();
-		/* S^T_w = K_w Q^T: 16 keys x BQ queries. */
-		for (nt = 0; nt < FA_BBQ / 16; nt++) {
-			wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
-			wmma::fill_fragment(acc, 0.0f);
-			for (kk = 0; kk < dh; kk += 16) {
-				wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a;
-				wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> bfr;
-				wmma::load_matrix_sync(a, Ks + warp * 16 * dh + kk, dh);
-				wmma::load_matrix_sync(bfr, Qs + nt * 16 * dh + kk, dh);
-				wmma::mma_sync(acc, a, bfr, acc);
-			}
-			wmma::store_matrix_sync(Ss + warp * 16 * SLD + nt * 16, acc,
-			    SLD, wmma::mem_row_major);
-		}
-		__syncwarp();
-		/* P^T[kj, qi] = exp(scale S - lse_qi), causal mask kj <= qi. */
-		{
-			const int r = warp * 16 + (lane >> 1);
-			const int kj = k0 + r;
-			const float *srow = Ss + r * SLD + (lane & 1) * HC;
-			__nv_bfloat16 *prow = Pt + r * FA_BBQ + (lane & 1) * HC;
-
-			for (c = 0; c < HC; c++) {
-				int qc = (lane & 1) * HC + c;
-				int qi = q0 + qc;
-				float pv = kj <= qi
-				    ? __expf(srow[c] * scale - ls[qc]) : 0.0f;
-				prow[c] = __float2bfloat16(pv);
-			}
-		}
-		__syncwarp();
-		/* dV_w += P^T_w (16 x BQ) dO (BQ x dh). */
-		for (kk = 0; kk < FA_BBQ; kk += 16) {
-			wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a;
-			wmma::load_matrix_sync(a, Pt + warp * 16 * FA_BBQ + kk, FA_BBQ);
-			for (nt = 0; nt < ndt; nt++) {
-				wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> bfr;
-				wmma::load_matrix_sync(bfr, dOs + kk * dh + nt * 16, dh);
-				wmma::mma_sync(dvacc[nt], a, bfr, dvacc[nt]);
-			}
-		}
-		/* dP^T_w = V_w dO^T: 16 keys x BQ queries, into Ss. */
-		for (nt = 0; nt < FA_BBQ / 16; nt++) {
-			wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
-			wmma::fill_fragment(acc, 0.0f);
-			for (kk = 0; kk < dh; kk += 16) {
-				wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a;
-				wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> bfr;
-				wmma::load_matrix_sync(a, Vs + warp * 16 * dh + kk, dh);
-				wmma::load_matrix_sync(bfr, dOs + nt * 16 * dh + kk, dh);
-				wmma::mma_sync(acc, a, bfr, acc);
-			}
-			wmma::store_matrix_sync(Ss + warp * 16 * SLD + nt * 16, acc,
-			    SLD, wmma::mem_row_major);
-		}
-		__syncwarp();
-		/* dS^T = P^T (dP^T - D_qi) as BF16. */
-		{
-			const int r = warp * 16 + (lane >> 1);
-			const float *drow = Ss + r * SLD + (lane & 1) * HC;
-			const __nv_bfloat16 *prow = Pt + r * FA_BBQ + (lane & 1) * HC;
-			__nv_bfloat16 *dsrow = dSt + r * FA_BBQ + (lane & 1) * HC;
-
-			for (c = 0; c < HC; c++) {
-				int qc = (lane & 1) * HC + c;
-				float pv = __bfloat162float(prow[c]);
-				dsrow[c] = __float2bfloat16(pv * (drow[c] - dvs[qc]));
-			}
-		}
-		__syncthreads();	/* all warps' dS^T rows complete */
-		/* dK_w += scale dS^T_w (16 x BQ queries) Q (BQ x dh). */
-		for (kk = 0; kk < FA_BBQ; kk += 16) {
-			wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a;
-			wmma::load_matrix_sync(a, dSt + warp * 16 * FA_BBQ + kk, FA_BBQ);
-			for (nt = 0; nt < ndt; nt++) {
-				wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> bfr;
-				wmma::load_matrix_sync(bfr, Qs + kk * dh + nt * 16, dh);
-				wmma::mma_sync(dkacc[nt], a, bfr, dkacc[nt]);
-			}
-		}
-		/*
-		** dQ (16 queries per warp x dh) = scale dS (queries x keys) K:
-		** dS is the column-major view of dS^T; staged through Ss and
-		** atomically added to the global FP32 dQ (several key tiles).
-		*/
-		if (warp * 16 < FA_BBQ) {	/* BQ/16 warps own 16 query rows each */
-			float *wq = dqs + warp * 256;	/* 16 x 16 per warp */
-
-			for (nt = 0; nt < ndt; nt++) {
-				wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
-				wmma::fill_fragment(acc, 0.0f);
-				for (kk = 0; kk < FA_BK; kk += 16) {
-					wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::col_major> a;
-					wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> bfr;
-					wmma::load_matrix_sync(a, dSt + kk * FA_BBQ + warp * 16, FA_BBQ);
-					wmma::load_matrix_sync(bfr, Ks + kk * dh + nt * 16, dh);
-					wmma::mma_sync(acc, a, bfr, acc);
-				}
-				wmma::store_matrix_sync(wq, acc, 16, wmma::mem_row_major);
-				__syncwarp();
-				for (i = lane; i < 256; i += 32) {
-					int r = i >> 4, cc = i & 15;
-					atomicAdd(&dq[(row0 + q0 + warp * 16 + r) * D + h * dh
-					    + nt * 16 + cc], wq[i] * scale);
-				}
-				__syncwarp();
-			}
-		}
-		__syncthreads();	/* Qs / dOs / Ss reused by the next tile */
-	}
-	for (nt = 0; nt < ndt; nt++) {
-		for (i = 0; i < dkacc[nt].num_elements; i++)
-			dkacc[nt].x[i] *= scale;
-		wmma::store_matrix_sync(dk + (row0 + k0 + warp * 16) * D + h * dh
-		    + nt * 16, dkacc[nt], D, wmma::mem_row_major);
-		wmma::store_matrix_sync(dv + (row0 + k0 + warp * 16) * D + h * dh
-		    + nt * 16, dvacc[nt], D, wmma::mem_row_major);
-	}
-}
-
-static size_t fa_wmma_bwd_smem(int dh)
-{
-	return (size_t)(2 * FA_BK * dh + 2 * FA_BBQ * dh + 2 * FA_BK * FA_BBQ) * 2
-	    + (size_t)(FA_BK * (FA_BBQ + FA_BPAD) + 2 * FA_BBQ + FA_WARPS * 256)
-	    * sizeof(float);
-}
-
 static float *g_fa_dvec;
 static size_t g_fa_dvec_cap;
 
-/* Fused tensor-core causal attention backward (BF16 mode); dq/dk/dv written. */
+/*
+** Fused tensor-core causal attention backward (BF16 mode, FA2 kernels);
+** dq/dk/dv written. Reads the layer's BF16 QKV rows (consumed once); -1
+** when they are gone, which the forward that chose this path rules out.
+*/
 extern "C" int gpu_attn_fa_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat,
 	const mat *concat, const mat *q, const mat *k, const mat *v,
 	const mat *lse, int B, int T, int H, int dh)
@@ -7074,41 +6379,12 @@ extern "C" int gpu_attn_fa_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat,
 	ann_real *ptr[7];
 	int o[7];
 	int i, rc = -1;
-	size_t smem, nrows;
-	const __nv_bfloat16 *hq = NULL, *hk = NULL, *hv = NULL;
+	size_t nrows;
 
 	if (!dq || !dk || !dv || !dconcat || !concat || !q || !k || !v || !lse
-	    || !lse->d_data || !att_args_ok(B, T, H, dh) || !fa_wmma_ok(T, dh)
-	    || g_compute_prec != GPU_PREC_BF16)
+	    || !lse->d_data || !att_args_ok(B, T, H, dh) || !fa2_ok(T, dh)
+	    || !fa2_on() || g_att_seqlens_host || g_compute_prec != GPU_PREC_BF16)
 		return -1;
-	smem = fa_wmma_bwd_smem(dh);
-	{
-		static int attr_done;
-
-		if (!attr_done) {
-			if (cudaFuncSetAttribute(attn_fa_wmma_bwd_kernel,
-			    cudaFuncAttributeMaxDynamicSharedMemorySize,
-			    (int)fa_wmma_bwd_smem(64)) != cudaSuccess) {
-				(void)cudaGetLastError();
-				return -1;
-			}
-			attr_done = 1;
-			if (op_prof_on()) {
-				int nb_f = 0, nb_b = 0;
-				cudaDeviceProp prop;
-
-				(void)cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb_f,
-				    attn_fa_wmma_fwd_kernel, 32 * FA_WARPS, fa_wmma_smem(64));
-				(void)cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb_b,
-				    attn_fa_wmma_bwd_kernel, 32 * FA_WARPS, fa_wmma_bwd_smem(64));
-				(void)cudaGetDeviceProperties(&prop, 0);
-				fprintf(stderr, "[fa] dh=64: fwd smem %zu B -> %d blocks/SM, bwd smem %zu B -> %d blocks/SM (SM smem %zu B, %d SMs)\n",
-				    fa_wmma_smem(64), nb_f, fa_wmma_bwd_smem(64), nb_b,
-				    prop.sharedMemPerMultiprocessor, prop.multiProcessorCount);
-				(void)cudaGetLastError();
-			}
-		}
-	}
 	nrows = (size_t)B * H * T;
 	if (g_fa_dvec_cap < nrows) {
 		if (g_fa_dvec)
@@ -7138,154 +6414,96 @@ extern "C" int gpu_attn_fa_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat,
 	{
 		ann_real *a_dv;
 		int odv = 0;
-		dim3 grid(B * H, T / FA_BK);
 		const __nv_bfloat16 *dO16 = NULL;
+		size_t ndo = (size_t)B * T * H * dh;
+		qkv_bf16_slot *qs = o[2] ? NULL : qkv_bf16_get(ptr[2], B * T, H * dh, 0);
+		const __nv_bfloat16 *bq;
+		const int Dm = H * dh;
+		void *dk16 = NULL, *dv16 = NULL;
+		const float *fused_of = NULL;
+		int skip32;
 
+		if (!qs || !qs->live)
+			goto fa_bwd_out;
 		if (ensure_dev_out(dv, &a_dv, &odv) != 0)
 			goto fa_bwd_out;
-		if (cudaMemsetAsync(ptr[5], 0, (size_t)B * T * H * dh
-		    * sizeof(ann_real), 0) != cudaSuccess)
-			goto fa_bwd_out;
-		{
-			size_t npack = (size_t)B * H * T * dh;
-			int threads = 256;
-			int blocks = (int)((npack + threads - 1) / threads);
+		if (cudaMemsetAsync(ptr[5], 0, ndo * sizeof(ann_real), 0)
+		    != cudaSuccess)
+			goto fa_bwd_done;
+		/* The Wo dgrad may have left dO only as a BF16 twin (gpu_mat_mul_bt_twin). */
+		if (!o[0]) {
+			pthread_mutex_lock(&g_gemm_mu);
+			{
+				int ld16 = H * dh;	/* dense twin: row stride D */
 
-			/* The Wo dgrad may have left dO only as a BF16 twin (gpu_mat_mul_bt_twin). */
-			if (!o[0]) {
-				pthread_mutex_lock(&g_gemm_mu);
-				{
-					int ld16 = H * dh;	/* dense twin: row stride D */
-
-					dO16 = (const __nv_bfloat16 *)grad_twin_take(ptr[0], npack, H * dh, &ld16);
-					if (dO16 && ld16 != H * dh)
-						dO16 = NULL;	/* a strided twin is not what the kernel expects */
-				}
-				pthread_mutex_unlock(&g_gemm_mu);
+				dO16 = (const __nv_bfloat16 *)grad_twin_take(ptr[0], ndo, H * dh, &ld16);
+				if (dO16 && ld16 != H * dh)
+					dO16 = NULL;	/* a strided twin is not what the kernel expects */
 			}
-
-			qkv_bf16_slot *qs = o[2] ? NULL : qkv_bf16_get(ptr[2], B * T, H * dh, 0);
-			fa_pack_slot *ps = o[2] ? NULL : fa_pack_get(ptr[2], npack, 0);
-
-			/*
-			** The head-major dO scratch is only written by the paths that
-			** do not read dO's BF16 twin strided; allocate it on first
-			** real use (16 MB otherwise never touched).
-			*/
-			if (!(qs && qs->live && fa2_on() && dO16 && vram_lazy_on())
-			    && ensure_half_buf(&g_tc_half_do, &g_tc_half_do_cap, npack * 2) != 0)
-				goto fa_bwd_out;
-			if (qs && qs->live && fa2_on()) {
-				/* The fused QKV GEMM's BF16 rows; dO packed head-major. */
-				const __nv_bfloat16 *bq = (const __nv_bfloat16 *)qs->buf;
-				const int Dm = H * dh;
-
-				void *dk16 = NULL, *dv16 = NULL;
-				const float *fused_of = NULL;
-				int skip32;
-
-				qs->live = 0;
-				/* dK, dV also as BF16 twins: their wgrad and dgrad GEMMs then convert nothing. */
-				if (!o[6] && !odv && !stream_is_capturing() && twin_emit_on()) {
-					pthread_mutex_lock(&g_gemm_mu);
-					dk16 = grad_twin_reserve(ptr[6], npack);
-					dv16 = dk16 ? grad_twin_reserve(a_dv, npack) : NULL;
-					if (!dv16 && dk16)
-						grad_twin_forget(ptr[6]);
-					pthread_mutex_unlock(&g_gemm_mu);
-					if (!dv16)
-						dk16 = NULL;
-				}
-				if (dO16 && fa2_dvec_fused_on()) {
-					/* dO's BF16 twin; the backward kernel computes dvec itself from it and O. */
-					fused_of = ptr[1];
-				} else if (dO16) {
-					/* dO's BF16 twin (written by the Wo dgrad GEMM), read strided; dvec from it. */
-					{ OpNest _n(OP_ATT_SMX_ID); attn_fa_dvec16_kernel<<<(unsigned)((nrows + 255) / 256), 256>>>(
-					    g_fa_dvec, dO16, ptr[1], (int)nrows, T, H, dh); }
-				} else {
-					{ OpNest _n(OP_ATT_PACK_ID); attn_pack_heads_bf16_kernel<<<blocks, threads>>>(
-					    (__nv_bfloat16 *)g_tc_half_do, ptr[0], B, T, H, dh); }
-					{ OpNest _n(OP_ATT_SMX_ID); attn_fa_dvec_kernel<<<(unsigned)((nrows + 255) / 256), 256>>>(
-					    g_fa_dvec, ptr[0], ptr[1], (int)nrows, T, H, dh); }
-				}
-				/*
-				** B9: with both twins written and no FP8 GEMM (which
-				** quantises from FP32), the Wk / Wv wgrad (grad_twin_peek)
-				** and dgrad (grad_twin_take) read only the twins: skip the
-				** 2 x 16 MB FP32 stores. ANN_TWIN_CHECK=1 compares twins
-				** with their FP32, so it keeps them.
-				*/
-				skip32 = dk16 && fa2_twin_only_on() && !g_fp8_fwd
-				    && !g_fp8_dgrad && !twin_check_on();
-				{ OpNest _n(OP_ATT_GEMM_ID); if (fa2_bwd_launch_lay(ptr[5], skip32 ? NULL : ptr[6], skip32 ? NULL : a_dv, bq, bq + Dm, bq + 2 * Dm,
-				    dO16 ? dO16 : (const __nv_bfloat16 *)g_tc_half_do, lse->d_data, g_fa_dvec,
-				    B, T, H, dh, (float)(1.0 / sqrt((double)dh)),
-				    fa2_lay_rows(T, 3 * Dm, dh),
-				    dO16 ? fa2_lay_rows(T, Dm, dh) : fa2_lay_headmajor(T, H, dh),
-				    (__nv_bfloat16 *)dk16, (__nv_bfloat16 *)dv16, fused_of) != 0) {
-					if (dk16) {
-						grad_twin_forget(ptr[6]);
-						grad_twin_forget(a_dv);
-					}
-					goto fa_bwd_out;
-				} }
-				goto fa_bwd_launched;
-			}
-			if (ps && ps->live) {
-				/* The forward's packed Q, K, V (consumed once). */
-				hq = (const __nv_bfloat16 *)ps->qkv;
-				hk = hq + npack;
-				hv = hk + npack;
-				ps->live = 0;
-			} else {
-				if (!ptr[3] || !ptr[4])
-					goto fa_bwd_out;	/* lazy K/V: no FP32 values to pack */
-				if (ensure_half_buf(&g_tc_half_q, &g_tc_half_q_cap, npack * 2) != 0
-				    || ensure_half_buf(&g_tc_half_k, &g_tc_half_k_cap, npack * 2) != 0
-				    || ensure_half_buf(&g_tc_half_v, &g_tc_half_v_cap, npack * 2) != 0)
-					goto fa_bwd_out;
-				{ OpNest _n(OP_ATT_PACK_ID); attn_pack_heads_bf16_kernel<<<blocks, threads>>>(
-				    (__nv_bfloat16 *)g_tc_half_q, ptr[2], B, T, H, dh); }
-				{ OpNest _n(OP_ATT_PACK_ID); attn_pack_heads_bf16_kernel<<<blocks, threads>>>(
-				    (__nv_bfloat16 *)g_tc_half_k, ptr[3], B, T, H, dh); }
-				{ OpNest _n(OP_ATT_PACK_ID); attn_pack_heads_bf16_kernel<<<blocks, threads>>>(
-				    (__nv_bfloat16 *)g_tc_half_v, ptr[4], B, T, H, dh); }
-				hq = (const __nv_bfloat16 *)g_tc_half_q;
-				hk = (const __nv_bfloat16 *)g_tc_half_k;
-				hv = (const __nv_bfloat16 *)g_tc_half_v;
-			}
-			if (dO16) {
-				{ OpNest _n(OP_ATT_PACK_ID); attn_pack_heads_bf16_from16_kernel<<<blocks, threads>>>(
-				    (__nv_bfloat16 *)g_tc_half_do, dO16, B, T, H, dh); }
-			} else {
-				{ OpNest _n(OP_ATT_PACK_ID); attn_pack_heads_bf16_kernel<<<blocks, threads>>>(
-				    (__nv_bfloat16 *)g_tc_half_do, ptr[0], B, T, H, dh); }
-			}
+			pthread_mutex_unlock(&g_gemm_mu);
 		}
-		if (dO16) {
+		bq = (const __nv_bfloat16 *)qs->buf;
+		qs->live = 0;
+		/* dK, dV also as BF16 twins: their wgrad and dgrad GEMMs then convert nothing. */
+		if (!o[6] && !odv && !stream_is_capturing() && twin_emit_on()) {
+			pthread_mutex_lock(&g_gemm_mu);
+			dk16 = grad_twin_reserve(ptr[6], ndo);
+			dv16 = dk16 ? grad_twin_reserve(a_dv, ndo) : NULL;
+			if (!dv16 && dk16)
+				grad_twin_forget(ptr[6]);
+			pthread_mutex_unlock(&g_gemm_mu);
+			if (!dv16)
+				dk16 = NULL;
+		}
+		if (dO16 && fa2_dvec_fused_on()) {
+			/* dO's BF16 twin; the backward kernel computes dvec itself from it and O. */
+			fused_of = ptr[1];
+		} else if (dO16) {
+			/* dO's BF16 twin (written by the Wo dgrad GEMM), read strided; dvec from it. */
 			{ OpNest _n(OP_ATT_SMX_ID); attn_fa_dvec16_kernel<<<(unsigned)((nrows + 255) / 256), 256>>>(
 			    g_fa_dvec, dO16, ptr[1], (int)nrows, T, H, dh); }
 		} else {
+			/* FP32 dO only: BF16 rows in scratch (same rounding as the twin), dvec from the FP32. */
+			int threads = 256;
+			int n = (int)ndo;
+			int blocks = (n + threads * 4 - 1) / (threads * 4);
+
+			if (ensure_half_buf(&g_tc_half_do, &g_tc_half_do_cap, ndo * 2) != 0) {
+				if (dk16) {
+					grad_twin_forget(ptr[6]);
+					grad_twin_forget(a_dv);
+				}
+				goto fa_bwd_done;
+			}
+			{ OpNest _n(OP_ATT_PACK_ID); f32_to_bf16_kernel<<<blocks, threads>>>(
+			    (__nv_bfloat16 *)g_tc_half_do, ptr[0], n); }
 			{ OpNest _n(OP_ATT_SMX_ID); attn_fa_dvec_kernel<<<(unsigned)((nrows + 255) / 256), 256>>>(
 			    g_fa_dvec, ptr[0], ptr[1], (int)nrows, T, H, dh); }
 		}
-		{
-			OpNest _n(OP_ATT_GEMM_ID);
-
-			if (!fa2_on() || fa2_bwd_launch(ptr[5], ptr[6], a_dv, hq, hk, hv,
-			    (const __nv_bfloat16 *)g_tc_half_do, lse->d_data, g_fa_dvec,
-			    B, T, H, dh, (float)(1.0 / sqrt((double)dh))) != 0)
-				attn_fa_wmma_bwd_kernel<<<grid, 32 * FA_WARPS, smem>>>(ptr[5],
-				    ptr[6], a_dv, hq, hk, hv,
-				    (const __nv_bfloat16 *)g_tc_half_do, lse->d_data,
-				    g_fa_dvec, T, H, dh, (float)(1.0 / sqrt((double)dh)));
-		}
-fa_bwd_launched:
+		/*
+		** B9: with both twins written and no FP8 GEMM (which quantises from
+		** FP32), the Wk / Wv wgrad (grad_twin_peek) and dgrad (grad_twin_take)
+		** read only the twins: skip the 2 x 16 MB FP32 stores. ANN_TWIN_CHECK=1
+		** compares twins with their FP32, so it keeps them.
+		*/
+		skip32 = dk16 && fa2_twin_only_on() && !g_fp8_fwd
+		    && !g_fp8_dgrad && !twin_check_on();
+		{ OpNest _n(OP_ATT_GEMM_ID); if (fa2_bwd_launch_lay(ptr[5], skip32 ? NULL : ptr[6], skip32 ? NULL : a_dv, bq, bq + Dm, bq + 2 * Dm,
+		    dO16 ? dO16 : (const __nv_bfloat16 *)g_tc_half_do, lse->d_data, g_fa_dvec,
+		    B, T, H, dh, (float)(1.0 / sqrt((double)dh)),
+		    fa2_lay_rows(T, 3 * Dm, dh), fa2_lay_rows(T, Dm, dh),
+		    (__nv_bfloat16 *)dk16, (__nv_bfloat16 *)dv16, fused_of) != 0) {
+			if (dk16) {
+				grad_twin_forget(ptr[6]);
+				grad_twin_forget(a_dv);
+			}
+			goto fa_bwd_done;
+		} }
 		if (launch_done() == 0 && finish_out(dq, ptr[5], o[5]) == 0
 		    && finish_out(dk, ptr[6], o[6]) == 0
 		    && finish_out(dv, a_dv, odv) == 0)
 			rc = 0;
+fa_bwd_done:
 		if (odv && a_dv)
 			gpu_free(a_dv);
 	}
@@ -7394,8 +6612,7 @@ extern "C" int gpu_attn_tc_fwd(mat *concat, mat *w, const mat *q, const mat *k,
 		{ OpNest _n(OP_ATT_SMX_ID); attn_tc_softmax_kernel<<<sgrid, nth>>>(dw,
 		    g_compute_prec == GPU_PREC_BF16
 		    ? (__nv_bfloat16 *)g_tc_half_p : NULL, T, H, scale,
-		    g_att_seqlens_host ? g_att_seqlens_dev : NULL,
-		    tc_fp8_softmax_buf(batch, T)); }
+		    g_att_seqlens_host ? g_att_seqlens_dev : NULL); }
 	}
 #if CUDART_VERSION >= 11000
 	if (g_compute_prec == GPU_PREC_BF16) {
@@ -7538,7 +6755,7 @@ extern "C" int gpu_attn_tc_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat,
 			goto tc_bwd_out;
 		{ OpNest _n(OP_ATT_SMX_ID); attn_tc_softmax_kernel<<<sgrid, nth>>>(dw,
 		    (__nv_bfloat16 *)g_tc_half_p, T, H, (ann_real)scale,
-		    g_att_seqlens_host ? g_att_seqlens_dev : NULL, NULL); }
+		    g_att_seqlens_host ? g_att_seqlens_dev : NULL); }
 		/* dP = dO V^T: col-major dP^T[T,T] = V[dh,T]^T dO^T[dh,T]. */
 		if (OpNest(OP_ATT_GEMM_ID), tc_gemm_bf16_strided(CUBLAS_OP_T,
 		    CUBLAS_OP_N, T, T, dh, 1.0f, g_tc_half_v, dh, sv,
@@ -7583,8 +6800,7 @@ extern "C" int gpu_attn_tc_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat,
 			nth <<= 1;
 		{ OpNest _n(OP_ATT_SMX_ID); attn_tc_softmax_kernel<<<sgrid, nth>>>(dw, NULL, T, H,
 		    (ann_real)scale,
-		    g_att_seqlens_host ? g_att_seqlens_dev : NULL,
-		    tc_fp8_softmax_buf(batch, T)); }
+		    g_att_seqlens_host ? g_att_seqlens_dev : NULL); }
 		/* dP = dO V^T (needs V); then dV = W^T dO (overwrites V). */
 		if (OpNest(OP_ATT_GEMM_ID), tc_gemm_do_vt(g_tc_dp, g_tc_o, g_tc_v, T, dh, batch) != 0)
 			goto tc_bwd_out;
@@ -7672,9 +6888,11 @@ extern "C" int gpu_attn_qkv_fused(mat *q, mat *k, mat *v, const mat *x,
 {
 	OpScope _op(OP_QKV);
 	/*
-	** Three GemmEx sharing one BF16/FP16 convert of X (same for Wq/Wk/Wv).
-	** One fat X@[Wq|Wk|Wv] was tried; pack/split overhead canceled the win
-	** at T=64 / D=1024 on this card.
+	** With the FA2 hint (BF16, shape ok): one fat X@[Wq|Wk|Wv] GEMM into
+	** the layer's BF16 qkv rows, read strided by the attention kernels, so
+	** nothing is packed or split. Otherwise three GemmEx sharing one
+	** BF16/FP16 convert of X (same for Wq/Wk/Wv): the fat GEMM followed by
+	** a pack/split pass canceled its win at T=64 / D=1024 on this card.
 	*/
 	static void *s_x_half;
 	static size_t s_x_half_cap;
