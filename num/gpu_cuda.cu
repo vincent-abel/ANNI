@@ -4250,14 +4250,6 @@ __global__ static void bias_add_kernel(ann_real *x, const ann_real *bias,
 		x[i] += bias[i % cols];
 }
 
-__global__ static void relu_fwd_kernel(ann_real *x, int n)
-{
-	int i = blockIdx.x * blockDim.x + threadIdx.x;
-
-	if (i < n && x[i] < 0.0f)
-		x[i] = 0.0f;
-}
-
 /*
 ** FFN W1 finish: pre already has bias (from Lt epilogue) OR apply bias here
 ** when bias != NULL. Write ReLU(pre) into hidden.
@@ -4927,55 +4919,6 @@ tiled_bwd_out:
 	if (oL && a_L)
 		gpu_free(a_L);
 	pthread_mutex_unlock(&g_att_mu);
-	return rc;
-}
-
-extern "C" int gpu_bias_relu_forward(ann_real *x, const ann_real *bias,
-	int rows, int cols)
-{
-	OpScope _op(OP_ELEMWISE);
-	ew_ref rx;
-	ew_ref rb;
-	size_t nb;
-	int n;
-	int rc;
-	int dn;
-
-	if (!x || !bias || rows <= 0 || cols <= 0 || !gpu_available())
-		return -1;
-	n = rows * cols;
-	nb = (size_t)n * sizeof(ann_real);
-	pthread_mutex_lock(&g_ew_mu);
-	if (ew_acquire(&rx, 0, x, nb, 1, 1) != 0) {
-		pthread_mutex_unlock(&g_ew_mu);
-		return -1;
-	}
-	if (ew_acquire_param(&rb, 1, bias, (size_t)cols * sizeof(ann_real))
-	    != 0) {
-		pthread_mutex_unlock(&g_ew_mu);
-		return -1;
-	}
-	bias_add_kernel<<<(n + EW_BLOCK - 1) / EW_BLOCK, EW_BLOCK>>>(rx.dev,
-	    rb.dev, n, cols);
-	if (ew_launch_ok() != 0) {
-		pthread_mutex_unlock(&g_ew_mu);
-		return -1;
-	}
-	relu_fwd_kernel<<<(n + EW_BLOCK - 1) / EW_BLOCK, EW_BLOCK>>>(rx.dev, n);
-	if (ew_launch_ok() != 0) {
-		pthread_mutex_unlock(&g_ew_mu);
-		return -1;
-	}
-	rc = ew_release(&rx);
-	if (rc < 0) {
-		pthread_mutex_unlock(&g_ew_mu);
-		return -1;
-	}
-	dn = rc;
-	rc = ew_finish_sync(dn) == 0 ? 0 : -1;
-	pthread_mutex_unlock(&g_ew_mu);
-	if (rc == 0)
-		act_bf16_publish(x, n);
 	return rc;
 }
 
@@ -7384,34 +7327,6 @@ extern "C" int gpu_bias_row_add(ann_real *x, const ann_real *bias, int rows,
 
 	pthread_mutex_lock(&g_ew_mu);
 	rc = gpu_bias_row_add_locked(x, bias, rows, cols);
-	pthread_mutex_unlock(&g_ew_mu);
-	return rc;
-}
-
-static int gpu_relu_forward_locked(ann_real *x, int n)
-{
-	ew_ref rx;
-	int rc;
-
-	if (!x || n <= 0 || !gpu_available())
-		return -1;
-	if (ew_acquire(&rx, 0, x, (size_t)n * sizeof(ann_real), 1, 1) != 0)
-		return -1;
-	relu_fwd_kernel<<<(n + 255) / 256, 256>>>(rx.dev, n);
-	if (ew_launch_ok() != 0)
-		return -1;
-	rc = ew_release(&rx);
-	if (rc < 0)
-		return -1;
-	return ew_finish_sync(rc) == 0 ? 0 : -1;
-}
-
-extern "C" int gpu_relu_forward(ann_real *x, int n)
-{
-	int rc;
-
-	pthread_mutex_lock(&g_ew_mu);
-	rc = gpu_relu_forward_locked(x, n);
 	pthread_mutex_unlock(&g_ew_mu);
 	return rc;
 }

@@ -220,8 +220,6 @@ int	gpu_posenc_add_packed(ann_real *x, int B, int T, int D);
 */
 int	gpu_mat_col_sum_add(ann_real *db_host, const ann_real *x, int rows,
 		int cols);
-/* x[i] = max(x[i], 0) in place over n elements. */
-int	gpu_relu_forward(ann_real *x, int n);
 /*
 ** ReLU backward in place: dx[i] = 0 where ref[i] <= 0, else unchanged.
 ** Mask convention: ref is the pre-activation (z) or the post-ReLU output /
@@ -293,9 +291,6 @@ int	gpu_pack_seq_rows(ann_real *dst, const ann_real *src, int B, int T,
 		int D);
 int	gpu_unpack_seq_rows(ann_real *dst, const ann_real *src, int B, int T,
 		int D);
-/* S8: x += bias then ReLU in one launch (rows x cols). */
-int	gpu_bias_relu_forward(ann_real *x, const ann_real *bias, int rows,
-		int cols);
 /*
 ** FFN W1 finish: optional bias into pre, hidden = ReLU(pre), publish BF16
 ** twin of hidden for the W2 GEMM. bias NULL means pre already includes bias.

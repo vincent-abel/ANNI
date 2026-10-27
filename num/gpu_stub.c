@@ -465,15 +465,6 @@ int gpu_unpack_seq_rows(ann_real *dst, const ann_real *src, int B, int T,
 	return -1;
 }
 
-int gpu_bias_relu_forward(ann_real *x, const ann_real *bias, int rows, int cols)
-{
-	(void)x;
-	(void)bias;
-	(void)rows;
-	(void)cols;
-	return -1;
-}
-
 int gpu_ffn_w1_finish(ann_real *hidden, ann_real *pre, const ann_real *bias,
 	int rows, int cols)
 {
@@ -614,13 +605,6 @@ int gpu_mat_col_sum_add(ann_real *db_host, const ann_real *x, int rows, int cols
 	(void)x;
 	(void)rows;
 	(void)cols;
-	return -1;
-}
-
-int gpu_relu_forward(ann_real *x, int n)
-{
-	(void)x;
-	(void)n;
 	return -1;
 }
 
