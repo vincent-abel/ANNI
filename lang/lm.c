@@ -394,6 +394,30 @@ int lm_logits_at(vec *logits, const lm *model, const mat *hidden, int t)
 **   db_head += column sums of delta
 ** The T x V logits/delta matrix is built once and reused in place.
 */
+/* logits += b_head on every row (GPU pass, host loop otherwise). */
+static void head_bias_add(lm *model, mat *delta, int rows)
+{
+	ann_real *dp;
+	ann_real *row;
+	int V;
+	int t;
+	int v;
+
+	V = model->vocab_size;
+	dp = mat_compute_ptr(delta);
+	if (dp && gpu_bias_row_add(dp, model->b_head->data, rows, V) == 0)
+		mat_mark_written(delta, dp);
+	else {
+		(void)mat_ensure_host(delta);
+		for (t = 0; t < rows; t++) {
+			row = &delta->data[(size_t)t * V];
+			for (v = 0; v < V; v++)
+				row[v] += model->b_head->data[v];
+		}
+		mat_host_dirty(delta);
+	}
+}
+
 /*
 ** Shared CE core: hv is rows x D (hidden of the predicting positions), tgt[t]
 ** the target of row t. Fills dhv (rows x D, host view) with dL/dhidden and
@@ -413,9 +437,11 @@ static int ce_rows_backward(lm *model, const mat *hv, const int *tgt, int rows,
 	int v;
 	int n_valid;	/* rows with a target; tgt -1 = masked (no loss) */
 	ann_real *ce_dp;	/* fused: logits buffer now holding the BF16 delta */
+	int bias_pending;	/* head bias left to the fused CE kernel */
 	int rc;
 
 	ce_dp = NULL;
+	bias_pending = 0;
 	V = model->vocab_size;
 	n_valid = 0;
 	for (t = 0; t < rows; t++) {
@@ -438,22 +464,16 @@ static int ce_rows_backward(lm *model, const mat *hv, const int *tgt, int rows,
 		}
 		mat_host_dirty(delta);
 	} else {
-		ann_real *dp;
-
 		if (mat_mul(delta, hv, model->w_head) != 0)
 			goto fail;
-		dp = mat_compute_ptr(delta);
-		if (dp && gpu_bias_row_add(dp, model->b_head->data, rows, V) == 0)
-			mat_mark_written(delta, dp);
-		else {
-			(void)mat_ensure_host(delta);
-			for (t = 0; t < rows; t++) {
-				row = &delta->data[(size_t)t * V];
-				for (v = 0; v < V; v++)
-					row[v] += model->b_head->data[v];
-			}
-			mat_host_dirty(delta);
-		}
+		/*
+		** The fused CE kernel below adds the bias at its load (same
+		** FP32 add, one 268 MB pass fewer); added here when it is off
+		** and before the FP32 steps when it does not apply.
+		*/
+		bias_pending = gpu_ce_bias_fused();
+		if (!bias_pending)
+			head_bias_add(model, delta, rows);
 	}
 
 	/*
@@ -467,6 +487,7 @@ static int ce_rows_backward(lm *model, const mat *hv, const int *tgt, int rows,
 		ce_sum = -1.0;
 		rc = dp && dp == delta->d_data
 		    ? gpu_ce_softmax_delta_bf16(dp, tgt, rows, V,
+		    bias_pending ? model->b_head->data : NULL,
 		    model->db_head->data, mean_ce_out ? &ce_sum : NULL) : -1;
 		if (rc == -2)
 			goto fail;
@@ -479,6 +500,8 @@ static int ce_rows_backward(lm *model, const mat *hv, const int *tgt, int rows,
 				    : -1.0;
 			goto gemms;
 		}
+		if (bias_pending)
+			head_bias_add(model, delta, rows);
 	}
 
 	/* 2. softmax rows (GPU first, host rows otherwise). */

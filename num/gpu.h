@@ -186,7 +186,12 @@ int	gpu_ce_delta_from_softmax(ann_real *probs, const int *tgt, int rows,
 ** gpu_ce_bf16_delta_done(logits) after both GEMMs: 0 when both consumed it.
 */
 int	gpu_ce_softmax_delta_bf16(ann_real *logits, const int *tgt, int rows,
-		int V, ann_real *db_host, double *mean_ce);
+		int V, const ann_real *bias, ann_real *db_host, double *mean_ce);
+/*
+** 1 when the head bias goes into gpu_ce_softmax_delta_bf16 (bias argument)
+** instead of a separate gpu_bias_row_add pass (ANN_CE_BIAS=0: 0).
+*/
+int	gpu_ce_bias_fused(void);
 int	gpu_ce_bf16_delta_done(const ann_real *logits);
 /*
 ** Probe loss: out[r] = logsumexp(logits[r]) - logits[r][tgt[r]] in FP32 for

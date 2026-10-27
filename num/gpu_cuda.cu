@@ -9171,11 +9171,13 @@ __global__ static void posenc_packed_kernel(ann_real *x, int B, int T, int D)
 ** and the BF16 store (the store overwrites FP32 values of the same row, read
 ** before the reductions' barriers). Blocks stride over the rows and keep
 ** their column sums in registers: one atomic per column and block at the end.
+** bias (B2, may be NULL): the head bias added at the load, row[j] + bias[j]
+** in FP32 exactly as bias_add_kernel did in a separate pass before.
 */
 template <int NV>
 __global__ static void __launch_bounds__(EW_BLOCK)
 ce_softmax_delta_bf16_kernel(ann_real *x, const int *tgt, int rows, int V,
-	ann_real *db, float *ce_sum)
+	const ann_real *bias, ann_real *db, float *ce_sum)
 {
 	__shared__ ann_real sh[EW_BLOCK];
 	float e[NV];
@@ -9209,7 +9211,8 @@ ce_softmax_delta_bf16_kernel(ann_real *x, const int *tgt, int rows, int V,
 		for (k = 0; k < NV; k++) {
 			const int j = threadIdx.x + k * blockDim.x;
 
-			e[k] = j < V ? row[j] : -INFINITY;
+			e[k] = j < V ? (bias ? row[j] + bias[j] : row[j])
+			    : -INFINITY;
 			if (j < V && e[k] > m)
 				m = e[k];
 		}
@@ -9254,7 +9257,7 @@ ce_softmax_delta_bf16_kernel(ann_real *x, const int *tgt, int rows, int V,
 
 /* Launch the instance for nv = ceil(V / bs); -1 = no instance that large. */
 static int ce_softmax_delta_bf16_launch(ann_real *x, const int *tgt,
-	int rows, int V, ann_real *db, float *ce_sum)
+	int rows, int V, const ann_real *bias, ann_real *db, float *ce_sum)
 {
 	static int n_sm;
 	const int bs = ew_block_for(V);
@@ -9281,7 +9284,7 @@ static int ce_softmax_delta_bf16_launch(ann_real *x, const int *tgt,
 #define CE_BF16_CASE(NV) \
 	case NV: \
 		ce_softmax_delta_bf16_kernel<NV><<<grid, bs>>>(x, tgt, rows, V, \
-		    db, ce_sum); \
+		    bias, db, ce_sum); \
 		return 0;
 	switch (nv <= 1 ? 1 : nv <= 2 ? 2 : nv <= 4 ? 4 : nv <= 8 ? 8
 	    : nv <= 16 ? 16 : nv <= 32 ? 32 : nv <= 64 ? 64 : 0) {
@@ -9308,13 +9311,16 @@ static int g_ce_last_rows;
 ** fused = 0: probs holds the softmax rows; the one-hot is subtracted in
 ** place (FP32) and db is summed from it. fused = 1: probs holds the logits;
 ** ce_softmax_delta_bf16_kernel does the softmax as well and leaves the BF16
-** delta in place (the caller registers the twin).
+** delta in place (the caller registers the twin). bias (fused only, may be
+** NULL): the head bias, not yet added to the logits.
 */
 static int ce_delta_run(ann_real *probs, const int *tgt, int rows, int V,
-	ann_real *db_host, double *mean_ce, int fused, int *launched)
+	const ann_real *bias, ann_real *db_host, double *mean_ce, int fused,
+	int *launched)
 {
 	ew_ref rp;
 	ew_ref rt;
+	ew_ref rb;
 	static ann_real *s_db_dev;
 	static ann_real *s_db_host;
 	static size_t s_db_cap;
@@ -9336,6 +9342,11 @@ static int ce_delta_run(ann_real *probs, const int *tgt, int rows, int V,
 		return -1;
 	}
 	if (ew_acquire(&rt, 1, tgt, nbt, 1, 0) != 0) {
+		pthread_mutex_unlock(&g_ew_mu);
+		return -1;
+	}
+	rb.dev = NULL;
+	if (fused && bias && ew_acquire_param(&rb, 2, bias, need_db) != 0) {
 		pthread_mutex_unlock(&g_ew_mu);
 		return -1;
 	}
@@ -9379,7 +9390,7 @@ static int ce_delta_run(ann_real *probs, const int *tgt, int rows, int V,
 #if CUDART_VERSION >= 11000
 		if (rp.dev != probs
 		    || ce_softmax_delta_bf16_launch(rp.dev, (const int *)rt.dev,
-		    rows, V, s_db_dev, g_ce_dev) != 0)
+		    rows, V, rb.dev, s_db_dev, g_ce_dev) != 0)
 			goto ce_fail;
 		*launched = 1;
 		if (ew_launch_ok() != 0)
@@ -9442,7 +9453,7 @@ extern "C" int gpu_ce_delta_from_softmax(ann_real *probs, const int *tgt,
 
 	int launched = 0;
 
-	return ce_delta_run(probs, tgt, rows, V, db_host, mean_ce, 0,
+	return ce_delta_run(probs, tgt, rows, V, NULL, db_host, mean_ce, 0,
 	    &launched);
 }
 
@@ -9456,10 +9467,25 @@ extern "C" int gpu_ce_delta_from_softmax(ann_real *probs, const int *tgt,
 ** destroyed, so the head's wgrad (peek) and dgrad (take) must both run on
 ** the twin, which gpu_ce_bf16_delta_done checks afterwards. -1 before any
 ** write (logits intact): run the FP32 steps; -2: failed after the kernel
-** was launched, the logits may be overwritten.
+** was launched, the logits may be overwritten. bias != NULL: the logits
+** are the bare GEMM output and the kernel adds the head bias itself (B2,
+** see gpu_ce_bias_fused); on -1 the caller still has to add it.
 */
+extern "C" int gpu_ce_bias_fused(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		const char *ev = getenv("ANN_CE_BIAS");
+
+		on = (ev && ev[0] == '0') ? 0 : 1;
+	}
+	return on;
+}
+
 extern "C" int gpu_ce_softmax_delta_bf16(ann_real *logits, const int *tgt,
-	int rows, int V, ann_real *db_host, double *mean_ce)
+	int rows, int V, const ann_real *bias, ann_real *db_host,
+	double *mean_ce)
 {
 #if CUDART_VERSION >= 11000
 	OpScope _op(OP_CE);
@@ -9484,8 +9510,8 @@ extern "C" int gpu_ce_softmax_delta_bf16(ann_real *logits, const int *tgt,
 	n = (size_t)rows * (size_t)V;
 	if (n > (size_t)0x7fffffff)
 		return -1;
-	if (ce_delta_run(logits, tgt, rows, V, db_host, mean_ce, 1, &launched)
-	    != 0)
+	if (ce_delta_run(logits, tgt, rows, V, bias, db_host, mean_ce, 1,
+	    &launched) != 0)
 		return launched ? -2 : -1;	/* -2: the logits are lost */
 	pthread_mutex_lock(&g_gemm_mu);
 	g_grad_twin[GRAD_TWIN_INPLACE].half = (void *)logits;
