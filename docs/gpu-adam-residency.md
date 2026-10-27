@@ -26,7 +26,7 @@ Per element: \(g\leftarrow g/B\); \(m\leftarrow\beta_1 m+(1-\beta_1)g\); \(v\lef
 ## How it shows up in this repo
 
 - [`lang/lm_adam.c`](../lang/lm_adam.c): `lm_adam_step_scaled(opt, lr, 1/B)` folds batch scaling into Adam. On GPU, persistent host/device flats are allocated once; `m`/`v` stay on the device across steps (uploaded on first step, synced back by `lm_adam_sync_host` before checkpoint save); each step uploads only packed param+grad and downloads param.
-- [`num/gpu.h`](../num/gpu.h): `gpu_adam_step_dev` (device pointers, `grad_scale` argument) and the one-shot host wrapper `gpu_adam_step`.
+- [`num/gpu.h`](../num/gpu.h): `gpu_adam_step_dev_bf16` (device pointers, `grad_scale` argument; the older `gpu_adam_step_dev` and host wrapper `gpu_adam_step` were removed).
 - [`lang/lm_train.c`](../lang/lm_train.c): no host `scale_grads` pass and no batch-boundary `mat_ensure_host`.
 - [Adam step on GPU](gpu-adam.md), [Host↔device sync](gpu-batch-sync.md)
 

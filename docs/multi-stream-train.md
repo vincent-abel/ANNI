@@ -6,7 +6,7 @@ Overlap host→device staging with compute where a second CUDA stream helps. R8 
 
 ## How it shows up in this repo
 
-- `gpu_copy_stream()` / `gpu_stream_sync_copy()` in [`num/gpu.h`](../num/gpu.h)
+- `gpu_copy_stream()` in [`num/gpu.h`](../num/gpu.h)
 - Packed train calls `gpu_copy_stream()` during `pack_ctx` init ([`lang/lm_train.c`](../lang/lm_train.c))
 - Embed gather uses the copy stream for async H2D ([`num/gpu_cuda.cu`](../num/gpu_cuda.cu))
 - Adam gather/scatter and fused attn stay on the default stream (mutex-serialized); dual-stream Adam would need graph-safe event waits — deferred

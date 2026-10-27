@@ -88,7 +88,6 @@ static lm *lm_create_with(vocab *v, bpe *tok)
 	model->b_head = vec_create(model->vocab_size);
 	model->dw_head = mat_create(LM_D_MODEL, model->vocab_size);
 	model->db_head = vec_create(model->vocab_size);
-	model->w_head_q = NULL;
 	if (!model->embed || !model->tr || !model->w_head || !model->b_head
 	    || !model->dw_head || !model->db_head) {
 		model->bpe = NULL;	/* caller keeps ownership on failure */
@@ -165,19 +164,8 @@ void lm_free(lm **model)
 	vec_free(&(*model)->b_head);
 	mat_free(&(*model)->dw_head);
 	vec_free(&(*model)->db_head);
-	qmat_free(&(*model)->w_head_q);
 	free(*model);
 	*model = NULL;
-}
-
-int lm_quantize_head(lm *model)
-{
-	if (!model || !model->w_head)
-		return -1;
-	qmat_free(&model->w_head_q);
-	(void)mat_pull_host(model->w_head);
-	model->w_head_q = qmat_from_mat(model->w_head);
-	return model->w_head_q ? 0 : -1;
 }
 
 void lm_zero_grad(lm *model)
@@ -355,10 +343,7 @@ int lm_logits_at(vec *logits, const lm *model, const mat *hidden, int t)
 	if (logits->n != model->vocab_size)
 		return -1;
 	h = &hidden->data[t * hidden->cols];
-	if (model->w_head_q) {
-		if (qmat_gemv_t(logits, model->w_head_q, h) != 0)
-			return -1;
-	} else {
+	{
 		/* Stack row views start host-only. The GEMM may pin a twin. */
 		hrow.data = (ann_real *)h;
 		hrow.d_data = NULL;
@@ -427,7 +412,6 @@ static int ce_rows_backward(lm *model, const mat *hv, const int *tgt, int rows,
 	mat *dhv, double *mean_ce_out)
 {
 	mat *delta;
-	vec lrow;
 	ann_real *tmp;
 	ann_real *row;
 	double ce_sum;
@@ -455,15 +439,7 @@ static int ce_rows_backward(lm *model, const mat *hv, const int *tgt, int rows,
 	mat_try_pin(dhv);
 
 	/* 1. logits for every position. */
-	if (model->w_head_q) {
-		for (t = 0; t < rows; t++) {
-			lrow.data = &delta->data[(size_t)t * V];
-			lrow.n = V;
-			if (lm_logits_at(&lrow, model, hv, t) != 0)
-				goto fail;
-		}
-		mat_host_dirty(delta);
-	} else {
+	{
 		if (mat_mul(delta, hv, model->w_head) != 0)
 			goto fail;
 		/*
@@ -481,7 +457,7 @@ static int ce_rows_backward(lm *model, const mat *hv, const int *tgt, int rows,
 	** the delta as BF16 only, in place over the logits, for the two GEMMs
 	** below (gpu_ce_softmax_delta_bf16). The FP32 delta is never formed.
 	*/
-	if (!model->w_head_q) {
+	{
 		ann_real *dp = mat_compute_ptr(delta);
 
 		ce_sum = -1.0;
@@ -947,7 +923,7 @@ int lm_batch_auto(int T, int vocab_size, size_t free_bytes, double frac,
 ** row). logits are never softmaxed in place: gpu_ce_nll_rows writes the FP32
 ** log-sum-exp - target logit of each row; the host sums them in FP64.
 ** win_nll[b] = mean CE over the T-1 predicting rows of window b. -1 = not
-** applicable (host head, quantized head, no GPU, B == 1): use lm_nll.
+** applicable (host head, no GPU, B == 1): use lm_nll.
 */
 int lm_nll_packed(lm *model, lm_cache *c, const int *ids, int B, int T,
 	double *win_nll)
@@ -964,7 +940,7 @@ int lm_nll_packed(lm *model, lm_cache *c, const int *ids, int B, int T,
 	int rc;
 
 	if (!model || !c || !ids || !win_nll || B <= 1 || T < 2 || c->B != B
-	    || c->T != T || model->w_head_q || !gpu_available())
+	    || c->T != T || !gpu_available())
 		return -1;
 	V = model->vocab_size;
 	rows = B * (T - 1);

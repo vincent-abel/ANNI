@@ -5,6 +5,7 @@
 #include <limits.h>
 #include <time.h>
 #include "../main.h"
+#include "quant.h"
 
 static void test_mse_known(void)
 {
@@ -1416,14 +1417,9 @@ static void test_gpu_gemm_bwd_stub(void)
 	da = mat_create(2, 2);
 	db = mat_create(2, 2);
 	assert(a && b && c && da && db);
-	assert(gpu_mat_mul_backward(da, db, c, a, b) != 0);
 	assert(gpu_mat_mul_bt(c, a, b) != 0);
 	assert(gpu_mat_mul_at(c, a, b) != 0);
 	assert(gpu_mat_outer_add(da, a, b) != 0);
-	assert(gpu_adam_step(a->data, b->data, c->data, da->data, 4,
-	    0.01, 0.9, 0.999, 1e-8, 1, 1.0) != 0);
-	assert(gpu_adam_step_dev(a->data, b->data, c->data, da->data, 4,
-	    0.01, 0.9, 0.999, 1e-8, 1, 1.0) != 0);
 	assert(gpu_dec_create(1, 2, 2, 2, 2, 1) == NULL);
 	mat_free(&a);
 	mat_free(&b);

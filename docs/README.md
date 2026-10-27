@@ -361,7 +361,7 @@ OpenMP splits mat_mul tiles and attention heads across cores. Each head keeps pr
 ann_dot picks AVX-512, AVX2, or scalar at compile time. Pass ARCH=-mavx2 when the CPU supports it. ann_simd_backend reports which path linked.
 
 ### [Quantization](quantization.md)
-Int8 qmat stores weights with one scale for cheaper inference GEMVs. lm_quantize_head packs the LM head; lm_logits_at uses it when present. Training remains full precision.
+Int8 qmat stores weights with one scale for cheaper inference GEMVs (the LM-head hook lm_quantize_head was removed: nothing called it). Training remains full precision.
 
 ### [Optimized inference](optimized-inference.md)
 A KV cache stores per-layer Keys and Values so generate attends only the new query. lm_generate_kv walks the prompt once then appends tokens. lm_generate prefers that path with a full-reforward fallback.
@@ -375,7 +375,7 @@ Default builds link a CPU GPU stub so make test needs no CUDA. make cuda swaps i
 Mats may own a CUDA d_data twin with H2D/D2H helpers. Attention and LM caches try to pin H/Q/K/V when a GPU is present. The CPU stub leaves pinning as a no-op.
 
 ### [CUDA GEMM backward](cuda-gemm-backward.md)
-gpu_mat_mul_backward forms dA and dB for C=AB on device. mat_mul_bt and mat_outer_add try GPU kernels then fall back to CPU. Stubs keep make test green without nvcc.
+gpu_mat_mul_bt and gpu_mat_mul_at form dA and dB for C=AB on device (the combined gpu_mat_mul_backward was removed). mat_mul_bt and mat_outer_add try GPU kernels then fall back to CPU. Stubs keep make test green without nvcc.
 
 ### [Attention backward on GPU](gpu-attention-backward.md)
 MHA backward uses mat_mul, mat_mul_bt, mat_mul_at, and outer_add so CUDA GEMMs apply. Softmax Jacobian rows stay on the host.
@@ -387,7 +387,7 @@ FFN backward is GEMM-shaped with a ReLU mask. LayerNorm tries a CUDA row kernel 
 CE delta updates dw_head via mat_outer_add so CUDA outer_add can run. dhidden accumulates W times delta on the host for the toy vocab.
 
 ### [Adam step on GPU](gpu-adam.md)
-lm_adam_step packs flat param/grad/m/v buffers and tries gpu_adam_step. CUDA Adam updates moments and weights then zeros grads; stubs keep the host loop.
+lm_adam_step packs flat param/grad/m/v buffers and runs gpu_adam_step_dev_bf16 on the device-resident flat buffers. CUDA Adam updates moments and weights then zeros grads; stubs keep the host loop.
 
 ### [KV-cache generate on GPU](gpu-kv-generate.md)
 Decode-step attention tries gpu_kv_attn_decode for QKV, K/V append, scores, and Wo. Softmax of the short score row stays on the host; sampling stays on the host.

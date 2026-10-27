@@ -157,17 +157,6 @@ int gpu_mat_mul(mat *c, const mat *a, const mat *b)
 	return -1;
 }
 
-int gpu_mat_mul_backward(mat *da, mat *db, const mat *dc,
-	const mat *a, const mat *b)
-{
-	(void)da;
-	(void)db;
-	(void)dc;
-	(void)a;
-	(void)b;
-	return -1;
-}
-
 int gpu_mat_mul_bt(mat *c, const mat *a, const mat *b)
 {
 	(void)c;
@@ -290,20 +279,6 @@ int gpu_softmax_bwd_rows(ann_real *dx, const ann_real *y, const ann_real *dy,
 	(void)dy;
 	(void)n_rows;
 	(void)n_cols;
-	return -1;
-}
-
-int gpu_layernorm_forward(ann_real *y, const ann_real *x, const ann_real *gamma,
-	const ann_real *beta, ann_real *x_hat, ann_real *inv_std, int T, int d)
-{
-	(void)y;
-	(void)x;
-	(void)gamma;
-	(void)beta;
-	(void)x_hat;
-	(void)inv_std;
-	(void)T;
-	(void)d;
 	return -1;
 }
 
@@ -517,9 +492,19 @@ int gpu_adam_step_dev_bf16(ann_real *d_param, void *d_param_bf16,
 	ann_real *d_grad, ann_real *d_m, ann_real *d_v, int n, double lr,
 	double beta1, double beta2, double eps, int t, double grad_scale)
 {
+	(void)d_param;
 	(void)d_param_bf16;
-	return gpu_adam_step_dev(d_param, d_grad, d_m, d_v, n, lr, beta1, beta2,
-	    eps, t, grad_scale);
+	(void)d_grad;
+	(void)d_m;
+	(void)d_v;
+	(void)n;
+	(void)lr;
+	(void)beta1;
+	(void)beta2;
+	(void)eps;
+	(void)t;
+	(void)grad_scale;
+	return -1;
 }
 
 int gpu_ce_fetch_mean(double *mean_ce, int rows)
@@ -619,41 +604,6 @@ int gpu_relu_backward(ann_real *dx, const ann_real *x_pre_relu_or_mask, int n)
 	(void)dx;
 	(void)x_pre_relu_or_mask;
 	(void)n;
-	return -1;
-}
-
-int gpu_adam_step(ann_real *param, ann_real *grad, ann_real *m, ann_real *v, int n,
-	double lr, double beta1, double beta2, double eps, int t, double grad_scale)
-{
-	(void)param;
-	(void)grad;
-	(void)m;
-	(void)v;
-	(void)n;
-	(void)lr;
-	(void)beta1;
-	(void)beta2;
-	(void)eps;
-	(void)t;
-	(void)grad_scale;
-	return -1;
-}
-
-int gpu_adam_step_dev(ann_real *d_param, ann_real *d_grad, ann_real *d_m,
-	ann_real *d_v, int n, double lr, double beta1, double beta2, double eps,
-	int t, double grad_scale)
-{
-	(void)d_param;
-	(void)d_grad;
-	(void)d_m;
-	(void)d_v;
-	(void)n;
-	(void)lr;
-	(void)beta1;
-	(void)beta2;
-	(void)eps;
-	(void)t;
-	(void)grad_scale;
 	return -1;
 }
 
@@ -759,10 +709,6 @@ void gpu_host_free(void *p)
 void *gpu_copy_stream(void)
 {
 	return NULL;
-}
-
-void gpu_stream_sync_copy(void)
-{
 }
 
 int gpu_graph_begin(void)

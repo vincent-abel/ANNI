@@ -8,7 +8,6 @@
 #include "bpe.h"
 #include "embed.h"
 #include "mat.h"
-#include "quant.h"
 #include "vocab.h"
 
 typedef struct	lm {
@@ -20,7 +19,6 @@ typedef struct	lm {
 	vec		*b_head;
 	mat		*dw_head;
 	vec		*db_head;
-	qmat		*w_head_q;	/* optional int8 head for inference */
 	int		vocab_size;
 } lm;
 
@@ -72,7 +70,6 @@ void	lm_wgrads_zero_device(lm *model);
 int	lm_forward(mat *hidden, const lm *model, const int *ids, int n);
 int	lm_forward_cache(lm *model, const int *ids, int n, lm_cache *c);
 int	lm_logits_at(vec *logits, const lm *model, const mat *hidden, int t);
-int	lm_quantize_head(lm *model);
 /* mean_ce may be NULL; otherwise receives mean softmax CE over predicting rows. */
 int	lm_loss_backward(lm *model, const lm_cache *c, const int *ids, int n,
 		mat *dhidden, double *mean_ce);
