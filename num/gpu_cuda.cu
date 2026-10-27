@@ -184,6 +184,7 @@ typedef struct {
 	cublasLtMatrixLayout_t layoutA, layoutB, layoutC;
 	const float	*bias;
 	size_t		ws;
+	int		align;	/* lt_align_key of the pointers the algo was chosen for */
 } lt_algo_entry;
 static lt_algo_entry g_lt_algo[LT_ALGO_CACHE];
 /* Device bias scratch for Lt epilogues (host vec biases are not aliased). */
@@ -301,6 +302,57 @@ static int lt_heuristic_only(void)
 }
 
 /*
+** Largest power of two (<= 256) dividing p. The heuristic assumes 256-byte
+** aligned operands unless told otherwise, and cublasLtMatmul refuses an
+** algorithm whose vector loads the actual pointers do not allow: a weight
+** twin inside the Adam flat sits at its parameter's offset (2-byte aligned
+** for an odd-length vector before it), so the cached algorithm of the first
+** call was refused from the second optimizer step on and the GEMM fell back.
+*/
+static unsigned lt_ptr_align(const void *p)
+{
+	uintptr_t a = (uintptr_t)p;
+	unsigned al = 256;
+
+	while (al > 1 && (a & (al - 1)) != 0)
+		al >>= 1;
+	return al;
+}
+
+/* The four operand alignments in one int (log2 of each, 4 bits apiece). */
+static int lt_align_key(const void *a, const void *b, const void *c,
+	const void *d)
+{
+	const void *p[4];
+	int key = 0;
+	int i;
+
+	p[0] = a; p[1] = b; p[2] = c; p[3] = d;
+	for (i = 0; i < 4; i++) {
+		unsigned al = lt_ptr_align(p[i]);
+		int lg = 0;
+
+		while ((1u << lg) < al)
+			lg++;
+		key |= lg << (4 * i);
+	}
+	return key;
+}
+
+/* ANN_LT_LOG=1: say when a cached cuBLASLt algorithm is refused at run time. */
+static int lt_log_on(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		const char *e = getenv("ANN_LT_LOG");
+
+		on = (e && e[0] == '1') ? 1 : 0;
+	}
+	return on;
+}
+
+/*
 ** cuBLASLt BF16 GEMM with cached heuristic. Falls back to GemmEx.
 ** Column-major dims match existing GemmEx callers (N,M,K with opa/opb).
 ** epi/bias_dev: optional Lt epilogue (BIAS / RELU_BIAS); bias length = N.
@@ -323,6 +375,7 @@ static int cublas_lt_gemm_half(cublasOperation_t opa, cublasOperation_t opb,
 	int epi_i;
 	lt_algo_entry *e;
 	size_t ws_need;
+	int ak;
 
 	if (cublas_ensure() != 0)
 		return -1;
@@ -333,12 +386,14 @@ static int cublas_lt_gemm_half(cublasOperation_t opa, cublasOperation_t opb,
 	if (!bf16)
 		return -1;	/* FP16 was removed */
 	dt = CUDA_R_16BF;
+	/* Lt roles: layoutA = B, layoutB = A, then C and D. */
+	ak = lt_align_key(B, A, C, D);
 	for (i = 0; i < LT_ALGO_CACHE; i++) {
 		e = &g_lt_algo[i];
 		if (e->valid && e->M == M && e->N == N && e->K == K
 		    && e->opa == (int)opa && e->opb == (int)opb
 		    && e->bf16 == bf16 && e->fp8 == 0 && e->epi == epi_i
-		    && e->obf == out_bf16) {
+		    && e->obf == out_bf16 && e->align == ak) {
 			slot = i;
 			break;
 		}
@@ -353,6 +408,7 @@ static int cublas_lt_gemm_half(cublasOperation_t opa, cublasOperation_t opb,
 	if (e->handles && e->valid && e->M == M && e->N == N && e->K == K
 	    && e->opa == (int)opa && e->opb == (int)opb && e->bf16 == bf16
 	    && e->fp8 == 0 && e->epi == epi_i && e->obf == out_bf16
+	    && e->align == ak
 	    && e->lda == lda && e->ldb == ldb && e->ldc == ldc) {
 		if (bias_dev != e->bias) {
 			(void)cublasLtMatmulDescSetAttribute(e->desc,
@@ -364,6 +420,9 @@ static int cublas_lt_gemm_half(cublasOperation_t opa, cublasOperation_t opb,
 		    A, e->layoutB, beta, C, e->layoutC, D, e->layoutC,
 		    &e->algo, g_lt_workspace,
 		    e->ws > 0 ? e->ws : g_lt_workspace_bytes, g_st);
+		if (st != CUBLAS_STATUS_SUCCESS && lt_log_on())
+			fprintf(stderr, "[lt] cached algo refused (status %d): M %d N %d K %d epi %d obf %d align key %#x\n",
+			    (int)st, M, N, K, epi_i, out_bf16, ak);
 		return st == CUBLAS_STATUS_SUCCESS ? 0 : -1;
 	}
 	if (e->handles) {
@@ -447,10 +506,28 @@ static int cublas_lt_gemm_half(cublasOperation_t opa, cublasOperation_t opb,
 	ws_need = g_lt_workspace_bytes;
 	(void)cublasLtMatmulPreferenceSetAttribute(pref,
 	    CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws_need, sizeof(ws_need));
+	/* Only algorithms the actual operand alignments allow (lt_ptr_align). */
+	{
+		uint32_t alv[4];
+
+		alv[0] = lt_ptr_align(B);
+		alv[1] = lt_ptr_align(A);
+		alv[2] = lt_ptr_align(C);
+		alv[3] = lt_ptr_align(D);
+		(void)cublasLtMatmulPreferenceSetAttribute(pref,
+		    CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_A_BYTES, &alv[0], sizeof(alv[0]));
+		(void)cublasLtMatmulPreferenceSetAttribute(pref,
+		    CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_B_BYTES, &alv[1], sizeof(alv[1]));
+		(void)cublasLtMatmulPreferenceSetAttribute(pref,
+		    CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_C_BYTES, &alv[2], sizeof(alv[2]));
+		(void)cublasLtMatmulPreferenceSetAttribute(pref,
+		    CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_D_BYTES, &alv[3], sizeof(alv[3]));
+	}
 
 	if (!e->valid || e->M != M || e->N != N || e->K != K
 	    || e->opa != (int)opa || e->opb != (int)opb || e->bf16 != bf16
-	    || e->fp8 != 0 || e->epi != epi_i || e->obf != out_bf16) {
+	    || e->fp8 != 0 || e->epi != epi_i || e->obf != out_bf16
+	    || e->align != ak) {
 		cublasLtMatmulHeuristicResult_t heurs[16];
 		cublasLtMatmulHeuristicResult_t alt_best;
 		int alt_won = 0;
@@ -627,6 +704,7 @@ static int cublas_lt_gemm_half(cublasOperation_t opa, cublasOperation_t opb,
 		e->fp8 = 0;
 		e->epi = epi_i;
 		e->obf = out_bf16;
+		e->align = ak;
 		e->lda = lda;
 		e->ldb = ldb;
 		e->ldc = ldc;
@@ -641,6 +719,9 @@ static int cublas_lt_gemm_half(cublasOperation_t opa, cublasOperation_t opb,
 	st = cublasLtMatmul(g_cublaslt, op, alpha, B, layoutA, A, layoutB, beta,
 	    C, layoutC, D, layoutC, &e->algo,
 	    g_lt_workspace, e->ws > 0 ? e->ws : g_lt_workspace_bytes, g_st);
+	if (st != CUBLAS_STATUS_SUCCESS && lt_log_on())
+		fprintf(stderr, "[lt] algo refused (status %d): M %d N %d K %d epi %d obf %d align key %#x\n",
+		    (int)st, M, N, K, epi_i, out_bf16, ak);
 	cublasLtMatmulPreferenceDestroy(pref);
 	return st == CUBLAS_STATUS_SUCCESS ? 0 : -1;
 }
