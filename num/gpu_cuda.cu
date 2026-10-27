@@ -2171,6 +2171,8 @@ static int lt_bias_upload(const ann_real *bias_host, int N)
 	    == cudaSuccess ? 0 : -1;
 }
 
+static const void *lt_bias_cached(const ann_real *host, int N, int bf16);
+
 /*
 ** Row-major C = epi(A B + bias). epi is BIAS or RELU_BIAS. Bias length N.
 */
@@ -2189,16 +2191,19 @@ static int cublas_gemm_rm_epi_res(ann_real *dC, const ann_real *dA,
 	int use_bf16;
 	void *hA_use;
 	void *hB_use;
+	const void *bias_dev = NULL;
 	int rc;
 
 	if (cublas_ensure() != 0)
 		return -1;
-	if (bias_host && lt_bias_upload(bias_host, N) != 0)
-		return -1;
 	if (!bias_host && epi != CUBLASLT_EPILOGUE_DEFAULT)
 		return -1;
+	if (bias_host)
+		bias_dev = lt_bias_cached(bias_host, N, out_bf16);
+	if (bias_host && !bias_dev && lt_bias_upload(bias_host, N) != 0)
+		return -1;
 	pthread_mutex_lock(&g_gemm_mu);
-	if (bias_host && out_bf16) {
+	if (bias_host && out_bf16 && !bias_dev) {
 		/* The epilogue bias in BF16, as the BF16 output requires. */
 		if (ensure_half_buf(&g_lt_bias16, &g_lt_bias16_cap, (size_t)N * 2) != 0
 		    || half_wt_convert(g_lt_bias16, g_lt_bias_dev, N, 1) != 0) {
@@ -2243,7 +2248,8 @@ static int cublas_gemm_rm_epi_res(ann_real *dC, const ann_real *dA,
 	}
 	rc = cublas_lt_gemm_half(CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha,
 	    hB_use, N, hA_use, K, &beta, res ? (ann_real *)res : dC, N, 1, epi,
-	    bias_host ? (out_bf16 ? (const float *)g_lt_bias16 : g_lt_bias_dev) : NULL,
+	    !bias_host ? NULL : bias_dev ? (const float *)bias_dev
+	    : (out_bf16 ? (const float *)g_lt_bias16 : g_lt_bias_dev),
 	    res ? dC : NULL, out_bf16);
 	pthread_mutex_unlock(&g_gemm_mu);
 	return rc;
@@ -3554,12 +3560,17 @@ static int ew_is_dev(const void *p)
 }
 
 /* Small host vectors (bias/LN) reused across launches until g_wt_epoch bumps. */
-#define BIAS_CACHE_SLOTS	64
+/* 128: 12 layers x (LN1, LN2 gamma/beta + FFN b1/b2) + head is about 75. */
+#define BIAS_CACHE_SLOTS	128
 typedef struct {
 	const void	*host;
 	void		*dev;
 	size_t		bytes;
 	unsigned	epoch;
+	void		*dev16;		/* BF16 copy of dev (lt_bias_cached) */
+	size_t		bytes16;
+	const void	*src16;		/* dev it was converted from */
+	unsigned	epoch16;
 } bias_cache_ent;
 static bias_cache_ent g_bias_cache[BIAS_CACHE_SLOTS];
 
@@ -3629,6 +3640,81 @@ static void *bias_cache_get(const void *host, size_t bytes)
 	return e->dev;
 }
 
+/*
+** B1: device copy of a cuBLASLt epilogue bias (FFN b1 / b2) served from the
+** parameter cache above instead of a blocking pageable cudaMemcpy per GEMM
+** (24 syncs per microbatch), plus its BF16 copy for the BF16-output W1
+** epilogue, converted once per weight epoch with the same f32_to_bf16 RN
+** kernel (12 conversions per microbatch saved). Same values, so the GEMMs
+** are bit-identical. The host bias only changes in an Adam scatter or a
+** load, both of which bump g_wt_epoch (as for the LN and head vectors
+** already served from this cache). ANN_LT_BIAS_CACHE=0 restores the
+** per-GEMM upload. NULL = use the upload path.
+*/
+static int lt_bias_cache_on(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		const char *e = getenv("ANN_LT_BIAS_CACHE");
+
+		on = (e && e[0] == '0') ? 0 : 1;
+	}
+	return on;
+}
+
+static const void *lt_bias_cached(const ann_real *host, int N, int bf16)
+{
+	bias_cache_ent *e = NULL;
+	void *dev;
+	size_t nb16;
+	int i;
+
+	if (!host || N <= 0 || !lt_bias_cache_on())
+		return NULL;
+	pthread_mutex_lock(&g_ew_mu);
+	dev = bias_cache_get(host, (size_t)N * sizeof(ann_real));
+	if (!dev || !bf16) {
+		pthread_mutex_unlock(&g_ew_mu);
+		return dev;
+	}
+	for (i = 0; i < BIAS_CACHE_SLOTS; i++) {
+		if (g_bias_cache[i].host == host && g_bias_cache[i].dev == dev) {
+			e = &g_bias_cache[i];
+			break;
+		}
+	}
+	nb16 = (size_t)N * 2;
+	if (!e) {
+		pthread_mutex_unlock(&g_ew_mu);
+		return NULL;
+	}
+	if (!e->dev16 || e->bytes16 < nb16) {
+		if (e->dev16)
+			cudaFree(e->dev16);
+		e->dev16 = NULL;
+		e->bytes16 = 0;
+		e->src16 = NULL;
+		if (cudaMalloc(&e->dev16, nb16) != cudaSuccess) {
+			e->dev16 = NULL;
+			pthread_mutex_unlock(&g_ew_mu);
+			return NULL;
+		}
+		e->bytes16 = nb16;
+	}
+	if (e->src16 != dev || e->epoch16 != g_wt_epoch) {
+		if (half_wt_convert(e->dev16, (const ann_real *)dev, N, 1) != 0) {
+			e->src16 = NULL;
+			pthread_mutex_unlock(&g_ew_mu);
+			return NULL;
+		}
+		e->src16 = dev;
+		e->epoch16 = g_wt_epoch;
+	}
+	pthread_mutex_unlock(&g_ew_mu);
+	return e->dev16;
+}
+
 extern "C" void gpu_host_forget(const void *host)
 {
 	int i;
@@ -3653,9 +3739,14 @@ extern "C" void gpu_host_forget(const void *host)
 		if (g_bias_cache[i].host == host) {
 			if (g_bias_cache[i].dev)
 				cudaFree(g_bias_cache[i].dev);
+			if (g_bias_cache[i].dev16)
+				cudaFree(g_bias_cache[i].dev16);
 			g_bias_cache[i].dev = NULL;
 			g_bias_cache[i].host = NULL;
 			g_bias_cache[i].bytes = 0;
+			g_bias_cache[i].dev16 = NULL;
+			g_bias_cache[i].bytes16 = 0;
+			g_bias_cache[i].src16 = NULL;
 		}
 	}
 	for (i = 0; i < COLSUM_ACC_SLOTS; i++) {
