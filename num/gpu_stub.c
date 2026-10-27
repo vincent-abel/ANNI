@@ -563,13 +563,19 @@ int gpu_ce_nll_rows(const ann_real *logits, const int *tgt, int rows, int V,
 	return -1;
 }
 
+int gpu_ce_bias_fused(void)
+{
+	return 0;
+}
+
 int gpu_ce_softmax_delta_bf16(ann_real *logits, const int *tgt, int rows,
-	int V, ann_real *db_host, double *mean_ce)
+	int V, const ann_real *bias, ann_real *db_host, double *mean_ce)
 {
 	(void)logits;
 	(void)tgt;
 	(void)rows;
 	(void)V;
+	(void)bias;
 	(void)db_host;
 	(void)mean_ce;
 	return -1;
