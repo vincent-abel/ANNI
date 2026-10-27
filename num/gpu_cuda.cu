@@ -8997,9 +8997,89 @@ __global__ static void embed_scatter_kernel(ann_real *dtable, const ann_real *do
 	atomicAdd(&dtable[id * d + j], dout[i]);
 }
 
+/*
+** B8: host index vectors (token ids, CE targets) staged through a pinned
+** buffer into a persistent device buffer, async on the main stream, instead
+** of cudaMalloc + a pageable copy + cudaFree per call (cudaFree and the
+** pageable copy synchronise with the device at every microbatch boundary).
+** The event guards the pinned buffer: the host refills it only once the
+** previous copy out of it has completed, which in training happened a
+** microbatch earlier. The device buffer is reused in stream order. Not
+** while capturing a graph. ANN_MB_NOSYNC=0 restores the old paths.
+*/
+typedef struct {
+	void		*dev;
+	void		*pin;
+	size_t		cap;
+	cudaEvent_t	ev;
+	int		ev_ok;
+	int		pending;
+} h2d_stage;
+
+static int mb_nosync_on(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		const char *e = getenv("ANN_MB_NOSYNC");
+
+		on = (e && e[0] == '0') ? 0 : 1;
+	}
+	return on;
+}
+
+/* Device copy of host[0..bytes) on stream 0; NULL = use the old path. */
+static void *h2d_stage_put(h2d_stage *s, const void *host, size_t bytes)
+{
+	if (!host || bytes == 0 || !mb_nosync_on() || stream_is_capturing())
+		return NULL;
+	if (s->pending) {
+		if (cudaEventSynchronize(s->ev) != cudaSuccess)
+			return NULL;
+		s->pending = 0;
+	}
+	if (!s->ev_ok) {
+		if (cudaEventCreateWithFlags(&s->ev, cudaEventDisableTiming)
+		    != cudaSuccess)
+			return NULL;
+		s->ev_ok = 1;
+	}
+	if (s->cap < bytes) {
+		if (s->dev)
+			cudaFree(s->dev);
+		if (s->pin)
+			cudaFreeHost(s->pin);
+		s->dev = NULL;
+		s->pin = NULL;
+		s->cap = 0;
+		if (cudaMalloc(&s->dev, bytes) != cudaSuccess) {
+			s->dev = NULL;
+			return NULL;
+		}
+		if (cudaHostAlloc(&s->pin, bytes, cudaHostAllocDefault)
+		    != cudaSuccess) {
+			cudaFree(s->dev);
+			s->dev = NULL;
+			s->pin = NULL;
+			return NULL;
+		}
+		s->cap = bytes;
+	}
+	memcpy(s->pin, host, bytes);
+	if (cudaMemcpyAsync(s->dev, s->pin, bytes, cudaMemcpyHostToDevice, 0)
+	    != cudaSuccess)
+		return NULL;
+	if (cudaEventRecord(s->ev, 0) == cudaSuccess)
+		s->pending = 1;
+	else if (cudaStreamSynchronize(0) != cudaSuccess)
+		return NULL;
+	return s->dev;
+}
+
 extern "C" int gpu_embed_lookup(mat *out, const mat *table, const int *ids, int n)
 {
 	OpScope _op(OP_EMBED);
+	static h2d_stage s_ids;
 	int *d_ids;
 	int d;
 	int nd;
@@ -9013,6 +9093,16 @@ extern "C" int gpu_embed_lookup(mat *out, const mat *table, const int *ids, int 
 	if (mat_ensure_dev_auth((mat *)table) != 0 || mat_device_alloc(out) != 0)
 		return -1;
 	ib = (size_t)n * sizeof(int);
+	d_ids = (int *)h2d_stage_put(&s_ids, ids, ib);
+	if (d_ids) {
+		nd = n * d;
+		embed_lookup_kernel<<<(nd + 255) / 256, 256>>>(out->d_data,
+		    table->d_data, d_ids, n, d);
+		if (launch_done() != 0)
+			return -1;
+		out->on_device = MAT_DEV_DEVICE;
+		return 0;
+	}
 	d_ids = (int *)gpu_malloc(ib);
 	if (!d_ids)
 		return -1;
@@ -9042,6 +9132,7 @@ extern "C" int gpu_embed_scatter(mat *dtable, const mat *dout, const int *ids,
 	int n)
 {
 	OpScope _op(OP_EMBED);
+	static h2d_stage s_ids;
 	int *d_ids;
 	int d;
 	int nd;
@@ -9061,6 +9152,16 @@ extern "C" int gpu_embed_scatter(mat *dtable, const mat *dout, const int *ids,
 		dtable->on_device = MAT_DEV_SYNCED;
 	}
 	ib = (size_t)n * sizeof(int);
+	d_ids = (int *)h2d_stage_put(&s_ids, ids, ib);
+	if (d_ids) {
+		nd = n * d;
+		embed_scatter_kernel<<<(nd + 255) / 256, 256>>>(dtable->d_data,
+		    dout->d_data, d_ids, n, d);
+		if (launch_done() != 0)
+			return -1;
+		dtable->on_device = MAT_DEV_DEVICE;
+		return 0;
+	}
 	d_ids = (int *)gpu_malloc(ib);
 	if (!d_ids)
 		return -1;
@@ -9341,6 +9442,7 @@ static int ce_delta_run(ann_real *probs, const int *tgt, int rows, int V,
 	ew_ref rp;
 	ew_ref rt;
 	ew_ref rb;
+	static h2d_stage s_tgt;	/* B8: pinned staging of the targets */
 	static ann_real *s_db_dev;
 	static ann_real *s_db_host;
 	static size_t s_db_cap;
@@ -9361,7 +9463,9 @@ static int ce_delta_run(ann_real *probs, const int *tgt, int rows, int V,
 		pthread_mutex_unlock(&g_ew_mu);
 		return -1;
 	}
-	if (ew_acquire(&rt, 1, tgt, nbt, 1, 0) != 0) {
+	rt.dev = ew_is_dev(tgt) ? NULL
+	    : (ann_real *)h2d_stage_put(&s_tgt, tgt, nbt);
+	if (!rt.dev && ew_acquire(&rt, 1, tgt, nbt, 1, 0) != 0) {
 		pthread_mutex_unlock(&g_ew_mu);
 		return -1;
 	}

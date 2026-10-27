@@ -626,12 +626,38 @@ int lm_loss_backward(lm *model, const lm_cache *c, const int *ids, int n,
 	return 0;
 }
 
+/*
+** B8: the input gradient stays in transformer_backward's own device buffer
+** and goes straight to the embedding scatter: no 16 MB host dx created,
+** uploaded and freed (cudaFree synchronises the device) per microbatch.
+** ANN_MB_NOSYNC=0 restores the copy.
+*/
+static int lm_mb_nosync_on(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		const char *e = getenv("ANN_MB_NOSYNC");
+
+		on = (e && e[0] == '0') ? 0 : 1;
+	}
+	return on;
+}
+
 int lm_backward(lm *model, const mat *dhidden, const lm_cache *c)
 {
 	mat *dx;
 
 	if (!model || !dhidden || !c || !c->trc)
 		return -1;
+	if (lm_mb_nosync_on()) {
+		const mat *g;
+
+		if (transformer_backward_ref(&g, dhidden, model->tr, c->trc) != 0)
+			return -1;
+		/* posenc is constant add — gradient passes through unchanged */
+		return embed_backward(model->embed, g, c->ids, c->n);
+	}
 	dx = mat_create(c->n, LM_D_MODEL);
 	if (!dx)
 		return -1;
