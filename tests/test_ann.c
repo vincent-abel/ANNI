@@ -1608,6 +1608,41 @@ static void test_lm_rejects_double_magic(void)
 	assert(m == NULL);
 }
 
+/* lm bench step hook: production pack_run + Adam, loss falls on a fixed batch. */
+static void test_lm_bench_packed(void)
+{
+	lm *m;
+	lm_adam *o;
+	lm_step_time st[6];
+	int ids[2 * 8];
+	int B;
+	int i;
+	double f;
+	double p;
+
+	srand(3);
+	m = lm_create_vocab(300);
+	o = m ? lm_adam_create(m) : NULL;
+	assert(m && o && m->vocab_size == 300);
+	for (i = 0; i < 2 * 8; i++)
+		ids[i] = VOCAB_SPECIALS + (i * 7) % 200;
+	B = 2;
+	assert(lm_train_bench_packed(m, o, ids, &B, 8, 1e-3, 1, 6, 1, st) == 0);
+	assert(B == 2);
+	for (i = 0; i < 6; i++) {
+		assert(st[i].ms >= 0.0);
+		assert(st[i].fwd_ms >= 0.0 && st[i].adam_ms >= 0.0);
+	}
+	assert(st[0].ce > 0.0 && st[5].ce > 0.0 && st[5].ce < st[0].ce);
+	/* FLOP model: 6*(L*(4D^2 + 2*D*FF) + D*V) + 6*L*T*D. */
+	p = (double)LM_N_BLOCKS * (4.0 * LM_D_MODEL * LM_D_MODEL
+	    + 2.0 * LM_D_MODEL * LM_D_FF) + (double)LM_D_MODEL * 300.0;
+	f = 6.0 * p + 6.0 * LM_N_BLOCKS * 8.0 * LM_D_MODEL;
+	assert(fabs(lm_bench_flops_per_token(8, 300) - f) < 1e-6 * f);
+	lm_adam_free(&o);
+	lm_free(&m);
+}
+
 int main(void)
 {
 	test_mse_known();
@@ -1682,6 +1717,7 @@ int main(void)
 		lm_adam_free(&o);
 		lm_free(&m);
 	}
+	test_lm_bench_packed();
 	puts("ok");
 	return 0;
 }

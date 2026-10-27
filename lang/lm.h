@@ -37,6 +37,8 @@ typedef struct	lm_cache {
 } lm_cache;
 
 lm	*lm_create(void);
+/* Byte-tokenizer model with a vocab_size-row head (bench a BPE-sized head). */
+lm	*lm_create_vocab(int vocab_size);
 /* Subword model: vocab_size = tok->vocab_size. Takes ownership of tok on success. */
 lm	*lm_create_bpe(bpe *tok);
 /* Attach/replace the tokenizer of an existing model (sizes must match). */
