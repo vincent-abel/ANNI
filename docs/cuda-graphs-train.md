@@ -40,16 +40,22 @@ At every `gpu_device_sync` (the optimizer step) the pool gives back the idle blo
 
 ## Results
 
-`make test-gpu`, check 7 (small test model, B = 4, T = 64, three microbatches per Adam step, four steps): 8 replays out of 12 microbatches. Every per-microbatch loss and every gradient (weights, embedding, head bias, an FFN bias, a LayerNorm gain) matches the plain run within the plain run's own run-to-run noise. The plain run is not bitwise reproducible: float atomics in the CE sum, the bias column sums and the embedding scatter.
+`make test-gpu`, check 8 (small test model, B = 4, T = 64, three microbatches per Adam step, four steps): 8 replays out of 12 microbatches. Every per-microbatch loss and every gradient (weights, embedding, head bias, an FFN bias, a LayerNorm gain) matches the plain run. Since the column sums and the embedding scatter add in a fixed order (`ANN_DET_SUM`, below), the gradients of the graph run and of two plain runs are bitwise equal; only the CE sum (the reported loss, not its gradient) still uses float atomics.
 
-Five consecutive `make test-gpu` runs, worst values:
+Ten consecutive `make test-gpu` runs, worst values:
 
 | Precision | graphs vs plain: max \|Δloss\| | max grad rel. diff | plain vs plain: max \|Δloss\| | max grad rel. diff |
 |---|---|---|---|---|
-| BF16 | 5.3e-6 | 9.7e-8 | 4.8e-6 | 1.0e-7 |
-| FP32 | 4.8e-6 | 4.7e-7 | 4.4e-6 | 4.8e-7 |
+| BF16 | 2.9e-6 | 0 | 2.4e-6 | 0 |
+| FP32 | 5.3e-6 | 0 | 4.8e-6 | 0 |
 
-A stale id, target or bias in a replay moves those numbers by 1e-3 and more; the test's bounds (2e-5 on a loss of ~5.5, 2e-6 relative on a gradient) sit just above the noise.
+Check 9 trains the same model eight times in a row and holds every gradient to 1e-6 of the first run (worst over the ten runs: 0); check 8 holds graphs against plain and plain against plain to 1e-6 as well. A stale id, target or bias in a replay moves those numbers by 1e-3 and more.
+
+### The intermittent 2% gap (fixed)
+
+Before `ANN_DET_SUM`, about half the runs of check 8 (then numbered 7) showed a gradient gap of exactly 0.0207 (or 0.033) between two runs that should agree, from step 3 on and on every tensor, between graphs and plain as often as between the two plain runs; it is not a replay or gradient-twin defect. Logging a checksum of every served twin and of the LayerNorm inputs showed two plain runs bitwise equal until the first optimizer step, then a one-ulp difference in a LayerNorm beta: its gradient is a column sum whose block partials were added with float atomics, in an order that varies from run to run. A few microbatches later that ulp moved one FFN pre-activation across zero (the masked BF16 dh of the fused ReLU backward jumps from 1e-7 to 3e-5 relative in one microbatch), and Adam turned that into a 2% gradient gap a step later. Every outcome was a valid FP32 gradient of slightly different weights; nothing stale was ever served. It became frequent with the warp-per-row LayerNorm (d7cff2f, `ANN_LN_FAST`: its forward rounding put this model near the tie, its backward added more atomics per column): 0 of 29 repeats diverge at f718a06, 12 to 18 of 29 from d7cff2f on (`ANN_LN_FAST=0` on candidate 16: 0 of 29; `ANN_TWIN_EMIT=0`: 3 of 29).
+
+`ANN_DET_SUM` (default on) writes one partial row per block (row slab, warp or CE row stride) to a scratch buffer and adds the partials with a fixed two-level reduction (runs of consecutive partials, then the run sums in order); the embedding scatter adds each repeated token's rows in token order. Same FP32 terms, one order. With it: 0 of 29 plain repeats and 0 of 50 check-8 comparisons differ at all; `ANN_DET_SUM=0` brings back 14 of 29 and fails check 9. The FP64 clip-norm sum (`sumsq_gs_kernel`) adds its block partials in block order as well. Not covered: the dQ atomics of the FA2 backward over several key tiles (T > 64, the 170M run) and the old tiled attention backward's dK / dV atomics, so the full-size run is still not bitwise reproducible.
 
 The `lm train` loop at the test dimensions (2 epochs, B = 8, T = 64, grad-accum 4, BF16, FA2) ends at the same train / validation NLL with and without `--cuda-graphs`: 3.5203 / 3.5789 against 3.5203 / 3.5790.
 
@@ -57,6 +63,7 @@ Not measured yet: the saving on the 170M run (expected up to ~4 ms of a 63 ms mi
 
 ## Pitfalls
 
+- Run-to-run determinism matters for these tests: any float atomic in a gradient reduction can, through Adam and a ReLU mask, become a percent-size gap two steps later in the small test model. Reductions over blocks go through `colsum_reduce_kernel`, not atomics.
 - Summation order is part of "the same math". A first version summed each microbatch's head-bias column sums straight into the accumulator, which reassociates FP32 additions: still a valid gradient, but in about one run of three it moved one FFN pre-activation of the test model across zero by step 4 (a 2.7e-5 gradient gap, with or without any replay). Keeping the plain path's order removed it (0 of 14 runs).
 - Never add a `stream_is_capturing()` branch that changes *what* is computed: a capture must record exactly the uncaptured microbatch. A path that cannot be captured refuses the capture (`capture_refuse`).
 - Host data that changes between microbatches must not be read by a captured copy, pinned memory included (a replay reads it at replay time): stage it before the launch, as the ids are.

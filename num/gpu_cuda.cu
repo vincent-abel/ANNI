@@ -3594,7 +3594,7 @@ extern "C" int gpu_mat_mul_bt_twin(mat *c, const mat *a, const mat *b)
 	int rc = -1;
 
 	if (!c || !a || !b || !gpu_available() || g_compute_prec != GPU_PREC_BF16
-	    || g_sync_mode == GPU_SYNC_EAGER || stream_is_capturing() || !twin_emit_on())
+	    || g_sync_mode == GPU_SYNC_EAGER || !twin_emit_on())
 		return -1;
 #if CUDART_VERSION >= 12000
 	if (g_fp8_dgrad)	/* the FP8 dgrad writes FP32 and would leave the twin unwritten */
@@ -4353,7 +4353,7 @@ __global__ static void ln_bwd_kernel(ann_real *dx, const ann_real *dy,
 */
 #define COLSUM_SLAB	64
 __global__ static void col_sum_tiled_kernel(ann_real *db, const ann_real *x,
-	const ann_real *x2, int rows, int cols)
+	const ann_real *x2, int rows, int cols, ann_real *part)
 {
 	int c = blockIdx.x * blockDim.x + threadIdx.x;
 	int r0 = blockIdx.y * COLSUM_SLAB;
@@ -4374,7 +4374,106 @@ __global__ static void col_sum_tiled_kernel(ann_real *db, const ann_real *x,
 		for (r = r0; r < r1; r++)
 			s += x[(size_t)r * (size_t)cols + (size_t)c];
 	}
-	atomicAdd(&db[c], s);
+	if (part)	/* deterministic: colsum_reduce_kernel adds the slabs in order */
+		part[(size_t)blockIdx.y * (size_t)cols + (size_t)c] = s;
+	else
+		atomicAdd(&db[c], s);
+}
+
+/*
+** ANN_DET_SUM (default on; 0 = float atomics): a column sum spread over
+** several blocks (row slabs, warps, CE row strides) writes one partial row
+** per block into g_cs_part, and colsum_reduce_kernel adds the partials to
+** the accumulator in one fixed association (runs of consecutive partials,
+** then the run sums in order). FP32 sums of the same terms as the atomics,
+** whose order is arbitrary too, but always the same one: the atomics' order changed
+** from run to run, so the last bit of a bias or LayerNorm gradient did,
+** and through Adam and the ReLU masks that bit grew into a different
+** trajectory (test_gpu check 7: a 2% gradient gap two steps later in about
+** half the runs). A single block per column keeps its one atomic: one add
+** onto the accumulator has only one order. g_cs_part is used under g_ew_mu.
+*/
+static int det_sum_on(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		const char *e = getenv("ANN_DET_SUM");
+
+		on = (e && e[0] == '0') ? 0 : 1;
+	}
+	return on;
+}
+
+static void *g_cs_part;
+static size_t g_cs_part_cap;
+
+/* Partial-row scratch of n floats (grow-only; the first microbatch sizes it before any capture); NULL = use the atomics. */
+static ann_real *cs_part(size_t n)
+{
+	if (!det_sum_on() || ensure_half_buf(&g_cs_part, &g_cs_part_cap,
+	    n * sizeof(ann_real)) != 0)
+		return NULL;
+	return (ann_real *)g_cs_part;
+}
+
+/*
+** acc[c] += the partials part[p * stride + c], p = 0 .. np - 1, in a fixed
+** association: CSR_GROUPS threads per column each add a run of consecutive
+** partials in order, then the group sums are added to acc in group order.
+** Up to 512 partials (the LayerNorm backward's warps at 4096 rows) a single
+** thread per column would wait on 512 dependent loads; this waits on
+** np / 16 + 16.
+*/
+#define CSR_COLS	32
+#define CSR_GROUPS	16
+__global__ static void colsum_reduce_kernel(ann_real *acc,
+	const ann_real *part, int np, int cols, int stride)
+{
+	__shared__ ann_real gs[CSR_GROUPS][CSR_COLS];
+	const int cx = threadIdx.x;
+	const int g = threadIdx.y;
+	const int c = blockIdx.x * CSR_COLS + cx;
+	const int per = (np + CSR_GROUPS - 1) / CSR_GROUPS;
+	const int p1 = min((g + 1) * per, np);
+	ann_real s = 0.0f;
+	int p;
+
+	if (c < cols)
+		for (p = g * per; p < p1; p++)
+			s += part[(size_t)p * (size_t)stride + (size_t)c];
+	gs[g][cx] = s;
+	__syncthreads();
+	if (g == 0 && c < cols) {
+		ann_real a = acc[c];
+		int k;
+
+		for (k = 0; k < CSR_GROUPS; k++)
+			a += gs[k][cx];
+		acc[c] = a;
+	}
+}
+
+static void colsum_reduce_launch(ann_real *acc, const ann_real *part, int np,
+	int cols, int stride)
+{
+	colsum_reduce_kernel<<<(cols + CSR_COLS - 1) / CSR_COLS,
+	    dim3(CSR_COLS, CSR_GROUPS), 0, g_st>>>(acc, part, np, cols, stride);
+}
+
+/* db[c] += sum over rows of x[r,c] (* x2[r,c]): col_sum_tiled_kernel, slabs reduced in a fixed order. */
+static void col_sum_tiled_run(ann_real *db, const ann_real *x,
+	const ann_real *x2, int rows, int cols)
+{
+	dim3 grid((cols + EW_BLOCK - 1) / EW_BLOCK,
+	    (rows + COLSUM_SLAB - 1) / COLSUM_SLAB);
+	ann_real *part = grid.y > 1 ? cs_part((size_t)grid.y * (size_t)cols)
+	    : NULL;
+
+	col_sum_tiled_kernel<<<grid, EW_BLOCK, 0, g_st>>>(db, x, x2, rows, cols,
+	    part);
+	if (part)
+		colsum_reduce_launch(db, part, (int)grid.y, cols, cols);
 }
 
 /*
@@ -4515,14 +4614,16 @@ __device__ __forceinline__ static float4 lnf_xhat(const ann_real *x_hat,
 ** Backward: each warp owns rpw consecutive rows, keeps its dgamma / dbeta
 ** partial sums in registers (per-lane columns) and adds them to the global
 ** accumulators once at the end: no separate column-sum launches. dx may be
-** read (accumulate) and written by the same lane only.
+** read (accumulate) and written by the same lane only. With part (ANN_DET_SUM)
+** the partials go to part[warp][dgamma | dbeta] instead, reduced in a fixed order
+** by colsum_reduce_kernel.
 */
 template <int NV>
 __global__ static void __launch_bounds__(LNF_WARPS * 32, LNF_BWD_MINB) ln_bwd_warp_kernel(
 	ann_real *dx, const ann_real *dy, const ann_real *gamma,
 	const ann_real *x_hat, const ann_real *inv_std, ann_real *dgamma,
 	ann_real *dbeta, int d, int accumulate, __nv_bfloat16 *dx16, int rows,
-	int rpw, const ann_real *x_in, const ann_real *mean_in)
+	int rpw, const ann_real *x_in, const ann_real *mean_in, ann_real *part)
 {
 	int lane = threadIdx.x & 31;
 	int warp = blockIdx.x * LNF_WARPS + (threadIdx.x >> 5);
@@ -4614,7 +4715,12 @@ __global__ static void __launch_bounds__(LNF_WARPS * 32, LNF_BWD_MINB) ln_bwd_wa
 	for (i = 0; i < NV; i++) {
 		int j = lane + 32 * i;
 
-		if (j < d4) {
+		if (j < d4 && part) {
+			float *pw = part + (size_t)warp * 2 * (size_t)d;
+
+			((float4 *)pw)[j] = ag[i];
+			((float4 *)(pw + d))[j] = ab[i];
+		} else if (j < d4) {
 			float *pg = dgamma + 4 * j;
 			float *pb = dbeta + 4 * j;
 
@@ -4699,9 +4805,15 @@ static int ln_bwd_fast_launch(ann_real *dx, const ann_real *dy,
 	int rpw = ln_bwd_rpw();
 	int warps = (T + rpw - 1) / rpw;
 	int grid = (warps + LNF_WARPS - 1) / LNF_WARPS;
+	ann_real *part = warps > 1 ? cs_part((size_t)warps * 2 * (size_t)d)
+	    : NULL;
 
 	LNF_DISPATCH(nv, ln_bwd_warp_kernel, grid, dx, dy, gamma, x_hat,
-	    inv_std, dgamma, dbeta, d, accumulate, dx16, T, rpw, x_in, mean_in);
+	    inv_std, dgamma, dbeta, d, accumulate, dx16, T, rpw, x_in, mean_in, part);
+	if (part) {
+		colsum_reduce_launch(dgamma, part, warps, d, 2 * d);
+		colsum_reduce_launch(dbeta, part + d, warps, d, 2 * d);
+	}
 	return 0;
 }
 
@@ -7808,13 +7920,8 @@ static int gpu_layernorm_backward_locked(mat *dx, const mat *dy, const ann_real 
 	if (ew_launch_ok() != 0)
 		return -1;
 	if (!fast_bwd) {
-		dim3 grid((d + EW_BLOCK - 1) / EW_BLOCK,
-		    (T + COLSUM_SLAB - 1) / COLSUM_SLAB);
-
-		col_sum_tiled_kernel<<<grid, EW_BLOCK, 0, g_st>>>(acc_b->dev, rdy.dev,
-		    NULL, T, d);
-		col_sum_tiled_kernel<<<grid, EW_BLOCK, 0, g_st>>>(acc_g->dev, rdy.dev,
-		    rh.dev, T, d);
+		col_sum_tiled_run(acc_b->dev, rdy.dev, NULL, T, d);
+		col_sum_tiled_run(acc_g->dev, rdy.dev, rh.dev, T, d);
 	}
 	if (ew_launch_ok() != 0)
 		return -1;
@@ -8023,7 +8130,7 @@ extern "C" int gpu_relu_backward(ann_real *dx, const ann_real *x_pre_relu_or_mas
 */
 __global__ static void relu_bwd_pack_colsum_kernel(__nv_bfloat16 *dst,
 	ann_real *acc, const ann_real *dh, const ann_real *hid,
-	const __nv_bfloat16 *hid16, int rows, int cols)
+	const __nv_bfloat16 *hid16, int rows, int cols, ann_real *part)
 {
 	const int c0 = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
 	const int r0 = blockIdx.y * COLSUM_SLAB;
@@ -8060,6 +8167,11 @@ __global__ static void relu_bwd_pack_colsum_kernel(__nv_bfloat16 *dst,
 		s3 += g.w;
 		*(__nv_bfloat162 *)(dst + off) = __floats2bfloat162_rn(g.x, g.y);
 		*(__nv_bfloat162 *)(dst + off + 2) = __floats2bfloat162_rn(g.z, g.w);
+	}
+	if (part) {	/* ANN_DET_SUM: slab partials, reduced in a fixed order */
+		*(float4 *)(part + (size_t)blockIdx.y * (size_t)cols + c0)
+		    = make_float4(s0, s1, s2, s3);
+		return;
 	}
 	atomicAdd(acc + c0, s0);
 	atomicAdd(acc + c0 + 1, s1);
@@ -8119,10 +8231,15 @@ extern "C" int gpu_ffn_relu_bwd_fused(mat *dh, const mat *hidden,
 	{
 		dim3 grid((cols / 4 + EW_BLOCK - 1) / EW_BLOCK,
 		    (rows + COLSUM_SLAB - 1) / COLSUM_SLAB);
+		ann_real *part = grid.y > 1
+		    ? cs_part((size_t)grid.y * (size_t)cols) : NULL;
 
 		relu_bwd_pack_colsum_kernel<<<grid, EW_BLOCK, 0, g_st>>>(
 		    (__nv_bfloat16 *)twin, acc->dev, ddh, dhid,
-		    (const __nv_bfloat16 *)hid16, rows, cols);
+		    (const __nv_bfloat16 *)hid16, rows, cols, part);
+		if (part)
+			colsum_reduce_launch(acc->dev, part, (int)grid.y, cols,
+			    cols);
 	}
 	if (ew_launch_ok() != 0) {
 		pthread_mutex_unlock(&g_ew_mu);
@@ -8193,7 +8310,8 @@ __global__ static void sumsq_kernel(const ann_real *x, int n, double *acc)
 ** address per step (5.3 ms); the result only feeds the clip norm, whose
 ** summation order was already nondeterministic.
 */
-__global__ static void sumsq_gs_kernel(const ann_real *x, size_t n, double *acc)
+__global__ static void sumsq_gs_kernel(const ann_real *x, size_t n, double *acc,
+	double *part)
 {
 	__shared__ double s[32];
 	size_t stride = (size_t)gridDim.x * blockDim.x;
@@ -8225,9 +8343,23 @@ __global__ static void sumsq_gs_kernel(const ann_real *x, size_t n, double *acc)
 		v = lane < (int)(blockDim.x >> 5) ? s[lane] : 0.0;
 		for (k = 16; k > 0; k >>= 1)
 			v += __shfl_down_sync(0xffffffffu, v, k);
-		if (lane == 0)
+		if (lane == 0 && part)	/* ANN_DET_SUM: summed in block order below */
+			part[blockIdx.x] = v;
+		else if (lane == 0)
 			atomicAdd(acc, v);
 	}
+}
+
+/* *acc += part[0] + part[1] + ... in block order (one thread: a few hundred adds). */
+__global__ static void sumsq_part_reduce_kernel(double *acc, const double *part,
+	int np)
+{
+	double a = *acc;
+	int p;
+
+	for (p = 0; p < np; p++)
+		a += part[p];
+	*acc = a;
 }
 
 /* ANN_SUMSQ_GS=0: back to the one-block-per-256-values sumsq_kernel. */
@@ -8247,6 +8379,7 @@ extern "C" int gpu_grad_sumsq(const ann_real *d_x, int n, double *out)
 {
 	OpScope _op(OP_ADAM);
 	static double *s_acc;
+	static double *s_part;	/* ANN_DET_SUM: one partial per block */
 
 	if (!d_x || n <= 0 || !out || !gpu_available())
 		return -1;
@@ -8275,7 +8408,19 @@ extern "C" int gpu_grad_sumsq(const ann_real *d_x, int n, double *out)
 			nb = s_blocks;
 		if (nb < 1)
 			nb = 1;
-		sumsq_gs_kernel<<<nb, 256, 0, g_st>>>(d_x, (size_t)n, s_acc);
+		/*
+		** ANN_DET_SUM: the clip norm in a fixed order too, so the clip
+		** scale (and every clipped gradient) cannot change its last bit
+		** from run to run.
+		*/
+		if (det_sum_on() && nb > 1 && !s_part
+		    && cudaMalloc((void **)&s_part, (size_t)s_blocks
+		    * sizeof(double)) != cudaSuccess)
+			s_part = NULL;
+		sumsq_gs_kernel<<<nb, 256, 0, g_st>>>(d_x, (size_t)n, s_acc,
+		    det_sum_on() && nb > 1 ? s_part : NULL);
+		if (det_sum_on() && nb > 1 && s_part)
+			sumsq_part_reduce_kernel<<<1, 1, 0, g_st>>>(s_acc, s_part, nb);
 	} else
 		sumsq_kernel<<<(n + 255) / 256, 256, 0, g_st>>>(d_x, n, s_acc);
 	if (cudaGetLastError() != cudaSuccess)
@@ -8716,6 +8861,95 @@ static void *h2d_stage_put(h2d_stage *s, const void *host, size_t bytes)
 }
 
 /*
+** ANN_DET_SUM: the scatter in token order. next[t] = the next token with
+** the same id (-1: none); first[t] = no earlier token has it. One thread
+** per (first occurrence, column) then adds that id's rows in token order:
+** the additions of the atomics, in a fixed order (a repeated token's rows
+** used to land in whatever order the atomics ran).
+*/
+__global__ static void embed_chain_kernel(const int *ids, int n, int *next,
+	unsigned char *first)
+{
+	int t = blockIdx.x * blockDim.x + threadIdx.x;
+	int id;
+	int u;
+	int nx = -1;
+	unsigned char f = 1;
+
+	if (t >= n)
+		return;
+	id = ids[t];
+	for (u = t + 1; u < n; u++)
+		if (ids[u] == id) {
+			nx = u;
+			break;
+		}
+	for (u = 0; u < t; u++)
+		if (ids[u] == id) {
+			f = 0;
+			break;
+		}
+	next[t] = nx;
+	first[t] = f;
+}
+
+__global__ static void embed_scatter_det_kernel(ann_real *dtable,
+	const ann_real *dout, const int *ids, const int *next,
+	const unsigned char *first, int n, int d)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	int t;
+	int j;
+	int u;
+	ann_real *dst;
+	ann_real a;
+
+	if (i >= n * d)
+		return;
+	t = i / d;
+	j = i % d;
+	if (!first[t])
+		return;
+	dst = &dtable[(size_t)ids[t] * (size_t)d + (size_t)j];
+	a = *dst;
+	for (u = t; u >= 0; u = next[u])
+		a += dout[(size_t)u * (size_t)d + (size_t)j];
+	*dst = a;
+}
+
+/* Chain scratch of the deterministic scatter (grow-only, under its mutex). */
+static pthread_mutex_t g_emb_det_mu = PTHREAD_MUTEX_INITIALIZER;
+static void *g_emb_next;
+static size_t g_emb_next_cap;
+static void *g_emb_first;
+static size_t g_emb_first_cap;
+
+static void embed_scatter_launch(ann_real *dtable, const ann_real *dout,
+	const int *d_ids, int n, int d)
+{
+	int nd = n * d;
+
+	if (det_sum_on() && n > 1) {
+		pthread_mutex_lock(&g_emb_det_mu);
+		if (ensure_half_buf(&g_emb_next, &g_emb_next_cap,
+		    (size_t)n * sizeof(int)) == 0
+		    && ensure_half_buf(&g_emb_first, &g_emb_first_cap,
+		    (size_t)n) == 0) {
+			embed_chain_kernel<<<(n + 255) / 256, 256, 0, g_st>>>(d_ids,
+			    n, (int *)g_emb_next, (unsigned char *)g_emb_first);
+			embed_scatter_det_kernel<<<(nd + 255) / 256, 256, 0, g_st>>>(
+			    dtable, dout, d_ids, (const int *)g_emb_next,
+			    (const unsigned char *)g_emb_first, n, d);
+			pthread_mutex_unlock(&g_emb_det_mu);
+			return;
+		}
+		pthread_mutex_unlock(&g_emb_det_mu);
+	}
+	embed_scatter_kernel<<<(nd + 255) / 256, 256, 0, g_st>>>(dtable, dout,
+	    d_ids, n, d);
+}
+
+/*
 ** Staged token ids (gpu_ids_stage): one fixed device buffer that a captured
 ** graph reads, refilled on the compute stream before every microbatch from
 ** a two-slot page-locked ring. The host waits for a slot's previous copy
@@ -8919,7 +9153,6 @@ extern "C" int gpu_embed_scatter(mat *dtable, const mat *dout, const int *ids,
 	int *d_ids;
 	const int *staged;
 	int d;
-	int nd;
 	size_t ib;
 
 	if (!dtable || !dout || !ids || n <= 0 || !gpu_available())
@@ -8936,9 +9169,7 @@ extern "C" int gpu_embed_scatter(mat *dtable, const mat *dout, const int *ids,
 		dtable->on_device = MAT_DEV_SYNCED;
 	}
 	if ((staged = ids_staged(ids, n)) != NULL) {
-		nd = n * d;
-		embed_scatter_kernel<<<(nd + 255) / 256, 256, 0, g_st>>>(
-		    dtable->d_data, dout->d_data, staged, n, d);
+		embed_scatter_launch(dtable->d_data, dout->d_data, staged, n, d);
 		if (launch_done() != 0)
 			return -1;
 		dtable->on_device = MAT_DEV_DEVICE;
@@ -8947,9 +9178,7 @@ extern "C" int gpu_embed_scatter(mat *dtable, const mat *dout, const int *ids,
 	ib = (size_t)n * sizeof(int);
 	d_ids = (int *)h2d_stage_put(&s_ids, ids, ib);
 	if (d_ids) {
-		nd = n * d;
-		embed_scatter_kernel<<<(nd + 255) / 256, 256, 0, g_st>>>(dtable->d_data,
-		    dout->d_data, d_ids, n, d);
+		embed_scatter_launch(dtable->d_data, dout->d_data, d_ids, n, d);
 		if (launch_done() != 0)
 			return -1;
 		dtable->on_device = MAT_DEV_DEVICE;
@@ -8962,9 +9191,7 @@ extern "C" int gpu_embed_scatter(mat *dtable, const mat *dout, const int *ids,
 		gpu_free(d_ids);
 		return -1;
 	}
-	nd = n * d;
-	embed_scatter_kernel<<<(nd + 255) / 256, 256, 0, g_st>>>(dtable->d_data,
-	    dout->d_data, d_ids, n, d);
+	embed_scatter_launch(dtable->d_data, dout->d_data, d_ids, n, d);
 	gpu_free(d_ids);
 	if (launch_done() != 0)
 		return -1;
@@ -9069,7 +9296,7 @@ __global__ static void posenc_packed_kernel(ann_real *x, int B, int T, int D)
 template <int NV>
 __global__ static void __launch_bounds__(EW_BLOCK)
 ce_softmax_delta_bf16_kernel(ann_real *x, const int *tgt, int rows, int V,
-	const ann_real *bias, ann_real *db, float *ce_sum)
+	const ann_real *bias, ann_real *db, float *ce_sum, ann_real *part)
 {
 	__shared__ ann_real sh[EW_BLOCK];
 	float e[NV];
@@ -9142,7 +9369,9 @@ ce_softmax_delta_bf16_kernel(ann_real *x, const int *tgt, int rows, int V,
 	for (k = 0; k < NV; k++) {
 		const int j = threadIdx.x + k * blockDim.x;
 
-		if (j < V)
+		if (j < V && part)	/* ANN_DET_SUM: this block's row, reduced in a fixed order */
+			part[(size_t)blockIdx.x * (size_t)V + (size_t)j] = cs[k];
+		else if (j < V)
 			atomicAdd(&db[j], cs[k]);
 	}
 }
@@ -9154,6 +9383,7 @@ static int ce_softmax_delta_bf16_launch(ann_real *x, const int *tgt,
 	static int n_sm;
 	const int bs = ew_block_for(V);
 	const int nv = (V + bs - 1) / bs;
+	ann_real *part;
 	int grid;
 
 	if (n_sm <= 0) {
@@ -9173,10 +9403,13 @@ static int ce_softmax_delta_bf16_launch(ann_real *x, const int *tgt,
 	grid = 2 * n_sm;
 	if (grid > rows)
 		grid = rows;
+	part = grid > 1 ? cs_part((size_t)grid * (size_t)V) : NULL;
 #define CE_BF16_CASE(NV) \
 	case NV: \
 		ce_softmax_delta_bf16_kernel<NV><<<grid, bs, 0, g_st>>>(x, tgt, rows, V, \
-		    bias, db, ce_sum); \
+		    bias, db, ce_sum, part); \
+		if (part) \
+			colsum_reduce_launch(db, part, grid, V, V); \
 		return 0;
 	switch (nv <= 1 ? 1 : nv <= 2 ? 2 : nv <= 4 ? 4 : nv <= 8 ? 8
 	    : nv <= 16 ? 16 : nv <= 32 ? 32 : nv <= 64 ? 64 : 0) {
@@ -9315,13 +9548,7 @@ static int ce_delta_run(ann_real *probs, const int *tgt, int rows, int V,
 			    rp.dev, (const int *)rt.dev, rows, V, g_ce_dev);
 			if (ew_launch_ok() != 0)
 				goto ce_fail;
-			{
-				dim3 grid((V + EW_BLOCK - 1) / EW_BLOCK,
-				    (rows + COLSUM_SLAB - 1) / COLSUM_SLAB);
-
-				col_sum_tiled_kernel<<<grid, EW_BLOCK, 0, g_st>>>(s_dbg_dev,
-				    rp.dev, NULL, rows, V);
-			}
+			col_sum_tiled_run(s_dbg_dev, rp.dev, NULL, rows, V);
 		}
 		vec_acc_kernel<<<(V + EW_BLOCK - 1) / EW_BLOCK, EW_BLOCK, 0, g_st>>>(
 		    acc->dev, s_dbg_dev, V);
@@ -9378,13 +9605,7 @@ static int ce_delta_run(ann_real *probs, const int *tgt, int rows, int V,
 		    EW_BLOCK, 0, g_st>>>(rp.dev, (const int *)rt.dev, rows, V, g_ce_dev);
 		if (ew_launch_ok() != 0)
 			goto ce_fail;
-		{
-			dim3 grid((V + EW_BLOCK - 1) / EW_BLOCK,
-			    (rows + COLSUM_SLAB - 1) / COLSUM_SLAB);
-
-			col_sum_tiled_kernel<<<grid, EW_BLOCK, 0, g_st>>>(s_db_dev, rp.dev,
-			    NULL, rows, V);
-		}
+		col_sum_tiled_run(s_db_dev, rp.dev, NULL, rows, V);
 		if (ew_launch_ok() != 0)
 			goto ce_fail;
 	}
@@ -9651,13 +9872,7 @@ extern "C" int gpu_mat_col_sum_add(ann_real *db_host, const ann_real *x,
 		pthread_mutex_unlock(&g_ew_mu);
 		return -1;
 	}
-	{
-		dim3 grid((cols + EW_BLOCK - 1) / EW_BLOCK,
-		    (rows + COLSUM_SLAB - 1) / COLSUM_SLAB);
-
-		col_sum_tiled_kernel<<<grid, EW_BLOCK, 0, g_st>>>(acc->dev, rx.dev, NULL,
-		    rows, cols);
-	}
+	col_sum_tiled_run(acc->dev, rx.dev, NULL, rows, cols);
 	if (ew_launch_ok() != 0) {
 		pthread_mutex_unlock(&g_ew_mu);
 		return -1;
