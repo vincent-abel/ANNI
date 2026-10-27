@@ -697,7 +697,7 @@ attn_pcache *attn_pcache_create(int B, int T, int n_heads, int d_head)
 	** saves VRAM for huge T but is slower than strided GemmEx here.
 	** When scores do not fit, leave w_all NULL and use tiled FA.
 	*/
-	/* The fused WMMA path needs no score buffer: 67 MB per layer saved. */
+	/* The fused FA2 path needs no score buffer: 67 MB per layer saved. */
 	if (gpu_available() && T <= 256
 	    && !(g_flash_attn && gpu_attn_fa_usable(T, d_head))) {
 		size_t sb = (size_t)B * (size_t)n_heads * (size_t)T
@@ -873,24 +873,22 @@ int attn_mha_forward_packed_res(mat *out, attn *a, const mat *x,
 	if (attn_qkv_project(c->q, c->k, c->v, a, x) != 0)
 		return -1;
 	/*
-	** Prefer TC GemmEx when w_all fits (faster at T=64 meter; FA ~3×
-	** slower here). Else tiled FA under --flash-attn (no T×T HBM). Then
-	** legacy / host.
+	** Under --flash-attn in BF16 with T % 64 == 0 and no seqlens the FA2
+	** mma.sync kernels run first (no T x T scores in HBM); the lse they
+	** write feeds their backward. When they cannot run (ANN_FA2=0, QKV
+	** rows missing) the TC GemmEx path follows if w_all was allocated
+	** (it is not while FA2 is usable), else tiled FA, then legacy / host.
 	*/
 	c->fused = 0;
-	/*
-	** Fused tensor-core attention (no T x T scores in HBM): BF16 mode,
-	** T % 64 == 0, no seqlens; the lse it writes feeds its backward.
-	*/
 	if (g_flash_attn && c->lse
 	    && gpu_attn_fa_fwd(c->concat, c->q, c->k, c->v, c->B, T, nh,
 	    a->d_head, c->lse) == 0) {
-		static int s_fa_wmma_once;
+		static int s_fa2_once;
 
 		c->fused = 5;
-		if (!s_fa_wmma_once) {
-			s_fa_wmma_once = 1;
-			fprintf(stderr, "[attn] fused tensor-core attention (WMMA)\n");
+		if (!s_fa2_once) {
+			s_fa2_once = 1;
+			fprintf(stderr, "[attn] fused tensor-core attention (FA2 mma.sync)\n");
 			fflush(stderr);
 		}
 		return attn_project_out(out, a, c, res);
@@ -1013,20 +1011,6 @@ int attn_mha_backward_packed(mat *dx, const mat *dout, attn *a,
 		if (!c->w_all
 		    || gpu_attn_tc_bwd(dq, dk, dv, dconcat, c->w_all, c->q,
 		    c->k, c->v, c->B, T, nh, a->d_head) != 0)
-			return -1;
-		goto proj;
-	}
-	if (c->fused == 2) {
-		/*
-		** Slow path used to fill a B·H·T·T score tensor
-		** (gpu_attn_recompute_w) and then a second dS tensor.
-		** Recompute only the row logsumexp of the same causal
-		** softmax, then the tiled backward. T stays the train window.
-		*/
-		if (gpu_attn_recompute_w(c->lse, c->q, c->k, c->B, T, nh,
-		    a->d_head) != 0
-		    || gpu_attn_tiled_bwd(dq, dk, dv, dconcat, c->concat,
-		    c->q, c->k, c->v, c->lse, c->B, T, nh, a->d_head) != 0)
 			return -1;
 		goto proj;
 	}

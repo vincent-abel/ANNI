@@ -21,8 +21,7 @@
 
 /*
 ** Where the BF16 rows of one tensor live: element (b, h, t, c) is at
-** base + b * bstride + h * hstride + t * ld + c. Head-major packs
-** (attn_pack_heads_bf16_kernel) have {H*T*DH, T*DH, DH}; a row-major
+** base + b * bstride + h * hstride + t * ld + c. A row-major
 ** [b*T][ncols] matrix with the head's columns at hoff has {T*ld, DH, ld}
 ** (base already offset by hoff).
 */
@@ -31,16 +30,6 @@ typedef struct {
 	long long	hstride;
 	int		ld;
 } fa2_lay;
-
-static fa2_lay fa2_lay_headmajor(int T, int H, int dh)
-{
-	fa2_lay l;
-
-	l.bstride = (long long)H * T * dh;
-	l.hstride = (long long)T * dh;
-	l.ld = dh;
-	return l;
-}
 
 static fa2_lay fa2_lay_rows(int T, int ld, int dh)
 {
@@ -442,7 +431,7 @@ attn_fa2_bwd_kernel(float *dq, float *dk, float *dv, const __nv_bfloat16 *q,
 			s[n][1] = kj0 <= qi + 1 ? __expf(s[n][1] * scale - l1) : 0.0f;
 			s[n][2] = kj1 <= qi ? __expf(s[n][2] * scale - l0) : 0.0f;
 			s[n][3] = kj1 <= qi + 1 ? __expf(s[n][3] * scale - l1) : 0.0f;
-			/* The WMMA kernel used the BF16-rounded P^T here; so do we. */
+			/* P^T is rounded to BF16 here: it is the A operand of the dV MMA. */
 			{
 				float p0 = __bfloat162float(__float2bfloat16(s[n][0]));
 				float p1 = __bfloat162float(__float2bfloat16(s[n][1]));
@@ -581,19 +570,7 @@ static int fa2_bwd_launch_lay(float *dq, float *dk, float *dv, const __nv_bfloat
 	return 0;
 }
 
-/* Head-major packed q, k, v and dO. */
-static int fa2_bwd_launch(float *dq, float *dk, float *dv, const __nv_bfloat16 *q,
-	const __nv_bfloat16 *k, const __nv_bfloat16 *v, const __nv_bfloat16 *dO,
-	const float *lse, const float *dvec, int B, int T, int H, int dh, float scale)
-{
-	fa2_lay l = fa2_lay_headmajor(T, H, dh);
-
-	return fa2_bwd_launch_lay(dq, dk, dv, q, k, v, dO, lse, dvec, B, T, H, dh,
-	    scale, l, l, NULL, NULL, NULL);
-}
-
-/* Host launcher; q, k, v head-major [b][h][t][dh] BF16. */
-/* Host launcher; q, k, v head-major [b][h][t][dh] BF16; -1 = shape not covered. */
+/* Host launcher; q, k, v addressed through lq; -1 = shape not covered. */
 static int fa2_fwd_launch_lay(float *out, float *lse, const __nv_bfloat16 *q,
 	const __nv_bfloat16 *k, const __nv_bfloat16 *v, int B, int T, int H, int dh,
 	float scale, fa2_lay lq, __nv_bfloat16 *out16)
@@ -609,15 +586,6 @@ static int fa2_fwd_launch_lay(float *out, float *lse, const __nv_bfloat16 *q,
 	default: attn_fa2_fwd_kernel<64><<<grid, 32 * FA2_WARPS>>>(out, lse, q, k, v, T, H, scale, lq, out16); break;
 	}
 	return 0;
-}
-
-/* Head-major packed q, k, v (the attn_pack_heads_bf16_kernel layout). */
-static int fa2_fwd_launch(float *out, float *lse, const __nv_bfloat16 *q,
-	const __nv_bfloat16 *k, const __nv_bfloat16 *v, int B, int T, int H, int dh,
-	float scale)
-{
-	return fa2_fwd_launch_lay(out, lse, q, k, v, B, T, H, dh, scale,
-	    fa2_lay_headmajor(T, H, dh), NULL);
 }
 
 #endif /* ATTN_FA2_CUH */
