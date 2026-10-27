@@ -16,11 +16,18 @@ typedef struct	layernorm {
 	double	eps;
 } layernorm;
 
+/*
+** x_hat is NULL while the GPU recomputes it in the backward from x_src (the
+** LayerNorm input, kept alive by the block cache) and mean / inv_std
+** (ANN_LN_RECOMPUTE=0 stores it). x_src is set by a forward that skipped
+** x_hat and NULL when x_hat holds the current values.
+*/
 typedef struct	ln_cache {
-	mat	*x_hat;
-	vec	*mean;
-	vec	*inv_std;
-	int	T;
+	mat		*x_hat;
+	const mat	*x_src;
+	vec		*mean;
+	vec		*inv_std;
+	int		T;
 } ln_cache;
 
 layernorm	*layernorm_create(void);

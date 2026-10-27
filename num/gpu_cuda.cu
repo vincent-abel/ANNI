@@ -4286,6 +4286,27 @@ __global__ static void ln_fwd_warp_kernel(ann_real *y, const ann_real *x,
 }
 
 /*
+** x_hat for the backward: loaded, or (B12, x_in non-NULL) recomputed from
+** the LayerNorm input and the stored row mean / inv_std as the forward
+** kernels compute it, (x - mean) * inv with no FMA contraction, so the
+** values are bit-identical and the 16 MB x_hat per LayerNorm is never stored.
+*/
+__device__ __forceinline__ static float4 lnf_xhat(const ann_real *x_hat,
+	const ann_real *x_in, size_t i, float mu, float inv)
+{
+	float4 h;
+
+	if (!x_in)
+		return ((const float4 *)x_hat)[i];
+	h = ((const float4 *)x_in)[i];
+	h.x = __fmul_rn(__fsub_rn(h.x, mu), inv);
+	h.y = __fmul_rn(__fsub_rn(h.y, mu), inv);
+	h.z = __fmul_rn(__fsub_rn(h.z, mu), inv);
+	h.w = __fmul_rn(__fsub_rn(h.w, mu), inv);
+	return h;
+}
+
+/*
 ** Backward: each warp owns rpw consecutive rows, keeps its dgamma / dbeta
 ** partial sums in registers (per-lane columns) and adds them to the global
 ** accumulators once at the end: no separate column-sum launches. dx may be
@@ -4296,7 +4317,7 @@ __global__ static void __launch_bounds__(LNF_WARPS * 32, LNF_BWD_MINB) ln_bwd_wa
 	ann_real *dx, const ann_real *dy, const ann_real *gamma,
 	const ann_real *x_hat, const ann_real *inv_std, ann_real *dgamma,
 	ann_real *dbeta, int d, int accumulate, __nv_bfloat16 *dx16, int rows,
-	int rpw)
+	int rpw, const ann_real *x_in, const ann_real *mean_in)
 {
 	int lane = threadIdx.x & 31;
 	int warp = blockIdx.x * LNF_WARPS + (threadIdx.x >> 5);
@@ -4321,6 +4342,7 @@ __global__ static void __launch_bounds__(LNF_WARPS * 32, LNF_BWD_MINB) ln_bwd_wa
 	for (r = r0; r < r1; r++) {
 		size_t off = (size_t)r * (size_t)d4;
 		float inv = inv_std[r];
+		float mu = x_in ? mean_in[r] : 0.0f;
 		float sd = 0.0f;
 		float sdx = 0.0f;
 		float a;
@@ -4336,7 +4358,7 @@ __global__ static void __launch_bounds__(LNF_WARPS * 32, LNF_BWD_MINB) ln_bwd_wa
 
 			if (j < d4) {
 				float4 q = ((const float4 *)dy)[off + j];
-				float4 h = ((const float4 *)x_hat)[off + j];
+				float4 h = lnf_xhat(x_hat, x_in, off + j, mu, inv);
 				float4 g = ((const float4 *)gamma)[j];
 				float tx = q.x * g.x, ty = q.y * g.y;
 				float tz = q.z * g.z, tw = q.w * g.w;
@@ -4357,7 +4379,7 @@ __global__ static void __launch_bounds__(LNF_WARPS * 32, LNF_BWD_MINB) ln_bwd_wa
 
 			if (j < d4) {
 				float4 q = ((const float4 *)dy)[off + j];
-				float4 h = ((const float4 *)x_hat)[off + j];
+				float4 h = lnf_xhat(x_hat, x_in, off + j, mu, inv);
 				float4 g = ((const float4 *)gamma)[j];
 				float4 o;
 
@@ -4466,7 +4488,7 @@ static int ln_bwd_rpw(void)
 static int ln_bwd_fast_launch(ann_real *dx, const ann_real *dy,
 	const ann_real *gamma, const ann_real *x_hat, const ann_real *inv_std,
 	ann_real *dgamma, ann_real *dbeta, int T, int d, int accumulate,
-	__nv_bfloat16 *dx16)
+	__nv_bfloat16 *dx16, const ann_real *x_in, const ann_real *mean_in)
 {
 	int nv = (d / 4 + 31) / 32;
 	int rpw = ln_bwd_rpw();
@@ -4474,7 +4496,7 @@ static int ln_bwd_fast_launch(ann_real *dx, const ann_real *dy,
 	int grid = (warps + LNF_WARPS - 1) / LNF_WARPS;
 
 	LNF_DISPATCH(nv, ln_bwd_warp_kernel, grid, dx, dy, gamma, x_hat,
-	    inv_std, dgamma, dbeta, d, accumulate, dx16, T, rpw);
+	    inv_std, dgamma, dbeta, d, accumulate, dx16, T, rpw, x_in, mean_in);
 	return 0;
 }
 
@@ -8136,15 +8158,22 @@ extern "C" int gpu_layernorm_forward(ann_real *y, const ann_real *x,
 	    T, d, 1e-5);
 }
 
+/*
+** x_in / mean non-NULL (B12): x_hat is NULL and recomputed in the kernel
+** from the LayerNorm input and the row means; only the warp-per-row kernel
+** does that, so any other shape returns -1 before launching anything.
+*/
 static int gpu_layernorm_backward_locked(mat *dx, const mat *dy, const ann_real *gamma,
 	const ann_real *x_hat, const ann_real *inv_std, int T, int d,
-	ann_real *dgamma, ann_real *dbeta, int accumulate)
+	ann_real *dgamma, ann_real *dbeta, int accumulate,
+	const ann_real *x_in, const ann_real *mean)
 {
 	ew_ref rdx;
 	ew_ref rdy;
 	ew_ref rg;
 	ew_ref rh;
 	ew_ref ri;
+	ann_real *rmean = NULL;
 	colsum_acc *acc_g;
 	colsum_acc *acc_b;
 	const ann_real *dyp;
@@ -8155,7 +8184,9 @@ static int gpu_layernorm_backward_locked(mat *dx, const mat *dy, const ann_real 
 	int did;
 	int rc;
 
-	if (!dx || !dy || !gamma || !x_hat || !inv_std || !dgamma || !dbeta)
+	if (!dx || !dy || !gamma || !inv_std || !dgamma || !dbeta)
+		return -1;
+	if (x_in ? (!mean || x_hat) : !x_hat)
 		return -1;
 	if (!gpu_available() || T <= 0 || d <= 0)
 		return -1;
@@ -8174,12 +8205,19 @@ static int gpu_layernorm_backward_locked(mat *dx, const mat *dy, const ann_real 
 		return -1;
 	if (ew_acquire(&rdy, 1, dyp, mb, 1, 0) != 0
 	    || ew_acquire_param(&rg, 2, gamma, gb) != 0
-	    || ew_acquire(&rh, 3, x_hat, mb, 1, 0) != 0)
+	    || ew_acquire(&rh, 3, x_in ? x_in : x_hat, mb, 1, 0) != 0)
 		return -1;
 	ri.dev = (ann_real *)(ew_is_dev(inv_std) ? (void *)inv_std
 	    : devvec_get(inv_std, vb));
 	if (!ri.dev)
 		return -1;
+	if (x_in) {
+		rmean = (ann_real *)(ew_is_dev(mean) ? (void *)mean
+		    : devvec_get(mean, vb));
+		if (!rmean || !ln_fast_ok(d, rdx.dev, rdy.dev, rg.dev, rh.dev,
+		    NULL) || ((size_t)ri.dev & 3) != 0)
+			return -1;
+	}
 	/*
 	** dgamma / dbeta accumulate on the device (same accumulators as the
 	** FFN bias grads) and reach the host at gpu_device_sync: staging them
@@ -8203,9 +8241,17 @@ static int gpu_layernorm_backward_locked(mat *dx, const mat *dy, const ann_real 
 		    && ((size_t)ri.dev & 3) == 0 && ((size_t)acc_g->dev & 3) == 0
 		    && ((size_t)acc_b->dev & 3) == 0) {
 			fast_bwd = 1;
-			ln_bwd_fast_launch(rdx.dev, rdy.dev, rg.dev, rh.dev,
-			    ri.dev, acc_g->dev, acc_b->dev, T, d, accumulate,
-			    (__nv_bfloat16 *)dx16);
+			ln_bwd_fast_launch(rdx.dev, rdy.dev, rg.dev,
+			    x_in ? NULL : rh.dev, ri.dev, acc_g->dev, acc_b->dev,
+			    T, d, accumulate, (__nv_bfloat16 *)dx16,
+			    x_in ? rh.dev : NULL, rmean);
+		} else if (x_in) {
+			if (dx16) {
+				pthread_mutex_lock(&g_gemm_mu);
+				grad_twin_forget(dx->d_data);
+				pthread_mutex_unlock(&g_gemm_mu);
+			}
+			return -1;
 		} else {
 			ln_bwd_kernel<<<T, ew_block_for(d)>>>(rdx.dev, rdy.dev, rg.dev, rh.dev,
 			    ri.dev, NULL, NULL, d, accumulate, (__nv_bfloat16 *)dx16);
@@ -8252,7 +8298,8 @@ extern "C" int gpu_layernorm_backward(mat *dx, const mat *dy, const ann_real *ga
 	int rc;
 
 	pthread_mutex_lock(&g_ew_mu);
-	rc = gpu_layernorm_backward_locked(dx, dy, gamma, x_hat, inv_std, T, d, dgamma, dbeta, 0);
+	rc = gpu_layernorm_backward_locked(dx, dy, gamma, x_hat, inv_std, T, d, dgamma, dbeta, 0,
+	    NULL, NULL);
 	pthread_mutex_unlock(&g_ew_mu);
 	return rc;
 }
@@ -8267,7 +8314,87 @@ extern "C" int gpu_layernorm_backward_acc(mat *dx, const mat *dy, const ann_real
 	int rc;
 
 	pthread_mutex_lock(&g_ew_mu);
-	rc = gpu_layernorm_backward_locked(dx, dy, gamma, x_hat, inv_std, T, d, dgamma, dbeta, 1);
+	rc = gpu_layernorm_backward_locked(dx, dy, gamma, x_hat, inv_std, T, d, dgamma, dbeta, 1,
+	    NULL, NULL);
+	pthread_mutex_unlock(&g_ew_mu);
+	return rc;
+}
+
+/*
+** B12: the same backward with x_hat recomputed from the LayerNorm input x
+** and the row means stored by the forward (x_hat was not written).
+** accumulate: dx += (dx device-resident). -1 = recompute the x_hat
+** (gpu_layernorm_xhat) and take the paths above.
+*/
+extern "C" int gpu_layernorm_backward_x(mat *dx, const mat *dy, const ann_real *gamma,
+	const ann_real *x, const ann_real *mean, const ann_real *inv_std,
+	int T, int d, ann_real *dgamma, ann_real *dbeta, int accumulate)
+{
+	OpScope _op(OP_LN_BWD);
+	int rc;
+
+	if (!x || !mean)
+		return -1;
+	pthread_mutex_lock(&g_ew_mu);
+	rc = gpu_layernorm_backward_locked(dx, dy, gamma, NULL, inv_std, T, d, dgamma, dbeta,
+	    accumulate ? 1 : 0, x, mean);
+	pthread_mutex_unlock(&g_ew_mu);
+	return rc;
+}
+
+__global__ static void ln_xhat_kernel(ann_real *x_hat, const ann_real *x,
+	const ann_real *mean, const ann_real *inv_std, int T, int d)
+{
+	size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+	int r;
+
+	if (i >= (size_t)T * (size_t)d)
+		return;
+	r = (int)(i / (size_t)d);
+	x_hat[i] = __fmul_rn(__fsub_rn(x[i], mean[r]), inv_std[r]);
+}
+
+/*
+** Fallback of B12: write x_hat = (x - mean) * inv_std (as the forward does)
+** into x_hat (device) when a backward needs it materialised.
+*/
+extern "C" int gpu_layernorm_xhat(ann_real *x_hat, const ann_real *x,
+	const ann_real *mean, const ann_real *inv_std, int T, int d)
+{
+	ew_ref rx;
+	ew_ref rh;
+	ann_real *rm;
+	ann_real *ri;
+	size_t mb;
+	size_t vb;
+	size_t n;
+	int rc;
+
+	if (!x_hat || !x || !mean || !inv_std || T <= 0 || d <= 0
+	    || !gpu_available())
+		return -1;
+	mb = (size_t)T * (size_t)d * sizeof(ann_real);
+	vb = (size_t)T * sizeof(ann_real);
+	n = (size_t)T * (size_t)d;
+	pthread_mutex_lock(&g_ew_mu);
+	rc = -1;
+	if (ew_acquire(&rx, 0, x, mb, 1, 0) == 0
+	    && ew_acquire(&rh, 1, x_hat, mb, 0, 1) == 0) {
+		rm = (ann_real *)(ew_is_dev(mean) ? (void *)mean
+		    : devvec_get(mean, vb));
+		ri = (ann_real *)(ew_is_dev(inv_std) ? (void *)inv_std
+		    : devvec_get(inv_std, vb));
+		if (rm && ri) {
+			ln_xhat_kernel<<<(unsigned)((n + 255) / 256), 256>>>(
+			    rh.dev, rx.dev, rm, ri, T, d);
+			if (ew_launch_ok() == 0) {
+				int did = ew_release(&rh);
+
+				if (did >= 0 && ew_finish_sync(did) == 0)
+					rc = 0;
+			}
+		}
+	}
 	pthread_mutex_unlock(&g_ew_mu);
 	return rc;
 }

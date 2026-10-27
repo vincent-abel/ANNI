@@ -115,6 +115,17 @@ int	gpu_layernorm_backward_acc(mat *dx, const mat *dy, const ann_real *gamma,
 		const ann_real *x_hat, const ann_real *inv_std, int T, int d,
 		ann_real *dgamma, ann_real *dbeta);
 /*
+** Same with x_hat recomputed from the LayerNorm input x and the row means
+** the forward stored (accumulate: dx +=). -1 = materialise x_hat with
+** gpu_layernorm_xhat and use the above.
+*/
+int	gpu_layernorm_backward_x(mat *dx, const mat *dy, const ann_real *gamma,
+		const ann_real *x, const ann_real *mean, const ann_real *inv_std,
+		int T, int d, ann_real *dgamma, ann_real *dbeta, int accumulate);
+/* x_hat = (x - mean) * inv_std per row, as the forward computes it. */
+int	gpu_layernorm_xhat(ann_real *x_hat, const ann_real *x,
+		const ann_real *mean, const ann_real *inv_std, int T, int d);
+/*
 ** Flat Adam step on host buffers (param/grad/m/v length n); uploads, runs,
 ** downloads. grad is scaled by grad_scale before the moment update.
 ** Updates param/m/v in place; zeros grad. Returns 0 on success, -1 = CPU.
