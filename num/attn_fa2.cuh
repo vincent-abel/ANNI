@@ -520,24 +520,24 @@ attn_fa2_bwd_kernel(float *dq, float *dk, float *dv, const __nv_bfloat16 *q,
 			}
 		}
 	}
-	/* dK (scaled) and dV out, float2 pairs. */
+	/*
+	** dK (scaled) and dV out, float2 pairs. dk == dv == NULL when only the
+	** BF16 twins are wanted (B9: every consumer then reads the twins).
+	*/
 	{
-		float *k0p = dk + ((size_t)b * T + kj0) * D + h * DH + (lane & 3) * 2;
-		float *k1p = k0p + (size_t)8 * D;
-		float *v0p = dv + ((size_t)b * T + kj0) * D + h * DH + (lane & 3) * 2;
-		float *v1p = v0p + (size_t)8 * D;
+		const size_t o0 = ((size_t)b * T + kj0) * D + h * DH + (lane & 3) * 2;
+		const size_t o1 = o0 + (size_t)8 * D;
 
-		for (n = 0; n < NT; n++) {
-			*(float2 *)(k0p + n * 8) = make_float2(dkacc[n][0] * scale, dkacc[n][1] * scale);
-			*(float2 *)(k1p + n * 8) = make_float2(dkacc[n][2] * scale, dkacc[n][3] * scale);
-			*(float2 *)(v0p + n * 8) = make_float2(dvacc[n][0], dvacc[n][1]);
-			*(float2 *)(v1p + n * 8) = make_float2(dvacc[n][2], dvacc[n][3]);
+		if (dk && dv) {
+			for (n = 0; n < NT; n++) {
+				*(float2 *)(dk + o0 + n * 8) = make_float2(dkacc[n][0] * scale, dkacc[n][1] * scale);
+				*(float2 *)(dk + o1 + n * 8) = make_float2(dkacc[n][2] * scale, dkacc[n][3] * scale);
+				*(float2 *)(dv + o0 + n * 8) = make_float2(dvacc[n][0], dvacc[n][1]);
+				*(float2 *)(dv + o1 + n * 8) = make_float2(dvacc[n][2], dvacc[n][3]);
+			}
 		}
 		/* BF16 twins of dK and dV for the Wk / Wv wgrad and dgrad GEMMs (same layout). */
 		if (dk16 && dv16) {
-			const size_t o0 = (size_t)(k0p - dk);
-			const size_t o1 = (size_t)(k1p - dk);
-
 			for (n = 0; n < NT; n++) {
 				*(unsigned *)(dk16 + o0 + n * 8) = fa2_pack_bf16(dkacc[n][0] * scale, dkacc[n][1] * scale);
 				*(unsigned *)(dk16 + o1 + n * 8) = fa2_pack_bf16(dkacc[n][2] * scale, dkacc[n][3] * scale);

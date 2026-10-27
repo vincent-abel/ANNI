@@ -6735,6 +6735,19 @@ fa_out:
 	return rc;
 }
 
+/* ANN_FA2_TWIN_ONLY=0: the FA2 backward stores FP32 dK / dV next to their BF16 twins. */
+static int fa2_twin_only_on(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		const char *e = getenv("ANN_FA2_TWIN_ONLY");
+
+		on = (e && e[0] == '0') ? 0 : 1;
+	}
+	return on;
+}
+
 /*
 ** ANN_FA2_DVEC=0: compute dvec with attn_fa_dvec16_kernel before the FA2
 ** backward instead of inside its query-tile prologue (B5).
@@ -7127,6 +7140,7 @@ extern "C" int gpu_attn_fa_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat,
 
 				void *dk16 = NULL, *dv16 = NULL;
 				const float *fused_of = NULL;
+				int skip32;
 
 				qs->live = 0;
 				/* dK, dV also as BF16 twins: their wgrad and dgrad GEMMs then convert nothing. */
@@ -7153,7 +7167,16 @@ extern "C" int gpu_attn_fa_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat,
 					{ OpNest _n(OP_ATT_SMX_ID); attn_fa_dvec_kernel<<<(unsigned)((nrows + 255) / 256), 256>>>(
 					    g_fa_dvec, ptr[0], ptr[1], (int)nrows, T, H, dh); }
 				}
-				{ OpNest _n(OP_ATT_GEMM_ID); if (fa2_bwd_launch_lay(ptr[5], ptr[6], a_dv, bq, bq + Dm, bq + 2 * Dm,
+				/*
+				** B9: with both twins written and no FP8 GEMM (which
+				** quantises from FP32), the Wk / Wv wgrad (grad_twin_peek)
+				** and dgrad (grad_twin_take) read only the twins: skip the
+				** 2 x 16 MB FP32 stores. ANN_TWIN_CHECK=1 compares twins
+				** with their FP32, so it keeps them.
+				*/
+				skip32 = dk16 && fa2_twin_only_on() && !g_fp8_fwd
+				    && !g_fp8_dgrad && !twin_check_on();
+				{ OpNest _n(OP_ATT_GEMM_ID); if (fa2_bwd_launch_lay(ptr[5], skip32 ? NULL : ptr[6], skip32 ? NULL : a_dv, bq, bq + Dm, bq + 2 * Dm,
 				    dO16 ? dO16 : (const __nv_bfloat16 *)g_tc_half_do, lse->d_data, g_fa_dvec,
 				    B, T, H, dh, (float)(1.0 / sqrt((double)dh)),
 				    fa2_lay_rows(T, 3 * Dm, dh),
