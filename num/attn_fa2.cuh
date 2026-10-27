@@ -114,7 +114,7 @@ template <int DH>
 __global__ static void __launch_bounds__(128)
 attn_fa2_fwd_kernel(float *out, float *lse, const __nv_bfloat16 *q,
 	const __nv_bfloat16 *k, const __nv_bfloat16 *v, int T, int H, float scale,
-	fa2_lay lq)
+	fa2_lay lq, __nv_bfloat16 *out16)
 {
 	const int NT = DH / 8;		/* n-tiles over dh */
 	const int KS = DH / 16;		/* k-steps over dh */
@@ -263,6 +263,20 @@ attn_fa2_fwd_kernel(float *out, float *lse, const __nv_bfloat16 *q,
 		for (n = 0; n < NT; n++) {
 			*(float2 *)(o0 + n * 8) = make_float2(oacc[n][0] * i0, oacc[n][1] * i0);
 			*(float2 *)(o1 + n * 8) = make_float2(oacc[n][2] * i1, oacc[n][3] * i1);
+		}
+		/*
+		** B11: the BF16 twin of O (same layout) from the same FP32 values,
+		** round-to-nearest like f32_to_bf16_kernel: the Wo GEMM and its
+		** wgrad read it, so act_bf16_publish no longer converts O.
+		*/
+		if (out16) {
+			__nv_bfloat16 *p0 = out16 + (o0 - out);
+			__nv_bfloat16 *p1 = out16 + (o1 - out);
+
+			for (n = 0; n < NT; n++) {
+				*(unsigned *)(p0 + n * 8) = fa2_pack_bf16(oacc[n][0] * i0, oacc[n][1] * i0);
+				*(unsigned *)(p1 + n * 8) = fa2_pack_bf16(oacc[n][2] * i1, oacc[n][3] * i1);
+			}
 		}
 		if ((lane & 3) == 0) {
 			lse[(size_t)bh * T + qi0] = m0 + __logf(l0);
@@ -582,17 +596,17 @@ static int fa2_bwd_launch(float *dq, float *dk, float *dv, const __nv_bfloat16 *
 /* Host launcher; q, k, v head-major [b][h][t][dh] BF16; -1 = shape not covered. */
 static int fa2_fwd_launch_lay(float *out, float *lse, const __nv_bfloat16 *q,
 	const __nv_bfloat16 *k, const __nv_bfloat16 *v, int B, int T, int H, int dh,
-	float scale, fa2_lay lq)
+	float scale, fa2_lay lq, __nv_bfloat16 *out16)
 {
 	dim3 grid(B * H, T / FA2_BQ);
 
 	if (!fa2_ok(T, dh))
 		return -1;
 	switch (dh) {
-	case 16: attn_fa2_fwd_kernel<16><<<grid, 32 * FA2_WARPS>>>(out, lse, q, k, v, T, H, scale, lq); break;
-	case 32: attn_fa2_fwd_kernel<32><<<grid, 32 * FA2_WARPS>>>(out, lse, q, k, v, T, H, scale, lq); break;
-	case 48: attn_fa2_fwd_kernel<48><<<grid, 32 * FA2_WARPS>>>(out, lse, q, k, v, T, H, scale, lq); break;
-	default: attn_fa2_fwd_kernel<64><<<grid, 32 * FA2_WARPS>>>(out, lse, q, k, v, T, H, scale, lq); break;
+	case 16: attn_fa2_fwd_kernel<16><<<grid, 32 * FA2_WARPS>>>(out, lse, q, k, v, T, H, scale, lq, out16); break;
+	case 32: attn_fa2_fwd_kernel<32><<<grid, 32 * FA2_WARPS>>>(out, lse, q, k, v, T, H, scale, lq, out16); break;
+	case 48: attn_fa2_fwd_kernel<48><<<grid, 32 * FA2_WARPS>>>(out, lse, q, k, v, T, H, scale, lq, out16); break;
+	default: attn_fa2_fwd_kernel<64><<<grid, 32 * FA2_WARPS>>>(out, lse, q, k, v, T, H, scale, lq, out16); break;
 	}
 	return 0;
 }
@@ -603,7 +617,7 @@ static int fa2_fwd_launch(float *out, float *lse, const __nv_bfloat16 *q,
 	float scale)
 {
 	return fa2_fwd_launch_lay(out, lse, q, k, v, B, T, H, dh, scale,
-	    fa2_lay_headmajor(T, H, dh));
+	    fa2_lay_headmajor(T, H, dh), NULL);
 }
 
 #endif /* ATTN_FA2_CUH */
