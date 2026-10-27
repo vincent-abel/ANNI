@@ -56,3 +56,18 @@ Candidate 16 (worker branch `worker/ce-bf16`): `ce_softmax_delta_bf16_kernel` re
 
 - The FP32 `q`, `k`, `v`, `hidden` buffers hold nothing in BF16 training: any new consumer must read the twins (`act_bf16_get`, the `qkv_bf16` slot). Eager evaluation (`lm info`, generation) keeps the FP32 outputs.
 - cuBLASLt returns `CUBLAS_STATUS_NOT_SUPPORTED` for a cached algorithm when a later call's pointers are less aligned than the heuristic assumed (seen in `make test-gpu` on per-head slices); the wrappers fall back to the FP32 path or GemmEx, so this costs speed, not correctness.
+
+## Candidates 17 to 20 (night of 2026-10-26/27): the audit's items, in parallel worktrees
+
+Six worker agents implemented the audit's approved items on branches off candidate 16 (`docs/code-audit-dead-paths-and-compute.md`); the lead rebased, tested and gated them in checkpoint windows while the run continued (`ANN_TWIN_EMIT=0` since 23:41, see below):
+
+| Candidate | Content | Gate (12 steps, twins off) | Peak VRAM |
+|---|---|---|---|
+| 17 | never-touched per-layer buffers lazy (ffn_out, attn_out, k, v, dtmp, g_tc_half_do) | with 18 | |
+| 18 | batched validation probe (16 windows per forward, ~2 s instead of ~40 s), resume double-probe fix, chunked checkpoint write (same bytes) | 66.4k tok/s vs 65.6k, loss same | 9934 MiB |
+| 19 | B1 device bias caches, B2 head bias in the CE kernel, B4 in-place residual gradients, B8 no per-microbatch syncs | with 20 | |
+| 20 | A1 grid-stride grad norm, A3 float4 Adam, B5 dvec in the attention backward prologue, B9 no FP32 dK/dV stores, B11 concat twin from the attention forward, B12 x_hat recomputed | +5% over 18, loss same | 9047 MiB |
+
+Live on candidate 20: 68.6k tok/s, ~103.6 TF on the meter, 8.8 GB.
+
+`ANN_TWIN_EMIT=0`: the CUDA-graph parity test (check 7 of `make test-gpu` on `worker/cuda-graphs`) sometimes reports a 2.07% gradient difference between two trainings that should agree to 1e-7, never with the producer-written twins off; until the cause is known the driver script passes `ANN_TWIN_EMIT=0` (`TRAIN_ENV` in `scripts/talk170m_run.sh`), which costs about 1-2%. The leading hypothesis is cuBLASLt re-timing its algorithm choice (a different split-K order) after a cache eviction rather than a race.

@@ -112,20 +112,26 @@ finetune() {
 # GEMM precision of the pretraining run; chosen by scripts/ab_precision.sh
 # after the GPU audit (docs/gpu-training-audit.md). Empty = FP32.
 PREC_FLAGS=${PREC_FLAGS:-"--bf16"}
+# Runtime switches for the trainer (tmux does not pass the caller's env):
+# ANN_TWIN_EMIT=0 keeps the producer-written gradient twins off until the
+# rare 2% gradient mismatch seen in tests/test_gpu check 7 is fixed.
+TRAIN_ENV=${TRAIN_ENV:-"ANN_TWIN_EMIT=0"}
+# Checkpoint cadence in minutes (27 tonight so a save lands just after 01:00 CET).
+CKPT_MIN=${CKPT_MIN:-27}
 
 pretrain() {
 	export ANN_GNORM_EVERY=50
 	local start=--force
 	[ -s "$OUT" ] && start="--resume $OUT"
 	log "pretrain start flag: $start"
-	./anni lm train $start --out "$OUT" \
+	env $TRAIN_ENV ./anni lm train $start --out "$OUT" \
 	    --data data/mix_train_ids.bin --val-data data/mix_val_ids.bin \
 	    --tokenizer bpe --vocab data/mix.vocab \
 	    --window 256 --stride 256 --batch 16 --grad-accum 32 --epochs 1 \
 	    --lr 3e-4 --lr-warmup 1000 --lr-decay cosine --lr-decay-steps 28100 --adam-beta2 0.95 \
 	    --grad-clip 1.0 --weight-decay 0.1 \
 	    --flash-attn $PREC_FLAGS \
-	    --eval-every 1 --eval-windows 256 --ckpt-minutes 30 --seed 1 -d
+	    --eval-every 1 --eval-windows 256 --ckpt-minutes ${CKPT_MIN:-30} --seed 1 -d
 }
 
 # Finished: leave llama-server alone.
