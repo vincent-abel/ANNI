@@ -123,11 +123,11 @@ int main(int argc, char **argv)
 	printf("fwd  cold old %.4f ms   new %.4f ms\n", timeit_min(fwd_old, 300, 1), timeit_min(fwd_new, 300, 1));
 
 	/* backward (accumulate mode, as in training) */
-	dim3 grid((d + EW_BLOCK - 1) / EW_BLOCK, (T + COLSUM_SLAB - 1) / COLSUM_SLAB);
+	/* Column sums as in training: deterministic partials unless ANN_DET_SUM=0. */
 	auto bwd_old = [&]() {
 		ln_bwd_kernel<<<T, ew_block_for(d)>>>(dx1, dy, g, xh1, i1, NULL, NULL, d, 1, dx16a);
-		col_sum_tiled_kernel<<<grid, EW_BLOCK>>>(db1, dy, NULL, T, d);
-		col_sum_tiled_kernel<<<grid, EW_BLOCK>>>(dg1, dy, xh1, T, d);
+		col_sum_tiled_run(db1, dy, NULL, T, d);
+		col_sum_tiled_run(dg1, dy, xh1, T, d);
 	};
 	auto bwd_new = [&]() { ln_bwd_fast_launch(dx2, dy, g, xh1, i1, dg2, db2, T, d, 1, dx16b, NULL, NULL); };
 	CK(cudaMemset(dg1, 0, d * 4)); CK(cudaMemset(db1, 0, d * 4));

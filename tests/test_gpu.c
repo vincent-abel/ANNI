@@ -8,6 +8,7 @@
 **	  5. BF16 gradients track FP32 from step 1 (cuBLASLt timing loop)
 **	  7. the batched validation probe matches lm_nll window by window
 **	  8. CUDA-graph replay gives the losses and gradients of the plain run
+**	  9. the same training repeated gives the same gradients (run-to-run)
 */
 #define _POSIX_C_SOURCE 200112L
 #include <assert.h>
@@ -476,11 +477,11 @@ static void test_probe_packed(void)
 ** uncaptured microbatch, then a captured one (step 1) or replays. Losses
 ** and every gradient (weights, embedding, head bias, FFN / LN vectors)
 ** must match the plain run; the replay count proves the graph ran.
-** The plain run is not bitwise reproducible itself (float atomics in the
-** CE sum, the bias column sums and the embedding scatter): two plain runs
-** differ by up to ~5e-6 in a loss and ~5e-7 relative in a gradient, which
-** the third run measures and prints. The bounds sit just above that; a
-** stale id, target or bias in a replay moves them by 1e-3 and more.
+** The column sums and the embedding scatter add in a fixed order
+** (ANN_DET_SUM), so the gradients of two plain runs agree; only the CE sum
+** (the loss value, not its gradient) still uses float atomics. The third
+** run measures plain against plain and is held to the same bounds; a stale
+** id, target or bias in a replay moves them by 1e-3 and more.
 */
 #define GACC 3
 #define GVEC 4	/* db_head, b0.db1, b0.ln1.dgamma, last block db2 */
@@ -617,6 +618,58 @@ static void check_graphs_match(const char *tag, int prec, double loss_tol,
 	assert(rep1 == STEPS * (GACC - 1));
 	assert(lg <= loss_tol);
 	assert(gg <= grad_tol);
+	assert(ln <= loss_tol);
+	assert(gn <= grad_tol);
+}
+
+/*
+** 9. The plain training repeated NREP times must give the same gradients
+** at every step (relative error <= grad_tol). Float atomics in the column
+** sums (bias, LayerNorm, head bias, embedding scatter) let the last bit of
+** a gradient change from run to run; in this model Adam and a ReLU mask
+** grew that bit into a 2% gradient gap two steps later in about half of
+** the repeats (ANN_DET_SUM=0 brings it back). One repeat in two failing,
+** NREP = 8 misses a regression with probability 1 / 128.
+*/
+#define NREP 8
+
+static void check_repeatable(const char *tag, int prec, double loss_tol,
+	double grad_tol)
+{
+	static float *s0[STEPS * NT];
+	static float *s1[STEPS * NT];
+	double l0[STEPS * GACC];
+	double l1[STEPS * GACC];
+	int sizes[NT];
+	char names[NT][16];
+	long rep;
+	double lw = 0.0;
+	double gw = 0.0;
+	int nt;
+	int k;
+	int i;
+
+	train_graphs(0, prec, l0, s0, &nt, sizes, names, &rep);
+	for (k = 1; k < NREP; k++) {
+		double lk;
+		double gk;
+
+		train_graphs(0, prec, l1, s1, &nt, sizes, names, &rep);
+		graphs_diff(l0, l1, s0, s1, nt + GVEC, sizes, names, grad_tol,
+		    &lk, &gk);
+		if (lk > lw)
+			lw = lk;
+		if (gk > gw)
+			gw = gk;
+	}
+	for (i = 0; i < STEPS * NT; i++) {
+		free(s0[i]);
+		s0[i] = NULL;
+	}
+	printf("  %s: %d repeats, max |dloss| %.3g, max grad rel diff %.3g\n",
+	    tag, NREP, lw, gw);
+	assert(lw <= loss_tol);
+	assert(gw <= grad_tol);
 }
 
 int main(void)
@@ -646,8 +699,11 @@ int main(void)
 	check_tracks_fp32("bf16-tc", GPU_PREC_BF16, 2e-3, 0.2, 0.1);
 	g_flash = 1;
 	printf("cuda graphs vs plain run\n");
-	check_graphs_match("bf16", GPU_PREC_BF16, 2e-5, 2e-6);
-	check_graphs_match("fp32", GPU_PREC_FP32, 2e-5, 2e-6);
+	check_graphs_match("bf16", GPU_PREC_BF16, 2e-5, 1e-6);
+	check_graphs_match("fp32", GPU_PREC_FP32, 2e-5, 1e-6);
+	printf("repeated training (run-to-run determinism)\n");
+	check_repeatable("bf16", GPU_PREC_BF16, 2e-5, 1e-6);
+	check_repeatable("fp32", GPU_PREC_FP32, 2e-5, 1e-6);
 	printf("test_gpu: all passed\n");
 	return 0;
 }
