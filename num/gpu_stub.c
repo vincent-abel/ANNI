@@ -552,6 +552,17 @@ int gpu_ce_delta_from_softmax(ann_real *probs, const int *tgt, int rows, int V,
 	return -1;
 }
 
+int gpu_ce_nll_rows(const ann_real *logits, const int *tgt, int rows, int V,
+	float *out)
+{
+	(void)logits;
+	(void)tgt;
+	(void)rows;
+	(void)V;
+	(void)out;
+	return -1;
+}
+
 int gpu_ce_softmax_delta_bf16(ann_real *logits, const int *tgt, int rows,
 	int V, ann_real *db_host, double *mean_ce)
 {

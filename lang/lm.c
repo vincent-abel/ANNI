@@ -918,6 +918,76 @@ int lm_batch_auto(int T, int vocab_size, size_t free_bytes, double frac,
 	return b;
 }
 
+/*
+** Probe loss of B packed windows in one forward and one head GEMM (the
+** per-window lm_nll built a cache, ran a GEMV and a host FP64 softmax per
+** row). logits are never softmaxed in place: gpu_ce_nll_rows writes the FP32
+** log-sum-exp - target logit of each row; the host sums them in FP64.
+** win_nll[b] = mean CE over the T-1 predicting rows of window b. -1 = not
+** applicable (host head, quantized head, no GPU, B == 1): use lm_nll.
+*/
+int lm_nll_packed(lm *model, lm_cache *c, const int *ids, int B, int T,
+	double *win_nll)
+{
+	mat *hc;
+	mat *lg;
+	float *per;
+	int *tgt;
+	ann_real *dp;
+	int rows;
+	int V;
+	int b;
+	int t;
+	int rc;
+
+	if (!model || !c || !ids || !win_nll || B <= 1 || T < 2 || c->B != B
+	    || c->T != T || model->w_head_q || !gpu_available())
+		return -1;
+	V = model->vocab_size;
+	rows = B * (T - 1);
+	hc = mat_create_dev(rows, LM_D_MODEL);
+	lg = mat_create_dev(rows, V);
+	per = malloc((size_t)rows * sizeof(float));
+	tgt = malloc((size_t)rows * sizeof(int));
+	rc = -1;
+	if (!hc || !lg || !per || !tgt)
+		goto out;
+	if (lm_forward_cache_packed(model, ids, B, T, c) != 0)
+		goto out;
+	if (!c->hidden->d_data || c->hidden->on_device == MAT_DEV_HOST
+	    || !hc->d_data
+	    || gpu_pack_seq_rows(hc->d_data, c->hidden->d_data, B, T,
+	    LM_D_MODEL) != 0)
+		goto out;
+	hc->on_device = MAT_DEV_DEVICE;
+	for (b = 0; b < B; b++)
+		for (t = 0; t < T - 1; t++)
+			tgt[b * (T - 1) + t] = ids[b * T + t + 1];
+	if (mat_mul(lg, hc, model->w_head) != 0)
+		goto out;
+	dp = mat_compute_ptr(lg);
+	if (!dp || dp != lg->d_data
+	    || gpu_bias_row_add(dp, model->b_head->data, rows, V) != 0)
+		goto out;
+	mat_mark_written(lg, dp);
+	if (gpu_ce_nll_rows(dp, tgt, rows, V, per) != 0)
+		goto out;
+	for (b = 0; b < B; b++) {
+		double s = 0.0;
+
+		for (t = 0; t < T - 1; t++)
+			s += (double)per[b * (T - 1) + t];
+		win_nll[b] = s / (double)(T - 1);
+	}
+	rc = 0;
+out:
+	mat_free(&hc);
+	mat_free(&lg);
+	free(per);
+	free(tgt);
+	return rc;
+}
+
 double lm_nll(const lm *model, const int *ids, int n)
 {
 	mat *hidden;
