@@ -1125,6 +1125,18 @@ int attn_mha_backward_packed(mat *dx, const mat *dout, attn *a,
 	mat_host_dirty(dk);
 	mat_host_dirty(dv);
 proj:
+	/*
+	** The FA2 backward may have left [dQ|dK|dV] as one BF16 row block
+	** (B3): one dgrad GEMM with K = 3 D and one batched wgrad. Its dK and
+	** dV then exist nowhere else, so a failure there is an error.
+	*/
+	if (c->fused == 5) {
+		int r = gpu_attn_qkv_bwd(dx, a->dwq, a->dwk, a->dwv, c->x_in, dq,
+		    a->wq, a->wk, a->wv);
+
+		if (r <= 0)
+			return r;
+	}
 	if (mat_outer_add(a->dwq, c->x_in, dq) != 0
 	    || mat_outer_add(a->dwk, c->x_in, dk) != 0
 	    || mat_outer_add(a->dwv, c->x_in, dv) != 0)

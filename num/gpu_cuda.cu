@@ -1412,6 +1412,23 @@ static void *grad_twin_peek(const ann_real *src, size_t n, int dense_ld,
 }
 
 /*
+** B3: the BF16 [dQ|dK|dV] rows ([N][3 D], row stride 3 D) of the last FA2
+** attention backward, keyed on its FP32 dq buffer. The backward kernel
+** writes the dK / dV column blocks, a strided conversion the dQ block; the
+** QKV projection backward (gpu_attn_qkv_bwd) consumes them in one dgrad
+** GEMM with K = 3 D and one strided-batched wgrad. One shot, like the
+** gradient twins: live from that backward to that projection only.
+*/
+typedef struct {
+	void		*buf;
+	size_t		cap;
+	const ann_real	*key;
+	size_t		n;	/* N x D: the size of one block */
+	int		live;
+} qkv_d16_state;
+static qkv_d16_state g_qkv_d16;
+
+/*
 ** Drop every pending gradient twin: called when a microbatch's backward is
 ** done, so a twin left by a producer without a GEMM consumer (the first
 ** block's LayerNorm backward) can never be served for whatever the next
@@ -1425,6 +1442,8 @@ extern "C" void gpu_grad_twins_clear(void)
 		g_grad_twin[i].src = NULL;
 		g_grad_twin[i].n = 0;
 	}
+	g_qkv_d16.key = NULL;
+	g_qkv_d16.live = 0;
 }
 
 static void grad_twin_forget(const void *p)
@@ -5872,6 +5891,62 @@ static int fa2_dvec_fused_on(void)
 	return on;
 }
 
+/*
+** ANN_QKV_BWD=0: the FA2 backward writes two dense dK / dV twins and the
+** QKV projection backward runs three dgrad and three wgrad GEMMs, instead
+** of the merged [dQ|dK|dV] rows and gpu_attn_qkv_bwd (B3).
+*/
+static int qkv_bwd_on(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		const char *e = getenv("ANN_QKV_BWD");
+
+		on = (e && e[0] == '0') ? 0 : 1;
+	}
+	return on;
+}
+
+/*
+** ANN_QKV_WBATCH=0: with the merged rows, the Wq / Wk / Wv wgrads run as
+** three GEMMs on their column blocks instead of one strided-batched GEMM.
+*/
+static int qkv_wbatch_on(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		const char *e = getenv("ANN_QKV_WBATCH");
+
+		on = (e && e[0] == '0') ? 0 : 1;
+	}
+	return on;
+}
+
+/*
+** FP32 [rows][cols] to BF16 rows of stride ld (dQ into the merged rows);
+** same RN rounding as f32_to_bf16_kernel. cols % 4 == 0, ld even.
+*/
+__global__ static void f32_to_bf16_ld_kernel(__nv_bfloat16 *dst, int ld,
+	const float *src, int rows, int cols)
+{
+	size_t i = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) * 4;
+	size_t r;
+	size_t c;
+	float4 v;
+	__nv_bfloat162 *d;
+
+	if (i >= (size_t)rows * cols)
+		return;
+	r = i / cols;
+	c = i % cols;
+	v = *(const float4 *)(src + i);
+	d = (__nv_bfloat162 *)(dst + r * ld + c);
+	d[0] = __floats2bfloat162_rn(v.x, v.y);
+	d[1] = __floats2bfloat162_rn(v.z, v.w);
+}
+
 /* D_i = sum_c dO[i,c] O[i,c] per (b,h,i), one thread per row. */
 __global__ static void attn_fa_dvec_kernel(float *dvec, const ann_real *dO,
 	const ann_real *O, int nrows, int T, int H, int dh)
@@ -5975,6 +6050,7 @@ extern "C" int gpu_attn_fa_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat,
 		void *dk16 = NULL, *dv16 = NULL;
 		const float *fused_of = NULL;
 		int skip32;
+		int merged = 0;
 
 		if (!qs || !qs->live)
 			goto fa_bwd_out;
@@ -5997,8 +6073,31 @@ extern "C" int gpu_attn_fa_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat,
 		}
 		bq = (const __nv_bfloat16 *)qs->buf;
 		qs->live = 0;
+		/*
+		** B3: dK / dV go straight into the merged [dQ|dK|dV] rows (dQ is
+		** converted into its block after the kernel) for gpu_attn_qkv_bwd.
+		** The FP8 paths quantise from the FP32 gradients and the twin check
+		** compares twins with them: those keep the separate twins.
+		*/
+		g_qkv_d16.live = 0;
+		g_qkv_d16.key = NULL;
+		if (!o[5] && !o[6] && !odv && !stream_is_capturing() && twin_emit_on()
+		    && qkv_bwd_on() && !g_fp8_fwd && !g_fp8_dgrad && !twin_check_on()
+		    && (Dm & 3) == 0) {
+			pthread_mutex_lock(&g_gemm_mu);
+			if (ensure_half_buf(&g_qkv_d16.buf, &g_qkv_d16.cap, 3 * ndo * 2) == 0) {
+				dk16 = (void *)((__nv_bfloat16 *)g_qkv_d16.buf + Dm);
+				dv16 = (void *)((__nv_bfloat16 *)g_qkv_d16.buf + 2 * Dm);
+				merged = 1;
+				/* nothing may serve an older twin of these buffers now */
+				grad_twin_forget(ptr[5]);
+				grad_twin_forget(ptr[6]);
+				grad_twin_forget(a_dv);
+			}
+			pthread_mutex_unlock(&g_gemm_mu);
+		}
 		/* dK, dV also as BF16 twins: their wgrad and dgrad GEMMs then convert nothing. */
-		if (!o[6] && !odv && !stream_is_capturing() && twin_emit_on()) {
+		if (!merged && !o[6] && !odv && !stream_is_capturing() && twin_emit_on()) {
 			pthread_mutex_lock(&g_gemm_mu);
 			dk16 = grad_twin_reserve(ptr[6], ndo);
 			dv16 = dk16 ? grad_twin_reserve(a_dv, ndo) : NULL;
@@ -6041,21 +6140,35 @@ extern "C" int gpu_attn_fa_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat,
 		*/
 		skip32 = dk16 && fa2_twin_only_on() && !g_fp8_fwd
 		    && !g_fp8_dgrad && !twin_check_on();
-		{ OpNest _n(OP_ATT_GEMM_ID); if (fa2_bwd_launch_lay(ptr[5], skip32 ? NULL : ptr[6], skip32 ? NULL : a_dv, bq, bq + Dm, bq + 2 * Dm,
+		{ OpNest _n(OP_ATT_GEMM_ID); if (fa2_bwd_launch_lay16(ptr[5], skip32 ? NULL : ptr[6], skip32 ? NULL : a_dv, bq, bq + Dm, bq + 2 * Dm,
 		    dO16 ? dO16 : (const __nv_bfloat16 *)g_tc_half_do, lse->d_data, g_fa_dvec,
 		    B, T, H, dh, (float)(1.0 / sqrt((double)dh)),
 		    fa2_lay_rows(T, 3 * Dm, dh), fa2_lay_rows(T, Dm, dh),
-		    (__nv_bfloat16 *)dk16, (__nv_bfloat16 *)dv16, fused_of) != 0) {
+		    (__nv_bfloat16 *)dk16, (__nv_bfloat16 *)dv16, fused_of,
+		    merged ? 3 * Dm : 0) != 0) {
 			if (dk16) {
 				grad_twin_forget(ptr[6]);
 				grad_twin_forget(a_dv);
 			}
 			goto fa_bwd_done;
 		} }
+		if (merged) {
+			/* dQ (atomics, FP32) into its block of the merged rows. */
+			size_t n4 = ndo / 4;
+
+			{ OpNest _n(OP_ATT_PACK_ID); f32_to_bf16_ld_kernel<<<(unsigned)((n4 + 255) / 256), 256>>>(
+			    (__nv_bfloat16 *)g_qkv_d16.buf, 3 * Dm, ptr[5], B * T, Dm); }
+		}
 		if (launch_done() == 0 && finish_out(dq, ptr[5], o[5]) == 0
 		    && finish_out(dk, ptr[6], o[6]) == 0
-		    && finish_out(dv, a_dv, odv) == 0)
+		    && finish_out(dv, a_dv, odv) == 0) {
 			rc = 0;
+			if (merged) {
+				g_qkv_d16.key = ptr[5];
+				g_qkv_d16.n = ndo;
+				g_qkv_d16.live = 1;
+			}
+		}
 fa_bwd_done:
 		if (odv && a_dv)
 			gpu_free(a_dv);
@@ -6066,6 +6179,153 @@ fa_bwd_out:
 			gpu_free(ptr[i]);
 	pthread_mutex_unlock(&g_att_mu);
 	return rc;
+}
+
+/*
+** B3: the Q/K/V projection backward from the merged BF16 [dQ|dK|dV] rows
+** the FA2 backward left for dq:
+**   dx = [dQ|dK|dV] [Wq|Wk|Wv]^T		one GEMM, K = 3 D (packed weights)
+**   dWq, dWk, dWv += x_in^T [dQ|dK|dV]	one strided-batched GEMM
+** instead of three dgrads (two of them accumulating into dx) and three
+** wgrads. Same BF16 operands as the separate GEMMs; only the FP32
+** summation order changes. Returns 1 when no merged rows are pending for
+** dq (the caller runs the separate GEMMs), 0 done, -1 error: the merged
+** rows were then the only copy of dK and dV.
+*/
+extern "C" int gpu_attn_qkv_bwd(mat *dx, mat *dwq, mat *dwk, mat *dwv,
+	const mat *x_in, const mat *dq, const mat *wq, const mat *wk,
+	const mat *wv)
+{
+#ifdef ANN_CUBLAS
+	OpScope _op(OP_GEMM_DGRAD);
+	const mat *w3[3];
+	mat *dw3[3];
+	ann_real *pw[3];
+	ann_real *pdw[3];
+	void *hw[3];
+	int ow[3];
+	int odw[3];
+	ann_real *pdx = NULL;
+	ann_real *px = NULL;
+	int odx = 0;
+	int ox = 0;
+	const void *hx;
+	const __nv_bfloat16 *g16;
+	void *wqkv = NULL;
+	const float one = 1.0f;
+	const float zero = 0.0f;
+	size_t nx;
+	int N, D, i, rc = -1;
+
+	if (!dq || !dq->d_data || !g_qkv_d16.live || g_qkv_d16.key != dq->d_data)
+		return 1;
+	g_qkv_d16.live = 0;	/* one shot, whatever happens below */
+	g_qkv_d16.key = NULL;
+	N = dq->rows;
+	D = dq->cols;
+	if (!dx || !dwq || !dwk || !dwv || !x_in || !wq || !wk || !wv
+	    || g_qkv_d16.n != (size_t)N * (size_t)D || x_in->rows != N
+	    || x_in->cols != D || dx->rows != N || dx->cols != D
+	    || cublas_ensure() != 0)
+		return -1;
+	w3[0] = wq;
+	w3[1] = wk;
+	w3[2] = wv;
+	dw3[0] = dwq;
+	dw3[1] = dwk;
+	dw3[2] = dwv;
+	for (i = 0; i < 3; i++) {
+		pw[i] = pdw[i] = NULL;
+		ow[i] = odw[i] = 0;
+		hw[i] = NULL;
+		if (w3[i]->rows != D || w3[i]->cols != D || dw3[i]->rows != D
+		    || dw3[i]->cols != D)
+			return -1;
+	}
+	g16 = (const __nv_bfloat16 *)g_qkv_d16.buf;
+	nx = (size_t)N * (size_t)D;
+	if (ensure_dev_out(dx, &pdx, &odx) != 0 || ensure_dev(x_in, &px, &ox) != 0)
+		goto qb_out;
+	for (i = 0; i < 3; i++)
+		if (ensure_dev(w3[i], &pw[i], &ow[i]) != 0
+		    || ensure_dev(dw3[i], &pdw[i], &odw[i]) != 0)
+			goto qb_out;
+	pthread_mutex_lock(&g_gemm_mu);
+	/* x_in's BF16 twin (the LayerNorm output may exist only as BF16). */
+	hx = act_bf16_get(px, (int)nx);
+	if (!hx && ensure_half_buf(&g_half_A, &g_half_A_cap, nx * 2) == 0
+	    && half_wt_convert(g_half_A, px, (int)nx, 1) == 0)
+		hx = g_half_A;
+	for (i = 0; i < 3; i++)
+		hw[i] = half_wt_get(pw[i], (size_t)D * (size_t)D, 1);
+	if (hw[0] && hw[1] && hw[2])
+		wqkv = qkv_wt_get(hw[0], hw[1], hw[2], D);
+	rc = hx ? 0 : -1;
+	/* dgrad: dx = G [Wq|Wk|Wv]^T, G and the packed weights both of row stride 3 D. */
+	if (rc == 0 && wqkv)
+		rc = cublas_gemm_ex_bf16(CUBLAS_OP_T, CUBLAS_OP_N, D, N, 3 * D,
+		    &one, wqkv, 3 * D, g16, 3 * D, &zero, pdx, D);
+	else if (rc == 0) {
+		/* no packed weights (weights outside the Adam flat): per block, accumulating */
+		for (i = 0; i < 3 && rc == 0; i++) {
+			const void *hwi = hw[i];
+
+			if (!hwi) {
+				if (ensure_half_buf(&g_half_B, &g_half_B_cap,
+				    (size_t)D * D * 2) != 0
+				    || half_wt_convert(g_half_B, pw[i], D * D, 1) != 0) {
+					rc = -1;
+					break;
+				}
+				hwi = g_half_B;
+			}
+			rc = cublas_gemm_ex_bf16(CUBLAS_OP_T, CUBLAS_OP_N, D, N, D,
+			    &one, hwi, D, g16 + (size_t)i * D, 3 * D,
+			    i ? &one : &zero, pdx, D);
+		}
+	}
+	/* wgrad: dW_i += x_in^T G_i; one batch when dWq, dWk, dWv are consecutive (Adam flat). */
+	if (rc == 0) {
+		OpNest _n(OP_GEMM_WGRAD);
+
+		if (qkv_wbatch_on() && pdw[1] == pdw[0] + (size_t)D * D
+		    && pdw[2] == pdw[1] + (size_t)D * D)
+			rc = cublasGemmStridedBatchedEx(g_cublas, CUBLAS_OP_N,
+			    CUBLAS_OP_T, D, D, N, &one, g16, CUDA_R_16BF, 3 * D,
+			    (long long)D, hx, CUDA_R_16BF, D, 0LL, &one, pdw[0],
+			    CUDA_R_32F, D, (long long)D * D, 3,
+			    CUBLAS_COMPUTE_32F_FAST_16BF,
+			    CUBLAS_GEMM_DEFAULT_TENSOR_OP)
+			    == CUBLAS_STATUS_SUCCESS ? 0 : -1;
+		else
+			for (i = 0; i < 3 && rc == 0; i++)
+				rc = cublas_gemm_ex_bf16(CUBLAS_OP_N, CUBLAS_OP_T,
+				    D, D, N, &one, g16 + (size_t)i * D, 3 * D, hx, D,
+				    &one, pdw[i], D);
+	}
+	pthread_mutex_unlock(&g_gemm_mu);
+	if (rc == 0 && (launch_done() != 0 || finish_out(dx, pdx, odx) != 0))
+		rc = -1;
+	for (i = 0; i < 3 && rc == 0; i++)
+		if (finish_out(dw3[i], pdw[i], odw[i]) != 0)
+			rc = -1;
+qb_out:
+	if (ox && px)
+		gpu_free(px);
+	for (i = 0; i < 3; i++) {
+		if (ow[i] && pw[i])
+			gpu_free(pw[i]);
+		if (odw[i] && pdw[i])
+			gpu_free(pdw[i]);
+	}
+	if (rc != 0)
+		fprintf(stderr, "[attn] merged QKV projection backward failed\n");
+	return rc;
+#else
+	(void)dx; (void)dwq; (void)dwk; (void)dwv; (void)x_in; (void)dq;
+	(void)wq; (void)wk; (void)wv;
+	return 1;
+#endif
 }
 
 extern "C" int gpu_attn_tc_fwd(mat *concat, mat *w, const mat *q, const mat *k,
