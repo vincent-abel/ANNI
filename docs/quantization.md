@@ -2,7 +2,7 @@
 
 ## Abstract
 
-**Int8 quantization** packs a full-precision weight matrix into `int8` values plus one **scale** so inference uses less memory bandwidth. `qmat_from_mat` chooses `scale = max|w|/127`; `qmat_gemv_t` reconstructs approximately \(y \approx scale \cdot Q^\top x\). Training stays in `double`; call `lm_quantize_head` before generate to switch the LM head.
+**Int8 quantization** packs a full-precision weight matrix into `int8` values plus one **scale** so inference uses less memory bandwidth. `qmat_from_mat` chooses `scale = max|w|/127`; `qmat_gemv_t` reconstructs approximately \(y \approx scale \cdot Q^\top x\). Only `qmat` itself remains (the LM-head switch `lm_quantize_head` was removed: nothing called it).
 
 ## What problem it solves (plain language)
 
@@ -28,7 +28,6 @@ y_j = s \sum_i x_i Q_{ij}
 ```text
 q = qmat_from_mat(W)
 qmat_gemv_t(logits, q, hidden_row)
-lm_quantize_head(model)  /* sets model->w_head_q */
 ```
 
 `lm_logits_at` uses `w_head_q` when present.
@@ -44,7 +43,6 @@ lm_quantize_head(model)  /* sets model->w_head_q */
 ## How it shows up in this repo
 
 - [`lang/quant.h`](../lang/quant.h) / [`lang/quant.c`](../lang/quant.c)
-- [`lang/lm.c`](../lang/lm.c): `lm_quantize_head`, quantized branch in `lm_logits_at`
 
 ## Worked example
 

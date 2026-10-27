@@ -90,9 +90,6 @@ int	gpu_mat_mul_bias_relu(mat *c, const mat *a, const mat *b,
 		const ann_real *bias);
 /* End of a microbatch backward: forget every pending BF16 gradient twin. */
 void	gpu_grad_twins_clear(void);
-/* dA = dC * B^T, dB = A^T * dC (NULL skips that output). */
-int	gpu_mat_mul_backward(mat *da, mat *db, const mat *dc,
-		const mat *a, const mat *b);
 int	gpu_mat_mul_bt(mat *c, const mat *a, const mat *b);
 /* c += a b^T (cuBLAS beta = 1); -1 = do c = a b^T into a scratch and add. */
 int	gpu_mat_mul_bt_acc(mat *c, const mat *a, const mat *b);
@@ -120,27 +117,15 @@ int	gpu_layernorm_backward_x(mat *dx, const mat *dy, const ann_real *gamma,
 /* x_hat = (x - mean) * inv_std per row, as the forward computes it. */
 int	gpu_layernorm_xhat(ann_real *x_hat, const ann_real *x,
 		const ann_real *mean, const ann_real *inv_std, int T, int d);
-/*
-** Flat Adam step on host buffers (param/grad/m/v length n); uploads, runs,
-** downloads. grad is scaled by grad_scale before the moment update.
-** Updates param/m/v in place; zeros grad. Returns 0 on success, -1 = CPU.
-*/
-int	gpu_adam_step(ann_real *param, ann_real *grad, ann_real *m, ann_real *v, int n,
-		double lr, double beta1, double beta2, double eps, int t,
-		double grad_scale);
-/*
-** Same update on device pointers (no copies): d_param/d_grad/d_m/d_v are
-** gpu_malloc'd length n. g = grad_scale * d_grad; d_grad is zeroed after.
-** Returns 0 on success, -1 = CPU (stub or invalid args).
-*/
-int	gpu_adam_step_dev(ann_real *d_param, ann_real *d_grad, ann_real *d_m,
-		ann_real *d_v, int n, double lr, double beta1, double beta2,
-		double eps, int t, double grad_scale);
 /* Decoupled weight decay applied by the device Adam kernels (0 = off). */
 void	gpu_adam_set_weight_decay(double wd);
 /* *out = sum of d_x[i]^2 over n device floats (grad-norm clipping). */
 int	gpu_grad_sumsq(const ann_real *d_x, int n, double *out);
-/* Like gpu_adam_step_dev; when d_param_bf16 non-NULL and BF16 prec, writes twins. */
+/*
+** Flat Adam step on device pointers (gpu_malloc'd, length n): g = grad_scale *
+** d_grad, d_grad is zeroed after; when d_param_bf16 is non-NULL and the
+** precision is BF16 the BF16 twins are written too. 0 = done, -1 = CPU.
+*/
 int	gpu_adam_step_dev_bf16(ann_real *d_param, void *d_param_bf16,
 		ann_real *d_grad, ann_real *d_m, ann_real *d_v, int n,
 		double lr, double beta1, double beta2, double eps, int t,
@@ -163,13 +148,9 @@ int	gpu_softmax_bwd_rows(ann_real *dx, const ann_real *y,
 		const ann_real *dy, int n_rows, int n_cols);
 /*
 ** Row LayerNorm forward over T x d: x_hat = (x-mean)*inv_std,
-** y = x_hat*gamma + beta. y may alias x. x_hat / inv_std may be NULL.
-** Uses eps = 1e-5; gpu_layernorm_forward_ex takes eps and also stores the
-** per-row mean (mean may be NULL).
+** y = x_hat*gamma + beta. y may alias x. x_hat / inv_std may be NULL; the
+** per-row mean is stored too (mean may be NULL).
 */
-int	gpu_layernorm_forward(ann_real *y, const ann_real *x,
-		const ann_real *gamma, const ann_real *beta,
-		ann_real *x_hat, ann_real *inv_std, int T, int d);
 int	gpu_layernorm_forward_ex(ann_real *y, const ann_real *x,
 		const ann_real *gamma, const ann_real *beta,
 		ann_real *x_hat, ann_real *mean, ann_real *inv_std,
@@ -321,7 +302,6 @@ void	gpu_host_free(void *p);
 
 /* R8/E6: secondary copy stream (NULL/0 = default). */
 void	*gpu_copy_stream(void);
-void	gpu_stream_sync_copy(void);
 
 /*
 ** R12: capture/replay helpers for a fixed microbatch. begin/end wrap the

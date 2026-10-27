@@ -3,9 +3,7 @@
 */
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
-#if CUDART_VERSION >= 11000
 #include <cuda_bf16.h>
-#endif
 #if CUDART_VERSION >= 12000
 #include <cuda_fp8.h>
 #endif
@@ -166,7 +164,6 @@ static int qkv_par_ensure(void)
 	return 0;
 }
 
-#if CUDART_VERSION >= 11000
 static int cublas_gemm_ex_bf16_h(cublasHandle_t h, int N, int M, int K,
 	const float *alpha, const void *B, int ldb, const void *A, int lda,
 	const float *beta, float *C, int ldc)
@@ -176,7 +173,6 @@ static int cublas_gemm_ex_bf16_h(cublasHandle_t h, int N, int M, int K,
 	    CUBLAS_COMPUTE_32F_FAST_16BF, CUBLAS_GEMM_DEFAULT_TENSOR_OP)
 	    == CUBLAS_STATUS_SUCCESS ? 0 : -1;
 }
-#endif
 
 static int lt_heuristic_only(void)
 {
@@ -1219,7 +1215,6 @@ static int cublas_lt_gemm_fp8_ex(cublasOperation_t opa, cublasOperation_t opb,
 }
 #endif /* CUDART>=12000 FP8 */
 
-#if CUDART_VERSION >= 11000
 __global__ static void f32_to_bf16_kernel(__nv_bfloat16 *dst, const float *src,
 	int n)
 {
@@ -1237,7 +1232,6 @@ __global__ static void f32_to_bf16_kernel(__nv_bfloat16 *dst, const float *src,
 			dst[i] = __float2bfloat16(src[i]);
 	}
 }
-#endif
 
 static void *g_half_A;
 static void *g_half_B;
@@ -1522,7 +1516,6 @@ static int half_wt_convert(void *dst, const ann_real *src, int n, int bf16)
 	int prof = op_begin_nested(OP_CONVERT_ID);
 	int rc;
 
-#if CUDART_VERSION >= 11000
 	if (bf16) {
 		/* Vectorized kernel: 4 elems/thread. */
 		blocks = (n + threads * 4 - 1) / (threads * 4);
@@ -1534,14 +1527,9 @@ static int half_wt_convert(void *dst, const ann_real *src, int n, int bf16)
 		op_end(prof);
 		return rc;
 	}
-#else
-	(void)bf16;
-#endif
 	/* FP16 was removed: only the BF16 conversion exists. */
-	(void)dst; (void)src; (void)n; (void)threads; (void)blocks;
-	rc = -1;
 	op_end(prof);
-	return rc;
+	return -1;
 }
 
 extern "C" int gpu_adam_seed_bf16_flat(void *bf16, const ann_real *fp32, int n)
@@ -1799,7 +1787,6 @@ static void *half_wt_get(const ann_real *fp32, size_t n, int bf16)
 	return e->half;
 }
 
-#if CUDART_VERSION >= 11000
 static int cublas_gemm_ex_bf16(cublasOperation_t opa, cublasOperation_t opb,
 	int N, int M, int K, const float *alpha, const void *B, int ldb,
 	const void *A, int lda, const float *beta, float *C, int ldc)
@@ -1813,7 +1800,6 @@ static int cublas_gemm_ex_bf16(cublasOperation_t opa, cublasOperation_t opb,
 	    CUBLAS_COMPUTE_32F_FAST_16BF, CUBLAS_GEMM_DEFAULT_TENSOR_OP)
 	    == CUBLAS_STATUS_SUCCESS ? 0 : -1;
 }
-#endif
 
 /*
 ** Row-major C = A B. If hA_pre is non-NULL it is already FP16/BF16 of A
@@ -1836,10 +1822,6 @@ static int cublas_gemm_rm_ha(ann_real *dC, const ann_real *dA, const ann_real *d
 	pthread_mutex_lock(&g_gemm_mu);
 	half_scratch_warm();
 	use_bf16 = (g_compute_prec == GPU_PREC_BF16);
-#if CUDART_VERSION < 11000
-	if (use_bf16)
-		use_bf16 = 0;
-#endif
 	if (g_compute_prec == GPU_PREC_FP32) {
 		rc = cublasSgemm(g_cublas, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K,
 		    &alpha, dB, N, dA, K, &beta, dC, N)
@@ -1991,9 +1973,6 @@ static int cublas_gemm_rm_epi_res(ann_real *dC, const ann_real *dA,
 	}
 	half_scratch_warm();
 	use_bf16 = (g_compute_prec == GPU_PREC_BF16);
-#if CUDART_VERSION < 11000
-	use_bf16 = 0;
-#endif
 	if (!use_bf16) {
 		pthread_mutex_unlock(&g_gemm_mu);
 		return -1;
@@ -2124,9 +2103,6 @@ static int cublas_gemm_rm_bt_ex(ann_real *dC, const ann_real *dA,
 		int use_bf16 = (g_compute_prec == GPU_PREC_BF16);
 		void *hB_use;
 
-#if CUDART_VERSION < 11000
-		use_bf16 = 0;
-#endif
 		hB_use = half_wt_get(dB, nB, use_bf16);
 		if (!hB_use) {
 			if (ensure_half_buf(&g_half_B, &g_half_B_cap, nB * 2)
@@ -2141,7 +2117,6 @@ static int cublas_gemm_rm_bt_ex(ann_real *dC, const ann_real *dA,
 			}
 			hB_use = g_half_B;
 		}
-#if CUDART_VERSION >= 11000
 		if (use_bf16) {
 			const void *hA_use = NULL;
 			int ldA = K;
@@ -2174,7 +2149,6 @@ static int cublas_gemm_rm_bt_ex(ann_real *dC, const ann_real *dA,
 			pthread_mutex_unlock(&g_gemm_mu);
 			return rc;
 		}
-#endif
 		pthread_mutex_unlock(&g_gemm_mu);
 		return -1;
 	}
@@ -2205,7 +2179,6 @@ static int cublas_gemm_rm_at(ann_real *dC, const ann_real *dA,
 	}
 	nA = (size_t)T * (size_t)M;
 	nB = (size_t)T * (size_t)N;
-#if CUDART_VERSION >= 11000
 	if (g_compute_prec == GPU_PREC_BF16) {
 		const void *hA_use = act_bf16_get(dA, (int)nA);
 		const void *hB_use = act_bf16_get(dB, (int)nB);
@@ -2247,7 +2220,6 @@ static int cublas_gemm_rm_at(ann_real *dC, const ann_real *dA,
 		pthread_mutex_unlock(&g_gemm_mu);
 		return rc;
 	}
-#endif
 	pthread_mutex_unlock(&g_gemm_mu);
 	return -1;
 }
@@ -5257,7 +5229,6 @@ __global__ static void attn_pack_heads_kernel(ann_real *out, const ann_real *in,
 	    in[(b * T + t) * D + h * dh + c];
 }
 
-#if CUDART_VERSION >= 11000
 /* Pack heads and cast to BF16 in one pass (TC QK skips a later convert). */
 __global__ static void attn_pack_heads_bf16_kernel(__nv_bfloat16 *out,
 	const ann_real *in, int B, int T, int H, int dh)
@@ -5280,7 +5251,6 @@ __global__ static void attn_pack_heads_bf16_kernel(__nv_bfloat16 *out,
 	out[((b * H + h) * T + t) * dh + c] =
 	    __float2bfloat16(in[(b * T + t) * D + h * dh + c]);
 }
-#endif
 
 __global__ static void attn_unpack_heads_kernel(ann_real *out,
 	const ann_real *in, int B, int T, int H, int dh)
@@ -5306,11 +5276,7 @@ __global__ static void attn_unpack_heads_kernel(ann_real *out,
 
 /* One block per (b,h,i) row: causal scale+softmax (parallel reduce; T<=256). */
 __global__ static void attn_tc_softmax_kernel(ann_real *w,
-#if CUDART_VERSION >= 11000
 	__nv_bfloat16 *w_bf16,
-#else
-	void *w_bf16,
-#endif
 	int T, int H, ann_real scale, const int *seqlens)
 {
 	__shared__ ann_real red[ATT_BLOCK];
@@ -5323,9 +5289,7 @@ __global__ static void attn_tc_softmax_kernel(ann_real *w,
 	ann_real sum;
 	size_t base = (size_t)bh * T * T + (size_t)i * T;
 	ann_real *wr = w + base;
-#if CUDART_VERSION >= 11000
 	__nv_bfloat16 *wbr = w_bf16 ? (w_bf16 + base) : NULL;
-#endif
 
 	if (i >= T)
 		return;
@@ -5360,22 +5324,14 @@ __global__ static void attn_tc_softmax_kernel(ann_real *w,
 	for (j = (int)threadIdx.x; j < T; j += (int)blockDim.x) {
 		ann_real p = wr[j] / sum;
 		wr[j] = p;
-#if CUDART_VERSION >= 11000
 		if (wbr)
 			wbr[j] = __float2bfloat16(p);
-#else
-		(void)w_bf16;
-#endif
 	}
 }
 
 /* Softmax bwd: dP = P * (dP - sum_k P_k * dP_k) in place on dp; uses w. */
 __global__ static void attn_tc_softmax_bwd_kernel(ann_real *dp,
-#if CUDART_VERSION >= 11000
 	__nv_bfloat16 *dp_bf16,
-#else
-	void *dp_bf16,
-#endif
 	const ann_real *w, int T, int H, const int *seqlens)
 {
 	__shared__ ann_real red[ATT_BLOCK];
@@ -5388,9 +5344,7 @@ __global__ static void attn_tc_softmax_bwd_kernel(ann_real *dp,
 	size_t base = (size_t)bh * T * T + (size_t)i * T;
 	ann_real *drow = dp + base;
 	const ann_real *prow = w + base;
-#if CUDART_VERSION >= 11000
 	__nv_bfloat16 *dbr = dp_bf16 ? (dp_bf16 + base) : NULL;
-#endif
 
 	if (L < 1)
 		L = 1;
@@ -5401,10 +5355,8 @@ __global__ static void attn_tc_softmax_bwd_kernel(ann_real *dp,
 	if (i >= L) {
 		for (j = (int)threadIdx.x; j < T; j += (int)blockDim.x) {
 			drow[j] = 0.0f;
-#if CUDART_VERSION >= 11000
 			if (dbr)
 				dbr[j] = __float2bfloat16(0.0f);
-#endif
 		}
 		return;
 	}
@@ -5416,12 +5368,8 @@ __global__ static void attn_tc_softmax_bwd_kernel(ann_real *dp,
 	for (j = (int)threadIdx.x; j < T; j += (int)blockDim.x) {
 		ann_real g = (j <= i && j < L) ? prow[j] * (drow[j] - dot) : 0.0f;
 		drow[j] = g;
-#if CUDART_VERSION >= 11000
 		if (dbr)
 			dbr[j] = __float2bfloat16(g);
-#else
-		(void)dp_bf16;
-#endif
 	}
 }
 
@@ -5475,7 +5423,6 @@ static int tc_gemm_qk_half(ann_real *scores, int T, int dh, int batch)
 
 	if (cublas_ensure() != 0)
 		return -1;
-#if CUDART_VERSION >= 11000
 	return cublasGemmStridedBatchedEx(g_cublas, CUBLAS_OP_T,
 	    CUBLAS_OP_N, T, T, dh, &alpha, g_tc_half_k, CUDA_R_16BF,
 	    dh, stride, g_tc_half_q, CUDA_R_16BF, dh, stride, &beta,
@@ -5483,13 +5430,6 @@ static int tc_gemm_qk_half(ann_real *scores, int T, int dh, int batch)
 	    CUBLAS_COMPUTE_32F_FAST_16BF,
 	    CUBLAS_GEMM_DEFAULT_TENSOR_OP) == CUBLAS_STATUS_SUCCESS
 	    ? 0 : -1;
-#else
-	(void)scores;
-	(void)T;
-	(void)dh;
-	(void)batch;
-	return -1;
-#endif
 }
 
 /* Prefer Tensor Core strided GemmEx; fall back to FP32 SgemmStridedBatched. */
@@ -5515,7 +5455,6 @@ static int tc_gemm_qk_batched(ann_real *scores, const ann_real *Q,
 	if (ensure_half_buf(&g_tc_half_q, &g_tc_half_q_cap, n * 2) != 0
 	    || ensure_half_buf(&g_tc_half_k, &g_tc_half_k_cap, n * 2) != 0)
 		return -1;
-#if CUDART_VERSION >= 11000
 	if (g_compute_prec == GPU_PREC_BF16) {
 		int blocks = (int)((n + (size_t)threads * 4 - 1)
 		    / ((size_t)threads * 4));
@@ -5528,17 +5467,9 @@ static int tc_gemm_qk_batched(ann_real *scores, const ann_real *Q,
 		    (__nv_bfloat16 *)g_tc_half_k, K, (int)n);
 		return tc_gemm_qk_half(scores, T, dh, batch);
 	}
-#endif
-#if CUDART_VERSION >= 11000
 	return -1;
-#else
-	return cublasSgemmStridedBatched(g_cublas, CUBLAS_OP_T, CUBLAS_OP_N,
-	    T, T, dh, &alpha, K, dh, stride, Q, dh, stride, &beta, scores, T,
-	    stride_s, batch) == CUBLAS_STATUS_SUCCESS ? 0 : -1;
-#endif
 }
 
-#if CUDART_VERSION >= 11000
 static int tc_gemm_bf16_strided(cublasOperation_t opa, cublasOperation_t opb,
 	int m, int n, int k, float alpha_val, const void *A, int lda,
 	long long strideA, const void *B, int ldb, long long strideB,
@@ -5554,7 +5485,6 @@ static int tc_gemm_bf16_strided(cublasOperation_t opa, cublasOperation_t opb,
 	    C, CUDA_R_32F, ldc, strideC, batch, CUBLAS_COMPUTE_32F_FAST_16BF,
 	    CUBLAS_GEMM_DEFAULT_TENSOR_OP) == CUBLAS_STATUS_SUCCESS ? 0 : -1;
 }
-#endif
 
 static int tc_gemm_pv_batched(ann_real *O, const ann_real *W, const ann_real *V,
 	int T, int dh, int batch)
@@ -6188,7 +6118,6 @@ extern "C" int gpu_attn_tc_fwd(mat *concat, mat *w, const mat *q, const mat *k,
 	** BF16: pack Q/K straight into half twins (skip FP32 pack + convert).
 	** V stays FP32 for the PV Sgemm.
 	*/
-#if CUDART_VERSION >= 11000
 	if (g_compute_prec == GPU_PREC_BF16) {
 		/*
 		** All attention products on tensor cores: Q, K, V packed as
@@ -6214,7 +6143,6 @@ extern "C" int gpu_attn_tc_fwd(mat *concat, mat *w, const mat *q, const mat *k,
 		if (OpNest(OP_ATT_GEMM_ID), tc_gemm_qk_half(dw, T, dh, batch) != 0)
 			goto tc_fwd_out;
 	} else
-#endif
 	{
 		{ OpNest _n(OP_ATT_PACK_ID); attn_pack_heads_kernel<<<(npack + threads - 1) / threads,
 		    threads>>>(g_tc_q, dq, B, T, H, dh); }
@@ -6237,7 +6165,6 @@ extern "C" int gpu_attn_tc_fwd(mat *concat, mat *w, const mat *q, const mat *k,
 		    ? (__nv_bfloat16 *)g_tc_half_p : NULL, T, H, scale,
 		    g_att_seqlens_host ? g_att_seqlens_dev : NULL); }
 	}
-#if CUDART_VERSION >= 11000
 	if (g_compute_prec == GPU_PREC_BF16) {
 		/* O = P V: col-major O^T[dh,T] = V^T[dh,T] P^T[T,T]. */
 		if (OpNest(OP_ATT_GEMM_ID), tc_gemm_bf16_strided(CUBLAS_OP_N,
@@ -6246,7 +6173,6 @@ extern "C" int gpu_attn_tc_fwd(mat *concat, mat *w, const mat *q, const mat *k,
 		    g_tc_o, dh, (long long)T * dh, batch) != 0)
 			goto tc_fwd_out;
 	} else
-#endif
 	if (OpNest(OP_ATT_GEMM_ID), tc_gemm_pv_batched(g_tc_o, dw, g_tc_v, T, dh, batch) != 0)
 		goto tc_fwd_out;
 	{ OpNest _n(OP_ATT_PACK_ID); attn_unpack_heads_kernel<<<(npack + threads - 1) / threads, threads>>>(
@@ -6344,7 +6270,6 @@ extern "C" int gpu_attn_tc_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat,
 		goto tc_bwd_out;
 	scale = (float)(1.0 / sqrt((double)dh));
 	sgrid = dim3(batch, T, 1);
-#if CUDART_VERSION >= 11000
 	if (g_compute_prec == GPU_PREC_BF16) {
 		int nth = 32;
 		long long sv = (long long)T * dh;
@@ -6404,7 +6329,6 @@ extern "C" int gpu_attn_tc_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat,
 		    g_tc_half_ds, T, ss, g_tc_k, dh, sv, batch) != 0)
 			goto tc_bwd_out;
 	} else
-#endif
 	{
 		int nth = 32;
 
@@ -6646,9 +6570,6 @@ extern "C" int gpu_attn_qkv_fused(mat *q, mat *k, mat *v, const mat *x,
 	}
 #endif
 	use_bf16 = (g_compute_prec == GPU_PREC_BF16);
-#if CUDART_VERSION < 11000
-	use_bf16 = 0;
-#endif
 	{
 		const void *cached = use_bf16 ? act_bf16_get(dx, (int)nA)
 		    : NULL;
@@ -6716,7 +6637,6 @@ extern "C" int gpu_attn_qkv_fused(mat *q, mat *k, mat *v, const mat *x,
 			int i;
 			int par = 0;
 
-#if CUDART_VERSION >= 11000
 			if (use_bf16 && !stream_is_capturing()
 			    && qkv_par_ensure() == 0) {
 				hwq = half_wt_get(dwq, (size_t)D * (size_t)D,
@@ -6760,7 +6680,6 @@ extern "C" int gpu_attn_qkv_fused(mat *q, mat *k, mat *v, const mat *x,
 					}
 				}
 			}
-#endif
 			if (!par
 			    && (cublas_gemm_rm_ha(dq, dx, dwq, N, D, D,
 			    x_half) != 0
@@ -6989,14 +6908,6 @@ extern "C" int gpu_layernorm_forward_ex(ann_real *y, const ann_real *x,
 	    && g_compute_prec == GPU_PREC_BF16)
 		act_bf16_publish(y, T * d);
 	return rc;
-}
-
-extern "C" int gpu_layernorm_forward(ann_real *y, const ann_real *x,
-	const ann_real *gamma, const ann_real *beta, ann_real *x_hat,
-	ann_real *inv_std, int T, int d)
-{
-	return gpu_layernorm_forward_ex(y, x, gamma, beta, x_hat, NULL, inv_std,
-	    T, d, 1e-5);
 }
 
 /*
@@ -7312,7 +7223,6 @@ extern "C" int gpu_relu_backward(ann_real *dx, const ann_real *x_pre_relu_or_mas
 	return rc;
 }
 
-#if CUDART_VERSION >= 11000
 /*
 ** FFN ReLU backward in one pass: dst = BF16(dh masked by hid > 0) and
 ** acc[c] += column sums of the masked dh. One thread per 4 columns and
@@ -7364,7 +7274,6 @@ __global__ static void relu_bwd_pack_colsum_kernel(__nv_bfloat16 *dst,
 	atomicAdd(acc + c0 + 2, s2);
 	atomicAdd(acc + c0 + 3, s3);
 }
-#endif
 
 /*
 ** FFN backward, BF16 mode: the ReLU backward of dh (mask hidden > 0), its
@@ -7378,7 +7287,6 @@ __global__ static void relu_bwd_pack_colsum_kernel(__nv_bfloat16 *dst,
 extern "C" int gpu_ffn_relu_bwd_fused(mat *dh, const mat *hidden,
 	ann_real *db1_host)
 {
-#if CUDART_VERSION >= 11000
 	OpScope _op(OP_ELEMWISE);
 	ann_real *ddh;
 	const ann_real *dhid;
@@ -7456,10 +7364,6 @@ extern "C" int gpu_ffn_relu_bwd_fused(mat *dh, const mat *hidden,
 			fprintf(stderr, "[ffn] ReLU backward, BF16 twin of dh and db1 in one kernel\n");
 	}
 	return 0;
-#else
-	(void)dh; (void)hidden; (void)db1_host;
-	return -1;
-#endif
 }
 
 /* Decoupled weight decay for the device Adam kernels (host path: lm_adam.c). */
@@ -7609,7 +7513,6 @@ __global__ static void adam_kernel(ann_real *param, ann_real *grad, ann_real *m,
 	grad[i] = 0.0f;
 }
 
-#if CUDART_VERSION >= 11000
 __global__ static void adam_kernel_bf16(ann_real *param, __nv_bfloat16 *param_bf16,
 	ann_real *grad, ann_real *m, ann_real *v, int n, ann_real lr,
 	ann_real beta1, ann_real beta2, ann_real eps, ann_real bc1, ann_real bc2,
@@ -7720,16 +7623,6 @@ static int adam_v4_on(void)
 	return on;
 }
 
-#endif
-
-extern "C" int gpu_adam_step_dev(ann_real *d_p, ann_real *d_g, ann_real *d_m,
-	ann_real *d_v, int n, double lr, double beta1, double beta2, double eps,
-	int t, double grad_scale)
-{
-	return gpu_adam_step_dev_bf16(d_p, NULL, d_g, d_m, d_v, n, lr, beta1,
-	    beta2, eps, t, grad_scale);
-}
-
 extern "C" int gpu_adam_step_dev_bf16(ann_real *d_p, void *d_p_bf16,
 	ann_real *d_g, ann_real *d_m, ann_real *d_v, int n, double lr,
 	double beta1, double beta2, double eps, int t, double grad_scale)
@@ -7750,7 +7643,6 @@ extern "C" int gpu_adam_step_dev_bf16(ann_real *d_p, void *d_p_bf16,
 	if (g_fp8_fwd || g_fp8_dgrad)
 		fp8_wt_invalidate(NULL);
 #endif
-#if CUDART_VERSION >= 11000
 	if (d_p_bf16 && g_compute_prec == GPU_PREC_BF16 && adam_v4_on()
 	    && (((uintptr_t)d_p | (uintptr_t)d_g | (uintptr_t)d_m
 	    | (uintptr_t)d_v) & 15) == 0 && ((uintptr_t)d_p_bf16 & 7) == 0) {
@@ -7773,73 +7665,9 @@ extern "C" int gpu_adam_step_dev_bf16(ann_real *d_p, void *d_p_bf16,
 		    (__nv_bfloat16 *)d_p_bf16, d_g, d_m, d_v, n, lr, beta1,
 		    beta2, eps, bc1, bc2, (ann_real)grad_scale, g_adam_wd);
 	} else
-#endif
 		adam_kernel<<<(n + 255) / 256, 256>>>(d_p, d_g, d_m, d_v, n, lr,
 		    beta1, beta2, eps, bc1, bc2, (ann_real)grad_scale, g_adam_wd);
 	return cudaGetLastError() == cudaSuccess ? 0 : -1;
-}
-
-extern "C" int gpu_adam_step(ann_real *param, ann_real *grad, ann_real *m, ann_real *v,
-	int n, double lr, double beta1, double beta2, double eps, int t,
-	double grad_scale)
-{
-	ann_real *d_p;
-	ann_real *d_g;
-	ann_real *d_m;
-	ann_real *d_v;
-	size_t nbytes;
-
-	if (!param || !grad || !m || !v || n <= 0 || lr <= 0.0 || t < 1)
-		return -1;
-	if (!gpu_available())
-		return -1;
-	nbytes = (size_t)n * sizeof(ann_real);
-	d_p = d_g = d_m = d_v = NULL;
-	if (!(d_p = (ann_real *)gpu_malloc(nbytes))
-	    || !(d_g = (ann_real *)gpu_malloc(nbytes))
-	    || !(d_m = (ann_real *)gpu_malloc(nbytes))
-	    || !(d_v = (ann_real *)gpu_malloc(nbytes)))
-		goto fail;
-	if (gpu_memcpy_h2d(d_p, param, nbytes) != 0
-	    || gpu_memcpy_h2d(d_g, grad, nbytes) != 0
-	    || gpu_memcpy_h2d(d_m, m, nbytes) != 0
-	    || gpu_memcpy_h2d(d_v, v, nbytes) != 0)
-		goto fail;
-	if (gpu_adam_step_dev(d_p, d_g, d_m, d_v, n, lr, beta1, beta2, eps, t,
-	    grad_scale) != 0)
-		goto fail;
-	if (gpu_memcpy_d2h(param, d_p, nbytes) != 0
-	    || gpu_memcpy_d2h(grad, d_g, nbytes) != 0
-	    || gpu_memcpy_d2h(m, d_m, nbytes) != 0
-	    || gpu_memcpy_d2h(v, d_v, nbytes) != 0)
-		goto fail;
-	gpu_free(d_p);
-	gpu_free(d_g);
-	gpu_free(d_m);
-	gpu_free(d_v);
-	return 0;
-fail:
-	gpu_free(d_p);
-	gpu_free(d_g);
-	gpu_free(d_m);
-	gpu_free(d_v);
-	return -1;
-}
-
-extern "C" int gpu_mat_mul_backward(mat *da, mat *db, const mat *dc,
-	const mat *a, const mat *b)
-{
-	/*
-	** dA = dC * B^T ; dB = A^T * dC. H2: OP_T GEMMs read B / A in place,
-	** so no host transpose copies (and no D2H of device-resident a/b).
-	*/
-	if (!dc || !a || !b || !gpu_available())
-		return -1;
-	if (da && gpu_mat_mul_bt(da, dc, b) != 0)
-		return -1;
-	if (db && gpu_mat_mul_at(db, a, dc) != 0)
-		return -1;
-	return 0;
 }
 
 __global__ static void axpy_kernel(ann_real *y, const ann_real *x, ann_real a, int n)
@@ -8226,12 +8054,6 @@ extern "C" void *gpu_copy_stream(void)
 	return (void *)g_copy_stream;
 }
 
-extern "C" void gpu_stream_sync_copy(void)
-{
-	if (g_copy_stream)
-		(void)cudaStreamSynchronize(g_copy_stream);
-}
-
 /*
 ** S1/S2/S3: CE delta, packed posenc, column-sum bias grads (device-first).
 */
@@ -8256,21 +8078,6 @@ __global__ static void ce_onehot_ce_kernel(ann_real *probs, const int *tgt,
 		p = 1e-12f;
 	atomicAdd(ce_sum, -logf(p));
 	probs[(size_t)r * (size_t)V + (size_t)t] -= 1.0f;
-}
-
-__global__ static void col_sum_kernel(ann_real *db, const ann_real *x,
-	int rows, int cols)
-{
-	int c = blockIdx.x * blockDim.x + threadIdx.x;
-	int r;
-	double s;
-
-	if (c >= cols)
-		return;
-	s = 0.0;
-	for (r = 0; r < rows; r++)
-		s += (double)x[(size_t)r * (size_t)cols + (size_t)c];
-	atomicAdd(&db[c], (ann_real)s);
 }
 
 __global__ static void posenc_packed_kernel(ann_real *x, int B, int T, int D)
@@ -8298,7 +8105,6 @@ __global__ static void posenc_packed_kernel(ann_real *x, int B, int T, int D)
 		x[i] += cosf(angle);
 }
 
-#if CUDART_VERSION >= 11000
 /*
 ** Head loss in one pass (BF16 training): for each row of FP32 logits,
 ** softmax, the CE term of the target, delta = p - onehot written as BF16 in
@@ -8440,7 +8246,6 @@ static int ce_softmax_delta_bf16_launch(ann_real *x, const int *tgt,
 	}
 #undef CE_BF16_CASE
 }
-#endif
 
 /* Device CE sum + pinned host mirror (captured graph D2H updates host). */
 static float *g_ce_dev;
@@ -8530,7 +8335,6 @@ static int ce_delta_run(ann_real *probs, const int *tgt, int rows, int V,
 	cudaMemset(g_ce_dev, 0, sizeof(float));
 	cudaMemset(s_db_dev, 0, need_db);
 	if (fused) {
-#if CUDART_VERSION >= 11000
 		if (rp.dev != probs
 		    || ce_softmax_delta_bf16_launch(rp.dev, (const int *)rt.dev,
 		    rows, V, rb.dev, s_db_dev, g_ce_dev) != 0)
@@ -8538,9 +8342,6 @@ static int ce_delta_run(ann_real *probs, const int *tgt, int rows, int V,
 		*launched = 1;
 		if (ew_launch_ok() != 0)
 			goto ce_fail;
-#else
-		goto ce_fail;
-#endif
 	} else {
 		ce_onehot_ce_kernel<<<(rows + EW_BLOCK - 1) / EW_BLOCK,
 		    EW_BLOCK>>>(rp.dev, (const int *)rt.dev, rows, V, g_ce_dev);
@@ -8630,7 +8431,6 @@ extern "C" int gpu_ce_softmax_delta_bf16(ann_real *logits, const int *tgt,
 	int rows, int V, const ann_real *bias, ann_real *db_host,
 	double *mean_ce)
 {
-#if CUDART_VERSION >= 11000
 	OpScope _op(OP_CE);
 	static int on = -1;
 	int launched = 0;
@@ -8671,11 +8471,6 @@ extern "C" int gpu_ce_softmax_delta_bf16(ann_real *logits, const int *tgt,
 			fprintf(stderr, "[lm] head softmax, CE and BF16 delta in one kernel\n");
 	}
 	return 0;
-#else
-	(void)logits; (void)tgt; (void)rows; (void)V; (void)db_host;
-	(void)mean_ce;
-	return -1;
-#endif
 }
 
 /*
