@@ -46,11 +46,6 @@ extern "C" void gpu_set_compute_prec(int prec)
 	g_compute_prec = prec;
 }
 
-extern "C" int gpu_compute_prec(void)
-{
-	return g_compute_prec;
-}
-
 extern "C" void gpu_set_fp8(int on)
 {
 	/* On implies dgrad; off switches both (an FP8 dgrad left on after an
@@ -67,11 +62,6 @@ extern "C" int gpu_fp8(void)
 extern "C" void gpu_set_fp8_dgrad(int on)
 {
 	g_fp8_dgrad = on ? 1 : 0;
-}
-
-extern "C" int gpu_fp8_dgrad(void)
-{
-	return g_fp8_dgrad;
 }
 
 extern "C" void gpu_set_sync_mode(int mode)

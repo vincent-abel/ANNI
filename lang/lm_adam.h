@@ -26,7 +26,6 @@ typedef struct	lm_adam_seg {
 	vec	*dwv;
 	int	off;
 	int	n;
-	int	host_use;	/* host code reads/writes it every step (embed table) */
 } lm_adam_seg;
 
 typedef struct	lm_adam {

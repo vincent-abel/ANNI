@@ -329,11 +329,6 @@ void gpu_set_compute_prec(int prec)
 	(void)prec;
 }
 
-int gpu_compute_prec(void)
-{
-	return GPU_PREC_FP32;
-}
-
 void gpu_set_fp8(int on)
 {
 	(void)on;
@@ -347,11 +342,6 @@ int gpu_fp8(void)
 void gpu_set_fp8_dgrad(int on)
 {
 	(void)on;
-}
-
-int gpu_fp8_dgrad(void)
-{
-	return 0;
 }
 
 int gpu_bias_row_add(ann_real *x, const ann_real *bias, int rows, int cols)

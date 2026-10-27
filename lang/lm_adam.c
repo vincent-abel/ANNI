@@ -9,7 +9,7 @@
 #include "lm_adam.h"
 
 static void add_seg(lm_adam *opt, mat *w, mat *dw, vec *wv, vec *dwv,
-	int off, int n, int host_use)
+	int off, int n)
 {
 	lm_adam_seg *s;
 
@@ -20,10 +20,9 @@ static void add_seg(lm_adam *opt, mat *w, mat *dw, vec *wv, vec *dwv,
 	s->dwv = dwv;
 	s->off = off;
 	s->n = n;
-	s->host_use = host_use;
 }
 
-static void add_mat(lm_adam *opt, int *i, mat *w, mat *dw, int host_use)
+static void add_mat(lm_adam *opt, int *i, mat *w, mat *dw)
 {
 	int k;
 	int n;
@@ -31,7 +30,7 @@ static void add_mat(lm_adam *opt, int *i, mat *w, mat *dw, int host_use)
 	if (!w || !dw || !w->data || !dw->data)
 		return;
 	n = w->rows * w->cols;
-	add_seg(opt, w, dw, NULL, NULL, *i, n, host_use);
+	add_seg(opt, w, dw, NULL, NULL, *i, n);
 	for (k = 0; k < n; k++) {
 		opt->slots[*i].param = &w->data[k];
 		opt->slots[*i].grad = &dw->data[k];
@@ -47,7 +46,7 @@ static void add_vec(lm_adam *opt, int *i, vec *w, vec *dw)
 
 	if (!w || !dw || !w->data || !dw->data)
 		return;
-	add_seg(opt, NULL, NULL, w, dw, *i, w->n, 1);
+	add_seg(opt, NULL, NULL, w, dw, *i, w->n);
 	for (k = 0; k < w->n; k++) {
 		opt->slots[*i].param = &w->data[k];
 		opt->slots[*i].grad = &dw->data[k];
@@ -114,19 +113,19 @@ lm_adam *lm_adam_create(lm *model)
 	opt->grad_clip = 0.0;
 	opt->last_grad_norm = 0.0;
 	i = 0;
-	add_mat(opt, &i, model->w_head, model->dw_head, 0);
+	add_mat(opt, &i, model->w_head, model->dw_head);
 	add_vec(opt, &i, model->b_head, model->db_head);
-	/* Embedding lookup/scatter are host code: table/dtable stay host-used. */
-	add_mat(opt, &i, model->embed->table, model->embed->dtable, 0); /* R2 */
+	/* The embedding table is updated like every other matrix. */
+	add_mat(opt, &i, model->embed->table, model->embed->dtable); /* R2 */
 	for (n = 0; n < model->tr->n_blocks; n++) {
 		b = &model->tr->blocks[n];
-		add_mat(opt, &i, b->attn->wq, b->attn->dwq, 0);
-		add_mat(opt, &i, b->attn->wk, b->attn->dwk, 0);
-		add_mat(opt, &i, b->attn->wv, b->attn->dwv, 0);
-		add_mat(opt, &i, b->attn->wo, b->attn->dwo, 0);
-		add_mat(opt, &i, b->ffn->w1, b->ffn->dw1, 0);
+		add_mat(opt, &i, b->attn->wq, b->attn->dwq);
+		add_mat(opt, &i, b->attn->wk, b->attn->dwk);
+		add_mat(opt, &i, b->attn->wv, b->attn->dwv);
+		add_mat(opt, &i, b->attn->wo, b->attn->dwo);
+		add_mat(opt, &i, b->ffn->w1, b->ffn->dw1);
 		add_vec(opt, &i, b->ffn->b1, b->ffn->db1);
-		add_mat(opt, &i, b->ffn->w2, b->ffn->dw2, 0);
+		add_mat(opt, &i, b->ffn->w2, b->ffn->dw2);
 		add_vec(opt, &i, b->ffn->b2, b->ffn->db2);
 		add_vec(opt, &i, b->ln1->gamma, b->ln1->dgamma);
 		add_vec(opt, &i, b->ln1->beta, b->ln1->dbeta);
@@ -245,7 +244,7 @@ static int gpu_buffers_init(lm_adam *opt)
 			ann_real *dp;
 			ann_real *dg;
 
-			if (!s->w || !s->dw || s->host_use)
+			if (!s->w || !s->dw)
 				continue;
 			nb = (size_t)s->n * sizeof(ann_real);
 			dp = opt->d_param + s->off;
@@ -389,7 +388,7 @@ static int seg_gather(lm_adam *opt, const lm_adam_seg *s)
 	} else if (gpu_memcpy_h2d(dp, w->data, nb) != 0) {
 		return -1;	/* host is authoritative (or no twin) */
 	}
-	if (dw->d_data && !s->host_use && dw->on_device != MAT_DEV_HOST)
+	if (dw->d_data && dw->on_device != MAT_DEV_HOST)
 		return gpu_memcpy_d2d(dg, dw->d_data, nb) == 0 ? 0 : -1;
 	return gpu_memcpy_h2d(dg, dw->data, nb) == 0 ? 0 : -1;
 }
@@ -414,29 +413,16 @@ static int seg_scatter(lm_adam *opt, const lm_adam_seg *s)
 	w = s->w;
 	if (w->on_device == MAT_DEV_ALIASED && w->d_data == dp) {
 		/* In-place Adam already wrote w->d_data; flat d_grad zeroed once. */
-		if (s->host_use && w->data
-		    && gpu_memcpy_d2h(w->data, dp, nb) != 0)
-			return -1;
-		if (s->host_use)
-			mat_zero(s->dw);
 		return 0;
 	}
 	if (w->d_data && gpu_memcpy_d2d(w->d_data, dp, nb) == 0) {
-		if (!s->host_use)
-			w->on_device = MAT_DEV_DEVICE;	/* host stale until pulled */
-		else if (gpu_memcpy_d2h(w->data, dp, nb) == 0)
-			w->on_device = MAT_DEV_SYNCED;
-		else
-			return -1;
+		w->on_device = MAT_DEV_DEVICE;	/* host stale until pulled */
 	} else {
 		if (gpu_memcpy_d2h(w->data, dp, nb) != 0)
 			return -1;
 		mat_host_dirty(w);
 	}
-	if (s->host_use)
-		mat_zero(s->dw);
-	else
-		mat_zero_dev(s->dw);
+	mat_zero_dev(s->dw);
 	return 0;
 }
 
