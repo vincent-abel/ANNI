@@ -200,31 +200,6 @@ int ffn_forward_cache_res(mat *out, const mat *x, ffn *f, ffn_cache *c,
 		    bias_fused ? NULL : f->b1->data, T, LM_D_FF) == 0) {
 			mat_mark_written(c->pre_act, pre);
 			mat_mark_written(c->hidden, hid);
-		} else if (!bias_fused && pre
-		    && resid_copy(c->hidden, c->pre_act) == 0
-		    && (hid = mat_compute_ptr(c->hidden))
-		    && gpu_bias_relu_forward(hid, f->b1->data, T, LM_D_FF)
-		    == 0) {
-			mat_mark_written(c->hidden, hid);
-			if (gpu_bias_row_add(pre, f->b1->data, T, LM_D_FF)
-			    == 0)
-				mat_mark_written(c->pre_act, pre);
-		} else if (!bias_fused && pre
-		    && gpu_bias_row_add(pre, f->b1->data, T, LM_D_FF) == 0) {
-			mat_mark_written(c->pre_act, pre);
-			if (resid_copy(c->hidden, c->pre_act) != 0)
-				copy_mat(c->hidden, c->pre_act);
-			hid = mat_compute_ptr(c->hidden);
-			if (hid && gpu_relu_forward(hid, T * LM_D_FF) == 0)
-				mat_mark_written(c->hidden, hid);
-			else {
-				(void)mat_ensure_host(c->hidden);
-				for (t = 0; t < T; t++)
-					for (j = 0; j < LM_D_FF; j++)
-						mat_set(c->hidden, t, j,
-						    ffn_relu(mat_get(
-						    c->hidden, t, j)));
-			}
 		} else if (!bias_fused) {
 			(void)mat_ensure_host(c->pre_act);
 			for (t = 0; t < T; t++) {

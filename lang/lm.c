@@ -802,7 +802,7 @@ int lm_loss_backward_packed_lens(lm *model, const lm_cache *c, const int *ids,
 		return -1;
 	}
 	mat_try_pin(dhidden);
-	/* Gather: prefer one kernel; else B× D2D; else host. */
+	/* Gather: one kernel on the device; else host. */
 	if (c->hidden->d_data && c->hidden->on_device != MAT_DEV_HOST
 	    && hc->d_data && gpu_available()
 	    && gpu_pack_seq_rows(hc->d_data, c->hidden->d_data, B, T,
@@ -813,21 +813,6 @@ int lm_loss_backward_packed_lens(lm *model, const lm_cache *c, const int *ids,
 		hc->on_device = MAT_DEV_DEVICE;
 		goto gather_done;
 	}
-	if (c->hidden->d_data && c->hidden->on_device != MAT_DEV_HOST
-	    && hc->d_data && gpu_available()) {
-		for (b = 0; b < B; b++) {
-			if (gpu_memcpy_d2d(
-			    hc->d_data + (size_t)b * (T - 1) * LM_D_MODEL,
-			    c->hidden->d_data + (size_t)b * T * LM_D_MODEL,
-			    (size_t)(T - 1) * rb) != 0)
-				goto gather_host;
-			for (t = 0; t < T - 1; t++)
-				tgt[b * (T - 1) + t] = packed_target(ids, b * T + t);
-		}
-		hc->on_device = MAT_DEV_DEVICE;
-		goto gather_done;
-	}
-gather_host:
 	(void)mat_ensure_host(c->hidden);
 	for (b = 0; b < B; b++) {
 		memcpy(&hc->data[(size_t)b * (T - 1) * LM_D_MODEL],
@@ -846,18 +831,7 @@ gather_done:
 		    && gpu_unpack_seq_rows(dhidden->d_data, dhc->d_data, B, T,
 		    LM_D_MODEL) == 0) {
 			dhidden->on_device = MAT_DEV_DEVICE;
-		} else if (dhc->d_data && dhc->on_device != MAT_DEV_HOST
-		    && dhidden->d_data && gpu_available()) {
-			for (b = 0; b < B; b++) {
-				if (gpu_memcpy_d2d(
-				    dhidden->d_data + (size_t)b * T * LM_D_MODEL,
-				    dhc->d_data + (size_t)b * (T - 1) * LM_D_MODEL,
-				    (size_t)(T - 1) * rb) != 0)
-					goto scatter_host;
-			}
-			dhidden->on_device = MAT_DEV_DEVICE;
 		} else {
-scatter_host:
 			(void)mat_ensure_host(dhc);
 			(void)mat_ensure_host(dhidden);
 			for (b = 0; b < B; b++)
