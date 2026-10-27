@@ -168,7 +168,7 @@ static void *g_lt_workspace;
 static size_t g_lt_workspace_bytes;
 static pthread_mutex_t g_gemm_mu = PTHREAD_MUTEX_INITIALIZER;
 #define LT_WS_BYTES	(128ull * 1024ull * 1024ull)
-#define LT_ALGO_CACHE	64
+#define LT_ALGO_CACHE	128	/* (shape, ld, alignment) keys of a training step: well under */
 typedef struct {
 	int		M, N, K;
 	int		opa, opb;
@@ -393,7 +393,8 @@ static int cublas_lt_gemm_half(cublasOperation_t opa, cublasOperation_t opb,
 		if (e->valid && e->M == M && e->N == N && e->K == K
 		    && e->opa == (int)opa && e->opb == (int)opb
 		    && e->bf16 == bf16 && e->fp8 == 0 && e->epi == epi_i
-		    && e->obf == out_bf16 && e->align == ak) {
+		    && e->obf == out_bf16 && e->align == ak
+		    && e->lda == lda && e->ldb == ldb && e->ldc == ldc) {
 			slot = i;
 			break;
 		}
@@ -527,10 +528,26 @@ static int cublas_lt_gemm_half(cublasOperation_t opa, cublasOperation_t opb,
 	if (!e->valid || e->M != M || e->N != N || e->K != K
 	    || e->opa != (int)opa || e->opb != (int)opb || e->bf16 != bf16
 	    || e->fp8 != 0 || e->epi != epi_i || e->obf != out_bf16
-	    || e->align != ak) {
+	    || e->align != ak || e->lda != lda || e->ldb != ldb
+	    || e->ldc != ldc) {
 		cublasLtMatmulHeuristicResult_t heurs[16];
 		cublasLtMatmulHeuristicResult_t alt_best;
 		int alt_won = 0;
+
+		/*
+		** A choice made inside a graph capture would differ from the
+		** uncaptured microbatch's (no timing possible) and its timing
+		** scratch would be a cudaMalloc: refuse the capture instead.
+		*/
+		if (capturing_now()) {
+			capture_refuse("cuBLASLt algorithm chosen inside a capture", __LINE__);
+			cublasLtMatmulPreferenceDestroy(pref);
+			cublasLtMatrixLayoutDestroy(layoutC);
+			cublasLtMatrixLayoutDestroy(layoutB);
+			cublasLtMatrixLayoutDestroy(layoutA);
+			cublasLtMatmulDescDestroy(op);
+			return -1;
+		}
 		float heur_ms = 1e30f;
 		int hi;
 		int best_i;
@@ -564,7 +581,7 @@ static int cublas_lt_gemm_half(cublasOperation_t opa, cublasOperation_t opb,
 		best_ms = 1e30f;
 		time_D = D;
 		time_D_owned = 0;
-		if (*beta != 0.0f && D == C) {
+		if (*beta != 0.0f && D == C && !lt_heuristic_only()) {
 			size_t d_bytes = (size_t)M * (size_t)N * (out_bf16 ? 2 : sizeof(float));
 
 			if (cudaMalloc(&time_D, d_bytes) == cudaSuccess)
