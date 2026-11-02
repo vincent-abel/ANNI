@@ -168,6 +168,7 @@ Full code checklists live in the root [`../README.md`](../README.md): **Capable 
 - [Talking model data](talk-170m-data.md)
 - [Talking model pretraining run](talk-170m-pretrain.md)
 - [Talking model chat fine-tune](talk-170m-chat.md)
+- [Weight-space edits](weight-space-edits.md)
 
 # How this neural network works
 
@@ -458,3 +459,6 @@ Batch 16 × 32 accumulation at window 256, BF16 flash attention, 11.7 GB peak VR
 
 ### [Talking model chat fine-tune](talk-170m-chat.md)
 Two epochs on 24M tokens of User:/Assistant: conversations from the pretrained checkpoint. User turns are stored as -(id+1) and masked out of the loss on the host and the GPU, so the model is trained only on its answers.
+
+### [Weight-space edits](weight-space-edits.md)
+Edits to the FFN output weights, with no training: one direction projected out of one block, after the Weight-Space Programming blog article. Edits against held-out code/web NLL all made it worse. Removing the chat model's "talk reply" direction from block 9 made the coding bench's File: format 0.12 nats per token more likely, with no cost on code or web text.

@@ -228,4 +228,5 @@ function main() {
   console.log("results: " + path.relative(ROOT, out));
 }
 
-main();
+if (require.main === module) main();
+module.exports = { prepare, buildPrompt, SELFTEST };
