@@ -23,6 +23,10 @@ void	lm_train_set_vram_frac(double f);	/* default 0.85 */
 /* E2: warmup steps, then cosine|linear|none over decay_steps (0 = flat). */
 void	lm_train_set_lr_schedule(int warmup_steps, int decay_steps,
 		const char *kind);
+/* Count the schedule's steps from Adam step `from` (continued training from a checkpoint). */
+void	lm_train_set_lr_sched_from(int from);
+/* Learning rate of Adam step `step` under the schedule above. */
+double	lm_train_step_lr(double base_lr, int step);
 void	lm_train_set_grad_clip(double max_norm);	/* 0 = off */
 void	lm_train_set_weight_decay(double wd);		/* AdamW-style; 0 = off */
 /* E9: if >0, derive grad_accum from B*T so each Adam ≈ this many tokens. */
