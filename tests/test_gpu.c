@@ -9,6 +9,7 @@
 **	  7. the batched validation probe matches lm_nll window by window
 **	  8. CUDA-graph replay gives the losses and gradients of the plain run
 **	  9. the same training repeated gives the same gradients (run-to-run)
+**	 10. past 256 tokens the BF16 FA2 attention tracks the FP32 host path
 */
 #define _POSIX_C_SOURCE 200112L
 #include <assert.h>
@@ -672,6 +673,115 @@ static void check_repeatable(const char *tag, int prec, double loss_tol,
 	assert(gw <= grad_tol);
 }
 
+/*
+** 10. Long context: at LT = 512 (past the 256 limit of the one-thread-per-key
+** kernels) BF16 must still take the FA2 attention, and one microbatch must
+** give the loss and gradients of FP32, whose attention falls back to the host.
+*/
+#define LB 2
+#define LT 512
+
+static double long_ctx_pass(int prec, int *fused, float **snaps, int *nt,
+	int *sizes, char names[][16])
+{
+	lm *m;
+	lm_adam *opt;
+	lm_cache *c;
+	mat *dh;
+	mat *g[NT];
+	int ids[LB * LT];
+	unsigned x = 4242u;
+	double ce = -1.0;
+	int i;
+
+	srand(1234);
+	m = lm_create();
+	opt = lm_adam_create(m);
+	assert(m && opt);
+	gpu_set_fp8(0);
+	gpu_set_compute_prec(prec);
+	attn_set_flash(1);
+	lm_weights_to_device(m);
+	c = lm_cache_create_packed(LB, LT);
+	dh = mat_create(LB * LT, LM_D_MODEL);
+	assert(c && dh);
+	gpu_set_sync_mode(GPU_SYNC_BATCH);
+	for (i = 0; i < LB * LT; i++) {
+		x = x * 1103515245u + 12345u;
+		ids[i] = (int)((x >> 16) % 256u);
+	}
+	lm_adam_zero_grad(m);
+	vec_zero(m->db_head);
+	assert(lm_forward_cache_packed(m, ids, LB, LT, c) == 0);
+	assert(lm_loss_backward_packed(m, c, ids, LB, LT, dh, &ce) == 0);
+	assert(lm_backward_packed(m, dh, c) == 0);
+	gpu_device_sync();
+	*fused = c->trc->bc[0].attnpc->fused;
+	*nt = collect(m, g, names);
+	for (i = 0; i < *nt; i++) {
+		sizes[i] = g[i]->rows * g[i]->cols;
+		snaps[i] = malloc((size_t)sizes[i] * sizeof(float));
+		assert(snaps[i] && mat_pull_host(g[i]) == 0);
+		memcpy(snaps[i], g[i]->data, (size_t)sizes[i] * sizeof(float));
+	}
+	gpu_set_sync_mode(GPU_SYNC_EAGER);
+	lm_weights_ensure_host(m);
+	lm_adam_free(&opt);
+	lm_cache_free(&c);
+	mat_free(&dh);
+	lm_free(&m);
+	return ce;
+}
+
+static void check_long_ctx(void)
+{
+	static float *s32[NT];
+	static float *s16[NT];
+	int sizes[NT];
+	char names[NT][16];
+	int nt;
+	int f32;
+	int f16;
+	double l32;
+	double l16;
+	int i;
+	int j;
+	int bad = 0;
+
+	l32 = long_ctx_pass(GPU_PREC_FP32, &f32, s32, &nt, sizes, names);
+	l16 = long_ctx_pass(GPU_PREC_BF16, &f16, s16, &nt, sizes, names);
+	printf("  T=%d loss fp32 %.5f (attn path %d) bf16 %.5f (attn path %d)\n",
+	    LT, l32, f32, l16, f16);
+	assert(f16 == 5);
+	if (fabs(l32 - l16) > 2e-3)
+		bad = 1;
+	for (i = 0; i < nt; i++) {
+		double num = 0.0;
+		double den = 0.0;
+		double rel;
+
+		for (j = 0; j < sizes[i]; j++) {
+			double d = s32[i][j] - s16[i][j];
+
+			num += d * d;
+			den += (double)s32[i][j] * s32[i][j];
+		}
+		rel = sqrt(num / (den + 1e-30));
+		if (rel > 0.2) {
+			double n16 = 0.0;
+
+			for (j = 0; j < sizes[i]; j++)
+				n16 += (double)s16[i][j] * s16[i][j];
+			printf("    %s: rel_err %.3f |fp32| %.3e |bf16| %.3e\n",
+			    names[i], rel, sqrt(den), sqrt(n16));
+			bad = 1;
+		}
+		free(s32[i]);
+		free(s16[i]);
+	}
+	assert(!bad);
+}
+
 int main(void)
 {
 	if (!gpu_available()) {
@@ -704,6 +814,8 @@ int main(void)
 	printf("repeated training (run-to-run determinism)\n");
 	check_repeatable("bf16", GPU_PREC_BF16, 2e-5, 1e-6);
 	check_repeatable("fp32", GPU_PREC_FP32, 2e-5, 1e-6);
+	printf("long context (T=%d) bf16 FA2 vs fp32 host\n", LT);
+	check_long_ctx();
 	printf("test_gpu: all passed\n");
 	return 0;
 }

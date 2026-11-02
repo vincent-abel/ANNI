@@ -927,8 +927,9 @@ int attn_mha_forward_packed_res(mat *out, attn *a, const mat *x,
 	}
 	if (pcache_ensure_seq(c) != 0)
 		return -1;
+	/* concat too: the host loop writes every row (GPU runs keep it device-only). */
 	if (mat_ensure_host(c->q) != 0 || mat_ensure_host(c->k) != 0
-	    || mat_ensure_host(c->v) != 0)
+	    || mat_ensure_host(c->v) != 0 || mat_ensure_host(c->concat) != 0)
 		return -1;
 	fail = 0;
 	/* Causal attention only inside each sequence: B*H independent items. */
@@ -947,7 +948,8 @@ int attn_mha_forward_packed_res(mat *out, attn *a, const mat *x,
 		copy_head_rows(s->k_h[h], c->k, b * T, h, a->d_head);
 		copy_head_rows(s->v_h[h], c->v, b * T, h, a->d_head);
 		if (self_forward_cache(s->o_h[h], s->q_h[h], s->k_h[h],
-		    s->v_h[h], 1, s->attn_w[h], &s->softmax_tmp[h * T]) != 0)
+		    s->v_h[h], 1, s->attn_w[h], &s->softmax_tmp[h * T]) != 0
+		    || mat_ensure_host(s->o_h[h]) != 0)
 			fail = 1;
 		else
 			write_head_rows(c->concat, s->o_h[h], b * T, h,
@@ -1026,6 +1028,10 @@ int attn_mha_backward_packed(mat *dx, const mat *dout, attn *a,
 	mat_zero(dq);
 	mat_zero(dk);
 	mat_zero(dv);
+	/* The host loop writes their rows: GPU runs may keep them device-only. */
+	if (mat_ensure_host(dq) != 0 || mat_ensure_host(dk) != 0
+	    || mat_ensure_host(dv) != 0)
+		return -1;
 	fail = 0;
 #ifdef _OPENMP
 #pragma omp parallel reduction(|:fail)

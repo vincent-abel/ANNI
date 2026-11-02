@@ -167,8 +167,12 @@ static lm *read_model(FILE *fp)
 	    || read_i32(fp, &d_ff) != 0 || read_i32(fp, &max_ctx) != 0
 	    || read_i32(fp, &n_blocks) != 0 || read_i32(fp, &vsize) != 0)
 		return NULL;
+	/*
+	** Positions are fixed sinusoids, so no weight depends on the context:
+	** a model trained at a shorter context loads into a longer build.
+	*/
 	if (d_model != LM_D_MODEL || n_heads != LM_N_HEADS || d_ff != LM_D_FF
-	    || max_ctx != LM_MAX_CTX || n_blocks != LM_N_BLOCKS)
+	    || max_ctx < 2 || max_ctx > LM_MAX_CTX || n_blocks != LM_N_BLOCKS)
 		return NULL;
 	tok = NULL;
 	if (magic == (int)LM_MAGIC_BPE) {
