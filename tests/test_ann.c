@@ -862,6 +862,22 @@ static void test_lm_load_shorter_ctx(void)
 	lm_free(&a);
 }
 
+/* --lr-sched-from: warmup and cosine restart at the given Adam step. */
+static void test_lr_sched_from(void)
+{
+	lm_train_set_lr_schedule(100, 1000, "cosine");
+	lm_train_set_lr_sched_from(0);
+	assert(fabs(lm_train_step_lr(1.0, 29000) - 0.0) < 1e-12);
+	lm_train_set_lr_sched_from(29000);
+	assert(fabs(lm_train_step_lr(1.0, 29000) - 0.01) < 1e-12);
+	assert(fabs(lm_train_step_lr(1.0, 29099) - 1.0) < 1e-12);
+	assert(fabs(lm_train_step_lr(1.0, 29600) - 0.5) < 1e-12);
+	assert(fabs(lm_train_step_lr(1.0, 31000) - 0.0) < 1e-12);
+	assert(fabs(lm_train_step_lr(1.0, 10) - 0.01) < 1e-12);
+	lm_train_set_lr_sched_from(0);
+	lm_train_set_lr_schedule(0, 0, "none");
+}
+
 static void test_lm_merge_average(void)
 {
 	lm *a;
@@ -1721,6 +1737,7 @@ int main(void)
 	test_lm_loss_mask();
 	test_lm_serialize_roundtrip();
 	test_lm_load_shorter_ctx();
+	test_lr_sched_from();
 	test_lm_merge_average();
 	test_lm_checkpoint_resume();
 	test_lm_epoch_order();
