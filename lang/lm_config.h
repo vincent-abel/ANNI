@@ -17,7 +17,7 @@
 # define LM_D_FF	4096
 #endif
 #ifndef LM_MAX_CTX
-# define LM_MAX_CTX	256
+# define LM_MAX_CTX	2048
 #endif
 #ifndef LM_N_BLOCKS
 # define LM_N_BLOCKS	12
