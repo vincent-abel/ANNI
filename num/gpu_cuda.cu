@@ -5257,6 +5257,12 @@ static int att_args_ok(int B, int T, int H, int dh)
 	    && gpu_available();
 }
 
+/* The FA2 kernels stream keys in 64-wide tiles: no T <= ATT_BLOCK limit. */
+static int fa2_args_ok(int B, int T, int H, int dh)
+{
+	return B > 0 && T > 0 && H > 0 && dh > 0 && gpu_available();
+}
+
 extern "C" int gpu_attn_causal_fwd(mat *concat, mat *w, const mat *q,
 	const mat *k, const mat *v, int B, int T, int H, int dh)
 {
@@ -6545,7 +6551,7 @@ extern "C" int gpu_attn_fa_fwd(mat *concat, const mat *q, const mat *k,
 	act_bf16_slot *o16 = NULL;
 
 	if (!concat || !q || !k || !v || !lse || !lse->d_data
-	    || !att_args_ok(B, T, H, dh) || !fa2_ok(T, dh) || !fa2_on()
+	    || !fa2_args_ok(B, T, H, dh) || !fa2_ok(T, dh) || !fa2_on()
 	    || g_att_seqlens_host || g_compute_prec != GPU_PREC_BF16)
 		return -1;
 	if (q->rows != B * T || q->cols != H * dh || lse->rows != B * H * T)
@@ -6745,7 +6751,7 @@ extern "C" int gpu_attn_fa_bwd(mat *dq, mat *dk, mat *dv, const mat *dconcat,
 	size_t nrows;
 
 	if (!dq || !dk || !dv || !dconcat || !concat || !q || !k || !v || !lse
-	    || !lse->d_data || !att_args_ok(B, T, H, dh) || !fa2_ok(T, dh)
+	    || !lse->d_data || !fa2_args_ok(B, T, H, dh) || !fa2_ok(T, dh)
 	    || !fa2_on() || g_att_seqlens_host || g_compute_prec != GPU_PREC_BF16)
 		return -1;
 	nrows = (size_t)B * H * T;

@@ -1,0 +1,7 @@
+{
+  "name": "minilib",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Small dependency-free helpers used by the Galaxy benchmark",
+  "scripts": { "test": "node test.js" }
+}

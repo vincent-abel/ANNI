@@ -72,6 +72,24 @@ void lm_decoder_free(lm_decoder **d)
 	*d = NULL;
 }
 
+/*
+** Prompts past ATT_BLOCK (256) would take the host attention loop of
+** lm_forward_cache: they go through the device decode step instead, one
+** token at a time, so a long prompt never runs attention on the CPU.
+*/
+#define PREFILL_FULL_MAX	256
+
+static int prefill_steps(lm_decoder *d, const int *ids, int n, vec *logits)
+{
+	int i;
+
+	for (i = 0; i < n; i++)
+		if (gpu_dec_step(d->dec, ids[i], i, logits->data) != 0)
+			return -1;
+	d->len = n;
+	return 0;
+}
+
 int lm_decoder_prefill(lm_decoder *d, const int *ids, int n, vec *logits)
 {
 	lm_cache *c;
@@ -79,8 +97,11 @@ int lm_decoder_prefill(lm_decoder *d, const int *ids, int n, vec *logits)
 	int i;
 	int rc;
 
-	if (!d || !ids || n <= 0 || n > LM_MAX_CTX || !logits)
+	if (!d || !ids || n <= 0 || n > LM_MAX_CTX || !logits
+	    || logits->n != d->model->vocab_size)
 		return -1;
+	if (n > PREFILL_FULL_MAX || getenv("ANN_PREFILL_STEPS"))
+		return prefill_steps(d, ids, n, logits);
 	c = lm_cache_create(n);
 	if (!c)
 		return -1;

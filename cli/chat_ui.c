@@ -131,7 +131,7 @@ static void chat_draw(chat_ui *ui)
 	mvhline(rows - 2, 0, ACS_HLINE, cols);
 	mvprintw(rows - 2, 0, "> %.*s", cols - 3, ui->comp);
 	mvprintw(rows - 1, 0,
-	    "Enter send  PgUp/PgDn scroll  Esc clear/quit  q quit  Ctrl-L redraw");
+	    "Enter send  PgUp/PgDn scroll  Esc clear/quit  Ctrl-L redraw");
 	move(rows - 2, 2 + ui->comp_len);
 	refresh();
 }
@@ -188,6 +188,7 @@ int chat_ui_run(const chat_ui_cfg *cfg)
 	cbreak();
 	noecho();
 	keypad(stdscr, TRUE);
+	set_escdelay(25);	/* a lone Esc quits without the 1 s default wait */
 	curs_set(1);
 	getmaxyx(stdscr, rows, cols);
 	(void)rows;
@@ -214,6 +215,16 @@ int chat_ui_run(const chat_ui_cfg *cfg)
 			continue;
 		}
 		if (ch == 27) {	/* Esc */
+			/* A terminal sequence the keypad did not decode (focus
+			** in/out, bracketed paste) starts with Esc too: drop it. */
+			timeout(50);
+			if (getch() != ERR) {
+				while (getch() != ERR)
+					;
+				timeout(-1);
+				continue;
+			}
+			timeout(-1);
 			if (ui.comp_len > 0) {
 				ui.comp_len = 0;
 				ui.comp[0] = '\0';
@@ -221,8 +232,6 @@ int chat_ui_run(const chat_ui_cfg *cfg)
 				break;
 			continue;
 		}
-		if ((ch == 'q' || ch == 'Q') && ui.comp_len == 0)
-			break;
 		if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
 			if (ui.comp_len > 0) {
 				ui.comp_len--;

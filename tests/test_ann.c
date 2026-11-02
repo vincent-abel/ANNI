@@ -828,6 +828,56 @@ static void test_lm_serialize_roundtrip(void)
 	lm_free(&b);
 }
 
+/* Write ctx into the max_ctx header field (sixth int32) of a saved model. */
+static void set_saved_ctx(const char *path, int ctx)
+{
+	FILE *fp;
+
+	fp = fopen(path, "r+b");
+	assert(fp);
+	assert(fseek(fp, 5 * (long)sizeof(int), SEEK_SET) == 0);
+	assert(fwrite(&ctx, sizeof(int), 1, fp) == 1);
+	fclose(fp);
+}
+
+/* Sinusoidal positions: a shorter-context model loads, a longer one does not. */
+static void test_lm_load_shorter_ctx(void)
+{
+	lm *a;
+	lm *b;
+
+	srand(13);
+	a = lm_create();
+	assert(a);
+	assert(lm_save(a, "objects/test_lm_ctx.bin") == 0);
+	set_saved_ctx("objects/test_lm_ctx.bin", LM_MAX_CTX / 8);
+	b = lm_load("objects/test_lm_ctx.bin");
+	assert(b);
+	assert(fabs(b->w_head->data[0] - a->w_head->data[0]) < 1e-7);
+	lm_free(&b);
+	set_saved_ctx("objects/test_lm_ctx.bin", LM_MAX_CTX * 2);
+	assert(lm_load("objects/test_lm_ctx.bin") == NULL);
+	set_saved_ctx("objects/test_lm_ctx.bin", 0);
+	assert(lm_load("objects/test_lm_ctx.bin") == NULL);
+	lm_free(&a);
+}
+
+/* --lr-sched-from: warmup and cosine restart at the given Adam step. */
+static void test_lr_sched_from(void)
+{
+	lm_train_set_lr_schedule(100, 1000, "cosine");
+	lm_train_set_lr_sched_from(0);
+	assert(fabs(lm_train_step_lr(1.0, 29000) - 0.0) < 1e-12);
+	lm_train_set_lr_sched_from(29000);
+	assert(fabs(lm_train_step_lr(1.0, 29000) - 0.01) < 1e-12);
+	assert(fabs(lm_train_step_lr(1.0, 29099) - 1.0) < 1e-12);
+	assert(fabs(lm_train_step_lr(1.0, 29600) - 0.5) < 1e-12);
+	assert(fabs(lm_train_step_lr(1.0, 31000) - 0.0) < 1e-12);
+	assert(fabs(lm_train_step_lr(1.0, 10) - 0.01) < 1e-12);
+	lm_train_set_lr_sched_from(0);
+	lm_train_set_lr_schedule(0, 0, "none");
+}
+
 static void test_lm_merge_average(void)
 {
 	lm *a;
@@ -1686,6 +1736,8 @@ int main(void)
 	test_lm_packed_matches_sequential();
 	test_lm_loss_mask();
 	test_lm_serialize_roundtrip();
+	test_lm_load_shorter_ctx();
+	test_lr_sched_from();
 	test_lm_merge_average();
 	test_lm_checkpoint_resume();
 	test_lm_epoch_order();

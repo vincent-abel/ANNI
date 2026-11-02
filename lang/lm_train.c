@@ -64,6 +64,7 @@ static void *g_progress_ud;
 static train_control *g_train_ctl;
 static int g_warmup_steps;
 static int g_decay_steps;
+static int g_sched_from;
 static char g_decay_kind[16] = "none";
 static double g_grad_clip;
 static double g_weight_decay;
@@ -94,7 +95,7 @@ void lm_train_set_control(train_control *ctl)
 	g_train_ctl = ctl;
 }
 
-static double train_step_lr(double base_lr, int step)
+double lm_train_step_lr(double base_lr, int step)
 {
 	double lr;
 	double p;
@@ -103,6 +104,9 @@ static double train_step_lr(double base_lr, int step)
 	if (g_train_ctl && g_train_ctl->lr > 0.0)
 		return g_train_ctl->lr;
 	lr = base_lr;
+	step -= g_sched_from;
+	if (step < 0)
+		step = 0;
 	if (g_warmup_steps > 0 && step < g_warmup_steps)
 		return lr * ((double)step + 1.0) / (double)g_warmup_steps;
 	if (g_decay_steps <= 0 || strcmp(g_decay_kind, "none") == 0)
@@ -147,7 +151,7 @@ static int train_poll_control(train_progress *p)
 	while (g_train_ctl->pause && !g_train_ctl->quit_save) {
 		if (p) {
 			p->event = TRAIN_EV_STEP;
-			p->lr = train_step_lr(p->lr, p->adam_t);
+			p->lr = lm_train_step_lr(p->lr, p->adam_t);
 			emit_progress(p);
 		}
 		train_sleep_ms(50);
@@ -399,6 +403,11 @@ void lm_train_set_lr_schedule(int warmup_steps, int decay_steps, const char *kin
 		kind = "none";
 	strncpy(g_decay_kind, kind, sizeof(g_decay_kind) - 1);
 	g_decay_kind[sizeof(g_decay_kind) - 1] = '\0';
+}
+
+void lm_train_set_lr_sched_from(int from)
+{
+	g_sched_from = from < 0 ? 0 : from;
 }
 
 void lm_train_set_grad_clip(double max_norm)
@@ -1175,7 +1184,7 @@ double lm_train_corpus_val(lm *model, text_dataset *ds, lm_adam *opt,
 				tp.nll = last;
 				tp.win_nll = win;
 				tp.val_nll = val ? win : -1.0;
-				tp.lr = train_step_lr(lr, opt->t);
+				tp.lr = lm_train_step_lr(lr, opt->t);
 				tp.adam_t = opt->t;
 				elapsed = wall_sec() - t0;
 				tp.elapsed_sec = elapsed;
@@ -1311,7 +1320,7 @@ double lm_train_corpus_val(lm *model, text_dataset *ds, lm_adam *opt,
 				** A1: Adam gathers device-authoritative dW D2D and
 				** leaves weights device-authoritative.
 				*/
-				step_lr = train_step_lr(lr, opt->t);
+				step_lr = lm_train_step_lr(lr, opt->t);
 				opt->weight_decay = g_weight_decay;
 				opt->grad_clip = g_grad_clip;
 				{
@@ -1455,7 +1464,7 @@ double lm_train_corpus_val(lm *model, text_dataset *ds, lm_adam *opt,
 			tp.nll = last;
 			tp.win_nll = win;
 			tp.val_nll = val ? win : -1.0;
-			tp.lr = train_step_lr(lr, opt->t);
+			tp.lr = lm_train_step_lr(lr, opt->t);
 			tp.adam_t = opt->t;
 			tp.elapsed_sec = wall_sec() - t0;
 			tp.ms_tok = (tokens_done > 0 && tp.elapsed_sec > 0.0)
@@ -1528,7 +1537,7 @@ double lm_train_corpus_val(lm *model, text_dataset *ds, lm_adam *opt,
 		tp.tokens_done = tokens_done;
 		tp.nll = last;
 		tp.win_nll = win;
-		tp.lr = train_step_lr(lr, opt->t);
+		tp.lr = lm_train_step_lr(lr, opt->t);
 		tp.batch = batch_size;
 		tp.grad_accum = g_grad_accum;
 		tp.ckpt_path = ckpt_path;
@@ -1675,7 +1684,7 @@ double lm_train_stream(lm *model, text_stream *train, lm_adam *opt,
 				tp.nll = last;
 				tp.win_nll = win;
 				tp.val_nll = val ? win : -1.0;
-				tp.lr = train_step_lr(lr, opt->t);
+				tp.lr = lm_train_step_lr(lr, opt->t);
 				tp.adam_t = opt->t;
 				el = wall_sec() - ep_t0;
 				tp.elapsed_sec = wall_sec() - t0;
@@ -1833,7 +1842,7 @@ double lm_train_stream(lm *model, text_stream *train, lm_adam *opt,
 					gpu_set_sync_mode(GPU_SYNC_EAGER);
 					break;
 				}
-				step_lr = train_step_lr(lr, opt->t);
+				step_lr = lm_train_step_lr(lr, opt->t);
 				opt->weight_decay = g_weight_decay;
 				opt->grad_clip = g_grad_clip;
 				{
@@ -1952,7 +1961,7 @@ double lm_train_stream(lm *model, text_stream *train, lm_adam *opt,
 				tp.nw = tp.epoch_done > 0 ? tp.epoch_done
 				    : (est > 0 ? (int)est : 0);
 			}
-			tp.lr = train_step_lr(lr, opt->t);
+			tp.lr = lm_train_step_lr(lr, opt->t);
 			tp.adam_t = opt->t;
 			el = wall_sec() - ep_t0;
 			tp.elapsed_sec = wall_sec() - t0;
