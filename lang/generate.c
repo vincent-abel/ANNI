@@ -299,10 +299,11 @@ int lm_generate_stream(lm *model, const char *prompt, int max_new,
 	gpu_set_sync_mode(GPU_SYNC_BATCH);
 	nnew = generate_stream_dec(model, ids, n, max_new, temperature, top_k,
 	    top_p, on_text, ud);
-	if (nnew != -2) {
+	/* ANN_GPU_ONLY: no full-forward CPU fallback when the decoder fails. */
+	if (nnew != -2 || getenv("ANN_GPU_ONLY")) {
 		gpu_set_sync_mode(sync_was);
 		vec_free(&logits);
-		return nnew;
+		return nnew == -2 ? -1 : nnew;
 	}
 	nnew = 0;
 	for (i = 0; i < max_new && n < LM_MAX_CTX; i++) {

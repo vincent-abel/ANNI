@@ -10,6 +10,8 @@
 **	  8. CUDA-graph replay gives the losses and gradients of the plain run
 **	  9. the same training repeated gives the same gradients (run-to-run)
 **	 10. past 256 tokens the BF16 FA2 attention tracks the FP32 host path
+**	 11. a long prompt is prefilled by the device decode step (no host
+**	     attention) and its logits match the full forward
 */
 #define _POSIX_C_SOURCE 200112L
 #include <assert.h>
@@ -18,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "attn.h"
+#include "decode.h"
 #include "gpu.h"
 #include "gradutil.h"
 #include "lm.h"
@@ -782,6 +785,92 @@ static void check_long_ctx(void)
 	assert(!bad);
 }
 
+#define PT 300	/* past PREFILL_FULL_MAX: the step-wise device prefill */
+
+/* Logits of the full forward (FP32, host attention past 256) at n - 1. */
+static void ref_logits(lm *m, const int *ids, int n, vec *out)
+{
+	lm_cache *c;
+
+	c = lm_cache_create(n);
+	assert(c);
+	assert(lm_forward_cache(m, ids, n, c) == 0);
+	assert(lm_logits_at(out, m, c->hidden, n - 1) == 0);
+	lm_cache_free(&c);
+}
+
+static double max_diff(const vec *a, const vec *b, int *same_arg)
+{
+	double d = 0.0;
+	double scale = 0.0;
+	int aa = 0;
+	int ab = 0;
+	int v;
+
+	for (v = 0; v < a->n; v++) {
+		if (fabs((double)a->data[v] - b->data[v]) > d)
+			d = fabs((double)a->data[v] - b->data[v]);
+		if (fabs((double)a->data[v]) > scale)
+			scale = fabs((double)a->data[v]);
+		if (a->data[v] > a->data[aa])
+			aa = v;
+		if (b->data[v] > b->data[ab])
+			ab = v;
+	}
+	*same_arg = aa == ab;
+	return d / (scale + 1e-30);
+}
+
+static void check_long_prefill(void)
+{
+	lm *m;
+	lm_decoder *d;
+	vec *ref;
+	vec *got;
+	int ids[PT];
+	unsigned x = 777u;
+	double rel;
+	int same;
+	int i;
+
+	srand(1234);
+	m = lm_create();
+	assert(m);
+	gpu_set_fp8(0);
+	gpu_set_compute_prec(GPU_PREC_FP32);
+	gpu_set_sync_mode(GPU_SYNC_EAGER);
+	for (i = 0; i < PT; i++) {
+		x = x * 1103515245u + 12345u;
+		ids[i] = (int)((x >> 16) % 256u);
+	}
+	ref = vec_create(m->vocab_size);
+	got = vec_create(m->vocab_size);
+	assert(ref && got);
+	ref_logits(m, ids, PT, ref);
+	lm_weights_to_device(m);
+	d = lm_decoder_create(m);
+	assert(d);
+	assert(lm_decoder_prefill(d, ids, PT, got) == 0);
+	assert(d->len == PT);
+	rel = max_diff(ref, got, &same);
+	printf("  prefill %d tokens: max |dlogit| / max |logit| %.2e, argmax %s\n",
+	    PT, rel, same ? "same" : "differs");
+	assert(rel < 1e-2 && same);
+	/* The next decode step continues from the prefilled cache. */
+	ids[PT - 1] = 5;
+	ref_logits(m, ids, PT, ref);
+	d->len = PT - 1;
+	assert(lm_decoder_step(d, 5, got) == 0);
+	rel = max_diff(ref, got, &same);
+	printf("  step after it: %.2e, argmax %s\n", rel, same ? "same" : "differs");
+	assert(rel < 1e-2 && same);
+	lm_decoder_free(&d);
+	vec_free(&ref);
+	vec_free(&got);
+	lm_weights_ensure_host(m);
+	lm_free(&m);
+}
+
 int main(void)
 {
 	if (!gpu_available()) {
@@ -816,6 +905,8 @@ int main(void)
 	check_repeatable("fp32", GPU_PREC_FP32, 2e-5, 1e-6);
 	printf("long context (T=%d) bf16 FA2 vs fp32 host\n", LT);
 	check_long_ctx();
+	printf("long prompt prefill on the device decoder\n");
+	check_long_prefill();
 	printf("test_gpu: all passed\n");
 	return 0;
 }
