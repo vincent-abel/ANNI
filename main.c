@@ -216,6 +216,8 @@ static int run_lm_train_core(int argc, char **argv, int use_tower)
 		int tps = atoi(arg_value(argc, argv, "--tokens-per-step", "0"));
 
 		lm_train_set_lr_schedule(warm, decay, dk);
+		lm_train_set_lr_sched_from(atoi(arg_value(argc, argv,
+		    "--lr-sched-from", "0")));
 		lm_train_set_grad_clip(clip);
 		lm_train_set_weight_decay(wd);
 		lm_train_set_tokens_per_step(tps);
@@ -1340,7 +1342,7 @@ int main(int argc, char *argv[])
 		printf("       ./anni lm [phrase]\n");
 		printf("       ./anni lm train [--data PATH] [--epochs N] [--out PATH]\n");
 		printf("                 [--resume PATH] [--val-data PATH] [--ckpt-minutes M]\n");
-		printf("                 [--adam-beta2 B]\n");
+		printf("                 [--adam-beta2 B] [--lr-sched-from STEP]\n");
 		printf("                 [--lr RATE] [--window N]\n");
 		printf("                 [--batch N|auto] [--grad-accum K] [--vram-frac F]\n");
 		printf("                 [--seed N] [--eval-every N]\n");

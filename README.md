@@ -356,7 +356,7 @@ What we have at `f3a44b3` was a **byte-level** educational model (`LM_BYTE_VOCAB
 Stage 1 local turn loop on a pretrained checkpoint — not Stage 3 SFT/HTTP.
 
 - [x] **CHAT1** `./anni chat --model wiki_bpe.bin`: User/Assistant history, `lm_generate`, context ≤ `LM_MAX_CTX` (stdin when no TTY)
-- [x] **CHAT2** Docs + README example; exit on empty line / Ctrl-D (stdin) or Esc/q (ncurses)
+- [x] **CHAT2** Docs + README example; exit on empty line / Ctrl-D (stdin) or a lone Esc (ncurses)
 - [x] **CHAT3** Ncurses messenger UI on TTY (`libncurses-dev`); same flags as CHAT1; `./anni lm chat` is an alias
 
 **Done when:** subword vocab, ≥100 MB train data, ~10M+ params, train window ≈ generate horizon, FP32 (or faster) on GPU, and generate produces readable multi-word text on held-out-style prompts—not just low NLL on `toy_tiny`. Then `./anni chat` for multi-turn local chat.
