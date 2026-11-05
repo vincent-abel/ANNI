@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # From-scratch 555M run: tied 100k table, then the chat fine-tune.
 #
-#   scripts/run555m.sh --check         # 5 minutes of training, prints peak VRAM
+#   scripts/run555m.sh --check         # CHECK_SECONDS of training, prints peak VRAM
+#   BATCH=2 ACCUM=256 EXTRA=--act-checkpoint scripts/run555m.sh --check
 #   scripts/run555m.sh                 # start (or reattach to) tmux session run555m
 #   tmux attach -t run555m             # watch; Ctrl-b d to detach
 #   tail -f logs/run555m/pretrain.log
@@ -24,6 +25,8 @@ TRAIN=data/mix100k_train_ids.bin
 WINDOW=${WINDOW:-256}
 BATCH=${BATCH:-4}
 ACCUM=${ACCUM:-128}
+EXTRA=${EXTRA:-}
+CHECK_SECONDS=${CHECK_SECONDS:-600}
 CUDA_HOME=${CUDA_HOME:-$(ls -d /usr/local/cuda-13* | tail -1)}
 mkdir -p "$LOGS" models
 
@@ -62,7 +65,7 @@ train() {
 	    --lr 3e-4 --lr-warmup 1000 --lr-decay cosine --lr-decay-steps "$steps" \
 	    --adam-beta2 0.95 --grad-clip 1.0 --weight-decay 0.1 \
 	    --flash-attn --bf16 --eval-every 1 --eval-windows 256 \
-	    --ckpt-minutes 30 --seed 1 -d
+	    --ckpt-minutes 30 --seed 1 $EXTRA -d
 }
 
 pretrain() {
@@ -96,11 +99,11 @@ step() {	# step NAME MARKER CMD...
 
 if [ "${1:-}" = "--check" ]; then
 	need_free_gpu
-	build > "$LOGS/build.log" 2>&1
+	[ -x "$BUILD/anni" ] || build > "$LOGS/build.log" 2>&1
 	nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -l 2 \
 	    > "$LOGS/check_vram.log" &
 	smi=$!
-	timeout 300 bash -c "$(declare -f train); $(declare -p TRAIN WINDOW BATCH ACCUM BUILD VOCAB); \
+	timeout "$CHECK_SECONDS" bash -c "$(declare -f train); $(declare -p TRAIN WINDOW BATCH ACCUM BUILD VOCAB EXTRA); \
 	    train --force models/run555m-check.bin" > "$LOGS/check.log" 2>&1 || true
 	kill "$smi"
 	rm -f models/run555m-check.bin
