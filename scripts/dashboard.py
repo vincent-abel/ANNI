@@ -32,6 +32,8 @@ ROOT = Path(__file__).resolve().parents[1]
 MAX_POINTS = 3000
 CURVE_EVERY = 10 * 131072	# tokens between rows, 10 steps of the run
 D_MODEL, D_FF, N_BLOCKS, VOCAB = 1536, 6272, 14, 100000
+N_HEADS, MAX_CTX = 24, 2048
+TRAIN_ARGS = re.compile(rb"batch=(\d+) grad_accum=(\d+) lr=(\S+) window=(\d+)")
 
 
 def flops_per_token(window: int) -> float:
@@ -43,6 +45,46 @@ def flops_per_token(window: int) -> float:
 PROGRESS = re.compile(
     rb"ep \d+/\d+ .*?(\d+)/(\d+) NLL ([\d.]+) win ([\d.]+) ([\d.]+)ms/t "
     rb"(\d+)t/s ~([\d.]+)TF (\d+)MB")
+
+
+def run_params(args: tuple | None, total_tokens: int) -> list:
+    """Groups of (label, value) for the top of the page."""
+    d, f, v = D_MODEL, D_FF, VOCAB
+    block = 4 * d * d + 2 * d * f + f + d + 4 * d
+    total = N_BLOCKS * block + d * v + v
+    n = lambda x: f"{x:,}"
+    groups = [
+        ["Model", [
+            ["Parameters", n(total)],
+            ["Vocabulary", n(v)],
+            ["D model", n(d)],
+            ["Blocks", n(N_BLOCKS)],
+            ["Heads", f"{N_HEADS} of {d // N_HEADS}"],
+            ["FFN width", n(f)],
+            ["Max context", n(MAX_CTX)],
+        ]],
+        ["Matrices", [
+            ["Shared embed and head", f"{n(d)} x {n(v)} ({n(d * v)})"],
+            ["Wq, Wk, Wv, Wo", f"{n(d)} x {n(d)}, 4 per block"],
+            ["FFN W1", f"{n(d)} x {n(f)}"],
+            ["FFN W2", f"{n(f)} x {n(d)}"],
+            ["One block", n(block)],
+            ["All blocks", n(N_BLOCKS * block)],
+        ]],
+    ]
+    train = [["Tokens", f"{total_tokens / 1e9:.2f} G"] if total_tokens else ["Tokens", "-"]]
+    if args:
+        batch, accum, lr, window = args
+        step = batch * accum * window
+        train += [["Window", n(window)], ["Batch", f"{batch} x {accum} accumulation"],
+                  ["Tokens per step", n(step)]]
+        if total_tokens:
+            train.append(["Steps", n(total_tokens // step)])
+        train.append(["Learning rate", f"{lr}, warmup 1,000, cosine"])
+    train += [["Adam", "beta2 0.95, weight decay 0.1"], ["Gradient clip", "1.0"],
+              ["Precision", "BF16, flash attention"]]
+    groups.append(["Training", train])
+    return groups
 
 
 def load_config() -> dict:
@@ -80,10 +122,14 @@ class Log:
         self.speed: list[float] = []
         self.lines: list[str] = []
         self.current = ""
+        self.args: tuple | None = None
         self.lock = threading.Lock()
 
     def line(self, raw: bytes) -> None:
         m = PROGRESS.search(raw)
+        t = TRAIN_ARGS.search(raw)
+        if t:
+            self.args = (int(t[1]), int(t[2]), t[3].decode(), int(t[4]))
         if not m:
             text = raw.decode("utf-8", "replace").strip()
             if text:
@@ -134,6 +180,7 @@ class Log:
                 left = last["total_tokens"] - last["tokens"]
                 last["eta_s"] = left / avg if avg > 0 else None
             return {"progress": last, "points": list(self.points),
+                    "run": run_params(self.args, last.get("total_tokens", 0)),
                     "log": self.lines + [self.current]}
 
 
@@ -220,9 +267,15 @@ h1 { font-size:20px; margin:0; } h2 { font-size:14px; margin:0 0 8px; color:var(
   padding:4px 8px; border-radius:4px; font-size:13px; white-space:nowrap; }
 pre { margin:0; padding:12px; background:var(--term); color:var(--termink); border-radius:6px;
   font:12.5px/1.4 ui-monospace,monospace; height:260px; overflow:auto; white-space:pre-wrap; word-break:break-all; }
+.params { display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:6px 28px; }
+.params h3 { font-size:13px; margin:0 0 6px; color:var(--ink2); font-weight:600; }
+.params div div { display:flex; justify-content:space-between; gap:12px; font-size:13px; padding:2px 0;
+  border-bottom:1px solid var(--line); }
+.params span { color:var(--ink2); } .params b { font-weight:500; font-variant-numeric:tabular-nums; text-align:right; }
 .two { display:grid; grid-template-columns:repeat(auto-fit,minmax(340px,1fr)); gap:14px; }
 </style></head><body><main>
 <header><h1>ANNI 555M training</h1><div id="status">connecting</div></header>
+<section class="card"><div id="params" class="params"></div></section>
 <section class="card"><h2 id="pct">Progress</h2><div class="bar"><i id="fill"></i></div></section>
 <section class="tiles">
 <div class="card tile"><b id="nll">-</b><span>training loss (NLL)</span></div>
@@ -284,7 +337,15 @@ $("chart").addEventListener("mouseleave", () => { $("tip").style.display = "none
   if (geo) { geo.cross.setAttribute("visibility", "hidden"); geo.dot.setAttribute("visibility", "hidden"); } });
 function follow(pre, text) { const end = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 8;
   pre.textContent = text; if (end) pre.scrollTop = pre.scrollHeight; }
+function params(groups) {
+  $("params").replaceChildren(...groups.map(([title, rows]) => { const g = document.createElement("div"),
+    h = document.createElement("h3"); h.textContent = title; g.append(h);
+    for (const [k, v] of rows) { const r = document.createElement("div"), a = document.createElement("span"),
+      b = document.createElement("b"); a.textContent = k; b.textContent = v; r.append(a, b); g.append(r); }
+    return g; }));
+}
 function show(s, label) {
+    params(s.run);
     const p = s.progress, g = s.gpu;
     $("status").textContent = label + " " + new Date(s.now * 1000).toLocaleString();
     $("panetitle").textContent = "tmux " + s.session;

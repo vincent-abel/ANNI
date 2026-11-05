@@ -24,7 +24,7 @@ shot() {	# shot NAME
 	local profile
 	profile=$(mktemp -d)
 	timeout 60 "$CHROME" --headless=new --no-sandbox --disable-gpu \
-	    --user-data-dir="$profile" --window-size=1200,1350 \
+	    --user-data-dir="$profile" --window-size=1200,1600 \
 	    --virtual-time-budget=5000 --screenshot="$SHOTS/$1.png.part.png" \
 	    "$(python3 scripts/dashboard.py --print-url)" >/dev/null 2>&1 || true
 	rm -rf "$profile"
