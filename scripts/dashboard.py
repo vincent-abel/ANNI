@@ -31,6 +31,15 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 MAX_POINTS = 3000
 CURVE_EVERY = 10 * 131072	# tokens between rows, 10 steps of the run
+D_MODEL, D_FF, N_BLOCKS, VOCAB = 1536, 6272, 14, 100000
+
+
+def flops_per_token(window: int) -> float:
+    """Train FLOPs of one token: 6 per weight of the blocks and head, plus
+    causal attention. The trainer's own figure counts the FFN twice and drops
+    the head, so it is not used here."""
+    weights = N_BLOCKS * (4 * D_MODEL ** 2 + 2 * D_MODEL * D_FF) + D_MODEL * VOCAB
+    return 6.0 * weights + 6.0 * N_BLOCKS * window * D_MODEL
 PROGRESS = re.compile(
     rb"ep \d+/\d+ .*?(\d+)/(\d+) NLL ([\d.]+) win ([\d.]+) ([\d.]+)ms/t "
     rb"(\d+)t/s ~([\d.]+)TF (\d+)MB")
@@ -83,9 +92,10 @@ class Log:
         self.current = raw.decode("utf-8", "replace").strip()
         done, total = int(m[1]), int(m[2])
         tok_s = int(m[6])
+        tflops = round(tok_s * flops_per_token(self.window) / 1e12, 2)
         self.speed = (self.speed + [tok_s])[-200:]
         self.last = {"windows": done, "total": total, "nll": float(m[3]),
-                     "tok_s": tok_s, "tflops": float(m[7]), "mb": int(m[8]),
+                     "tok_s": tok_s, "tflops": tflops, "mb": int(m[8]),
                      "tokens": done * self.window,
                      "total_tokens": total * self.window}
         tokens = done * self.window
@@ -93,7 +103,7 @@ class Log:
             self.curve_last = tokens
             stamp = int(time.time()) if self.live else ""
             with open(self.curve, "a", encoding="utf-8") as f:
-                f.write(f"{stamp},{tokens},{float(m[3])},{tok_s},{float(m[7])},{int(m[8])}\n")
+                f.write(f"{stamp},{tokens},{float(m[3])},{tok_s},{tflops},{int(m[8])}\n")
         self.seen += 1
         if self.seen % self.every == 0:
             self.points.append([done * self.window / 1e9, float(m[3])])
