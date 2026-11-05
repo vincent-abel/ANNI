@@ -413,7 +413,8 @@ static int run_lm_train_core(int argc, char **argv, int use_tower)
 			    tok->vocab_size, tok->n_merges, vocab_arg);
 		}
 		train_dbg(debug, "creating BPE model and Adam optimizer");
-		model = lm_create_bpe(tok);
+		model = arg_flag(argc, argv, NULL, "--tied")
+		    ? lm_create_bpe_tied(tok) : lm_create_bpe(tok);
 		if (!model)
 			bpe_free(&tok);
 		opt = model ? lm_adam_create(model) : NULL;
@@ -1342,7 +1343,7 @@ int main(int argc, char *argv[])
 		printf("       ./anni lm [phrase]\n");
 		printf("       ./anni lm train [--data PATH] [--epochs N] [--out PATH]\n");
 		printf("                 [--resume PATH] [--val-data PATH] [--ckpt-minutes M]\n");
-		printf("                 [--adam-beta2 B] [--lr-sched-from STEP]\n");
+		printf("                 [--adam-beta2 B] [--lr-sched-from STEP] [--tied]\n");
 		printf("                 [--lr RATE] [--window N]\n");
 		printf("                 [--batch N|auto] [--grad-accum K] [--vram-frac F]\n");
 		printf("                 [--seed N] [--eval-every N]\n");

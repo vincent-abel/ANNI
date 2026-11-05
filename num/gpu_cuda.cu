@@ -8853,8 +8853,9 @@ extern "C" int gpu_mat_axpy(mat *y, double a, const mat *x)
 	return 0;
 }
 
+/* Element j of token id sits at id * sid + j * sj (tied: head columns). */
 __global__ static void embed_lookup_kernel(ann_real *out, const ann_real *table,
-	const int *ids, int n, int d)
+	const int *ids, int n, int d, size_t sid, size_t sj, ann_real scale)
 {
 	int i = blockIdx.x * blockDim.x + threadIdx.x;
 	int t;
@@ -8866,11 +8867,11 @@ __global__ static void embed_lookup_kernel(ann_real *out, const ann_real *table,
 	t = i / d;
 	j = i % d;
 	id = ids[t];
-	out[i] = table[id * d + j];
+	out[i] = table[(size_t)id * sid + (size_t)j * sj] * scale;
 }
 
 __global__ static void embed_scatter_kernel(ann_real *dtable, const ann_real *dout,
-	const int *ids, int n, int d)
+	const int *ids, int n, int d, size_t sid, size_t sj, ann_real scale)
 {
 	int i = blockIdx.x * blockDim.x + threadIdx.x;
 	int t;
@@ -8882,7 +8883,7 @@ __global__ static void embed_scatter_kernel(ann_real *dtable, const ann_real *do
 	t = i / d;
 	j = i % d;
 	id = ids[t];
-	atomicAdd(&dtable[id * d + j], dout[i]);
+	atomicAdd(&dtable[(size_t)id * sid + (size_t)j * sj], dout[i] * scale);
 }
 
 /*
@@ -8999,7 +9000,8 @@ __global__ static void embed_chain_kernel(const int *ids, int n, int *next,
 
 __global__ static void embed_scatter_det_kernel(ann_real *dtable,
 	const ann_real *dout, const int *ids, const int *next,
-	const unsigned char *first, int n, int d)
+	const unsigned char *first, int n, int d, size_t sid, size_t sj,
+	ann_real scale)
 {
 	int i = blockIdx.x * blockDim.x + threadIdx.x;
 	int t;
@@ -9014,10 +9016,10 @@ __global__ static void embed_scatter_det_kernel(ann_real *dtable,
 	j = i % d;
 	if (!first[t])
 		return;
-	dst = &dtable[(size_t)ids[t] * (size_t)d + (size_t)j];
+	dst = &dtable[(size_t)ids[t] * sid + (size_t)j * sj];
 	a = *dst;
 	for (u = t; u >= 0; u = next[u])
-		a += dout[(size_t)u * (size_t)d + (size_t)j];
+		a += dout[(size_t)u * (size_t)d + (size_t)j] * scale;
 	*dst = a;
 }
 
@@ -9029,7 +9031,7 @@ static void *g_emb_first;
 static size_t g_emb_first_cap;
 
 static void embed_scatter_launch(ann_real *dtable, const ann_real *dout,
-	const int *d_ids, int n, int d)
+	const int *d_ids, int n, int d, size_t sid, size_t sj, ann_real scale)
 {
 	int nd = n * d;
 
@@ -9043,14 +9045,15 @@ static void embed_scatter_launch(ann_real *dtable, const ann_real *dout,
 			    n, (int *)g_emb_next, (unsigned char *)g_emb_first);
 			embed_scatter_det_kernel<<<(nd + 255) / 256, 256, 0, g_st>>>(
 			    dtable, dout, d_ids, (const int *)g_emb_next,
-			    (const unsigned char *)g_emb_first, n, d);
+			    (const unsigned char *)g_emb_first, n, d, sid, sj,
+			    scale);
 			pthread_mutex_unlock(&g_emb_det_mu);
 			return;
 		}
 		pthread_mutex_unlock(&g_emb_det_mu);
 	}
 	embed_scatter_kernel<<<(nd + 255) / 256, 256, 0, g_st>>>(dtable, dout,
-	    d_ids, n, d);
+	    d_ids, n, d, sid, sj, scale);
 }
 
 /*
@@ -9187,7 +9190,8 @@ extern "C" const int *gpu_ce_targets_staged(const int *ids, int B, int T)
 	return cudaGetLastError() == cudaSuccess ? g_tgt_dev : NULL;
 }
 
-extern "C" int gpu_embed_lookup(mat *out, const mat *table, const int *ids, int n)
+extern "C" int gpu_embed_lookup(mat *out, const mat *table, const int *ids, int n,
+	int tied, ann_real scale)
 {
 	OpScope _op(OP_EMBED);
 	static h2d_stage s_ids;
@@ -9196,18 +9200,22 @@ extern "C" int gpu_embed_lookup(mat *out, const mat *table, const int *ids, int 
 	int d;
 	int nd;
 	size_t ib;
+	size_t sid;
+	size_t sj;
 
 	if (!out || !table || !ids || n <= 0 || !gpu_available())
 		return -1;
-	if (out->rows != n || out->cols != table->cols)
+	d = out->cols;
+	if (out->rows != n || d != (tied ? table->rows : table->cols))
 		return -1;
-	d = table->cols;
+	sid = tied ? 1 : (size_t)d;
+	sj = tied ? (size_t)table->cols : 1;
 	if (mat_ensure_dev_auth((mat *)table) != 0 || mat_device_alloc(out) != 0)
 		return -1;
 	if ((staged = ids_staged(ids, n)) != NULL) {
 		nd = n * d;
 		embed_lookup_kernel<<<(nd + 255) / 256, 256, 0, g_st>>>(
-		    out->d_data, table->d_data, staged, n, d);
+		    out->d_data, table->d_data, staged, n, d, sid, sj, scale);
 		if (launch_done() != 0)
 			return -1;
 		out->on_device = MAT_DEV_DEVICE;
@@ -9218,7 +9226,7 @@ extern "C" int gpu_embed_lookup(mat *out, const mat *table, const int *ids, int 
 	if (d_ids) {
 		nd = n * d;
 		embed_lookup_kernel<<<(nd + 255) / 256, 256, 0, g_st>>>(out->d_data,
-		    table->d_data, d_ids, n, d);
+		    table->d_data, d_ids, n, d, sid, sj, scale);
 		if (launch_done() != 0)
 			return -1;
 		out->on_device = MAT_DEV_DEVICE;
@@ -9241,7 +9249,7 @@ extern "C" int gpu_embed_lookup(mat *out, const mat *table, const int *ids, int 
 	}
 	nd = n * d;
 	embed_lookup_kernel<<<(nd + 255) / 256, 256, 0, g_st>>>(out->d_data, table->d_data,
-	    d_ids, n, d);
+	    d_ids, n, d, sid, sj, scale);
 	gpu_free(d_ids);
 	if (launch_done() != 0)
 		return -1;
@@ -9250,7 +9258,7 @@ extern "C" int gpu_embed_lookup(mat *out, const mat *table, const int *ids, int 
 }
 
 extern "C" int gpu_embed_scatter(mat *dtable, const mat *dout, const int *ids,
-	int n)
+	int n, int tied, ann_real scale)
 {
 	OpScope _op(OP_EMBED);
 	static h2d_stage s_ids;
@@ -9258,12 +9266,16 @@ extern "C" int gpu_embed_scatter(mat *dtable, const mat *dout, const int *ids,
 	const int *staged;
 	int d;
 	size_t ib;
+	size_t sid;
+	size_t sj;
 
 	if (!dtable || !dout || !ids || n <= 0 || !gpu_available())
 		return -1;
-	if (dout->rows != n || dout->cols != dtable->cols)
+	d = dout->cols;
+	if (dout->rows != n || d != (tied ? dtable->rows : dtable->cols))
 		return -1;
-	d = dtable->cols;
+	sid = tied ? 1 : (size_t)d;
+	sj = tied ? (size_t)dtable->cols : 1;
 	if (mat_ensure_dev_auth((mat *)dout) != 0 || mat_device_alloc(dtable) != 0)
 		return -1;
 	if (dtable->on_device == MAT_DEV_HOST) {
@@ -9273,7 +9285,8 @@ extern "C" int gpu_embed_scatter(mat *dtable, const mat *dout, const int *ids,
 		dtable->on_device = MAT_DEV_SYNCED;
 	}
 	if ((staged = ids_staged(ids, n)) != NULL) {
-		embed_scatter_launch(dtable->d_data, dout->d_data, staged, n, d);
+		embed_scatter_launch(dtable->d_data, dout->d_data, staged, n, d,
+		    sid, sj, scale);
 		if (launch_done() != 0)
 			return -1;
 		dtable->on_device = MAT_DEV_DEVICE;
@@ -9282,7 +9295,8 @@ extern "C" int gpu_embed_scatter(mat *dtable, const mat *dout, const int *ids,
 	ib = (size_t)n * sizeof(int);
 	d_ids = (int *)h2d_stage_put(&s_ids, ids, ib);
 	if (d_ids) {
-		embed_scatter_launch(dtable->d_data, dout->d_data, d_ids, n, d);
+		embed_scatter_launch(dtable->d_data, dout->d_data, d_ids, n, d,
+		    sid, sj, scale);
 		if (launch_done() != 0)
 			return -1;
 		dtable->on_device = MAT_DEV_DEVICE;
@@ -9295,7 +9309,8 @@ extern "C" int gpu_embed_scatter(mat *dtable, const mat *dout, const int *ids,
 		gpu_free(d_ids);
 		return -1;
 	}
-	embed_scatter_launch(dtable->d_data, dout->d_data, d_ids, n, d);
+	embed_scatter_launch(dtable->d_data, dout->d_data, d_ids, n, d, sid, sj,
+	    scale);
 	gpu_free(d_ids);
 	if (launch_done() != 0)
 		return -1;
@@ -10182,6 +10197,9 @@ struct gpu_dec {
 	int		dh;
 	dec_layer	*lay;
 	const ann_real	*embed;
+	size_t		embed_sid;
+	size_t		embed_sj;
+	ann_real	embed_scale;
 	const ann_real	*w_head;
 	ann_real	*b_head;
 	ann_real	*kc;
@@ -10299,7 +10317,7 @@ static ann_real *dec_upload(const ann_real *host, int n)
 }
 
 __global__ static void dec_embed_kernel(ann_real *x, const ann_real *table,
-	const int *step, int D)
+	const int *step, int D, size_t sid, size_t sj, ann_real scale)
 {
 	int d = blockIdx.x * blockDim.x + threadIdx.x;
 	int pair;
@@ -10312,7 +10330,7 @@ __global__ static void dec_embed_kernel(ann_real *x, const ann_real *table,
 	pair = d / 2;
 	log_base = -logf(10000.0f) / (float)D;
 	angle = (float)step[1] * expf((2.0f * (float)pair) * log_base);
-	x[d] = table[(size_t)step[0] * (size_t)D + d]
+	x[d] = table[(size_t)step[0] * sid + (size_t)d * sj] * scale
 	    + ((d & 1) == 0 ? sinf(angle) : cosf(angle));
 }
 
@@ -10482,11 +10500,15 @@ extern "C" int gpu_dec_set_layer(gpu_dec *g, int i, const gpu_dec_layer_w *w)
 }
 
 extern "C" int gpu_dec_set_io(gpu_dec *g, const ann_real *embed_dev,
-	const ann_real *w_head_dev, const ann_real *b_head_host)
+	const ann_real *w_head_dev, const ann_real *b_head_host, int tied,
+	ann_real scale)
 {
 	if (!g || !embed_dev || !w_head_dev || !b_head_host)
 		return -1;
 	g->embed = embed_dev;
+	g->embed_sid = tied ? 1 : (size_t)g->D;
+	g->embed_sj = tied ? (size_t)g->V : 1;
+	g->embed_scale = scale;
 	g->w_head = w_head_dev;
 	g->b_head = dec_upload(b_head_host, g->V);
 	return g->b_head ? 0 : -1;
@@ -10560,7 +10582,7 @@ static void dec_launch_step(gpu_dec *g)
 	int i;
 
 	dec_embed_kernel<<<(D + 255) / 256, 256, 0, g->st>>>(g->x, g->embed,
-	    g->d_step, D);
+	    g->d_step, D, g->embed_sid, g->embed_sj, g->embed_scale);
 	for (i = 0; i < g->L; i++) {
 		dec_layer *l = &g->lay[i];
 		ann_real *kc = g->kc + (size_t)i * kvl;

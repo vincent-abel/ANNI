@@ -61,6 +61,10 @@ data/wiki_*
 # talk-170m mix fetched by scripts/fetch_mix.py (licensed sources, never vendored)
 data/raw/
 data/mix*
+data/code2*
+data/web2*
+data/code1*
+data/web1*
 data/chat*
 
 # local run logs

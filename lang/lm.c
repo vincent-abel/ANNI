@@ -66,7 +66,7 @@ static void softmax_inplace(ann_real *x, int n, ann_real *tmp)
 	}
 }
 
-static lm *lm_create_with(vocab *v, bpe *tok)
+static lm *lm_create_with(vocab *v, bpe *tok, int tied)
 {
 	lm *model;
 	int i;
@@ -82,12 +82,15 @@ static lm *lm_create_with(vocab *v, bpe *tok)
 	model->vocab = v;
 	model->bpe = tok;
 	model->vocab_size = vocab_size(model->vocab);
-	model->embed = embed_create(model->vocab_size);
+	if (!tied)
+		model->embed = embed_create(model->vocab_size);
 	model->tr = transformer_create();
 	model->w_head = mat_create(LM_D_MODEL, model->vocab_size);
 	model->b_head = vec_create(model->vocab_size);
 	model->dw_head = mat_create(LM_D_MODEL, model->vocab_size);
 	model->db_head = vec_create(model->vocab_size);
+	if (tied)
+		model->embed = embed_create_tied(model->w_head, model->dw_head);
 	if (!model->embed || !model->tr || !model->w_head || !model->b_head
 	    || !model->dw_head || !model->db_head) {
 		model->bpe = NULL;	/* caller keeps ownership on failure */
@@ -107,12 +110,12 @@ static lm *lm_create_with(vocab *v, bpe *tok)
 
 lm *lm_create(void)
 {
-	return lm_create_with(vocab_byte_create(), NULL);
+	return lm_create_with(vocab_byte_create(), NULL, 0);
 }
 
 lm *lm_create_vocab(int vocab_size)
 {
-	return lm_create_with(vocab_sized_create(vocab_size), NULL);
+	return lm_create_with(vocab_sized_create(vocab_size), NULL, 0);
 }
 
 lm *lm_create_bpe(bpe *tok)
@@ -121,10 +124,17 @@ lm *lm_create_bpe(bpe *tok)
 
 	if (!tok)
 		return NULL;
-	model = lm_create_with(bpe_vocab_create(tok), tok);
+	model = lm_create_with(bpe_vocab_create(tok), tok, 0);
 	if (!model)
 		return NULL;
 	return model;
+}
+
+lm *lm_create_bpe_tied(bpe *tok)
+{
+	if (!tok)
+		return NULL;
+	return lm_create_with(bpe_vocab_create(tok), tok, 1);
 }
 
 int lm_attach_bpe(lm *model, bpe *tok)

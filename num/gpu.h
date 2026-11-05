@@ -299,11 +299,14 @@ int	gpu_mat_add2(mat *dst, const mat *a, const mat *b);
 int	gpu_mat_axpy(mat *y, double a, const mat *x);
 
 /*
-** R2: embed gather / grad scatter. table is vocab x D (pinned). ids length n
-** on host (uploaded). out / dout are n x D mats.
+** R2: embed gather / grad scatter. table is vocab x D (pinned), or D x vocab
+** when tied (the LM head, token id = column id). ids length n on host
+** (uploaded). out / dout are n x D mats; both directions multiply by scale.
 */
-int	gpu_embed_lookup(mat *out, const mat *table, const int *ids, int n);
-int	gpu_embed_scatter(mat *dtable, const mat *dout, const int *ids, int n);
+int	gpu_embed_lookup(mat *out, const mat *table, const int *ids, int n,
+		int tied, ann_real scale);
+int	gpu_embed_scatter(mat *dtable, const mat *dout, const int *ids, int n,
+		int tied, ann_real scale);
 
 /* E5: page-locked host alloc for staging; NULL on stub/failure. */
 void	*gpu_host_alloc(size_t nbytes);
@@ -375,7 +378,8 @@ gpu_dec	*gpu_dec_create(int n_layers, int d_model, int d_ff, int vocab,
 		int max_T, int n_heads);
 int	gpu_dec_set_layer(gpu_dec *g, int i, const gpu_dec_layer_w *w);
 int	gpu_dec_set_io(gpu_dec *g, const ann_real *embed_dev,
-		const ann_real *w_head_dev, const ann_real *b_head_host);
+		const ann_real *w_head_dev, const ann_real *b_head_host,
+		int tied, ann_real scale);
 /* Rows [0, n) of layer's K/V from host buffers (n x d_model). */
 int	gpu_dec_kv_load(gpu_dec *g, int layer, const ann_real *k_host,
 		const ann_real *v_host, int n);

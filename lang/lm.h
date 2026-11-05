@@ -41,6 +41,8 @@ lm	*lm_create(void);
 lm	*lm_create_vocab(int vocab_size);
 /* Subword model: vocab_size = tok->vocab_size. Takes ownership of tok on success. */
 lm	*lm_create_bpe(bpe *tok);
+/* Same, with one table for the token embedding and the head (see embed.h). */
+lm	*lm_create_bpe_tied(bpe *tok);
 /* Attach/replace the tokenizer of an existing model (sizes must match). */
 int	lm_attach_bpe(lm *model, bpe *tok);
 /* Tokenize with the model's tokenizer (byte or BPE). Same contract as tokenize_*. */

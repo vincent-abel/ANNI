@@ -104,7 +104,8 @@ static int write_weights(FILE *fp, const lm *model)
 {
 	int i;
 
-	if (write_i32(fp, model->bpe ? (int)LM_MAGIC_BPE : (int)LM_MAGIC) != 0
+	if (write_i32(fp, model->embed->tied ? (int)LM_MAGIC_TIED
+	    : model->bpe ? (int)LM_MAGIC_BPE : (int)LM_MAGIC) != 0
 	    || write_i32(fp, (int)sizeof(ann_real)) != 0)
 		return -1;
 	if (write_i32(fp, LM_D_MODEL) != 0 || write_i32(fp, LM_N_HEADS) != 0
@@ -113,7 +114,7 @@ static int write_weights(FILE *fp, const lm *model)
 		return -1;
 	if (model->bpe && bpe_write_fp(fp, model->bpe) != 0)
 		return -1;
-	if (write_mat(fp, model->embed->table) != 0)
+	if (!model->embed->tied && write_mat(fp, model->embed->table) != 0)
 		return -1;
 	for (i = 0; i < model->tr->n_blocks; i++) {
 		if (write_block(fp, &model->tr->blocks[i]) != 0)
@@ -151,7 +152,8 @@ static lm *read_model(FILE *fp)
 		    (int)sizeof(ann_real));
 		return NULL;
 	}
-	if (magic != (int)LM_MAGIC && magic != (int)LM_MAGIC_BPE) {
+	if (magic != (int)LM_MAGIC && magic != (int)LM_MAGIC_BPE
+	    && magic != (int)LM_MAGIC_TIED) {
 		fprintf(stderr, "lm: bad checkpoint magic 0x%08lX (expected LMCF "
 		    "0x%08lX or LMCV 0x%08lX; double-precision LMCK checkpoints "
 		    "are incompatible)\n", (unsigned long)(unsigned int)magic,
@@ -175,13 +177,14 @@ static lm *read_model(FILE *fp)
 	    || max_ctx < 2 || max_ctx > LM_MAX_CTX || n_blocks != LM_N_BLOCKS)
 		return NULL;
 	tok = NULL;
-	if (magic == (int)LM_MAGIC_BPE) {
+	if (magic == (int)LM_MAGIC_BPE || magic == (int)LM_MAGIC_TIED) {
 		tok = bpe_read_fp(fp);
 		if (!tok || tok->vocab_size != vsize) {
 			bpe_free(&tok);
 			return NULL;
 		}
-		model = lm_create_bpe(tok);
+		model = magic == (int)LM_MAGIC_TIED ? lm_create_bpe_tied(tok)
+		    : lm_create_bpe(tok);
 		if (!model) {
 			bpe_free(&tok);
 			return NULL;
@@ -195,7 +198,7 @@ static lm *read_model(FILE *fp)
 			return NULL;
 		}
 	}
-	if (read_mat_into(fp, model->embed->table) != 0)
+	if (!model->embed->tied && read_mat_into(fp, model->embed->table) != 0)
 		goto fail;
 	for (i = 0; i < model->tr->n_blocks; i++) {
 		if (read_block(fp, &model->tr->blocks[i]) != 0)
@@ -449,7 +452,8 @@ static void copy_lm_weights(lm *dst, const lm *src)
 {
 	int i;
 
-	copy_mat(dst->embed->table, src->embed->table);
+	if (!dst->embed->tied)
+		copy_mat(dst->embed->table, src->embed->table);
 	for (i = 0; i < dst->tr->n_blocks; i++)
 		copy_block(&dst->tr->blocks[i], &src->tr->blocks[i]);
 	copy_mat(dst->w_head, src->w_head);
@@ -460,7 +464,8 @@ static void add_lm_weights(lm *acc, const lm *src)
 {
 	int i;
 
-	add_mat(acc->embed->table, src->embed->table);
+	if (!acc->embed->tied)
+		add_mat(acc->embed->table, src->embed->table);
 	for (i = 0; i < acc->tr->n_blocks; i++)
 		add_block(&acc->tr->blocks[i], &src->tr->blocks[i]);
 	add_mat(acc->w_head, src->w_head);
@@ -471,7 +476,8 @@ static void scale_lm_weights(lm *m, double s)
 {
 	int i;
 
-	scale_mat(m->embed->table, s);
+	if (!m->embed->tied)
+		scale_mat(m->embed->table, s);
 	for (i = 0; i < m->tr->n_blocks; i++)
 		scale_block(&m->tr->blocks[i], s);
 	scale_mat(m->w_head, s);
@@ -493,13 +499,15 @@ int lm_merge_average(lm *const *models, int n, lm **out)
 			return -1;
 	}
 	for (i = 1; i < n; i++) {
-		if ((models[i]->bpe != NULL) != (models[0]->bpe != NULL)
+		if (models[i]->embed->tied != models[0]->embed->tied
+		    || (models[i]->bpe != NULL) != (models[0]->bpe != NULL)
 		    || (models[0]->bpe && !bpe_equal(models[i]->bpe, models[0]->bpe)))
 			return -1;
 	}
 	if (models[0]->bpe) {
 		tok = bpe_clone(models[0]->bpe);
-		merged = tok ? lm_create_bpe(tok) : NULL;
+		merged = !tok ? NULL : models[0]->embed->tied
+		    ? lm_create_bpe_tied(tok) : lm_create_bpe(tok);
 		if (!merged)
 			bpe_free(&tok);
 	} else {

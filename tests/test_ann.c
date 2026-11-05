@@ -1186,6 +1186,128 @@ static const char bpe_sample[] =
 	"the cat sat on the mat. the cat saw the other cat on the mat.\n"
 	"the hat and the bat sat on the mat too. caf\xc3\xa9 au lait!\n";
 
+/* New vocabs keep indentation in one word; old ones encode as before. */
+static void test_bpe_ws_runs(void)
+{
+	static const char code[] = "\n        return x\n        return y\n";
+	bpe *tok;
+	bpe *old;
+	bpe *back;
+	int ids[64];
+	int n_new;
+	int n_old;
+	char out[64];
+
+	tok = bpe_train_text(code, strlen(code), 300);
+	assert(tok && tok->ws_runs);
+	n_new = bpe_encode(tok, "        return", ids, 64);
+	assert(bpe_decode(tok, ids, n_new, out, sizeof(out)) == 14);
+	assert(strcmp(out, "        return") == 0);
+	old = bpe_clone(tok);
+	assert(old && old->ws_runs);
+	old->ws_runs = 0;
+	n_old = bpe_encode(old, "        return", ids, 64);
+	assert(n_new < n_old);
+	assert(bpe_save(tok, "objects/test_ws.vocab") == 0);
+	back = bpe_load("objects/test_ws.vocab");
+	assert(back && back->ws_runs && bpe_equal(back, tok));
+	bpe_free(&back);
+	assert(bpe_save(old, "objects/test_ws.vocab") == 0);
+	back = bpe_load("objects/test_ws.vocab");
+	assert(back && !back->ws_runs && !bpe_equal(back, tok));
+	bpe_free(&back);
+	bpe_free(&old);
+	bpe_free(&tok);
+}
+
+/* One table: both paths land in dw_head, and the file round-trips without it. */
+static void test_lm_tied(void)
+{
+	bpe *tok;
+	lm *m;
+	lm *loaded;
+	lm_cache *cache;
+	mat *dh;
+	lm_info info;
+	ann_real row[LM_D_MODEL];
+	int ids[6];
+	int n;
+	int j;
+	double g;
+	double num;
+	double lp;
+	double lm_;
+	double saved;
+	const double eps = 1e-2;
+
+	srand(9);
+	tok = bpe_train_text(bpe_sample, strlen(bpe_sample), 280);
+	assert(tok);
+	m = lm_create_bpe_tied(tok);
+	assert(m && m->embed->tied && m->embed->table == m->w_head);
+	tok = bpe_clone(m->bpe);
+	assert(tok);
+	loaded = lm_create_bpe(tok);
+	assert(loaded);
+	assert(lm_param_count(loaded) - lm_param_count(m)
+	    == m->w_head->rows * m->w_head->cols);
+	lm_free(&loaded);
+	assert(embed_lookup_row(row, m->embed, 7) == 0);
+	for (j = 0; j < LM_D_MODEL; j++)
+		assert(fabs(row[j] - mat_get(m->w_head, j, 7) * m->embed->scale)
+		    < 1e-6);
+
+	/* The input token ids[1] is also the first target. */
+	n = lm_encode(m, "the cat the", ids, 6);
+	assert(n >= 2);
+	cache = lm_cache_create(n);
+	dh = mat_create(n, LM_D_MODEL);
+	assert(cache && dh);
+	lm_zero_grad(m);
+	assert(lm_forward_cache(m, ids, n, cache) == 0);
+	assert(lm_loss_backward(m, cache, ids, n, dh, NULL) == 0);
+	assert(lm_backward(m, dh, cache) == 0);
+	g = mat_get(m->dw_head, 0, ids[1]);
+	saved = mat_get(m->w_head, 0, ids[1]);
+	mat_set(m->w_head, 0, ids[1], saved + eps);
+	lp = lm_nll(m, ids, n);
+	mat_set(m->w_head, 0, ids[1], saved - eps);
+	lm_ = lm_nll(m, ids, n);
+	mat_set(m->w_head, 0, ids[1], saved);
+	num = (lp - lm_) / (2.0 * eps) * (double)(n - 1);
+	assert(fabs(g - num) < 5e-2 * (1.0 + fabs(num)));
+	lm_cache_free(&cache);
+	mat_free(&dh);
+
+	/* Scatter alone: a repeated token sums its rows, times the scale. */
+	lm_zero_grad(m);
+	dh = mat_create(2, LM_D_MODEL);
+	assert(dh);
+	for (j = 0; j < LM_D_MODEL; j++) {
+		mat_set(dh, 0, j, 0.25 + (double)j);
+		mat_set(dh, 1, j, 0.5);
+	}
+	ids[0] = ids[1] = 7;
+	assert(embed_backward(m->embed, dh, ids, 2) == 0);
+	for (j = 0; j < LM_D_MODEL; j++)
+		assert(fabs(mat_get(m->dw_head, j, 7)
+		    - (0.75 + (double)j) * m->embed->scale) < 1e-3);
+	assert(mat_get(m->dw_head, 0, 8) == 0.0);
+	mat_free(&dh);
+
+	assert(lm_save(m, "objects/test_lm_tied.bin") == 0);
+	assert(lm_info_peek("objects/test_lm_tied.bin", &info) == 0);
+	assert(info.magic_kind == LM_INFO_MAGIC_LMCT && info.is_bpe);
+	assert(info.n_merges == m->bpe->n_merges);
+	loaded = lm_load("objects/test_lm_tied.bin");
+	assert(loaded && loaded->embed->tied
+	    && loaded->embed->table == loaded->w_head);
+	assert(loaded->bpe->ws_runs && bpe_equal(loaded->bpe, m->bpe));
+	assert(fabs(loaded->w_head->data[3] - m->w_head->data[3]) < 1e-7);
+	lm_free(&loaded);
+	lm_free(&m);
+}
+
 static void test_bpe_roundtrip(void)
 {
 	bpe *b;
@@ -1731,6 +1853,8 @@ int main(void)
 	test_chat_reply_cut();
 	test_bpe_roundtrip();
 	test_bpe_lm_checkpoint();
+	test_bpe_ws_runs();
+	test_lm_tied();
 	test_split_and_stream();
 	test_lm_train_corpus();
 	test_lm_packed_matches_sequential();
