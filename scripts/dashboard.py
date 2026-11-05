@@ -3,6 +3,10 @@
 
     scripts/dashboard.py [--session run555m] [--log logs/run555m/pretrain.log]
 
+With --export FILE, write the page as one self-contained file for an artifact
+panel: it polls this server when it can reach it, else shows the embedded
+snapshot.
+
 Read-only. Host and port come from dashboard.local.json, else dashboard.json;
 ANNI_DASH_HOST and ANNI_DASH_PORT override them. No authentication, so keep
 the host on a private interface.
@@ -119,6 +123,17 @@ def gpu() -> dict:
     return {"used": used, "total": total, "util": util, "temp": temp, "power": power}
 
 
+def snapshot(log: Log, session: str) -> dict:
+    log.update()
+    state = log.state()
+    state["gpu"] = gpu()
+    state["session"] = session
+    state["pane"] = run(["tmux", "capture-pane", "-p", "-t",
+                         f"={session}:", "-S", "-200"]).rstrip()
+    state["now"] = time.time()
+    return state
+
+
 def make_handler(log: Log, session: str, page: bytes):
     class Handler(http.server.BaseHTTPRequestHandler):
         def send(self, body: bytes, kind: str) -> None:
@@ -126,6 +141,8 @@ def make_handler(log: Log, session: str, page: bytes):
             self.send_header("Content-Type", kind)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            if kind == "application/json":	# the exported page has another origin
+                self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             self.wfile.write(body)
 
@@ -133,14 +150,8 @@ def make_handler(log: Log, session: str, page: bytes):
             if self.path == "/":
                 self.send(page, "text/html; charset=utf-8")
             elif self.path == "/state":
-                log.update()
-                state = log.state()
-                state["gpu"] = gpu()
-                state["session"] = session
-                state["pane"] = run(["tmux", "capture-pane", "-p", "-t",
-                                     f"={session}:", "-S", "-200"]).rstrip()
-                state["now"] = time.time()
-                self.send(json.dumps(state).encode(), "application/json")
+                self.send(json.dumps(snapshot(log, session)).encode(),
+                          "application/json")
             else:
                 self.send_error(404)
 
@@ -195,6 +206,7 @@ pre { margin:0; padding:12px; background:var(--term); color:var(--termink); bord
 <div class="card"><h2>Trainer log</h2><pre id="log"></pre></div>
 </section></main>
 <script>
+const BASE = "", SNAPSHOT = null;
 const $ = id => document.getElementById(id);
 const NS = "http://www.w3.org/2000/svg";
 let pts = [], geo = null;
@@ -238,10 +250,9 @@ $("chart").addEventListener("mouseleave", () => { $("tip").style.display = "none
   if (geo) { geo.cross.setAttribute("visibility", "hidden"); geo.dot.setAttribute("visibility", "hidden"); } });
 function follow(pre, text) { const end = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 8;
   pre.textContent = text; if (end) pre.scrollTop = pre.scrollHeight; }
-async function tick() {
-  try {
-    const s = await (await fetch("/state")).json(), p = s.progress, g = s.gpu;
-    $("status").textContent = "updated " + new Date(s.now * 1000).toLocaleTimeString();
+function show(s, label) {
+    const p = s.progress, g = s.gpu;
+    $("status").textContent = label + " " + new Date(s.now * 1000).toLocaleString();
     $("panetitle").textContent = "tmux " + s.session;
     if (p.total) { const f = p.windows / p.total * 100;
       $("pct").textContent = `Progress: ${f.toFixed(2)}%, ${(p.tokens / 1e9).toFixed(3)} of ${(p.total_tokens / 1e9).toFixed(2)} G tokens`;
@@ -251,7 +262,11 @@ async function tick() {
       $("gpu").textContent = Math.round(g.util) + "%, " + Math.round(g.temp) + " °C"; }
     follow($("pane"), s.pane || "(no tmux session)"); follow($("log"), s.log.join("\n"));
     if (s.points.length !== pts.length || (s.points.length && s.points.at(-1)[0] !== pts.at(-1)[0])) { pts = s.points; draw(); }
-  } catch (e) { $("status").textContent = "disconnected"; }
+}
+async function tick() {
+  try { show(await (await fetch(BASE + "/state")).json(), "live, updated"); }
+  catch (e) { if (SNAPSHOT) show(SNAPSHOT, "live server unreachable, snapshot of");
+    else $("status").textContent = "disconnected"; }
   setTimeout(tick, 2000);
 }
 addEventListener("resize", draw); draw(); tick();
@@ -264,9 +279,17 @@ def main() -> int:
     ap.add_argument("--session", default="run555m")
     ap.add_argument("--log", default=str(ROOT / "logs/run555m/pretrain.log"))
     ap.add_argument("--window", type=int, default=256)
+    ap.add_argument("--export", help="write a self-contained page and exit")
     args = ap.parse_args()
     cfg = load_config()
     log = Log(Path(args.log), args.window)
+    if args.export:
+        data = json.dumps(snapshot(log, args.session)).replace("</", "<\\/")
+        base = json.dumps(f"http://{cfg['host']}:{cfg['port']}")
+        Path(args.export).write_text(PAGE.replace(
+            'const BASE = "", SNAPSHOT = null;',
+            f"const BASE = {base}, SNAPSHOT = {data};"), encoding="utf-8")
+        return 0
     handler = make_handler(log, args.session, PAGE.encode())
     server = http.server.ThreadingHTTPServer((cfg["host"], cfg["port"]), handler)
     print(f"dashboard: http://{cfg['host']}:{cfg['port']}/", flush=True)
