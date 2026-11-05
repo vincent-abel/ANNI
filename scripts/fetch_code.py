@@ -5,6 +5,8 @@
 
 Prose: the next fineweb-edu sample/10BT files after the 4 fetch_mix.py took.
 
+French: the start of fineweb-2 fra_Latn, every 1000th document held out.
+
 Code: the full codeparrot/github-code-clean shards, which mix all languages,
 read from the last shard backwards because fetch_mix.py took the start of the
 per-language exports. Same filter as fetch_mix.py: Python, C, C++, JavaScript
@@ -18,7 +20,9 @@ Output (gitignored):
   data/raw/github-code-full/  downloaded shards, reused on re-runs
   data/code2.txt              one blank line between documents
   data/web2.txt               same, prose
-  data/code2.SOURCE, data/web2.SOURCE   URLs, licenses, counts, retrieval time
+  data/fr2.txt, data/fr2_val.txt   same, French
+  data/code2.SOURCE, data/web2.SOURCE, data/fr2.SOURCE
+                              URLs, licenses, counts, retrieval time
 """
 from __future__ import annotations
 
@@ -31,13 +35,16 @@ from pathlib import Path
 
 import pyarrow.parquet as pq
 
-from fetch_mix import (CODE_LANGS, HF, MAX_CODE_BYTES, PERMISSIVE, WEB_URL, clean,
+from fetch_mix import (CODE_LANGS, HF, MAX_CODE_BYTES, PERMISSIVE, WEB_URL, Sink, clean,
                        download, rows)
 
 ROOT = Path(__file__).resolve().parents[1]
 SHARDS = 880
 SHARD_URL = (HF + "/codeparrot/github-code-clean/resolve/main/data/"
              "train-{:05d}-of-00880.parquet")
+
+
+FR_URL = HF + "/HuggingFaceFW/fineweb-2/resolve/main/data/fra_Latn/train/{:03d}_00000.parquet"
 
 
 def digest(text: str) -> bytes:
@@ -68,6 +75,24 @@ def fetch_web(raw: Path, out_path: Path, first: int, count: int) -> tuple[int, i
                 size += len(text.encode("utf-8", "surrogatepass")) + 2
             print(f"fetch_code: web {docs} docs, {size / 1e9:.2f} GB", flush=True)
     return docs, size
+
+
+def fetch_fr(data: Path, target_gb: float) -> None:
+    sink = Sink(data / "fr2.txt", data / "fr2_val.txt", 1000)
+    i = 0
+    while sink.bytes < target_gb * 1e9:
+        path = download(FR_URL.format(i), data / "raw" / "fineweb-2-fr" / f"{i:03d}_00000.parquet")
+        for r in rows(path, ["text"]):
+            sink.add(r["text"])
+            if sink.bytes >= target_gb * 1e9:
+                break
+        print(f"fetch_code: fr {sink.docs} docs, {sink.bytes / 1e9:.2f} GB", flush=True)
+        i += 1
+    sink.close()
+    with open(data / "fr2.SOURCE", "w", encoding="utf-8") as f:
+        f.write(f"retrieved: {utc_now()}\n")
+        f.write(f"fr: {FR_URL.format(0)} .. {i} files, {sink.docs} docs, "
+                f"{sink.bytes} bytes. License: ODC-By 1.0.\n")
 
 
 def utc_now() -> str:
@@ -127,6 +152,8 @@ def main() -> int:
     ap.add_argument("--web-files", type=int, default=10,
                     help="fineweb-edu files to add; 0 skips the prose")
     ap.add_argument("--web-first", type=int, default=4, help="first fineweb-edu file")
+    ap.add_argument("--fr-gb", type=float, default=6.0,
+                    help="French to keep, in GB; 0 skips it")
     ap.add_argument("--prefetch", type=int, default=3, help="shards downloaded ahead")
     ap.add_argument("--data", default=str(ROOT / "data"))
     args = ap.parse_args()
@@ -140,6 +167,8 @@ def main() -> int:
             f.write(f"retrieved: {utc_now()}\n")
             f.write(f"web: {WEB_URL.format(args.web_first)} .. {args.web_files} files, "
                     f"{docs} docs, {size} bytes. License: ODC-By 1.0.\n")
+    if args.fr_gb > 0:
+        fetch_fr(data, args.fr_gb)
     return 0
 
 
