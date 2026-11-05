@@ -195,6 +195,8 @@ pre { margin:0; padding:12px; background:var(--term); color:var(--termink); bord
 <section class="tiles">
 <div class="card tile"><b id="nll">-</b><span>training loss (NLL)</span></div>
 <div class="card tile"><b id="speed">-</b><span>tokens per second</span></div>
+<div class="card tile"><b id="tflops">-</b><span>TFLOPS</span></div>
+<div class="card tile"><b id="tokens">-</b><span>tokens read</span></div>
 <div class="card tile"><b id="eta">-</b><span>time left</span></div>
 <div class="card tile"><b id="vram">-</b><span>VRAM used</span></div>
 <div class="card tile"><b id="gpu">-</b><span>GPU load, temperature</span></div>
@@ -257,7 +259,8 @@ function show(s, label) {
     if (p.total) { const f = p.windows / p.total * 100;
       $("pct").textContent = `Progress: ${f.toFixed(2)}%, ${(p.tokens / 1e9).toFixed(3)} of ${(p.total_tokens / 1e9).toFixed(2)} G tokens`;
       $("fill").style.width = f + "%"; $("nll").textContent = p.nll.toFixed(3);
-      $("speed").textContent = Math.round(p.tok_s_avg).toLocaleString("en-US"); $("eta").textContent = dur(p.eta_s); }
+      $("speed").textContent = Math.round(p.tok_s_avg).toLocaleString("en-US"); $("eta").textContent = dur(p.eta_s);
+      $("tflops").textContent = p.tflops.toFixed(1); $("tokens").textContent = p.tokens.toLocaleString("en-US"); }
     if (g.total) { $("vram").textContent = (g.used / 1024).toFixed(1) + " / " + (g.total / 1024).toFixed(1) + " GiB";
       $("gpu").textContent = Math.round(g.util) + "%, " + Math.round(g.temp) + " °C"; }
     follow($("pane"), s.pane || "(no tmux session)"); follow($("log"), s.log.join("\n"));
