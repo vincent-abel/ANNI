@@ -77,3 +77,4 @@ tests/bench_attn
 tests/bench_ln
 bench/
 build/
+*.local.*
