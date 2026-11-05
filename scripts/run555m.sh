@@ -23,8 +23,8 @@ CHAT=models/run555m-chat.bin
 VOCAB=data/mix100k.vocab
 TRAIN=data/mix100k_train_ids.bin
 WINDOW=${WINDOW:-256}
-BATCH=${BATCH:-4}
-ACCUM=${ACCUM:-128}
+BATCH=${BATCH:-2}
+ACCUM=${ACCUM:-256}
 EXTRA=${EXTRA:-}
 CHECK_SECONDS=${CHECK_SECONDS:-600}
 CUDA_HOME=${CUDA_HOME:-$(ls -d /usr/local/cuda-13* | tail -1)}
@@ -79,7 +79,7 @@ finetune() {
 	"$BUILD/anni" lm train --resume "$OUT" --out "$CHAT" --force \
 	    --data data/chat100k_train_mids.bin --val-data data/chat100k_val_mids.bin \
 	    --tokenizer bpe --vocab "$VOCAB" \
-	    --window "$WINDOW" --stride "$WINDOW" --batch "$BATCH" --grad-accum 32 \
+	    --window "$WINDOW" --stride "$WINDOW" --batch "$BATCH" --grad-accum 64 \
 	    --epochs 2 --lr 5e-5 --lr-decay none --grad-clip 1.0 --weight-decay 0.1 \
 	    --flash-attn --bf16 --eval-every 1 --eval-windows 256 --seed 2 -d
 }
