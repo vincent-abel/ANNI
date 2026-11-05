@@ -3,6 +3,10 @@
 
     scripts/dashboard.py [--session run555m] [--log logs/run555m/pretrain.log]
 
+Every 10 steps a row goes to logs/run555m/curve.csv (time, tokens, loss, speed,
+TFLOPS, VRAM), so the curve survives the log. Rows read from an existing log
+have no time. A restart appends after the last row.
+
 With --export FILE, write the page as one self-contained file for an artifact
 panel: it polls this server when it can reach it, else shows the embedded
 snapshot.
@@ -26,6 +30,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 MAX_POINTS = 3000
+CURVE_EVERY = 10 * 131072	# tokens between rows, 10 steps of the run
 PROGRESS = re.compile(
     rb"ep \d+/\d+ .*?(\d+)/(\d+) NLL ([\d.]+) win ([\d.]+) ([\d.]+)ms/t "
     rb"(\d+)t/s ~([\d.]+)TF (\d+)MB")
@@ -35,7 +40,8 @@ def load_config() -> dict:
     local = ROOT / "dashboard.local.json"
     path = local if local.exists() else ROOT / "dashboard.json"
     if path != local:
-        print(f"dashboard: no {local.name}, using the mockup {path.name}", flush=True)
+        print(f"dashboard: no {local.name}, using the mockup {path.name}",
+              file=sys.stderr, flush=True)
     cfg = json.loads(path.read_text(encoding="utf-8"))
     return {"host": os.environ.get("ANNI_DASH_HOST", cfg["host"]),
             "port": int(os.environ.get("ANNI_DASH_PORT", cfg["port"]))}
@@ -44,8 +50,17 @@ def load_config() -> dict:
 class Log:
     """Follow the trainer log; progress lines end in \\r, the rest in \\n."""
 
-    def __init__(self, path: Path, window: int):
+    def __init__(self, path: Path, window: int, curve: Path):
         self.path = path
+        self.curve = curve
+        self.curve_last = 0
+        if curve.exists():
+            rows = curve.read_text(encoding="utf-8").splitlines()
+            if len(rows) > 1:
+                self.curve_last = int(rows[-1].split(",")[1])
+        else:
+            curve.write_text("time,tokens,nll,tok_s,tflops,vram_mb\n", encoding="utf-8")
+        self.live = False
         self.window = window
         self.pos = 0
         self.partial = b""
@@ -73,6 +88,12 @@ class Log:
                      "tok_s": tok_s, "tflops": float(m[7]), "mb": int(m[8]),
                      "tokens": done * self.window,
                      "total_tokens": total * self.window}
+        tokens = done * self.window
+        if tokens >= self.curve_last + CURVE_EVERY:
+            self.curve_last = tokens
+            stamp = int(time.time()) if self.live else ""
+            with open(self.curve, "a", encoding="utf-8") as f:
+                f.write(f"{stamp},{tokens},{float(m[3])},{tok_s},{float(m[7])},{int(m[8])}\n")
         self.seen += 1
         if self.seen % self.every == 0:
             self.points.append([done * self.window / 1e9, float(m[3])])
@@ -92,6 +113,7 @@ class Log:
             self.partial = parts.pop()
             for raw in parts:
                 self.line(raw)
+            self.live = True
 
     def state(self) -> dict:
         with self.lock:
@@ -283,9 +305,13 @@ def main() -> int:
     ap.add_argument("--log", default=str(ROOT / "logs/run555m/pretrain.log"))
     ap.add_argument("--window", type=int, default=256)
     ap.add_argument("--export", help="write a self-contained page and exit")
+    ap.add_argument("--print-url", action="store_true", help="print the page URL and exit")
     args = ap.parse_args()
     cfg = load_config()
-    log = Log(Path(args.log), args.window)
+    if args.print_url:
+        print(f"http://{cfg['host']}:{cfg['port']}/")
+        return 0
+    log = Log(Path(args.log), args.window, Path(args.log).parent / "curve.csv")
     if args.export:
         data = json.dumps(snapshot(log, args.session)).replace("</", "<\\/")
         base = json.dumps(f"http://{cfg['host']}:{cfg['port']}")
@@ -296,6 +322,13 @@ def main() -> int:
     handler = make_handler(log, args.session, PAGE.encode())
     server = http.server.ThreadingHTTPServer((cfg["host"], cfg["port"]), handler)
     print(f"dashboard: http://{cfg['host']}:{cfg['port']}/", flush=True)
+
+    def follow() -> None:	# the curve must not depend on an open page
+        while True:
+            log.update()
+            time.sleep(20)
+
+    threading.Thread(target=follow, daemon=True).start()
     server.serve_forever()
     return 0
 
