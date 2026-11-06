@@ -190,8 +190,11 @@ class Log:
         """Mark a restart and forget the points of the work it threw away."""
         resumed = time.mktime(time.strptime(stamp, "%Y-%m-%d %H:%M:%S"))
         stopped = [t for t in self.curve_times if t < resumed]
-        self.resumes.append({"tokens": tokens / 1e9, "resumed": resumed,
-                             "stopped": stopped[-1] if stopped else None})
+        if self.resumes and self.resumes[-1]["tokens"] == tokens / 1e9:
+            self.resumes[-1]["resumed"] = resumed	# restarted before the next save
+        else:
+            self.resumes.append({"tokens": tokens / 1e9, "resumed": resumed,
+                                 "stopped": stopped[-1] if stopped else None})
         self.points = [p for p in self.points if p[0] * 1e9 <= tokens]
         self.settled = tokens + RESUME_SETTLE
 
@@ -321,8 +324,13 @@ h1 { font-size:20px; margin:0; } h2 { font-size:14px; margin:0 0 8px; color:var(
 .tile span { color:var(--ink2); font-size:13px; }
 .bar { height:8px; background:var(--line); border-radius:4px; overflow:hidden; margin-top:10px; }
 .bar i { display:block; height:100%; width:0; background:var(--series); border-radius:4px; }
-#chart { position:relative; } svg { display:block; width:100%; height:280px; }
-#tip { position:absolute; display:none; pointer-events:none; background:var(--term); color:var(--termink);
+.chart { position:relative; } svg { display:block; width:100%; height:280px; }
+.charts { display:grid; grid-template-columns:repeat(auto-fit,minmax(340px,1fr)); gap:14px; }
+.charts > :first-child { grid-column:span 2; } @media (max-width:760px) { .charts > :first-child { grid-column:auto; } }
+.head { display:flex; justify-content:space-between; align-items:baseline; gap:8px; }
+.range button { background:none; border:0; border-bottom:2px solid transparent; color:var(--ink2); font:inherit;
+  font-size:13px; padding:0 6px 2px; cursor:pointer; } .range button.on { color:var(--ink); font-weight:600; border-bottom-color:var(--series); }
+.tip { position:absolute; display:none; pointer-events:none; background:var(--term); color:var(--termink);
   padding:4px 8px; border-radius:4px; font-size:13px; white-space:nowrap; }
 pre { margin:0; padding:12px; background:var(--term); color:var(--termink); border-radius:6px;
   font:12.5px/1.4 ui-monospace,monospace; height:260px; overflow:auto; white-space:pre-wrap; word-break:break-all; }
@@ -360,8 +368,13 @@ nav a.on { color:var(--ink); font-weight:600; border-bottom-color:var(--series);
 <div class="card tile"><b id="vram">-</b><span>VRAM used</span></div>
 <div class="card tile"><b id="gpu">-</b><span>GPU load, temperature</span></div>
 </section>
-<section class="card"><h2>Training loss by billions of tokens</h2>
-<div id="chart"><svg id="svg" role="img" aria-label="Training loss over tokens"></svg><div id="tip"></div></div></section>
+<section class="charts">
+<div class="card"><h2>Training loss by billions of tokens</h2>
+<div id="chart" class="chart"><svg id="svg" role="img" aria-label="Training loss over tokens"></svg><div id="tip" class="tip"></div></div></div>
+<div class="card"><div class="head"><h2>Loss, last <span id="zlabel">6 h</span></h2>
+<div id="range" class="range"><button data-h="1">1 h</button><button data-h="6" class="on">6 h</button><button data-h="24">24 h</button></div></div>
+<div id="zchart" class="chart"><svg id="zsvg" role="img" aria-label="Training loss over the last hours"></svg><div id="ztip" class="tip"></div></div></div>
+</section>
 <section class="card"><h2>When to test the model (rough estimates)</h2><div style="overflow-x:auto"><table class="steps">
 <thead><tr><th>Step</th><th>What to expect</th><th class="num">Tokens</th><th class="num">Expected NLL</th><th class="num">When</th><th class="num">Check</th></tr></thead>
 <tbody id="steps"></tbody></table></div></section>
@@ -375,7 +388,8 @@ nav a.on { color:var(--ink); font-weight:600; border-bottom-color:var(--series);
 const BASE = "", SNAPSHOT = null;
 const $ = id => document.getElementById(id);
 const NS = "http://www.w3.org/2000/svg";
-let pts = [], resumes = [], geo = null, testsSeen = "", history = {};
+let pts = [], resumes = [], testsSeen = "", history = {}, speed = 17000, hours = 6;
+const geos = {};
 const when = (t, opt) => new Date(t * 1000).toLocaleString("en-GB", opt || {day: "numeric", month: "short",
   hour: "2-digit", minute: "2-digit"});
 function dur(s) { if (s == null) return "-"; const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600),
@@ -386,40 +400,52 @@ function ticks(lo, hi, n) { const raw = (hi - lo) / n || 1, p = 10 ** Math.floor
   const step = [1, 2, 5, 10].map(k => k * p).find(s => s >= raw); const out = [];
   for (let v = Math.ceil(lo / step) * step; v <= hi + 1e-9; v += step) out.push(+v.toFixed(6)); return out; }
 function draw() {
-  const svg = $("svg"), W = svg.clientWidth, H = svg.clientHeight, L = 44, R = 12, T = 10, B = 26;
-  svg.setAttribute("viewBox", `0 0 ${W} ${H}`); svg.replaceChildren(); geo = null;
+  const end = pts.length ? pts[pts.length - 1][0] : 0, from = end - speed * hours * 3600 / 1e9;
+  plot("", pts); plot("z", pts.filter(p => p[0] >= from));
+}
+function plot(id, data) {
+  const zoom = !!id, svg = $(id + "svg"), W = svg.clientWidth, H = svg.clientHeight, L = 44, R = 12, T = 10, B = 26;
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`); svg.replaceChildren(); geos[id] = null;
   const css = getComputedStyle(document.documentElement), ink = css.getPropertyValue("--ink2"),
     line = css.getPropertyValue("--line"), ser = css.getPropertyValue("--series");
-  if (pts.length < 2) { svg.append(el("text", {x: W / 2, y: H / 2, "text-anchor": "middle", fill: ink, "font-size": 13},
+  if (data.length < 2) { svg.append(el("text", {x: W / 2, y: H / 2, "text-anchor": "middle", fill: ink, "font-size": 13},
     "Waiting for training steps")); return; }
-  const x0 = pts[0][0], x1 = Math.max(pts[pts.length - 1][0], ...resumes.map(r => r.tokens)) || 1; let y0 = Infinity, y1 = -Infinity;
-  for (const p of pts) { y0 = Math.min(y0, p[1]); y1 = Math.max(y1, p[1]); }
-  y0 = Math.floor(y0); y1 = Math.ceil(y1);
+  const last = data[data.length - 1][0], x0 = data[0][0],
+    x1 = (zoom ? last : Math.max(last, ...resumes.map(r => r.tokens))) || 1; let y0 = Infinity, y1 = -Infinity;
+  for (const p of data) { y0 = Math.min(y0, p[1]); y1 = Math.max(y1, p[1]); }
+  if (zoom) { const pad = (y1 - y0) * 0.1 || 0.01; y0 -= pad; y1 += pad; } else { y0 = Math.floor(y0); y1 = Math.ceil(y1); }
   const X = v => L + (v - x0) / (x1 - x0 || 1) * (W - L - R), Y = v => T + (y1 - v) / (y1 - y0 || 1) * (H - T - B);
   for (const v of ticks(y0, y1, 5)) { svg.append(el("line", {x1: L, x2: W - R, y1: Y(v), y2: Y(v), stroke: line}));
     svg.append(el("text", {x: L - 6, y: Y(v) + 4, "text-anchor": "end", fill: ink, "font-size": 12}, v)); }
-  for (const v of ticks(x0, x1, 6)) svg.append(el("text", {x: X(v), y: H - 8, "text-anchor": "middle", fill: ink, "font-size": 12}, v + " G"));
-  resumes.forEach((r, i) => { const x = X(r.tokens), left = x > W / 2, clock = {hour: "2-digit", minute: "2-digit"};
+  for (const v of ticks(x0, x1, zoom ? 3 : 6)) svg.append(el("text", {x: X(v), y: H - 8, "text-anchor": "middle", fill: ink, "font-size": 12}, v + " G"));
+  resumes.filter(r => r.tokens >= x0 && r.tokens <= x1).forEach((r, i) => { const x = X(r.tokens), left = x > W / 2, clock = {hour: "2-digit", minute: "2-digit"};
     svg.append(el("line", {x1: x, x2: x, y1: T, y2: H - B, stroke: ink, "stroke-dasharray": "4 4"}));
-    svg.append(el("text", {x: x + (left ? -6 : 6), y: T + 12 + i % 2 * 16, "text-anchor": left ? "end" : "start", fill: ink, "font-size": 12},
+    if (!zoom) svg.append(el("text", {x: x + (left ? -6 : 6), y: T + 12 + i % 2 * 16, "text-anchor": left ? "end" : "start", fill: ink, "font-size": 12},
       r.stopped ? `stopped ${when(r.stopped)}, resumed ${when(r.resumed, clock)}` : `resumed ${when(r.resumed)}`)); });
-  svg.append(el("path", {d: pts.map((p, i) => (i ? "L" : "M") + X(p[0]).toFixed(1) + " " + Y(p[1]).toFixed(1)).join(""),
+  svg.append(el("path", {d: data.map((p, i) => (i ? "L" : "M") + X(p[0]).toFixed(1) + " " + Y(p[1]).toFixed(1)).join(""),
     fill: "none", stroke: ser, "stroke-width": 2, "stroke-linejoin": "round"}));
   const cross = el("line", {y1: T, y2: H - B, stroke: ink, visibility: "hidden"}),
     dot = el("circle", {r: 5, fill: ser, stroke: css.getPropertyValue("--surface"), "stroke-width": 2, visibility: "hidden"});
-  svg.append(cross, dot); geo = {X, Y, cross, dot, W};
+  svg.append(cross, dot); geos[id] = {X, Y, cross, dot, W, data};
 }
-$("chart").addEventListener("mousemove", e => {
-  if (!geo) return; const r = $("svg").getBoundingClientRect(), mx = (e.clientX - r.left) * geo.W / r.width;
-  let best = pts[0], bd = Infinity; for (const p of pts) { const d = Math.abs(geo.X(p[0]) - mx); if (d < bd) { bd = d; best = p; } }
-  const x = geo.X(best[0]), y = geo.Y(best[1]);
-  geo.cross.setAttribute("x1", x); geo.cross.setAttribute("x2", x); geo.cross.setAttribute("visibility", "visible");
-  geo.dot.setAttribute("cx", x); geo.dot.setAttribute("cy", y); geo.dot.setAttribute("visibility", "visible");
-  const t = $("tip"); t.textContent = best[0].toFixed(3) + " G tokens, loss " + best[1].toFixed(3); t.style.display = "block";
-  t.style.left = Math.min(x + 10, r.width - t.offsetWidth - 4) + "px"; t.style.top = Math.max(y - 34, 0) + "px";
-});
-$("chart").addEventListener("mouseleave", () => { $("tip").style.display = "none";
-  if (geo) { geo.cross.setAttribute("visibility", "hidden"); geo.dot.setAttribute("visibility", "hidden"); } });
+function hover(id) {
+  const box = $(id + "chart"), tip = $(id + "tip");
+  box.addEventListener("mousemove", e => {
+    const geo = geos[id]; if (!geo) return; const r = $(id + "svg").getBoundingClientRect(), mx = (e.clientX - r.left) * geo.W / r.width;
+    let best = geo.data[0], bd = Infinity; for (const p of geo.data) { const d = Math.abs(geo.X(p[0]) - mx); if (d < bd) { bd = d; best = p; } }
+    const x = geo.X(best[0]), y = geo.Y(best[1]);
+    geo.cross.setAttribute("x1", x); geo.cross.setAttribute("x2", x); geo.cross.setAttribute("visibility", "visible");
+    geo.dot.setAttribute("cx", x); geo.dot.setAttribute("cy", y); geo.dot.setAttribute("visibility", "visible");
+    tip.textContent = best[0].toFixed(3) + " G tokens, loss " + best[1].toFixed(3); tip.style.display = "block";
+    tip.style.left = Math.max(0, Math.min(x + 10, r.width - tip.offsetWidth - 4)) + "px"; tip.style.top = Math.max(y - 34, 0) + "px";
+  });
+  box.addEventListener("mouseleave", () => { tip.style.display = "none"; const geo = geos[id];
+    if (geo) { geo.cross.setAttribute("visibility", "hidden"); geo.dot.setAttribute("visibility", "hidden"); } });
+}
+hover(""); hover("z");
+$("range").addEventListener("click", e => { const b = e.target.closest("button"); if (!b) return;
+  hours = +b.dataset.h; $("zlabel").textContent = b.textContent;
+  [...$("range").children].forEach(x => x.classList.toggle("on", x === b)); draw(); });
 function follow(pre, text) { const end = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 8;
   pre.textContent = text; if (end) pre.scrollTop = pre.scrollHeight; }
 function params(groups) {
@@ -465,7 +491,7 @@ function steps(s) {
 }
 function show(s, label) {
     params(s.run);
-    const p = s.progress, g = s.gpu;
+    const p = s.progress, g = s.gpu; if (p.tok_s_avg) speed = p.tok_s_avg;
     $("status").textContent = label + " " + new Date(s.now * 1000).toLocaleString();
     $("panetitle").textContent = "tmux " + s.session;
     if (p.total) { const f = p.windows / p.total * 100;
