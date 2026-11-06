@@ -376,7 +376,7 @@ nav a.on { color:var(--ink); font-weight:600; border-bottom-color:var(--series);
 </section>
 <section class="card"><div class="head"><h2>Training loss by billions of tokens</h2>
 <div id="range" class="range"><button class="on">All</button><button data-h="10">10 h</button><button data-h="3">3 h</button><button data-h="1">1 h</button><button data-h="0.5">30 min</button><button data-h="0.0833">5 min</button></div></div>
-<div id="legend" class="legend" hidden><i style="background:var(--series)"></i>Loss<i style="background:var(--trend)"></i>Mean trend<i style="background:var(--average)"></i>Moving average</div>
+<div class="legend"><i style="background:var(--series)"></i>Loss<i style="background:var(--trend)"></i>Mean trend<span id="avglabel" style="margin-left:12px" hidden><i style="background:var(--average)"></i>Moving average</span></div>
 <div id="chart" class="chart"><svg id="svg" role="img" aria-label="Training loss over tokens"></svg><div id="tip" class="tip"></div></div></section>
 <section class="card"><h2>When to test the model (rough estimates)</h2><div style="overflow-x:auto"><table class="steps">
 <thead><tr><th>Step</th><th>What to expect</th><th class="num">Tokens</th><th class="num">Expected NLL</th><th class="num">When</th><th class="num">Check</th></tr></thead>
@@ -402,26 +402,30 @@ function el(tag, at, text) { const e = document.createElementNS(NS, tag);
 function ticks(lo, hi, n) { const raw = (hi - lo) / n || 1, p = 10 ** Math.floor(Math.log10(raw));
   const step = [1, 2, 5, 10].map(k => k * p).find(s => s >= raw); const out = [];
   for (let v = Math.ceil(lo / step) * step; v <= hi + 1e-9; v += step) out.push(+v.toFixed(6)); return out; }
-const trend = () => hours > 0 && hours < 10;
+const short = () => hours > 0 && hours < 10;
 function draw() {
-  $("legend").hidden = !trend();
+  $("avglabel").hidden = !short();
   if (!hours) { plot("", pts, false); return; }
   const first = recent.length ? recent[0][0] : Infinity, all = pts.filter(p => p[0] < first).concat(recent);
   const end = all.length ? all[all.length - 1][0] : 0, from = end - speed * hours * 3600 / 1e9;
   plot("", all.filter(p => p[0] >= from), true);
 }
-// Centered mean over a twelfth of the tokens shown, narrower at each end, or
-// with `trailing` the mean of the last sixth, which only looks back.
-function mean(data, trailing) {
-  const span = data[data.length - 1][0] - data[0][0], w = span / 24, sum = [0], out = [];
+// Straight line across what is shown, from its first value to its last one;
+// on the short views each end is a mean, so noise does not tilt the line.
+function trend(data) {
+  const n = short() ? Math.max(5, Math.ceil(data.length / 100)) : 1, avg = a => a.reduce((t, p) => t + p[1], 0) / a.length;
+  return [[data[0][0], avg(data.slice(0, n)), true], [data[data.length - 1][0], avg(data.slice(-n))]];
+}
+// Mean of the last sixth of the tokens shown; it restarts after a stop.
+function average(data) {
+  const span = data[data.length - 1][0] - data[0][0], sum = [0], out = [];
   for (const p of data) sum.push(sum[sum.length - 1] + p[1]);
   const at = x => { let lo = 0, hi = data.length; while (lo < hi) { const m = lo + hi >> 1;
     if (data[m][0] < x) lo = m + 1; else hi = m; } return lo; };
-  for (let s = 0, e; s < data.length; s = e) {	// a stop leaves a gap: no mean across it
-    for (e = s + 1; e < data.length && data[e][0] - data[e - 1][0] <= w / 2; e++);
-    for (let i = s; i < e; i++) { const x = data[i][0], h = trailing ? span / 6 : Math.min(w, x - data[s][0], data[e - 1][0] - x);
-      const a = Math.max(s, at(x - h)), b = trailing ? i + 1 : Math.min(e, at(x + h + 1e-12));
-      out.push([x, (sum[b] - sum[a]) / (b - a), i === s]); }
+  for (let s = 0, e; s < data.length; s = e) {
+    for (e = s + 1; e < data.length && data[e][0] - data[e - 1][0] <= span / 48; e++);
+    for (let i = s; i < e; i++) { const a = Math.max(s, at(data[i][0] - span / 6));
+      out.push([data[i][0], (sum[i + 1] - sum[a]) / (i + 1 - a), i === s]); }
   }
   return out;
 }
@@ -446,7 +450,7 @@ function plot(id, data, zoom) {
       r.stopped ? `stopped ${when(r.stopped)}, resumed ${when(r.resumed, clock)}` : `resumed ${when(r.resumed)}`)); });
   svg.append(el("path", {d: data.map((p, i) => (i ? "L" : "M") + X(p[0]).toFixed(1) + " " + Y(p[1]).toFixed(1)).join(""),
     fill: "none", stroke: ser, "stroke-width": 2, "stroke-linejoin": "round"}));
-  if (trend()) for (const [line, color] of [[mean(data), "--trend"], [mean(data, true), "--average"]])
+  for (const [line, color] of [[trend(data), "--trend"], ...(short() ? [[average(data), "--average"]] : [])])
     svg.append(el("path", {d: line.map(p => (p[2] ? "M" : "L") + X(p[0]).toFixed(1) + " " + Y(p[1]).toFixed(1)).join(""),
       fill: "none", stroke: css.getPropertyValue(color), "stroke-width": 2, "stroke-linejoin": "round"}));
   const cross = el("line", {y1: T, y2: H - B, stroke: ink, visibility: "hidden"}),
