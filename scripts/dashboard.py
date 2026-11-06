@@ -375,8 +375,8 @@ nav a.on { color:var(--ink); font-weight:600; border-bottom-color:var(--series);
 <div class="card tile"><b id="gpu">-</b><span>GPU load, temperature</span></div>
 </section>
 <section class="card"><div class="head"><h2>Training loss by billions of tokens</h2>
-<div id="range" class="range"><button class="on">All</button><button data-h="10">10 h</button><button data-h="3">3 h</button><button data-h="1">1 h</button><button data-h="0.5">30 min</button><button data-h="0.0833">5 min</button></div></div>
-<div class="legend"><i style="background:var(--series)"></i>Loss<i style="background:var(--trend)"></i>Mean trend<span id="avglabel" style="margin-left:12px" hidden><i style="background:var(--average)"></i>Moving average</span></div>
+<div id="range" class="range"><button class="on">All</button><button data-h="10">10 h</button><button data-h="3">3 h</button><button data-h="1">1 h</button><button data-h="0.5">30 min</button><button data-h="0.3333">20 min</button><button data-h="0.1667">10 min</button><button data-h="0.0833">5 min</button></div></div>
+<div class="legend"><i style="background:var(--series)"></i>Loss<i style="background:var(--trend)"></i>Mean trend<span id="slope"></span><span id="avglabel" style="margin-left:12px" hidden><i style="background:var(--average)"></i>Moving average</span></div>
 <div id="chart" class="chart"><svg id="svg" role="img" aria-label="Training loss over tokens"></svg><div id="tip" class="tip"></div></div></section>
 <section class="card"><h2>When to test the model (rough estimates)</h2><div style="overflow-x:auto"><table class="steps">
 <thead><tr><th>Step</th><th>What to expect</th><th class="num">Tokens</th><th class="num">Expected NLL</th><th class="num">When</th><th class="num">Check</th></tr></thead>
@@ -450,8 +450,10 @@ function plot(id, data, zoom) {
       r.stopped ? `stopped ${when(r.stopped)}, resumed ${when(r.resumed, clock)}` : `resumed ${when(r.resumed)}`)); });
   svg.append(el("path", {d: data.map((p, i) => (i ? "L" : "M") + X(p[0]).toFixed(1) + " " + Y(p[1]).toFixed(1)).join(""),
     fill: "none", stroke: ser, "stroke-width": 2, "stroke-linejoin": "round"}));
-  for (const [line, color] of [[trend(data), "--trend"], ...(short() ? [[average(data), "--average"]] : [])])
-    svg.append(el("path", {d: line.map(p => (p[2] ? "M" : "L") + X(p[0]).toFixed(1) + " " + Y(p[1]).toFixed(1)).join(""),
+  const fit = trend(data), slope = (fit[1][1] - fit[0][1]) / (fit[1][0] - fit[0][0]);
+  $("slope").textContent = isFinite(slope) ? `: ${slope.toFixed(2).replace("-", "\u2212")} NLL per G tokens` : "";
+  for (const [path, color] of [[fit, "--trend"], ...(short() ? [[average(data), "--average"]] : [])])
+    svg.append(el("path", {d: path.map(p => (p[2] ? "M" : "L") + X(p[0]).toFixed(1) + " " + Y(p[1]).toFixed(1)).join(""),
       fill: "none", stroke: css.getPropertyValue(color), "stroke-width": 2, "stroke-linejoin": "round"}));
   const cross = el("line", {y1: T, y2: H - B, stroke: ink, visibility: "hidden"}),
     dot = el("circle", {r: 5, fill: ser, stroke: css.getPropertyValue("--surface"), "stroke-width": 2, visibility: "hidden"});
