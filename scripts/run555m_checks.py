@@ -4,18 +4,20 @@
     scripts/run555m_checks.py           # follow the run, in tmux session checks555m
     scripts/run555m_checks.py --now STEP  # test the last save, the run being stopped
 
-At the first save past a step's tokens: stop the training, sample the model on
-the GPU into logs/run555m/tests/STEP.txt (the dashboard shows those at the
-bottom), and start the training again from that save. The first chat try
-fine-tunes a copy first. The last step waits for the chat model of the run.
-A failed test writes its error to the same file, so it is not retried at every
-save, and the training restarts anyway.
+At the first save past a step's tokens: stop the training, run the test of
+that step and again those of all the steps before it, in order, into
+logs/run555m/tests/DATE-STEP/KIND.txt, and start the training from that save.
+The dashboard shows the last level and keeps all of them in its History tab.
+The first chat try fine-tunes a copy first. The last step waits for the chat
+model of the run. A failed test writes its error in place of its output, so it
+is not retried at every save, and the training restarts anyway.
 """
 from __future__ import annotations
 
 import argparse
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -23,7 +25,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from dashboard import MILESTONES, PROGRESS, ROOT, TESTS, step_slug
+from dashboard import MILESTONES, PROGRESS, ROOT, TESTS, levels, step_slug
 
 LOGS = ROOT / "logs/run555m"
 ANNI = ROOT / "build/555m/anni"
@@ -38,12 +40,19 @@ STEP_TOKENS = 131072
 TOTAL_TOKENS = 15_590_156_032
 STARTED = re.compile(rb"\[([\d-]+ [\d:]+)\] epoch \d+/\d+ starting")
 SAVED = re.compile(rb"\[([\d-]+ [\d:]+)\] saved checkpoint \S+ \(epoch \d+, window (\d+)/")
-PROMPTS = [
+WORD_PROMPTS = [
     "The history of the Roman Empire",
     "The main reason why the sky is blue is",
     "La ville de Paris est connue pour",
     "def fibonacci(n):\n",
     "#include <stdio.h>\n\nint main(void)\n{\n",
+]
+TEXT_PROMPTS = [
+    "Once upon a time, in a small village by the sea,",
+    "Climate change is a serious problem because",
+    "Les enfants sont rentrés de l'école et",
+    "To install the package, first open a terminal and",
+    "class Stack:\n    def __init__(self):\n",
 ]
 CHAT_PROMPTS = [
     "Hello, who are you?",
@@ -51,6 +60,15 @@ CHAT_PROMPTS = [
     "Write a Python function that reverses a string.",
     "Explique en une phrase pourquoi le ciel est bleu.",
 ]
+FINAL_PROMPTS = [
+    "Explain what a neural network is in two sentences.",
+    "Give me a simple recipe for pancakes.",
+    "Translate 'good morning, how are you?' into French.",
+    "Write a C function that returns the length of a string.",
+]
+KINDS = dict(zip([m[0] for m in MILESTONES],
+                 [WORD_PROMPTS, TEXT_PROMPTS, CHAT_PROMPTS, FINAL_PROMPTS]))
+FINAL_STEP = MILESTONES[-1][0]
 
 
 def say(text: str) -> None:
@@ -92,9 +110,9 @@ def pair(prompt: str, answer: str) -> str:
     return f"PROMPT\n{prompt.rstrip()}\n\nANSWER\n{answer.rstrip()}"
 
 
-def generate(model: Path) -> str:
+def generate(model: Path, prompts: list[str]) -> str:
     out = []
-    for prompt in PROMPTS:
+    for prompt in prompts:
         done = subprocess.run(
             [str(ANNI), "lm", "generate", "--model", str(model), "--vocab", VOCAB,
              "--prompt", prompt, "--tokens", "120", "--temperature", "0.8",
@@ -106,15 +124,15 @@ def generate(model: Path) -> str:
     return SEPARATOR.join(out)
 
 
-def chat(model: Path) -> str:
+def chat(model: Path, prompts: list[str]) -> str:
     done = subprocess.run(
         [str(ANNI), "chat", "--model", str(model), "--vocab", VOCAB, "--tokens", "120",
          "--temperature", "0.7", "--top-k", "40"],
-        cwd=ROOT, input="\n".join(CHAT_PROMPTS) + "\n", capture_output=True, text=True,
+        cwd=ROOT, input="\n".join(prompts) + "\n", capture_output=True, text=True,
         errors="replace", timeout=600, check=True, env=dict(os.environ, DISPLAY=""))
     answers = done.stdout.split("Assistant: ")[1:]
     answers = [a.removesuffix("User: ").strip() for a in answers]
-    return SEPARATOR.join(pair(p, a) for p, a in zip(CHAT_PROMPTS, answers))
+    return SEPARATOR.join(pair(p, a) for p, a in zip(prompts, answers))
 
 
 def finetune() -> None:
@@ -162,27 +180,37 @@ def summary(data: bytes) -> str:
     return ", ".join(parts)
 
 
-def test(name: str, saved: str) -> None:
-    say(f"test {name}: {saved}")
-    try:
-        if name == CHAT_STEP:
+def run_level(level: str) -> None:
+    """Test `level` and every kind before it, then publish them as one folder."""
+    say(f"level {level}")
+    failed = None
+    if level == CHAT_STEP:
+        try:
             finetune()
-            body = chat(FIRST_CHAT)
-        elif MILESTONES[-1][0] == name:
-            body = chat(CHAT)
-        else:
-            body = generate(MODEL)
-    except (OSError, subprocess.SubprocessError) as e:
-        body = f"test failed: {e}"
-    TESTS.mkdir(parents=True, exist_ok=True)
-    path = TESTS / f"{step_slug(name)}.txt"
-    part = path.with_suffix(".part")
+        except (OSError, subprocess.SubprocessError) as e:
+            failed = e
     title = summary((LOGS / "pretrain.log").read_bytes())
-    if name == CHAT_STEP or MILESTONES[-1][0] == name:
-        title += ", plus chat fine-tune"
-    part.write_text(f"{title}, tested {time.strftime('%-d %b %H:%M')}\n\n{body}\n", encoding="utf-8")
-    part.rename(path)
-    say(f"test {name}: done")
+    part = TESTS / f".part-{step_slug(level)}"
+    shutil.rmtree(part, ignore_errors=True)
+    part.mkdir(parents=True)
+    names = [m[0] for m in MILESTONES]
+    for kind in names[:names.index(level) + 1]:
+        tuned = kind in (CHAT_STEP, FINAL_STEP)
+        say(f"test {kind}")
+        try:
+            if tuned and failed:
+                raise failed
+            if tuned:
+                body = chat(CHAT if level == FINAL_STEP else FIRST_CHAT, KINDS[kind])
+            else:
+                body = generate(MODEL, KINDS[kind])
+        except (OSError, subprocess.SubprocessError) as e:
+            body = f"test failed: {e}"
+        line = title + (", plus chat fine-tune" if tuned else "")
+        (part / f"{step_slug(kind)}.txt").write_text(
+            f"{line}, tested {time.strftime('%-d %b %H:%M')}\n\n{body}\n", encoding="utf-8")
+    part.rename(TESTS / f"{time.strftime('%Y%m%d-%H%M')}-{step_slug(level)}")
+    say(f"level {level}: done")
 
 
 def saves(data: bytes) -> tuple[str, int] | None:
@@ -193,33 +221,32 @@ def saves(data: bytes) -> tuple[str, int] | None:
     return f"save of {found[-1][0].decode()}, {tokens / 1e9:.3f} G tokens", tokens
 
 
-def done(name: str) -> bool:
-    return (TESTS / f"{step_slug(name)}.txt").exists()
+def done(level: str) -> bool:
+    return any(d.name.endswith("-" + step_slug(level)) for d in levels())
 
 
 def follow() -> None:
     global stopped_at
     log = LOGS / "pretrain.log"
     pos = log.stat().st_size
-    while not all(done(m[0]) for m in MILESTONES):
+    while not done(FINAL_STEP):
         with open(log, "rb") as f:
             f.seek(pos)
             data = f.read()
             pos = f.tell()
         save = saves(data)
-        due = [m[0] for m in MILESTONES if m[2] and save and save[1] >= m[2] and not done(m[0])]
-        if due:
+        reached = [m[0] for m in MILESTONES if m[2] and save and save[1] >= m[2]]
+        if reached and not done(reached[-1]):
             stopped_at = time.time()
             say(f"stopping the run after the {save[0]}")
             stop_run()
             try:
-                for name in due:
-                    test(name, save[0])
+                run_level(reached[-1])
             finally:
                 start_run()
                 say("run restarted")
-        if (LOGS / ".chat").exists() and not done(MILESTONES[-1][0]):
-            test(MILESTONES[-1][0], "chat model")
+        if (LOGS / ".chat").exists():
+            run_level(FINAL_STEP)
         time.sleep(20)
     say("all tests done")
 
@@ -236,8 +263,7 @@ def main() -> int:
             sys.exit("the run is training: stop it first")
         if args.now not in [m[0] for m in MILESTONES]:
             sys.exit(f"steps: {', '.join(m[0] for m in MILESTONES)}")
-        save = saves((LOGS / "pretrain.log").read_bytes())
-        test(args.now, save[0] if save else "last save")
+        run_level(args.now)
         return 0
     follow()
     return 0

@@ -238,11 +238,25 @@ def gpu() -> dict:
     return {"used": used, "total": total, "util": util, "temp": temp, "power": power}
 
 
-def tests() -> list:
-    """(step, title line, output) of the tests done, the newest first."""
-    done = [(TESTS / f"{step_slug(m[0])}.txt", m[0]) for m in MILESTONES]
-    done = sorted((d for d in done if d[0].exists()), key=lambda d: -d[0].stat().st_mtime)
-    return [[name, *path.read_text(encoding="utf-8").split("\n\n", 1)] for path, name in done]
+def levels() -> list[Path]:
+    """Folders of the test levels done, the newest first."""
+    return sorted((d for d in TESTS.glob("[0-9]*") if d.is_dir()), reverse=True)
+
+
+def tests() -> tuple[list, dict]:
+    """The tests of the last level as (kind, title, output), the newest kind
+    first, and for each kind
+    all its runs as (title, output), the newest first."""
+    latest, history = [], {m[0]: [] for m in MILESTONES}
+    for i, level in enumerate(levels()):
+        for name in history:
+            path = level / f"{step_slug(name)}.txt"
+            if path.exists():
+                title, text = path.read_text(encoding="utf-8").split("\n\n", 1)
+                history[name].append([title, text])
+                if i == 0:
+                    latest.insert(0, [name, title, text])
+    return latest, history
 
 
 def snapshot(log: Log, session: str) -> dict:
@@ -250,7 +264,7 @@ def snapshot(log: Log, session: str) -> dict:
     state = log.state()
     state["gpu"] = gpu()
     state["milestones"] = MILESTONES
-    state["tests"] = tests()
+    state["tests"], state["history"] = tests()
     state["session"] = session
     state["pane"] = run(["tmux", "capture-pane", "-p", "-t",
                          f"={session}:", "-S", "-200"]).rstrip()
@@ -313,7 +327,12 @@ h1 { font-size:20px; margin:0; } h2 { font-size:14px; margin:0 0 8px; color:var(
 pre { margin:0; padding:12px; background:var(--term); color:var(--termink); border-radius:6px;
   font:12.5px/1.4 ui-monospace,monospace; height:260px; overflow:auto; white-space:pre-wrap; word-break:break-all; }
 pre.out { height:auto; }
-#tests { display:grid; gap:14px; } #tests:empty { display:none; }
+#tests, #hist, .view { display:grid; gap:14px; min-width:0; } #tests:empty { display:none; }
+.view[hidden] { display:none; }
+nav { display:flex; gap:6px; flex-wrap:wrap; border-bottom:1px solid var(--line); }
+nav a { padding:6px 12px; color:var(--ink2); text-decoration:none; font-size:14px;
+  border-bottom:2px solid transparent; margin-bottom:-1px; }
+nav a.on { color:var(--ink); font-weight:600; border-bottom-color:var(--series); }
 .params { display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:6px 28px; }
 .params h3 { font-size:13px; margin:0 0 6px; color:var(--ink2); font-weight:600; }
 .params div div { display:flex; justify-content:space-between; gap:12px; font-size:13px; padding:2px 0;
@@ -328,6 +347,8 @@ pre.out { height:auto; }
 .two { display:grid; grid-template-columns:repeat(auto-fit,minmax(340px,1fr)); gap:14px; }
 </style></head><body><main>
 <header><h1>ANNI 555M training</h1><div id="status">connecting</div></header>
+<nav id="tabs"><a href="#">Live</a><a href="#history">History</a></nav>
+<div id="live" class="view">
 <section class="card"><div id="params" class="params"></div></section>
 <section class="card"><h2 id="pct">Progress</h2><div class="bar"><i id="fill"></i></div></section>
 <section class="tiles">
@@ -348,12 +369,13 @@ pre.out { height:auto; }
 <div class="card"><h2 id="panetitle">tmux</h2><pre id="pane"></pre></div>
 <div class="card"><h2>Trainer log</h2><pre id="log"></pre></div>
 </section>
-<section id="tests"></section></main>
+<section id="tests"></section></div>
+<div id="history" class="view" hidden><nav id="kinds"></nav><section id="hist"></section></div></main>
 <script>
 const BASE = "", SNAPSHOT = null;
 const $ = id => document.getElementById(id);
 const NS = "http://www.w3.org/2000/svg";
-let pts = [], resumes = [], geo = null, testsSeen = "";
+let pts = [], resumes = [], geo = null, testsSeen = "", history = {};
 const when = (t, opt) => new Date(t * 1000).toLocaleString("en-GB", opt || {day: "numeric", month: "short",
   hour: "2-digit", minute: "2-digit"});
 function dur(s) { if (s == null) return "-"; const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600),
@@ -407,6 +429,24 @@ function params(groups) {
       b = document.createElement("b"); a.textContent = k; b.textContent = v; r.append(a, b); g.append(r); }
     return g; }));
 }
+function result(title, text) {
+  const c = document.createElement("div"), h = document.createElement("h2"), o = document.createElement("pre");
+  c.className = "card"; h.textContent = title; o.className = "out"; o.textContent = text; c.append(h, o); return c;
+}
+const slug = name => name.toLowerCase().replaceAll(" ", "-");
+function route() {
+  const [tab, sub] = location.hash.slice(1).split("/"), old = tab === "history";
+  $("live").hidden = old; $("history").hidden = !old;
+  [...$("tabs").children].forEach((a, i) => a.classList.toggle("on", !!i === old));
+  if (!old) { draw(); return; }
+  const names = Object.keys(history), name = names.find(n => slug(n) === sub) || names[0];
+  $("kinds").replaceChildren(...names.map(n => { const a = document.createElement("a");
+    a.href = "#history/" + slug(n); a.textContent = `${n} (${history[n].length})`;
+    a.classList.toggle("on", n === name); return a; }));
+  const runs = name ? history[name] : [];
+  $("hist").replaceChildren(...(runs.length ? runs.map(([title, text]) => result(title, text))
+    : [result("No test of this kind yet", "")]));
+}
 function steps(s) {
   const p = s.progress;
   $("steps").replaceChildren(...s.milestones.map(([name, say, at]) => {
@@ -417,13 +457,11 @@ function steps(s) {
     cells.forEach((text, i) => { const c = document.createElement("td"); c.textContent = text;
       c.className = ["", "say", "num", "num"][i]; r.append(c); });
     const c = document.createElement("td"); c.className = "num";
-    c.textContent = s.tests.some(t => t[0] === name) ? "✓ Tested, see below" : left <= 0 && at ? "at next save" : "-";
+    c.textContent = s.history[name].length ? "✓ Tested" : left <= 0 && at ? "at next save" : "-";
     r.append(c); return r; }));
-  const seen = JSON.stringify(s.tests);
-  if (seen !== testsSeen) { testsSeen = seen; $("tests").replaceChildren(...s.tests.map(([name, title, text]) => {
-    const c = document.createElement("div"), h = document.createElement("h2"), o = document.createElement("pre");
-    c.className = "card"; h.textContent = `${name}: ${title}`; o.className = "out"; o.textContent = text;
-    c.append(h, o); return c; })); }
+  const seen = JSON.stringify([s.tests, s.history]);
+  if (seen !== testsSeen) { testsSeen = seen; history = s.history;
+    $("tests").replaceChildren(...s.tests.map(([name, title, text]) => result(`${name}: ${title}`, text))); route(); }
 }
 function show(s, label) {
     params(s.run);
@@ -448,7 +486,7 @@ async function tick() {
     else $("status").textContent = "disconnected"; }
   setTimeout(tick, 2000);
 }
-addEventListener("resize", draw); draw(); tick();
+addEventListener("resize", draw); addEventListener("hashchange", route); draw(); tick();
 </script></body></html>
 """
 
