@@ -36,13 +36,15 @@ CURVE_EVERY = 10 * 131072	# tokens between rows, 10 steps of the run
 RESUME_SETTLE = 13_000_000
 D_MODEL, D_FF, N_BLOCKS, VOCAB = 1536, 6272, 14, 100000
 N_HEADS, MAX_CTX = 24, 2048
-# Estimates from the 170M run, in tokens so they follow the real speed.
+# Estimates from the 170M run, in tokens so they follow the real speed. The
+# last value is the expected training loss, extended from this run's curve.
 MILESTONES = [
-    ["Recognizable words", "Mostly noise, with words and bits of code", 300_000_000],
-    ["Readable text", "Rough sentences; continues what you write, does not answer", 960_000_000],
+    ["Recognizable words", "Mostly noise, with words and bits of code", 300_000_000, 3.7],
+    ["Readable text", "Rough sentences; continues what you write, does not answer",
+     960_000_000, 3.2],
     ["First chat try", "Clumsy conversation, after about 45 min of chat fine-tune on a copy",
-     2_200_000_000],
-    ["Final model", "The full result; the chat fine-tune follows on its own", None],
+     2_200_000_000, 2.9],
+    ["Final model", "The full result; the chat fine-tune follows on its own", None, 2.4],
 ]
 RESUME = re.compile(rb"\[([\d-]+ [\d:]+)\] resuming epoch \d+ at window (\d+)/")
 TESTS = ROOT / "logs/run555m/tests"	# samples of scripts/run555m_checks.py
@@ -360,7 +362,7 @@ nav a.on { color:var(--ink); font-weight:600; border-bottom-color:var(--series);
 <section class="card"><h2>Training loss by billions of tokens</h2>
 <div id="chart"><svg id="svg" role="img" aria-label="Training loss over tokens"></svg><div id="tip"></div></div></section>
 <section class="card"><h2>When to test the model (estimates)</h2><div style="overflow-x:auto"><table class="steps">
-<thead><tr><th>Step</th><th>What to expect</th><th class="num">Tokens</th><th class="num">When</th><th class="num">Check</th></tr></thead>
+<thead><tr><th>Step</th><th>What to expect</th><th class="num">Tokens</th><th class="num">Expected NLL</th><th class="num">When</th><th class="num">Check</th></tr></thead>
 <tbody id="steps"></tbody></table></div></section>
 <section class="two">
 <div class="card"><h2 id="panetitle">tmux</h2><pre id="pane"></pre></div>
@@ -446,13 +448,13 @@ function route() {
 }
 function steps(s) {
   const p = s.progress;
-  $("steps").replaceChildren(...s.milestones.map(([name, say, at]) => {
+  $("steps").replaceChildren(...s.milestones.map(([name, say, at, nll]) => {
     const goal = at || p.total_tokens, left = goal - p.tokens, r = document.createElement("tr");
     const secs = p.tok_s_avg ? left / p.tok_s_avg : null;
-    const cells = [name, say, goal ? (goal / 1e9).toFixed(2) + " G" : "-",
+    const cells = [name, say, goal ? (goal / 1e9).toFixed(2) + " G" : "-", "~" + nll.toFixed(1),
       !goal ? "-" : left <= 0 ? "✓ Reached" : secs == null ? "-" : "in " + dur(secs) + ", " + when(s.now + secs)];
     cells.forEach((text, i) => { const c = document.createElement("td"); c.textContent = text;
-      c.className = ["", "say", "num", "num"][i]; r.append(c); });
+      c.className = ["", "say", "num", "num", "num"][i]; r.append(c); });
     const c = document.createElement("td"); c.className = "num";
     c.textContent = s.history[name].length ? "✓ Tested" : left <= 0 && at ? "at next save" : "-";
     r.append(c); return r; }));
