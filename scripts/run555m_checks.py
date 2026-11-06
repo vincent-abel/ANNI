@@ -8,8 +8,8 @@ At the first save past a step's tokens: stop the training, run the test of
 that step and again those of all the steps before it, in order, into
 logs/run555m/tests/DATE-STEP/KIND.txt, and start the training from that save.
 The dashboard shows the last level and keeps all of them in its History tab.
-The first chat try fine-tunes a copy first. The last step waits for the chat
-model of the run. A failed test writes its error in place of its output, so it
+From the first chat try on, each step fine-tunes its own copy first, and the
+chat kinds run on it. The last step waits for the chat model of the run. A failed test writes its error in place of its output, so it
 is not retried at every save, and the training restarts anyway.
 """
 from __future__ import annotations
@@ -31,7 +31,6 @@ LOGS = ROOT / "logs/run555m"
 ANNI = ROOT / "build/555m/anni"
 MODEL = ROOT / "models/run555m.bin"
 CHAT = ROOT / "models/run555m-chat.bin"
-FIRST_CHAT = ROOT / "models/run555m-first-chat-try.bin"
 VOCAB = "data/mix100k.vocab"
 WINDOW = 256
 CHAT_STEP = "First chat try"
@@ -60,6 +59,24 @@ CHAT_PROMPTS = [
     "Write a Python function that reverses a string.",
     "Explique en une phrase pourquoi le ciel est bleu.",
 ]
+SIMPLE_PROMPTS = [
+    "How many days are there in a week?",
+    "What do bees make?",
+    "Name three colors.",
+    "Quelle est la couleur du ciel ?",
+]
+STEADY_PROMPTS = [
+    "Give me three tips to sleep better.",
+    "Write a short email asking for a day off.",
+    "Why do leaves fall in autumn?",
+    "Écris un petit poème sur la mer.",
+]
+USEFUL_PROMPTS = [
+    "What is the difference between a list and a tuple in Python?",
+    "If I have 3 apples and eat one, how many are left?",
+    "Summarize the story of Cinderella in three sentences.",
+    "Write a C function that adds two integers.",
+]
 FINAL_PROMPTS = [
     "Explain what a neural network is in two sentences.",
     "Give me a simple recipe for pancakes.",
@@ -67,8 +84,11 @@ FINAL_PROMPTS = [
     "Write a C function that returns the length of a string.",
 ]
 KINDS = dict(zip([m[0] for m in MILESTONES],
-                 [WORD_PROMPTS, TEXT_PROMPTS, CHAT_PROMPTS, FINAL_PROMPTS]))
+                 [WORD_PROMPTS, TEXT_PROMPTS, CHAT_PROMPTS, SIMPLE_PROMPTS,
+                  STEADY_PROMPTS, USEFUL_PROMPTS, FINAL_PROMPTS], strict=True))
 FINAL_STEP = MILESTONES[-1][0]
+NAMES = [m[0] for m in MILESTONES]
+TUNED = NAMES[NAMES.index(CHAT_STEP):]	# kinds that need a chat model
 
 
 def say(text: str) -> None:
@@ -135,11 +155,15 @@ def chat(model: Path, prompts: list[str]) -> str:
     return SEPARATOR.join(pair(p, a) for p, a in zip(prompts, answers))
 
 
-def finetune() -> None:
+def tuned_copy(level: str) -> Path:
+    return ROOT / f"models/run555m-{step_slug(level)}.bin"
+
+
+def finetune(level: str) -> None:
     """The fine-tune of scripts/run555m.sh, on a separate output."""
     with open(LOGS / "checks-finetune.log", "ab") as log:
         subprocess.run(
-            [str(ANNI), "lm", "train", "--resume", str(MODEL), "--out", str(FIRST_CHAT),
+            [str(ANNI), "lm", "train", "--resume", str(MODEL), "--out", str(tuned_copy(level)),
              "--force", "--data", "data/chat100k_train_mids.bin",
              "--val-data", "data/chat100k_val_mids.bin", "--tokenizer", "bpe",
              "--vocab", VOCAB, "--window", str(WINDOW), "--stride", str(WINDOW),
@@ -184,24 +208,23 @@ def run_level(level: str) -> None:
     """Test `level` and every kind before it, then publish them as one folder."""
     say(f"level {level}")
     failed = None
-    if level == CHAT_STEP:
+    if level in TUNED and level != FINAL_STEP:
         try:
-            finetune()
+            finetune(level)
         except (OSError, subprocess.SubprocessError) as e:
             failed = e
     title = summary((LOGS / "pretrain.log").read_bytes())
     part = TESTS / f".part-{step_slug(level)}"
     shutil.rmtree(part, ignore_errors=True)
     part.mkdir(parents=True)
-    names = [m[0] for m in MILESTONES]
-    for kind in names[:names.index(level) + 1]:
-        tuned = kind in (CHAT_STEP, FINAL_STEP)
+    for kind in NAMES[:NAMES.index(level) + 1]:
+        tuned = kind in TUNED
         say(f"test {kind}")
         try:
             if tuned and failed:
                 raise failed
             if tuned:
-                body = chat(CHAT if level == FINAL_STEP else FIRST_CHAT, KINDS[kind])
+                body = chat(CHAT if level == FINAL_STEP else tuned_copy(level), KINDS[kind])
             else:
                 body = generate(MODEL, KINDS[kind])
         except (OSError, subprocess.SubprocessError) as e:

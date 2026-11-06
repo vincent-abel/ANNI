@@ -46,6 +46,12 @@ MILESTONES = [
      600_000_000, 3.4],
     ["First chat try", "Clumsy conversation, after about 45 min of chat fine-tune on a copy",
      1_200_000_000, 3.1],
+    ["Simple answers", "Short answers that fit the question; facts often wrong",
+     2_500_000_000, 2.9],
+    ["Steady conversation", "Follows a request and stays on topic; still invents facts",
+     5_000_000_000, 2.75],
+    ["Useful answers", "Most easy questions right; small code that may work",
+     10_000_000_000, 2.55],
     ["Final model", "The full result; the chat fine-tune follows on its own", None, 2.4],
 ]
 RESUME = re.compile(rb"\[([\d-]+ [\d:]+)\] resuming epoch \d+ at window (\d+)/")
