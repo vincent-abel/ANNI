@@ -8,8 +8,10 @@ At the first save past a step's tokens: stop the training, run the test of
 that step and again those of all the steps before it, in order, into
 logs/run555m/tests/DATE-STEP/KIND.txt, and start the training from that save.
 The dashboard shows the last level and keeps all of them in its History tab.
-From the first chat try on, each step fine-tunes its own copy first, and the
-chat kinds run on it. The last step waits for the chat model of the run. A failed test writes its error in place of its output, so it
+Each step first keeps the weights of that save, for comparisons, as
+models/run555m-base-STEP.bin. From the first chat try on, it also fine-tunes its
+own copy, the chat kinds run on it, and only its weights are kept. The last step
+waits for the chat model of the run. A failed test writes its error in place of its output, so it
 is not retried at every save, and the training restarts anyway.
 """
 from __future__ import annotations
@@ -19,6 +21,7 @@ import os
 import re
 import shutil
 import signal
+import struct
 import subprocess
 import sys
 import time
@@ -37,6 +40,8 @@ CHAT_STEP = "First chat try"
 SEPARATOR = "\n\n---\n\n"
 STEP_TOKENS = 131072
 TOTAL_TOKENS = 15_590_156_032
+PARAMS = 555_762_080
+ADAM_HEADER = 20	# has_adam, epoch, step, t, n as int32
 STARTED = re.compile(rb"\[([\d-]+ [\d:]+)\] epoch \d+/\d+ starting")
 SAVED = re.compile(rb"\[([\d-]+ [\d:]+)\] saved checkpoint \S+ \(epoch \d+, window (\d+)/")
 WORD_PROMPTS = [
@@ -155,6 +160,34 @@ def chat(model: Path, prompts: list[str]) -> str:
     return SEPARATOR.join(pair(p, a) for p, a in zip(prompts, answers))
 
 
+def weights_only(src: Path, dst: Path) -> None:
+    """Write checkpoint `src` to `dst` without its Adam state, m and v per
+    parameter: two thirds of the file. `dst` can be `src`."""
+    end = src.stat().st_size - ADAM_HEADER - 8 * PARAMS
+    tmp = dst.with_name(dst.name + ".tmp")
+    with open(src, "rb") as f:
+        f.seek(end)
+        head = struct.unpack("<5i", f.read(ADAM_HEADER))
+        if head[0] != 1 or head[4] != PARAMS:
+            raise ValueError(f"{src.name}: no Adam section at byte {end}")
+        f.seek(0)
+        with open(tmp, "wb") as out:
+            left = end
+            while left:
+                left -= out.write(f.read(min(left, 1 << 24)))
+            out.write(struct.pack("<i", 0))
+    tmp.replace(dst)
+
+
+def keep_weights(src: Path, dst: Path) -> None:
+    """A failure here only costs disk space or a comparison point."""
+    try:
+        weights_only(src, dst)
+        say(f"kept the weights in {dst.name}")
+    except (OSError, ValueError, struct.error) as e:
+        say(f"weights of {src.name} not cut: {e}")
+
+
 def tuned_copy(level: str) -> Path:
     return ROOT / f"models/run555m-{step_slug(level)}.bin"
 
@@ -208,6 +241,8 @@ def run_level(level: str) -> None:
     """Test `level` and every kind before it, then publish them as one folder."""
     say(f"level {level}")
     failed = None
+    if level != FINAL_STEP:
+        keep_weights(MODEL, ROOT / f"models/run555m-base-{step_slug(level)}.bin")
     if level in TUNED and level != FINAL_STEP:
         try:
             finetune(level)
@@ -233,6 +268,10 @@ def run_level(level: str) -> None:
         (part / f"{step_slug(kind)}.txt").write_text(
             f"{line}, tested {time.strftime('%-d %b %H:%M')}\n\n{body}\n", encoding="utf-8")
     part.rename(TESTS / f"{time.strftime('%Y%m%d-%H%M')}-{step_slug(level)}")
+    if level in TUNED and level != FINAL_STEP and not failed:
+        copy = tuned_copy(level)
+        keep_weights(copy, copy)
+        copy.with_name(copy.name + ".best").unlink(missing_ok=True)
     say(f"level {level}: done")
 
 
