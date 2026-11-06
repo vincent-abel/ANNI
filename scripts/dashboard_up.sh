@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Bring back the live page and the screenshot taker of the 555M run, after a
-# reboot or a crash. Neither touches the training, and the curve goes on after
-# its last row.
+# Bring back the live page, the screenshot taker and the step checks of the
+# 555M run, after a reboot or a crash. None touches the training, and the curve
+# goes on after its last row.
 #
-#   scripts/dashboard_up.sh            # start whichever of the two is missing
-#   scripts/dashboard_up.sh --restart  # stop both first, to load new code
+#   scripts/dashboard_up.sh            # start whichever is missing
+#   scripts/dashboard_up.sh --restart  # stop them first, to load new code
 #
 # Screenshots wait for the run: without tmux session run555m the taker would
 # write final-stopped.png and exit, so start scripts/run555m.sh first.
@@ -15,12 +15,13 @@ cd "$ROOT"
 LOGS=logs/run555m
 DASH=dash555m
 SHOTS=shots555m
+CHECKS=checks555m
 mkdir -p "$LOGS"
 
 alive() { tmux has-session -t "=$1" 2>/dev/null; }
 
 if [ "${1:-}" = "--restart" ]; then
-	for session in "$DASH" "$SHOTS"; do
+	for session in "$DASH" "$SHOTS" "$CHECKS"; do
 		if alive "$session"; then
 			tmux kill-session -t "=$session"
 		fi
@@ -49,6 +50,14 @@ if ! curl -fsS -o /dev/null "$url" 2>/dev/null; then
 	exit 1
 fi
 echo "dashboard: $url"
+
+if alive "$CHECKS"; then
+	echo "checks: already running in tmux session $CHECKS"
+else
+	tmux new-session -d -s "$CHECKS" -c "$ROOT" \
+	    "python3 scripts/run555m_checks.py 2>&1 | tee -a $LOGS/checks.log"
+	echo "checks: started tmux session $CHECKS"
+fi
 
 if alive run555m; then
 	scripts/dashboard_shots.sh

@@ -45,7 +45,12 @@ MILESTONES = [
     ["Final model", "The full result; the chat fine-tune follows on its own", None],
 ]
 RESUME = re.compile(rb"\[([\d-]+ [\d:]+)\] resuming epoch \d+ at window (\d+)/")
+TESTS = ROOT / "logs/run555m/tests"	# samples of scripts/run555m_checks.py
 TRAIN_ARGS = re.compile(rb"batch=(\d+) grad_accum=(\d+) lr=(\S+) window=(\d+)")
+
+
+def step_slug(name: str) -> str:
+    return name.lower().replace(" ", "-")
 
 
 def flops_per_token(window: int) -> float:
@@ -238,6 +243,8 @@ def snapshot(log: Log, session: str) -> dict:
     state = log.state()
     state["gpu"] = gpu()
     state["milestones"] = MILESTONES
+    state["tests"] = [[m[0], (TESTS / f"{step_slug(m[0])}.txt").read_text(encoding="utf-8")]
+                      for m in MILESTONES if (TESTS / f"{step_slug(m[0])}.txt").exists()]
     state["session"] = session
     state["pane"] = run(["tmux", "capture-pane", "-p", "-t",
                          f"={session}:", "-S", "-200"]).rstrip()
@@ -299,6 +306,8 @@ h1 { font-size:20px; margin:0; } h2 { font-size:14px; margin:0 0 8px; color:var(
   padding:4px 8px; border-radius:4px; font-size:13px; white-space:nowrap; }
 pre { margin:0; padding:12px; background:var(--term); color:var(--termink); border-radius:6px;
   font:12.5px/1.4 ui-monospace,monospace; height:260px; overflow:auto; white-space:pre-wrap; word-break:break-all; }
+pre.out { height:auto; }
+#tests { display:grid; gap:14px; } #tests:empty { display:none; }
 .params { display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:6px 28px; }
 .params h3 { font-size:13px; margin:0 0 6px; color:var(--ink2); font-weight:600; }
 .params div div { display:flex; justify-content:space-between; gap:12px; font-size:13px; padding:2px 0;
@@ -327,17 +336,18 @@ pre { margin:0; padding:12px; background:var(--term); color:var(--termink); bord
 <section class="card"><h2>Training loss by billions of tokens</h2>
 <div id="chart"><svg id="svg" role="img" aria-label="Training loss over tokens"></svg><div id="tip"></div></div></section>
 <section class="card"><h2>When to test the model (estimates)</h2><div style="overflow-x:auto"><table class="steps">
-<thead><tr><th>Step</th><th>What to expect</th><th class="num">Tokens</th><th class="num">When</th></tr></thead>
+<thead><tr><th>Step</th><th>What to expect</th><th class="num">Tokens</th><th class="num">When</th><th class="num">Check</th></tr></thead>
 <tbody id="steps"></tbody></table></div></section>
 <section class="two">
 <div class="card"><h2 id="panetitle">tmux</h2><pre id="pane"></pre></div>
 <div class="card"><h2>Trainer log</h2><pre id="log"></pre></div>
-</section></main>
+</section>
+<section id="tests"></section></main>
 <script>
 const BASE = "", SNAPSHOT = null;
 const $ = id => document.getElementById(id);
 const NS = "http://www.w3.org/2000/svg";
-let pts = [], resumes = [], geo = null;
+let pts = [], resumes = [], geo = null, testsSeen = "";
 const when = (t, opt) => new Date(t * 1000).toLocaleString("en-GB", opt || {day: "numeric", month: "short",
   hour: "2-digit", minute: "2-digit"});
 function dur(s) { if (s == null) return "-"; const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600),
@@ -400,7 +410,14 @@ function steps(s) {
       !goal ? "-" : left <= 0 ? "✓ Reached" : secs == null ? "-" : "in " + dur(secs) + ", " + when(s.now + secs)];
     cells.forEach((text, i) => { const c = document.createElement("td"); c.textContent = text;
       c.className = ["", "say", "num", "num"][i]; r.append(c); });
-    return r; }));
+    const c = document.createElement("td"); c.className = "num";
+    c.textContent = s.tests.some(t => t[0] === name) ? "✓ Tested, see below" : left <= 0 && at ? "at next save" : "-";
+    r.append(c); return r; }));
+  const seen = JSON.stringify(s.tests);
+  if (seen !== testsSeen) { testsSeen = seen; $("tests").replaceChildren(...s.tests.map(([name, text]) => {
+    const c = document.createElement("div"), h = document.createElement("h2"), o = document.createElement("pre");
+    c.className = "card"; h.textContent = "Model test: " + name; o.className = "out"; o.textContent = text;
+    c.append(h, o); return c; })); }
 }
 function show(s, label) {
     params(s.run);
