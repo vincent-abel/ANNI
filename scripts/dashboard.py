@@ -376,7 +376,7 @@ nav a.on { color:var(--ink); font-weight:600; border-bottom-color:var(--series);
 </section>
 <section class="card"><div class="head"><h2>Training loss by billions of tokens</h2>
 <div id="range" class="range"><button class="on">All</button><button data-h="10">10 h</button><button data-h="3">3 h</button><button data-h="1">1 h</button><button data-h="0.5">30 min</button><button data-h="0.0833">5 min</button></div></div>
-<div class="legend"><i style="background:var(--series)"></i>Loss<i style="background:var(--trend)"></i>Mean trend</div>
+<div id="legend" class="legend" hidden><i style="background:var(--series)"></i>Loss<i style="background:var(--trend)"></i>Mean trend</div>
 <div id="chart" class="chart"><svg id="svg" role="img" aria-label="Training loss over tokens"></svg><div id="tip" class="tip"></div></div></section>
 <section class="card"><h2>When to test the model (rough estimates)</h2><div style="overflow-x:auto"><table class="steps">
 <thead><tr><th>Step</th><th>What to expect</th><th class="num">Tokens</th><th class="num">Expected NLL</th><th class="num">When</th><th class="num">Check</th></tr></thead>
@@ -402,7 +402,9 @@ function el(tag, at, text) { const e = document.createElementNS(NS, tag);
 function ticks(lo, hi, n) { const raw = (hi - lo) / n || 1, p = 10 ** Math.floor(Math.log10(raw));
   const step = [1, 2, 5, 10].map(k => k * p).find(s => s >= raw); const out = [];
   for (let v = Math.ceil(lo / step) * step; v <= hi + 1e-9; v += step) out.push(+v.toFixed(6)); return out; }
+const trend = () => hours > 0 && hours < 10;
 function draw() {
+  $("legend").hidden = !trend();
   if (!hours) { plot("", pts, false); return; }
   const first = recent.length ? recent[0][0] : Infinity, all = pts.filter(p => p[0] < first).concat(recent);
   const end = all.length ? all[all.length - 1][0] : 0, from = end - speed * hours * 3600 / 1e9;
@@ -442,7 +444,7 @@ function plot(id, data, zoom) {
       r.stopped ? `stopped ${when(r.stopped)}, resumed ${when(r.resumed, clock)}` : `resumed ${when(r.resumed)}`)); });
   svg.append(el("path", {d: data.map((p, i) => (i ? "L" : "M") + X(p[0]).toFixed(1) + " " + Y(p[1]).toFixed(1)).join(""),
     fill: "none", stroke: ser, "stroke-width": 2, "stroke-linejoin": "round"}));
-  svg.append(el("path", {d: mean(data).map(p => (p[2] ? "M" : "L") + X(p[0]).toFixed(1) + " " + Y(p[1]).toFixed(1)).join(""),
+  if (trend()) svg.append(el("path", {d: mean(data).map(p => (p[2] ? "M" : "L") + X(p[0]).toFixed(1) + " " + Y(p[1]).toFixed(1)).join(""),
     fill: "none", stroke: css.getPropertyValue("--trend"), "stroke-width": 2, "stroke-linejoin": "round"}));
   const cross = el("line", {y1: T, y2: H - B, stroke: ink, visibility: "hidden"}),
     dot = el("circle", {r: 5, fill: ser, stroke: css.getPropertyValue("--surface"), "stroke-width": 2, visibility: "hidden"});
