@@ -33,6 +33,7 @@ FIRST_CHAT = ROOT / "models/run555m-first-chat-try.bin"
 VOCAB = "data/mix100k.vocab"
 WINDOW = 256
 CHAT_STEP = "First chat try"
+SEPARATOR = "\n\n---\n\n"
 SAVED = re.compile(rb"\[([\d-]+ [\d:]+)\] saved checkpoint \S+ \(epoch \d+, window (\d+)/")
 PROMPTS = [
     "The history of the Roman Empire",
@@ -84,6 +85,10 @@ def start_run() -> None:
     subprocess.run(["scripts/dashboard_shots.sh"], cwd=ROOT, check=True)
 
 
+def pair(prompt: str, answer: str) -> str:
+    return f"PROMPT\n{prompt.rstrip()}\n\nANSWER\n{answer.rstrip()}"
+
+
 def generate(model: Path) -> str:
     out = []
     for prompt in PROMPTS:
@@ -93,8 +98,9 @@ def generate(model: Path) -> str:
              "--top-k", "40"],
             cwd=ROOT, capture_output=True, text=True, errors="replace",
             timeout=600, check=True)
-        out.append(done.stdout.strip())
-    return "\n\n---\n\n".join(out)
+        text = done.stdout.strip("\n")
+        out.append(pair(prompt, text.removeprefix(prompt.rstrip()).lstrip(" ").removeprefix("\n")))
+    return SEPARATOR.join(out)
 
 
 def chat(model: Path) -> str:
@@ -103,7 +109,9 @@ def chat(model: Path) -> str:
          "--temperature", "0.7", "--top-k", "40"],
         cwd=ROOT, input="\n".join(CHAT_PROMPTS) + "\n", capture_output=True, text=True,
         errors="replace", timeout=600, check=True, env=dict(os.environ, DISPLAY=""))
-    return done.stdout.strip()
+    answers = done.stdout.split("Assistant: ")[1:]
+    answers = [a.removesuffix("User: ").strip() for a in answers]
+    return SEPARATOR.join(pair(p, a) for p, a in zip(CHAT_PROMPTS, answers))
 
 
 def finetune() -> None:
