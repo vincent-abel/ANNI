@@ -83,6 +83,10 @@ double	lm_nll(const lm *model, const int *ids, int n);
 ** -1 when not applicable (caller falls back to lm_nll per window). */
 int	lm_nll_packed(lm *model, lm_cache *c, const int *ids, int B, int T,
 		double *win_nll);
+/* Same forward, per token: row_nll[B * (T - 1)], row b * (T - 1) + t being
+** the loss of token t + 1 of window b. */
+int	lm_nll_rows_packed(lm *model, lm_cache *c, const int *ids, int B, int T,
+		float *row_nll);
 double	lm_perplexity(const lm *model, const int *ids, int n);
 double	lm_train_steps(lm *model, const char *text, int steps, double lr);
 

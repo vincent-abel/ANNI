@@ -10,13 +10,16 @@ logs/run555m/tests/DATE-STEP/KIND.txt, and start the training from that save.
 The dashboard shows the last level and keeps all of them in its History tab.
 Each step first keeps the weights of that save, for comparisons, as
 models/run555m-base-STEP.bin. From the first chat try on, it also fine-tunes its
-own copy, the chat kinds run on it, and only its weights are kept. The last step
+own copy, the chat kinds run on it, and only its weights are kept. Each step
+also scores the pretrained model on HellaSwag, into the dashboard tab of that
+name; scripts/hellaswag_build.sh must have been run. The last step
 waits for the chat model of the run. A failed test writes its error in place of its output, so it
 is not retried at every save, and the training restarts anyway.
 """
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shutil
@@ -28,16 +31,18 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from dashboard import MILESTONES, PROGRESS, ROOT, TESTS, levels, step_slug
+from dashboard import HELLASWAG, MILESTONES, PROGRESS, ROOT, TESTS, hellaswag_rows, levels, step_slug
 
 LOGS = ROOT / "logs/run555m"
 ANNI = ROOT / "build/555m/anni"
+BENCH = ROOT / "build/hellaswag/anni"	# the same model code, with the bench
 MODEL = ROOT / "models/run555m.bin"
 CHAT = ROOT / "models/run555m-chat.bin"
 VOCAB = "data/mix100k.vocab"
 WINDOW = 256
 CHAT_STEP = "First chat try"
 SEPARATOR = "\n\n---\n\n"
+EARLIER_WEIGHTS = {"Readable text": ("models/run555m-base-0.653g.bin", 0.653)}	# before the bench
 STEP_TOKENS = 131072
 TOTAL_TOKENS = 15_590_156_032
 PARAMS = 555_762_080
@@ -237,6 +242,46 @@ def summary(data: bytes) -> str:
     return ", ".join(parts)
 
 
+def save_title(giga: float) -> str | None:
+    """The summary line of the save at `giga` billion tokens."""
+    data = (LOGS / "pretrain.log").read_bytes()
+    for m in SAVED.finditer(data):
+        if round(int(m[2]) * WINDOW / 1e9, 3) == giga:
+            return summary(data[:m.end()])
+    return None
+
+
+def hellaswag(step: str, model: Path, title: str) -> None:
+    """Add a row for `step`, an error row if it fails: the training must go on."""
+    say(f"hellaswag on {model.name}, as {step}")
+    tokens = re.search(r"([\d.]+) G tokens", title)
+    loss = re.search(r"loss ([\d.]+)", title)
+    row = {"step": step, "tested": time.strftime("%-d %b %H:%M"),
+           "tokens": float(tokens[1]) if tokens else None,
+           "nll": float(loss[1]) if loss else None}
+    try:
+        done = subprocess.run(
+            [str(BENCH), "lm", "hellaswag", "--model", str(model), "--vocab", VOCAB],
+            cwd=ROOT, capture_output=True, text=True, errors="replace",
+            timeout=3600, check=True)
+        row |= json.loads(done.stdout.strip().splitlines()[-1])
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError) as e:
+        row["error"] = str(e)[:200]
+    with open(HELLASWAG, "a", encoding="utf-8") as f:
+        f.write(json.dumps(row) + "\n")
+    say(f"hellaswag: {row.get('acc_norm', row.get('error'))}")
+
+
+def bench(level: str, title: str) -> None:
+    """Score this level, and first the older weights that have no score yet."""
+    tried = {row["step"] for row in hellaswag_rows()}
+    for step, (path, giga) in EARLIER_WEIGHTS.items():
+        earlier = save_title(giga)
+        if step not in tried and earlier and (ROOT / path).exists():
+            hellaswag(step, ROOT / path, earlier)
+    hellaswag(level, MODEL, title)
+
+
 def run_level(level: str) -> None:
     """Test `level` and every kind before it, then publish them as one folder."""
     say(f"level {level}")
@@ -268,6 +313,7 @@ def run_level(level: str) -> None:
         (part / f"{step_slug(kind)}.txt").write_text(
             f"{line}, tested {time.strftime('%-d %b %H:%M')}\n\n{body}\n", encoding="utf-8")
     part.rename(TESTS / f"{time.strftime('%Y%m%d-%H%M')}-{step_slug(level)}")
+    bench(level, title)
     if level in TUNED and level != FINAL_STEP and not failed:
         copy = tuned_copy(level)
         keep_weights(copy, copy)

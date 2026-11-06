@@ -1,5 +1,6 @@
 #include "main.h"
 #include "gpu.h"
+#include "hellaswag.h"
 #ifdef _WIN32
 #include "ann_posix.h"
 #else
@@ -931,6 +932,39 @@ static int run_lm_generate(int argc, char **argv)
 	return 0;
 }
 
+/* lm hellaswag --model FILE --vocab FILE [--data FILE] [--limit N] */
+static int run_lm_hellaswag(int argc, char **argv)
+{
+	hellaswag_score score;
+	lm *model;
+	const char *path;
+	const char *data;
+	int rc;
+
+	path = arg_value(argc, argv, "--model", "model.bin");
+	data = arg_value(argc, argv, "--data", "data/hellaswag_val.tsv");
+	model = lm_load_any(path);
+	if (!model) {
+		fprintf(stderr, "lm hellaswag: cannot load %s\n", path);
+		return 1;
+	}
+	if (apply_vocab_arg(model, argc, argv, "lm hellaswag") != 0) {
+		lm_free(&model);
+		return 1;
+	}
+	rc = lm_hellaswag(model, data, atoi(arg_value(argc, argv, "--limit", "0")),
+	    &score);
+	lm_free(&model);
+	if (rc != 0) {
+		fprintf(stderr, "lm hellaswag: failed on %s\n", data);
+		return 1;
+	}
+	printf("{\"questions\": %d, \"acc\": %.5f, \"acc_norm\": %.5f, "
+	    "\"nll_token\": %.5f}\n", score.questions, score.acc, score.acc_norm,
+	    score.nll_token);
+	return 0;
+}
+
 static int run_anni_chat_stdin(chat_session *sess, const char *path)
 {
 	char line[1024];
@@ -1257,6 +1291,8 @@ static int run_lm(int argc, char **argv)
 		return run_lm_info(argc, argv);
 	if (argc >= 3 && arg_eq(argv[2], "generate"))
 		return run_lm_generate(argc, argv);
+	if (argc >= 3 && arg_eq(argv[2], "hellaswag"))
+		return run_lm_hellaswag(argc, argv);
 	if (argc >= 3 && arg_eq(argv[2], "chat"))
 		return run_anni_chat(argc, argv);
 	if (argc >= 3 && arg_eq(argv[2], "load"))

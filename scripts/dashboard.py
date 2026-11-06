@@ -56,6 +56,7 @@ MILESTONES = [
 ]
 RESUME = re.compile(rb"\[([\d-]+ [\d:]+)\] resuming epoch \d+ at window (\d+)/")
 TESTS = ROOT / "logs/run555m/tests"	# samples of scripts/run555m_checks.py
+HELLASWAG = ROOT / "logs/run555m/hellaswag.jsonl"	# one bench result per line
 TRAIN_ARGS = re.compile(rb"batch=(\d+) grad_accum=(\d+) lr=(\S+) window=(\d+)")
 
 
@@ -273,12 +274,20 @@ def tests() -> tuple[list, dict]:
     return latest, history
 
 
+def hellaswag_rows() -> list[dict]:
+    """Bench results, the oldest first."""
+    if not HELLASWAG.exists():
+        return []
+    return [json.loads(line) for line in HELLASWAG.read_text(encoding="utf-8").splitlines()]
+
+
 def snapshot(log: Log, session: str) -> dict:
     log.update()
     state = log.state()
     state["gpu"] = gpu()
     state["milestones"] = MILESTONES
     state["tests"], state["history"] = tests()
+    state["hellaswag"] = hellaswag_rows()
     state["session"] = session
     state["pane"] = run(["tmux", "capture-pane", "-p", "-t",
                          f"={session}:", "-S", "-200"]).rstrip()
@@ -367,7 +376,7 @@ nav a.on { color:var(--ink); font-weight:600; border-bottom-color:var(--series);
 .two { display:grid; grid-template-columns:repeat(auto-fit,minmax(340px,1fr)); gap:14px; }
 </style></head><body><main>
 <header><h1>ANNI 555M training</h1><div id="status">connecting</div></header>
-<nav id="tabs"><a href="#">Live</a><a href="#history">History</a></nav>
+<nav id="tabs"><a href="#">Live</a><a href="#history">History</a><a href="#hellaswag">HellaSwag</a></nav>
 <div id="live" class="view">
 <section class="card"><div id="params" class="params"></div></section>
 <section class="card"><h2 id="pct">Progress</h2><div class="bar"><i id="fill"></i></div></section>
@@ -392,7 +401,11 @@ nav a.on { color:var(--ink); font-weight:600; border-bottom-color:var(--series);
 <div class="card"><h2>Trainer log</h2><pre id="log"></pre></div>
 </section>
 <section id="tests"></section></div>
-<div id="history" class="view" hidden><nav id="kinds"></nav><section id="hist"></section></div></main>
+<div id="history" class="view" hidden><nav id="kinds"></nav><section id="hist"></section></div>
+<div id="bench" class="view" hidden><section class="card"><h2>HellaSwag at each step</h2>
+<p class="say">Choosing the right ending of a sentence among four, on 10,042 questions, by log-likelihood, without examples. Chance is 25 %. The score is the accuracy normalized by length, the usual headline number; raw accuracy is next to it.</p>
+<div style="overflow-x:auto"><table class="steps"><thead><tr><th>Step</th><th>Tested</th><th class="num">Tokens</th><th class="num">Training NLL</th><th class="num">Score</th><th class="num">Raw</th><th class="num">NLL/token of right endings</th><th class="num">Questions</th></tr></thead>
+<tbody id="benchrows"></tbody></table></div><p id="benchnone" class="say">No result yet: the first comes with the next step.</p></section></div></main>
 <script>
 const BASE = "", SNAPSHOT = null;
 const $ = id => document.getElementById(id);
@@ -498,10 +511,10 @@ function result(title, text) {
 }
 const slug = name => name.toLowerCase().replaceAll(" ", "-");
 function route() {
-  const [tab, sub] = location.hash.slice(1).split("/"), old = tab === "history";
-  $("live").hidden = old; $("history").hidden = !old;
-  [...$("tabs").children].forEach((a, i) => a.classList.toggle("on", !!i === old));
-  if (!old) { draw(); return; }
+  const [tab, sub] = location.hash.slice(1).split("/"), old = tab === "history", bench = tab === "hellaswag";
+  $("live").hidden = old || bench; $("history").hidden = !old; $("bench").hidden = !bench;
+  [...$("tabs").children].forEach((a, i) => a.classList.toggle("on", i === (old ? 1 : bench ? 2 : 0)));
+  if (!old) { if (!bench) draw(); return; }
   const names = Object.keys(history), name = names.find(n => slug(n) === sub) || names[0];
   $("kinds").replaceChildren(...names.map(n => { const a = document.createElement("a");
     a.href = "#history/" + slug(n); a.textContent = `${n} (${history[n].length})`;
@@ -510,8 +523,20 @@ function route() {
   $("hist").replaceChildren(...(runs.length ? runs.map(([title, text]) => result(title, text))
     : [result("No test of this kind yet", "")]));
 }
+const pct = x => x == null ? "-" : (100 * x).toFixed(1) + " %";
+function bench(rows) {
+  $("benchrows").replaceChildren(...[...rows].reverse().map(b => { const r = document.createElement("tr");
+    const cells = [b.step, b.tested, b.tokens == null ? "-" : b.tokens.toFixed(3) + " G",
+      b.nll == null ? "-" : b.nll.toFixed(2), b.error ? "failed" : pct(b.acc_norm), pct(b.acc),
+      b.nll_token == null ? "-" : b.nll_token.toFixed(2), b.questions == null ? "-" : b.questions.toLocaleString("en")];
+    cells.forEach((text, i) => { const c = document.createElement("td"); c.textContent = text;
+      if (i > 1) c.className = "num"; if (i === 4 && b.error) c.title = b.error; r.append(c); });
+    return r; }));
+  $("benchnone").hidden = rows.length > 0;
+}
 function steps(s) {
   const p = s.progress;
+  bench(s.hellaswag);
   $("steps").replaceChildren(...s.milestones.map(([name, say, at, nll]) => {
     const goal = at || p.total_tokens, left = goal - p.tokens, r = document.createElement("tr");
     const secs = p.tok_s_avg ? left / p.tok_s_avg : null;

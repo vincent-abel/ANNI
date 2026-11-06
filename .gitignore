@@ -85,3 +85,6 @@ anni-probe
 anni-latent
 latent/third_party/
 models/latent/
+
+# fetched by scripts/hellaswag_data.py
+data/hellaswag_val.tsv

@@ -27,7 +27,7 @@ NET_SRC=net/neuron.c net/layer.c net/dataset.c net/optim.c net/serialize.c
 NUM_SRC=num/vec.c num/mat.c num/tensor.c num/ops.c num/arena.c num/simd.c num/gpu_stub.c
 NVCC ?= nvcc
 CUDA_OBJ=$(OBJDIR)/gpu_cuda.o
-LANG_SRC=lang/tokenize.c lang/vocab.c lang/bpe.c lang/embed.c lang/posenc.c lang/attn.c lang/ffn.c lang/layernorm.c lang/resid.c lang/block.c lang/lm.c lang/generate.c lang/gradutil.c lang/lm_adam.c lang/dataset_text.c lang/dataset_stream.c lang/lm_serialize.c lang/lm_train.c lang/lm_bench.c lang/lm_info.c lang/quant.c lang/decode.c
+LANG_SRC=lang/tokenize.c lang/vocab.c lang/bpe.c lang/embed.c lang/posenc.c lang/attn.c lang/ffn.c lang/layernorm.c lang/resid.c lang/block.c lang/lm.c lang/generate.c lang/gradutil.c lang/lm_adam.c lang/dataset_text.c lang/dataset_stream.c lang/lm_serialize.c lang/lm_train.c lang/lm_bench.c lang/lm_info.c lang/hellaswag.c lang/quant.c lang/decode.c
 CLI_SRC=cli/tower.c cli/chat_session.c cli/chat_ui.c
 LIB_SRC=$(NET_SRC) $(NUM_SRC) $(LANG_SRC)
 LIB_OBJ=$(patsubst %.c,$(OBJDIR)/%.o,$(notdir $(LIB_SRC)))
@@ -64,6 +64,7 @@ $(OBJDIR)/lm.o: lang/lm.c
 $(OBJDIR)/generate.o: lang/generate.c
 $(OBJDIR)/gradutil.o: lang/gradutil.c
 $(OBJDIR)/lm_adam.o: lang/lm_adam.c
+$(OBJDIR)/hellaswag.o: lang/hellaswag.c
 $(OBJDIR)/dataset_text.o: lang/dataset_text.c
 $(OBJDIR)/dataset_stream.o: lang/dataset_stream.c
 $(OBJDIR)/lm_train.o: lang/lm_train.c
