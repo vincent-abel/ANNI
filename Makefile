@@ -205,11 +205,50 @@ cuda: $(filter-out $(OBJDIR)/gpu_stub.o,$(OBJ)) $(CUDA_OBJ)
 $(CUDA_OBJ): num/gpu_cuda.cu | $(OBJDIR)
 	$(NVCC) $(CUDA_NVCC_FLAGS) -c num/gpu_cuda.cu -o $@
 
+# Latent space viewer. LATENT_LM_FLAGS must match the checkpoint, sizes being
+# compile-time; these are the 555M run's. Own objects, built for this CPU.
+LATENT_LM_FLAGS ?= -DLM_D_MODEL=1536 -DLM_N_HEADS=24 -DLM_D_FF=6272 -DLM_N_BLOCKS=14
+LATENT_OBJDIR=objects-latent
+LATENT_LIB_OBJ=$(patsubst $(OBJDIR)/%,$(LATENT_OBJDIR)/%,$(LIB_OBJ))
+LATENT_FLAGS=$(filter-out -ansi -pedantic,$(CFLAGS)) -Ilatent -march=native -D_GNU_SOURCE $(LATENT_LM_FLAGS)
+
+$(LATENT_OBJDIR):
+	mkdir -p $(LATENT_OBJDIR)
+
+$(LATENT_OBJDIR)/%.o: %.c | $(LATENT_OBJDIR)
+	$(CC) -o $@ -c $< $(LATENT_FLAGS)
+
+anni-probe: latent/probe.c latent/npy.c latent/npy.h $(LATENT_LIB_OBJ)
+	$(CC) $(LATENT_FLAGS) -o $@ latent/probe.c latent/npy.c $(LATENT_LIB_OBJ) $(LDFLAGS)
+
+IMGUI_DIR=latent/third_party/cimgui
+IMGUI_SRC=$(IMGUI_DIR)/cimgui.cpp $(IMGUI_DIR)/cimgui_impl.cpp $(IMGUI_DIR)/imgui/imgui.cpp \
+    $(IMGUI_DIR)/imgui/imgui_draw.cpp $(IMGUI_DIR)/imgui/imgui_demo.cpp $(IMGUI_DIR)/imgui/imgui_tables.cpp \
+    $(IMGUI_DIR)/imgui/imgui_widgets.cpp $(IMGUI_DIR)/imgui/backends/imgui_impl_glfw.cpp \
+    $(IMGUI_DIR)/imgui/backends/imgui_impl_opengl3.cpp
+IMGUI_FLAGS=-O2 -I$(IMGUI_DIR) -I$(IMGUI_DIR)/imgui -I$(IMGUI_DIR)/imgui/backends \
+    -DIMGUI_IMPL_API='extern "C"' -DCIMGUI_USE_GLFW -DCIMGUI_USE_OPENGL3
+
+$(LATENT_OBJDIR)/imgui.a: scripts/latent_deps.sh | $(LATENT_OBJDIR)
+	scripts/latent_deps.sh
+	rm -rf $(LATENT_OBJDIR)/imgui && mkdir -p $(LATENT_OBJDIR)/imgui
+	for f in $(IMGUI_SRC); do \
+	    g++ $(IMGUI_FLAGS) -c $$f -o $(LATENT_OBJDIR)/imgui/$$(basename $$f .cpp).o || exit 1; \
+	done
+	ar rcs $@ $(LATENT_OBJDIR)/imgui/*.o
+
+anni-latent: latent/viewer.c latent/project.c latent/project.h latent/npy.c latent/npy.h $(LATENT_OBJDIR)/imgui.a
+	$(CC) -O2 -std=gnu99 -fopenmp -march=native -W -Wall -Ilatent -I$(IMGUI_DIR) -I$(IMGUI_DIR)/generator/output \
+	    -o $@ latent/viewer.c latent/project.c latent/npy.c $(LATENT_OBJDIR)/imgui.a \
+	    -lglfw -lGL -lm -lstdc++
+
+latent: anni-probe anni-latent
+
 clean:
-	rm -rf $(OBJDIR)
+	rm -rf $(OBJDIR) $(LATENT_OBJDIR)
 
 mrproper: clean
-	rm -rf $(EXEC) ann
+	rm -rf $(EXEC) ann anni-probe anni-latent
 	rm -rf $(TEST)
 	rm -rf $(GUI)
 	rm -rf autotrain
