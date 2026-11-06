@@ -313,9 +313,9 @@ PAGE = r"""<!doctype html>
 <title>ANNI 555M</title>
 <style>
 :root { --bg:#f4f4f2; --surface:#fcfcfb; --ink:#0b0b0b; --ink2:#52514e; --line:#e2e1dc;
-  --series:#2a78d6; --term:#1a1a19; --termink:#f0efec; }
+  --series:#2a78d6; --trend:#d03b3b; --term:#1a1a19; --termink:#f0efec; }
 @media (prefers-color-scheme: dark) { :root { --bg:#111110; --surface:#1a1a19; --ink:#f0efec;
-  --ink2:#c3c2b7; --line:#33332f; --series:#3987e5; --term:#0d0d0c; } }
+  --ink2:#c3c2b7; --line:#33332f; --series:#3987e5; --trend:#e66767; --term:#0d0d0c; } }
 * { box-sizing:border-box; }
 body { margin:0; padding:20px; background:var(--bg); color:var(--ink);
   font:15px/1.4 system-ui,sans-serif; }
@@ -330,6 +330,9 @@ h1 { font-size:20px; margin:0; } h2 { font-size:14px; margin:0 0 8px; color:var(
 .bar { height:8px; background:var(--line); border-radius:4px; overflow:hidden; margin-top:10px; }
 .bar i { display:block; height:100%; width:0; background:var(--series); border-radius:4px; }
 .chart { position:relative; } svg { display:block; width:100%; height:280px; }
+.legend { font-size:13px; color:var(--ink2); margin:-4px 0 6px; }
+.legend i { display:inline-block; width:16px; height:2px; vertical-align:middle; margin:0 5px 0 12px; }
+.legend i:first-child { margin-left:0; }
 .head { display:flex; justify-content:space-between; align-items:baseline; gap:8px; }
 .range button { background:none; border:0; border-bottom:2px solid transparent; color:var(--ink2); font:inherit;
   font-size:13px; padding:0 6px 2px; cursor:pointer; } .range button.on { color:var(--ink); font-weight:600; border-bottom-color:var(--series); }
@@ -373,6 +376,7 @@ nav a.on { color:var(--ink); font-weight:600; border-bottom-color:var(--series);
 </section>
 <section class="card"><div class="head"><h2>Training loss by billions of tokens</h2>
 <div id="range" class="range"><button class="on">All</button><button data-h="10">10 h</button><button data-h="3">3 h</button><button data-h="1">1 h</button><button data-h="0.5">30 min</button><button data-h="0.0833">5 min</button></div></div>
+<div class="legend"><i style="background:var(--series)"></i>Loss<i style="background:var(--trend)"></i>Mean trend</div>
 <div id="chart" class="chart"><svg id="svg" role="img" aria-label="Training loss over tokens"></svg><div id="tip" class="tip"></div></div></section>
 <section class="card"><h2>When to test the model (rough estimates)</h2><div style="overflow-x:auto"><table class="steps">
 <thead><tr><th>Step</th><th>What to expect</th><th class="num">Tokens</th><th class="num">Expected NLL</th><th class="num">When</th><th class="num">Check</th></tr></thead>
@@ -404,6 +408,19 @@ function draw() {
   const end = all.length ? all[all.length - 1][0] : 0, from = end - speed * hours * 3600 / 1e9;
   plot("", all.filter(p => p[0] >= from), true);
 }
+function mean(data) {	// centered mean over a twelfth of the tokens shown, narrower at each end
+  const w = (data[data.length - 1][0] - data[0][0]) / 24, sum = [0], out = [];
+  for (const p of data) sum.push(sum[sum.length - 1] + p[1]);
+  const at = x => { let lo = 0, hi = data.length; while (lo < hi) { const m = lo + hi >> 1;
+    if (data[m][0] < x) lo = m + 1; else hi = m; } return lo; };
+  for (let s = 0, e; s < data.length; s = e) {	// a stop leaves a gap: no mean across it
+    for (e = s + 1; e < data.length && data[e][0] - data[e - 1][0] <= w / 2; e++);
+    for (let i = s; i < e; i++) { const x = data[i][0], h = Math.min(w, x - data[s][0], data[e - 1][0] - x);
+      const a = Math.max(s, at(x - h)), b = Math.min(e, at(x + h + 1e-12));
+      out.push([x, (sum[b] - sum[a]) / (b - a), i === s]); }
+  }
+  return out;
+}
 function plot(id, data, zoom) {
   const svg = $(id + "svg"), W = svg.clientWidth, H = svg.clientHeight, L = 44, R = 12, T = 10, B = 26;
   svg.setAttribute("viewBox", `0 0 ${W} ${H}`); svg.replaceChildren(); geos[id] = null;
@@ -425,6 +442,8 @@ function plot(id, data, zoom) {
       r.stopped ? `stopped ${when(r.stopped)}, resumed ${when(r.resumed, clock)}` : `resumed ${when(r.resumed)}`)); });
   svg.append(el("path", {d: data.map((p, i) => (i ? "L" : "M") + X(p[0]).toFixed(1) + " " + Y(p[1]).toFixed(1)).join(""),
     fill: "none", stroke: ser, "stroke-width": 2, "stroke-linejoin": "round"}));
+  svg.append(el("path", {d: mean(data).map(p => (p[2] ? "M" : "L") + X(p[0]).toFixed(1) + " " + Y(p[1]).toFixed(1)).join(""),
+    fill: "none", stroke: css.getPropertyValue("--trend"), "stroke-width": 2, "stroke-linejoin": "round"}));
   const cross = el("line", {y1: T, y2: H - B, stroke: ink, visibility: "hidden"}),
     dot = el("circle", {r: 5, fill: ser, stroke: css.getPropertyValue("--surface"), "stroke-width": 2, visibility: "hidden"});
   svg.append(cross, dot); geos[id] = {X, Y, cross, dot, W, data};
