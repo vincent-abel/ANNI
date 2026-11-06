@@ -8,7 +8,7 @@
 
 /* x: n rows of d floats, changed in place to mean 0. out: n rows of k scores. */
 int	pca_fit(float *x, long n, int d, int k, float *out);
-/* The KNN_K nearest of each row of x (n x d), rows normalized by cosine. */
+/* The KNN_K nearest of each row of x (n x d), by cosine. */
 int	knn_graph(const float *x, long n, int d, int *idx, float *dist);
 /*
 ** 3D layout of a kNN graph, into pos (n x 3) which holds the starting layout.

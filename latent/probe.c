@@ -165,7 +165,7 @@ static void write_states(FILE *fp, const mat *m, long layer, long n_points,
 }
 
 /* What the model expects after position t, into the points file. */
-static void write_point(FILE *fp, const lm *model, const lm_cache *c, vec *logits,
+static void write_point(FILE *fp, const lm *model, const lm_cache *c, ann_real *row,
 	const source *s, int window, int t, int next)
 {
 	double sum = 0.0;
@@ -173,19 +173,19 @@ static void write_point(FILE *fp, const lm *model, const lm_cache *c, vec *logit
 	int best = 0;
 	int v;
 
-	lm_logits_at(logits, model, c->hidden, t);
-	top = logits->data[0];
-	for (v = 1; v < logits->n; v++) {
-		if (logits->data[v] > top) {
-			top = logits->data[v];
+	for (v = 0; v < model->vocab_size; v++)
+		row[v] += model->b_head->data[v];
+	top = row[0];
+	for (v = 1; v < model->vocab_size; v++) {
+		if (row[v] > top) {
+			top = row[v];
 			best = v;
 		}
 	}
-	for (v = 0; v < logits->n; v++)
-		sum += exp((double)logits->data[v] - top);
+	for (v = 0; v < model->vocab_size; v++)
+		sum += exp((double)row[v] - top);
 	fprintf(fp, "%s\t%d\t%d\t%d\t%d\t%d\t%.4f\t%.4f\n", s->label, window, t,
-	    c->ids[t], next, best, 1.0 / sum,
-	    log(sum) - ((double)logits->data[next] - top));
+	    c->ids[t], next, best, 1.0 / sum, log(sum) - ((double)row[next] - top));
 }
 
 static int dump_states(lm *model, source *src, int n_src, long positions,
@@ -197,7 +197,7 @@ static int dump_states(lm *model, source *src, int n_src, long positions,
 	int ids[WINDOW + 1];
 	long shape[3];
 	lm_cache *c;
-	vec *logits;
+	mat *logits;
 	FILE *states;
 	FILE *points;
 	long w;
@@ -210,7 +210,7 @@ static int dump_states(lm *model, source *src, int n_src, long positions,
 	path_in(path, sizeof(path), dir, "points.tsv");
 	points = fopen(path, "wb");
 	c = lm_cache_create(WINDOW);
-	logits = vec_create(model->vocab_size);
+	logits = mat_create(WINDOW, model->vocab_size);
 	if (!states || !points || !c || !logits)
 		return -1;
 	if (ftell(states) != 128) {
@@ -230,12 +230,15 @@ static int dump_states(lm *model, source *src, int n_src, long positions,
 			    w * WINDOW, WINDOW);
 		write_states(states, c->hidden, LM_N_BLOCKS, n_points, w * WINDOW,
 		    WINDOW);
+		if (mat_mul(logits, c->hidden, model->w_head) != 0)
+			return -1;
 		for (i = 0; i < WINDOW; i++)
-			write_point(points, model, c, logits, s, (int)w, i, ids[i + 1]);
+			write_point(points, model, c, logits->data
+			    + (size_t)i * (size_t)model->vocab_size, s, (int)w, i, ids[i + 1]);
 		fprintf(stderr, "\rwindow %ld/%ld", w + 1, windows);
 	}
 	fprintf(stderr, "\n");
-	vec_free(&logits);
+	mat_free(&logits);
 	lm_cache_free(&c);
 	fclose(points);
 	return fclose(states);

@@ -13,6 +13,7 @@
 #define UMAP_NEGATIVE	5
 #define UMAP_CLIP	4.0f
 #define SIGMA_STEPS	64
+#define KNN_BLOCK	32
 
 static uint64_t next_random(uint64_t *state)
 {
@@ -155,35 +156,43 @@ int knn_graph(const float *x, long n, int d, int *idx, float *dist)
 		for (i = 0; i < d; i++)
 			u[i] = row[i] * (float)norm;
 	}
-	#pragma omp parallel for schedule(dynamic, 64)
-	for (r = 0; r < n; r++) {
-		const float *a = unit + (size_t)r * (size_t)d;
-		int *best = idx + (size_t)r * KNN_K;
-		float *near = dist + (size_t)r * KNN_K;
-		int found = 0;
+	/* A block of rows stays in cache while every other row goes past it. */
+	#pragma omp parallel for schedule(dynamic)
+	for (r = 0; r < n; r += KNN_BLOCK) {
+		long end = r + KNN_BLOCK < n ? r + KNN_BLOCK : n;
+		int found[KNN_BLOCK];
 		long c;
+		long q;
 
+		memset(found, 0, sizeof(found));
 		for (c = 0; c < n; c++) {
 			const float *b = unit + (size_t)c * (size_t)d;
-			float dot = 0.0f;
-			float dd;
-			int i;
 
-			if (c == r)
-				continue;
-			for (i = 0; i < d; i++)
-				dot += a[i] * b[i];
-			dd = 1.0f - dot;
-			if (found == KNN_K && dd >= near[KNN_K - 1])
-				continue;
-			i = found < KNN_K ? found++ : KNN_K - 1;
-			while (i > 0 && near[i - 1] > dd) {
-				near[i] = near[i - 1];
-				best[i] = best[i - 1];
-				i--;
+			for (q = r; q < end; q++) {
+				const float *a = unit + (size_t)q * (size_t)d;
+				int *best = idx + (size_t)q * KNN_K;
+				float *near = dist + (size_t)q * KNN_K;
+				int *have = &found[q - r];
+				float dot = 0.0f;
+				float dd;
+				int i;
+
+				if (c == q)
+					continue;
+				for (i = 0; i < d; i++)
+					dot += a[i] * b[i];
+				dd = 1.0f - dot;
+				if (*have == KNN_K && dd >= near[KNN_K - 1])
+					continue;
+				i = *have < KNN_K ? (*have)++ : KNN_K - 1;
+				while (i > 0 && near[i - 1] > dd) {
+					near[i] = near[i - 1];
+					best[i] = best[i - 1];
+					i--;
+				}
+				near[i] = dd;
+				best[i] = (int)c;
 			}
-			near[i] = dd;
-			best[i] = (int)c;
 		}
 	}
 	free(unit);
@@ -346,8 +355,7 @@ int umap_layout(const int *idx, const float *dist, long n, float *pos, int epoch
 					g = 2.0f * UMAP_B / ((0.001f + d2)
 					    * (UMAP_A * powf(d2, UMAP_B) + 1.0f));
 					for (c = 0; c < 3; c++)
-						a[c] += (g > 0.0f ? clip(g * dx[c]) : UMAP_CLIP)
-						    * alpha;
+						a[c] += clip(g * dx[c]) * alpha;
 				}
 			}
 		}
@@ -356,28 +364,50 @@ int umap_layout(const int *idx, const float *dist, long n, float *pos, int epoch
 	return 0;
 }
 
+static int compare_float(const void *a, const void *b)
+{
+	float x = *(const float *)a;
+	float y = *(const float *)b;
+
+	return (x > y) - (x < y);
+}
+
+/*
+** The median, not the mean: a few strays far out would shrink the whole cloud
+** to a dot in the middle of the window.
+*/
 void layout_normalize(float *pos, long n, float radius)
 {
-	double centre[3] = {0.0, 0.0, 0.0};
-	double spread = 0.0;
+	float *v = malloc(sizeof(float) * (size_t)n);
+	float centre[3];
+	float spread;
 	long i;
 	int c;
 
-	for (i = 0; i < n; i++) {
-		for (c = 0; c < 3; c++)
-			centre[c] += pos[i * 3 + c];
+	if (!v || n < 1) {
+		free(v);
+		return;
 	}
-	for (c = 0; c < 3; c++)
-		centre[c] /= (double)n;
+	for (c = 0; c < 3; c++) {
+		for (i = 0; i < n; i++)
+			v[i] = pos[i * 3 + c];
+		qsort(v, (size_t)n, sizeof(float), compare_float);
+		centre[c] = v[n / 2];
+	}
 	for (i = 0; i < n; i++) {
+		float r = 0.0f;
+
 		for (c = 0; c < 3; c++) {
-			pos[i * 3 + c] -= (float)centre[c];
-			spread += (double)pos[i * 3 + c] * pos[i * 3 + c];
+			pos[i * 3 + c] -= centre[c];
+			r += pos[i * 3 + c] * pos[i * 3 + c];
 		}
+		v[i] = r;
 	}
-	spread = sqrt(spread / (double)n);
-	if (spread <= 0.0)
+	qsort(v, (size_t)n, sizeof(float), compare_float);
+	spread = sqrtf(v[n / 2]);
+	free(v);
+	if (spread <= 0.0f)
 		return;
 	for (i = 0; i < n * 3; i++)
-		pos[i] *= radius / (float)spread;
+		pos[i] *= radius / spread;
 }

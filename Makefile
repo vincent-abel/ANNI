@@ -210,7 +210,7 @@ $(CUDA_OBJ): num/gpu_cuda.cu | $(OBJDIR)
 LATENT_LM_FLAGS ?= -DLM_D_MODEL=1536 -DLM_N_HEADS=24 -DLM_D_FF=6272 -DLM_N_BLOCKS=14
 LATENT_OBJDIR=objects-latent
 LATENT_LIB_OBJ=$(patsubst $(OBJDIR)/%,$(LATENT_OBJDIR)/%,$(LIB_OBJ))
-LATENT_FLAGS=$(filter-out -ansi -pedantic,$(CFLAGS)) -Ilatent -march=native -D_GNU_SOURCE $(LATENT_LM_FLAGS)
+LATENT_FLAGS=$(filter-out -ansi -pedantic,$(CFLAGS)) -O3 -ffast-math -Ilatent -march=native -D_GNU_SOURCE $(LATENT_LM_FLAGS)
 
 $(LATENT_OBJDIR):
 	mkdir -p $(LATENT_OBJDIR)
@@ -238,7 +238,7 @@ $(LATENT_OBJDIR)/imgui.a: scripts/latent_deps.sh | $(LATENT_OBJDIR)
 	ar rcs $@ $(LATENT_OBJDIR)/imgui/*.o
 
 anni-latent: latent/viewer.c latent/project.c latent/project.h latent/npy.c latent/npy.h $(LATENT_OBJDIR)/imgui.a
-	$(CC) -O2 -std=gnu99 -fopenmp -march=native -W -Wall -Ilatent -I$(IMGUI_DIR) -I$(IMGUI_DIR)/generator/output \
+	$(CC) -O3 -ffast-math -std=gnu99 -fopenmp -march=native -W -Wall -Ilatent -I$(IMGUI_DIR) -I$(IMGUI_DIR)/generator/output \
 	    -o $@ latent/viewer.c latent/project.c latent/npy.c $(LATENT_OBJDIR)/imgui.a \
 	    -lglfw -lGL -lm -lstdc++
 
