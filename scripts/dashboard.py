@@ -31,6 +31,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 MAX_POINTS = 3000
 CURVE_EVERY = 10 * 131072	# tokens between rows, 10 steps of the run
+# A resume seeds the trainer's loss average with the loss of the first tokens
+# of the dataset, far above the real one; 5 time constants of that average.
+RESUME_SETTLE = 13_000_000
 D_MODEL, D_FF, N_BLOCKS, VOCAB = 1536, 6272, 14, 100000
 N_HEADS, MAX_CTX = 24, 2048
 # Estimates from the 170M run, in tokens so they follow the real speed.
@@ -41,6 +44,7 @@ MILESTONES = [
      2_200_000_000],
     ["Final model", "The full result; the chat fine-tune follows on its own", None],
 ]
+RESUME = re.compile(rb"\[([\d-]+ [\d:]+)\] resuming epoch \d+ at window (\d+)/")
 TRAIN_ARGS = re.compile(rb"batch=(\d+) grad_accum=(\d+) lr=(\S+) window=(\d+)")
 
 
@@ -113,10 +117,12 @@ class Log:
         self.path = path
         self.curve = curve
         self.curve_last = 0
+        self.curve_times: list[int] = []
         if curve.exists():
             rows = curve.read_text(encoding="utf-8").splitlines()
             if len(rows) > 1:
                 self.curve_last = int(rows[-1].split(",")[1])
+            self.curve_times = [int(r.split(",")[0]) for r in rows[1:] if r[0] != ","]
         else:
             curve.write_text("time,tokens,nll,tok_s,tflops,vram_mb\n", encoding="utf-8")
         self.live = False
@@ -124,6 +130,8 @@ class Log:
         self.pos = 0
         self.partial = b""
         self.points: list[list[float]] = []
+        self.resumes: list[dict] = []
+        self.settled = 0	# tokens from which the loss can be trusted again
         self.every = 1
         self.seen = 0
         self.last: dict = {}
@@ -138,6 +146,9 @@ class Log:
         t = TRAIN_ARGS.search(raw)
         if t:
             self.args = (int(t[1]), int(t[2]), t[3].decode(), int(t[4]))
+        r = RESUME.search(raw)
+        if r:
+            self.resume(r[1].decode(), int(r[2]) * self.window)
         if not m:
             text = raw.decode("utf-8", "replace").strip()
             if text:
@@ -153,6 +164,8 @@ class Log:
                      "tokens": done * self.window,
                      "total_tokens": total * self.window}
         tokens = done * self.window
+        if tokens < self.settled:
+            return
         if tokens >= self.curve_last + CURVE_EVERY:
             self.curve_last = tokens
             stamp = int(time.time()) if self.live else ""
@@ -164,6 +177,15 @@ class Log:
             if len(self.points) > MAX_POINTS:
                 self.points = self.points[::2]
                 self.every *= 2
+
+    def resume(self, stamp: str, tokens: int) -> None:
+        """Mark a restart and forget the points of the work it threw away."""
+        resumed = time.mktime(time.strptime(stamp, "%Y-%m-%d %H:%M:%S"))
+        stopped = [t for t in self.curve_times if t < resumed]
+        self.resumes.append({"tokens": tokens / 1e9, "resumed": resumed,
+                             "stopped": stopped[-1] if stopped else None})
+        self.points = [p for p in self.points if p[0] * 1e9 <= tokens]
+        self.settled = tokens + RESUME_SETTLE
 
     def update(self) -> None:
         with self.lock:
@@ -188,6 +210,7 @@ class Log:
                 left = last["total_tokens"] - last["tokens"]
                 last["eta_s"] = left / avg if avg > 0 else None
             return {"progress": last, "points": list(self.points),
+                    "resumes": list(self.resumes),
                     "run": run_params(self.args, last.get("total_tokens", 0)),
                     "log": self.lines + [self.current]}
 
@@ -314,7 +337,9 @@ pre { margin:0; padding:12px; background:var(--term); color:var(--termink); bord
 const BASE = "", SNAPSHOT = null;
 const $ = id => document.getElementById(id);
 const NS = "http://www.w3.org/2000/svg";
-let pts = [], geo = null;
+let pts = [], resumes = [], geo = null;
+const when = (t, opt) => new Date(t * 1000).toLocaleString("en-GB", opt || {day: "numeric", month: "short",
+  hour: "2-digit", minute: "2-digit"});
 function dur(s) { if (s == null) return "-"; const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600),
   m = Math.floor(s % 3600 / 60); return d ? d + " d " + h + " h" : h + " h " + m + " min"; }
 function el(tag, at, text) { const e = document.createElementNS(NS, tag);
@@ -329,13 +354,17 @@ function draw() {
     line = css.getPropertyValue("--line"), ser = css.getPropertyValue("--series");
   if (pts.length < 2) { svg.append(el("text", {x: W / 2, y: H / 2, "text-anchor": "middle", fill: ink, "font-size": 13},
     "Waiting for training steps")); return; }
-  const x0 = pts[0][0], x1 = pts[pts.length - 1][0] || 1; let y0 = Infinity, y1 = -Infinity;
+  const x0 = pts[0][0], x1 = Math.max(pts[pts.length - 1][0], ...resumes.map(r => r.tokens)) || 1; let y0 = Infinity, y1 = -Infinity;
   for (const p of pts) { y0 = Math.min(y0, p[1]); y1 = Math.max(y1, p[1]); }
   y0 = Math.floor(y0); y1 = Math.ceil(y1);
   const X = v => L + (v - x0) / (x1 - x0 || 1) * (W - L - R), Y = v => T + (y1 - v) / (y1 - y0 || 1) * (H - T - B);
   for (const v of ticks(y0, y1, 5)) { svg.append(el("line", {x1: L, x2: W - R, y1: Y(v), y2: Y(v), stroke: line}));
     svg.append(el("text", {x: L - 6, y: Y(v) + 4, "text-anchor": "end", fill: ink, "font-size": 12}, v)); }
   for (const v of ticks(x0, x1, 6)) svg.append(el("text", {x: X(v), y: H - 8, "text-anchor": "middle", fill: ink, "font-size": 12}, v + " G"));
+  resumes.forEach((r, i) => { const x = X(r.tokens), left = x > W / 2, clock = {hour: "2-digit", minute: "2-digit"};
+    svg.append(el("line", {x1: x, x2: x, y1: T, y2: H - B, stroke: ink, "stroke-dasharray": "4 4"}));
+    svg.append(el("text", {x: x + (left ? -6 : 6), y: T + 12 + i % 2 * 16, "text-anchor": left ? "end" : "start", fill: ink, "font-size": 12},
+      r.stopped ? `stopped ${when(r.stopped)}, resumed ${when(r.resumed, clock)}` : `resumed ${when(r.resumed)}`)); });
   svg.append(el("path", {d: pts.map((p, i) => (i ? "L" : "M") + X(p[0]).toFixed(1) + " " + Y(p[1]).toFixed(1)).join(""),
     fill: "none", stroke: ser, "stroke-width": 2, "stroke-linejoin": "round"}));
   const cross = el("line", {y1: T, y2: H - B, stroke: ink, visibility: "hidden"}),
@@ -363,8 +392,7 @@ function params(groups) {
     return g; }));
 }
 function steps(s) {
-  const p = s.progress, when = t => new Date(t * 1000).toLocaleString("en-GB",
-    {day: "numeric", month: "short", hour: "2-digit", minute: "2-digit"});
+  const p = s.progress;
   $("steps").replaceChildren(...s.milestones.map(([name, say, at]) => {
     const goal = at || p.total_tokens, left = goal - p.tokens, r = document.createElement("tr");
     const secs = p.tok_s_avg ? left / p.tok_s_avg : null;
@@ -388,7 +416,8 @@ function show(s, label) {
       $("gpu").textContent = Math.round(g.util) + "%, " + Math.round(g.temp) + " °C"; }
     steps(s);
     follow($("pane"), s.pane || "(no tmux session)"); follow($("log"), s.log.join("\n"));
-    if (s.points.length !== pts.length || (s.points.length && s.points.at(-1)[0] !== pts.at(-1)[0])) { pts = s.points; draw(); }
+    if (s.points.length !== pts.length || s.resumes.length !== resumes.length ||
+        (s.points.length && s.points.at(-1)[0] !== pts.at(-1)[0])) { pts = s.points; resumes = s.resumes; draw(); }
 }
 async function tick() {
   try { show(await (await fetch(BASE + "/state")).json(), "live, updated"); }
