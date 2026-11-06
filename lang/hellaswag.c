@@ -9,6 +9,7 @@
 #define LINE_MAX_BYTES	16384
 #define MAX_TOKENS	256	/* the context of the pretraining */
 #define BATCH		32
+#define BATCH_TOKENS	4096	/* the batch of the training: the cache fits */
 #define T_STEP		32	/* window lengths: few, each one needs a cache */
 
 typedef struct	sequence {
@@ -155,30 +156,33 @@ static int score_batches(lm *model, question *qs, sequence *seqs, int total)
 	int rc = -1;
 
 	while (done < total) {
-		int count = total - done < BATCH ? total - done : BATCH;
-		int T = seqs[done + count - 1].n;
+		int T = seqs[done + (total - done < BATCH ? total - done : BATCH) - 1].n;
+		int B;
+		int count;
 		int b;
 
 		T = (T + T_STEP - 1) / T_STEP * T_STEP;
+		B = BATCH_TOKENS / T < BATCH ? BATCH_TOKENS / T : BATCH;
+		count = total - done < B ? total - done : B;
 		if (T != cache_T) {
 			lm_cache_free(&c);
 			free(ids);
 			free(rows);
-			c = lm_cache_create_packed(BATCH, T);
-			ids = malloc(sizeof(int) * BATCH * (size_t)T);
-			rows = malloc(sizeof(float) * BATCH * (size_t)(T - 1));
+			c = lm_cache_create_packed(B, T);
+			ids = malloc(sizeof(int) * (size_t)B * (size_t)T);
+			rows = malloc(sizeof(float) * (size_t)B * (size_t)(T - 1));
 			cache_T = T;
 			if (!c || !ids || !rows)
 				goto out;
 		}
 		/* Causal: what follows a sequence cannot change its losses. */
-		memset(ids, 0, sizeof(int) * BATCH * (size_t)T);
-		for (b = 0; b < BATCH; b++) {
+		memset(ids, 0, sizeof(int) * (size_t)B * (size_t)T);
+		for (b = 0; b < B; b++) {
 			const sequence *s = &seqs[done + (b < count ? b : 0)];
 
 			memcpy(ids + (size_t)b * T, s->ids, sizeof(int) * (size_t)s->n);
 		}
-		if (lm_nll_rows_packed(model, c, ids, BATCH, T, rows) != 0)
+		if (lm_nll_rows_packed(model, c, ids, B, T, rows) != 0)
 			goto out;
 		for (b = 0; b < count; b++)
 			add_rows(qs, &seqs[done + b], rows + (size_t)b * (T - 1));

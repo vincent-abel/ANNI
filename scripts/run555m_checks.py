@@ -265,6 +265,8 @@ def hellaswag(step: str, model: Path, title: str) -> None:
             cwd=ROOT, capture_output=True, text=True, errors="replace",
             timeout=3600, check=True)
         row |= json.loads(done.stdout.strip().splitlines()[-1])
+    except subprocess.CalledProcessError as e:
+        row["error"] = f"exit {e.returncode}: {e.stderr.strip()[-200:]}"
     except (OSError, subprocess.SubprocessError, ValueError, IndexError) as e:
         row["error"] = str(e)[:200]
     with open(HELLASWAG, "a", encoding="utf-8") as f:
@@ -274,7 +276,7 @@ def hellaswag(step: str, model: Path, title: str) -> None:
 
 def bench(level: str, title: str) -> None:
     """Score this level, and first the older weights that have no score yet."""
-    tried = {row["step"] for row in hellaswag_rows()}
+    tried = {row["step"] for row in hellaswag_rows() if "error" not in row}
     for step, (path, giga) in EARLIER_WEIGHTS.items():
         earlier = save_title(giga)
         if step not in tried and earlier and (ROOT / path).exists():
