@@ -244,18 +244,15 @@ def levels() -> list[Path]:
 
 
 def tests() -> tuple[list, dict]:
-    """The tests of the last level as (kind, title, output), the newest kind
-    first, and for each kind
-    all its runs as (title, output), the newest first."""
-    latest, history = [], {m[0]: [] for m in MILESTONES}
-    for i, level in enumerate(levels()):
-        for name in history:
+    """The last test of each kind as (kind, title, output), the newest kind
+    first, and for each kind all its runs as (title, output), the newest first."""
+    history = {m[0]: [] for m in MILESTONES}
+    for level in levels():
+        for name, runs in history.items():
             path = level / f"{step_slug(name)}.txt"
             if path.exists():
-                title, text = path.read_text(encoding="utf-8").split("\n\n", 1)
-                history[name].append([title, text])
-                if i == 0:
-                    latest.insert(0, [name, title, text])
+                runs.append(path.read_text(encoding="utf-8").split("\n\n", 1))
+    latest = [[name, *runs[0]] for name, runs in reversed(history.items()) if runs]
     return latest, history
 
 
