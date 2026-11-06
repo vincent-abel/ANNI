@@ -33,6 +33,14 @@ MAX_POINTS = 3000
 CURVE_EVERY = 10 * 131072	# tokens between rows, 10 steps of the run
 D_MODEL, D_FF, N_BLOCKS, VOCAB = 1536, 6272, 14, 100000
 N_HEADS, MAX_CTX = 24, 2048
+# Estimates from the 170M run, in tokens so they follow the real speed.
+MILESTONES = [
+    ["Recognizable words", "Mostly noise, with words and bits of code", 300_000_000],
+    ["Readable text", "Rough sentences; continues what you write, does not answer", 960_000_000],
+    ["First chat try", "Clumsy conversation, after about 45 min of chat fine-tune on a copy",
+     2_200_000_000],
+    ["Final model", "The full result; the chat fine-tune follows on its own", None],
+]
 TRAIN_ARGS = re.compile(rb"batch=(\d+) grad_accum=(\d+) lr=(\S+) window=(\d+)")
 
 
@@ -206,6 +214,7 @@ def snapshot(log: Log, session: str) -> dict:
     log.update()
     state = log.state()
     state["gpu"] = gpu()
+    state["milestones"] = MILESTONES
     state["session"] = session
     state["pane"] = run(["tmux", "capture-pane", "-p", "-t",
                          f"={session}:", "-S", "-200"]).rstrip()
@@ -272,6 +281,12 @@ pre { margin:0; padding:12px; background:var(--term); color:var(--termink); bord
 .params div div { display:flex; justify-content:space-between; gap:12px; font-size:13px; padding:2px 0;
   border-bottom:1px solid var(--line); }
 .params span { color:var(--ink2); } .params b { font-weight:500; font-variant-numeric:tabular-nums; text-align:right; }
+.steps { width:100%; border-collapse:collapse; font-size:13px; }
+.steps th { text-align:left; color:var(--ink2); font-weight:600; padding:0 12px 6px 0; }
+.steps td { padding:5px 12px 5px 0; border-top:1px solid var(--line); vertical-align:top; }
+.steps td:first-child { font-weight:500; white-space:nowrap; } .steps .say { color:var(--ink2); }
+.steps .num { text-align:right; font-variant-numeric:tabular-nums; white-space:nowrap; }
+.steps th:last-child, .steps td:last-child { padding-right:0; }
 .two { display:grid; grid-template-columns:repeat(auto-fit,minmax(340px,1fr)); gap:14px; }
 </style></head><body><main>
 <header><h1>ANNI 555M training</h1><div id="status">connecting</div></header>
@@ -288,6 +303,9 @@ pre { margin:0; padding:12px; background:var(--term); color:var(--termink); bord
 </section>
 <section class="card"><h2>Training loss by billions of tokens</h2>
 <div id="chart"><svg id="svg" role="img" aria-label="Training loss over tokens"></svg><div id="tip"></div></div></section>
+<section class="card"><h2>When to test the model (estimates)</h2><div style="overflow-x:auto"><table class="steps">
+<thead><tr><th>Step</th><th>What to expect</th><th class="num">Tokens</th><th class="num">When</th></tr></thead>
+<tbody id="steps"></tbody></table></div></section>
 <section class="two">
 <div class="card"><h2 id="panetitle">tmux</h2><pre id="pane"></pre></div>
 <div class="card"><h2>Trainer log</h2><pre id="log"></pre></div>
@@ -344,6 +362,18 @@ function params(groups) {
       b = document.createElement("b"); a.textContent = k; b.textContent = v; r.append(a, b); g.append(r); }
     return g; }));
 }
+function steps(s) {
+  const p = s.progress, when = t => new Date(t * 1000).toLocaleString("en-GB",
+    {day: "numeric", month: "short", hour: "2-digit", minute: "2-digit"});
+  $("steps").replaceChildren(...s.milestones.map(([name, say, at]) => {
+    const goal = at || p.total_tokens, left = goal - p.tokens, r = document.createElement("tr");
+    const secs = p.tok_s_avg ? left / p.tok_s_avg : null;
+    const cells = [name, say, goal ? (goal / 1e9).toFixed(2) + " G" : "-",
+      !goal ? "-" : left <= 0 ? "✓ Reached" : secs == null ? "-" : "in " + dur(secs) + ", " + when(s.now + secs)];
+    cells.forEach((text, i) => { const c = document.createElement("td"); c.textContent = text;
+      c.className = ["", "say", "num", "num"][i]; r.append(c); });
+    return r; }));
+}
 function show(s, label) {
     params(s.run);
     const p = s.progress, g = s.gpu;
@@ -356,6 +386,7 @@ function show(s, label) {
       $("tflops").textContent = p.tflops.toFixed(1); $("tokens").textContent = p.tokens.toLocaleString("en-US"); }
     if (g.total) { $("vram").textContent = (g.used / 1024).toFixed(1) + " / " + (g.total / 1024).toFixed(1) + " GiB";
       $("gpu").textContent = Math.round(g.util) + "%, " + Math.round(g.temp) + " °C"; }
+    steps(s);
     follow($("pane"), s.pane || "(no tmux session)"); follow($("log"), s.log.join("\n"));
     if (s.points.length !== pts.length || (s.points.length && s.points.at(-1)[0] !== pts.at(-1)[0])) { pts = s.points; draw(); }
 }
