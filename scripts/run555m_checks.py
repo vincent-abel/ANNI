@@ -23,7 +23,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from dashboard import MILESTONES, ROOT, TESTS, step_slug
+from dashboard import MILESTONES, PROGRESS, ROOT, TESTS, step_slug
 
 LOGS = ROOT / "logs/run555m"
 ANNI = ROOT / "build/555m/anni"
@@ -34,6 +34,9 @@ VOCAB = "data/mix100k.vocab"
 WINDOW = 256
 CHAT_STEP = "First chat try"
 SEPARATOR = "\n\n---\n\n"
+STEP_TOKENS = 131072
+TOTAL_TOKENS = 15_590_156_032
+STARTED = re.compile(rb"\[([\d-]+ [\d:]+)\] epoch \d+/\d+ starting")
 SAVED = re.compile(rb"\[([\d-]+ [\d:]+)\] saved checkpoint \S+ \(epoch \d+, window (\d+)/")
 PROMPTS = [
     "The history of the Roman Empire",
@@ -129,6 +132,36 @@ def finetune() -> None:
             cwd=ROOT, stdout=log, stderr=log, check=True)
 
 
+def stamp(raw: bytes) -> float:
+    return time.mktime(time.strptime(raw.decode(), "%Y-%m-%d %H:%M:%S"))
+
+
+def summary(data: bytes) -> str:
+    """One line on the last save. Training time leaves out the pauses and the
+    work a restart threw away, so it only runs from each start to its last save."""
+    events = sorted([(m.start(), m) for m in STARTED.finditer(data)] +
+                    [(m.start(), m) for m in SAVED.finditer(data)], key=lambda e: e[0])
+    trained, start, last, save = 0.0, 0.0, 0.0, None
+    for _, m in events:
+        if m.re is STARTED:
+            trained += last - start
+            start = last = stamp(m[1])
+        else:
+            last, save = stamp(m[1]), m
+    trained += last - start
+    if not save:
+        return "no save yet"
+    tokens = int(save[2]) * WINDOW
+    loss = PROGRESS.findall(data[max(0, save.start() - 4000):save.start()])
+    parts = [f"{tokens / 1e9:.3f} G tokens ({tokens / TOTAL_TOKENS:.1%})",
+             f"step {tokens // STEP_TOKENS:,}",
+             f"{int(trained // 3600)} h {int(trained % 3600 // 60)} min of training"]
+    if loss:
+        parts.append(f"loss {float(loss[-1][2]):.2f}")
+    parts.append(f"saved {time.strftime('%-d %b %H:%M', time.localtime(stamp(save[1])))}")
+    return ", ".join(parts)
+
+
 def test(name: str, saved: str) -> None:
     say(f"test {name}: {saved}")
     try:
@@ -144,7 +177,10 @@ def test(name: str, saved: str) -> None:
     TESTS.mkdir(parents=True, exist_ok=True)
     path = TESTS / f"{step_slug(name)}.txt"
     part = path.with_suffix(".part")
-    part.write_text(f"{saved}, tested {time.strftime('%F %H:%M')}\n\n{body}\n", encoding="utf-8")
+    title = summary((LOGS / "pretrain.log").read_bytes())
+    if name == CHAT_STEP or MILESTONES[-1][0] == name:
+        title += ", plus chat fine-tune"
+    part.write_text(f"{title}, tested {time.strftime('%-d %b %H:%M')}\n\n{body}\n", encoding="utf-8")
     part.rename(path)
     say(f"test {name}: done")
 

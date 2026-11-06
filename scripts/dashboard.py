@@ -238,13 +238,19 @@ def gpu() -> dict:
     return {"used": used, "total": total, "util": util, "temp": temp, "power": power}
 
 
+def tests() -> list:
+    """(step, title line, output) of the tests done, the newest first."""
+    done = [(TESTS / f"{step_slug(m[0])}.txt", m[0]) for m in MILESTONES]
+    done = sorted((d for d in done if d[0].exists()), key=lambda d: -d[0].stat().st_mtime)
+    return [[name, *path.read_text(encoding="utf-8").split("\n\n", 1)] for path, name in done]
+
+
 def snapshot(log: Log, session: str) -> dict:
     log.update()
     state = log.state()
     state["gpu"] = gpu()
     state["milestones"] = MILESTONES
-    state["tests"] = [[m[0], (TESTS / f"{step_slug(m[0])}.txt").read_text(encoding="utf-8")]
-                      for m in MILESTONES if (TESTS / f"{step_slug(m[0])}.txt").exists()]
+    state["tests"] = tests()
     state["session"] = session
     state["pane"] = run(["tmux", "capture-pane", "-p", "-t",
                          f"={session}:", "-S", "-200"]).rstrip()
@@ -414,9 +420,9 @@ function steps(s) {
     c.textContent = s.tests.some(t => t[0] === name) ? "✓ Tested, see below" : left <= 0 && at ? "at next save" : "-";
     r.append(c); return r; }));
   const seen = JSON.stringify(s.tests);
-  if (seen !== testsSeen) { testsSeen = seen; $("tests").replaceChildren(...s.tests.map(([name, text]) => {
+  if (seen !== testsSeen) { testsSeen = seen; $("tests").replaceChildren(...s.tests.map(([name, title, text]) => {
     const c = document.createElement("div"), h = document.createElement("h2"), o = document.createElement("pre");
-    c.className = "card"; h.textContent = "Model test: " + name; o.className = "out"; o.textContent = text;
+    c.className = "card"; h.textContent = `${name}: ${title}`; o.className = "out"; o.textContent = text;
     c.append(h, o); return c; })); }
 }
 function show(s, label) {
