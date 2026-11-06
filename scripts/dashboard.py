@@ -30,6 +30,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 MAX_POINTS = 3000
+MAX_RECENT = 4500	# every step of the last 10 hours, for the short timeframes
 CURVE_EVERY = 10 * 131072	# tokens between rows, 10 steps of the run
 # A resume seeds the trainer's loss average with the loss of the first tokens
 # of the dataset, far above the real one; 5 time constants of that average.
@@ -138,6 +139,7 @@ class Log:
         self.pos = 0
         self.partial = b""
         self.points: list[list[float]] = []
+        self.recent: list[list[float]] = []
         self.resumes: list[dict] = []
         self.settled = 0	# tokens from which the loss can be trusted again
         self.every = 1
@@ -179,6 +181,7 @@ class Log:
             stamp = int(time.time()) if self.live else ""
             with open(self.curve, "a", encoding="utf-8") as f:
                 f.write(f"{stamp},{tokens},{float(m[3])},{tok_s},{tflops},{int(m[8])}\n")
+        self.recent = (self.recent + [[tokens / 1e9, float(m[3])]])[-MAX_RECENT:]
         self.seen += 1
         if self.seen % self.every == 0:
             self.points.append([done * self.window / 1e9, float(m[3])])
@@ -196,6 +199,7 @@ class Log:
             self.resumes.append({"tokens": tokens / 1e9, "resumed": resumed,
                                  "stopped": stopped[-1] if stopped else None})
         self.points = [p for p in self.points if p[0] * 1e9 <= tokens]
+        self.recent = [p for p in self.recent if p[0] * 1e9 <= tokens]
         self.settled = tokens + RESUME_SETTLE
 
     def update(self) -> None:
@@ -221,6 +225,7 @@ class Log:
                 left = last["total_tokens"] - last["tokens"]
                 last["eta_s"] = left / avg if avg > 0 else None
             return {"progress": last, "points": list(self.points),
+                    "recent": list(self.recent),
                     "resumes": list(self.resumes),
                     "run": run_params(self.args, last.get("total_tokens", 0)),
                     "log": self.lines + [self.current]}
@@ -325,8 +330,6 @@ h1 { font-size:20px; margin:0; } h2 { font-size:14px; margin:0 0 8px; color:var(
 .bar { height:8px; background:var(--line); border-radius:4px; overflow:hidden; margin-top:10px; }
 .bar i { display:block; height:100%; width:0; background:var(--series); border-radius:4px; }
 .chart { position:relative; } svg { display:block; width:100%; height:280px; }
-.charts { display:grid; grid-template-columns:repeat(auto-fit,minmax(340px,1fr)); gap:14px; }
-.charts > :first-child { grid-column:span 2; } @media (max-width:760px) { .charts > :first-child { grid-column:auto; } }
 .head { display:flex; justify-content:space-between; align-items:baseline; gap:8px; }
 .range button { background:none; border:0; border-bottom:2px solid transparent; color:var(--ink2); font:inherit;
   font-size:13px; padding:0 6px 2px; cursor:pointer; } .range button.on { color:var(--ink); font-weight:600; border-bottom-color:var(--series); }
@@ -368,13 +371,9 @@ nav a.on { color:var(--ink); font-weight:600; border-bottom-color:var(--series);
 <div class="card tile"><b id="vram">-</b><span>VRAM used</span></div>
 <div class="card tile"><b id="gpu">-</b><span>GPU load, temperature</span></div>
 </section>
-<section class="charts">
-<div class="card"><h2>Training loss by billions of tokens</h2>
-<div id="chart" class="chart"><svg id="svg" role="img" aria-label="Training loss over tokens"></svg><div id="tip" class="tip"></div></div></div>
-<div class="card"><div class="head"><h2>Loss, last <span id="zlabel">6 h</span></h2>
-<div id="range" class="range"><button data-h="1">1 h</button><button data-h="6" class="on">6 h</button><button data-h="24">24 h</button></div></div>
-<div id="zchart" class="chart"><svg id="zsvg" role="img" aria-label="Training loss over the last hours"></svg><div id="ztip" class="tip"></div></div></div>
-</section>
+<section class="card"><div class="head"><h2>Training loss by billions of tokens</h2>
+<div id="range" class="range"><button class="on">All</button><button data-h="10">10 h</button><button data-h="3">3 h</button><button data-h="1">1 h</button><button data-h="0.5">30 min</button><button data-h="0.0833">5 min</button></div></div>
+<div id="chart" class="chart"><svg id="svg" role="img" aria-label="Training loss over tokens"></svg><div id="tip" class="tip"></div></div></section>
 <section class="card"><h2>When to test the model (rough estimates)</h2><div style="overflow-x:auto"><table class="steps">
 <thead><tr><th>Step</th><th>What to expect</th><th class="num">Tokens</th><th class="num">Expected NLL</th><th class="num">When</th><th class="num">Check</th></tr></thead>
 <tbody id="steps"></tbody></table></div></section>
@@ -388,7 +387,7 @@ nav a.on { color:var(--ink); font-weight:600; border-bottom-color:var(--series);
 const BASE = "", SNAPSHOT = null;
 const $ = id => document.getElementById(id);
 const NS = "http://www.w3.org/2000/svg";
-let pts = [], resumes = [], testsSeen = "", history = {}, speed = 17000, hours = 6;
+let pts = [], recent = [], resumes = [], testsSeen = "", history = {}, speed = 17000, hours = 0;
 const geos = {};
 const when = (t, opt) => new Date(t * 1000).toLocaleString("en-GB", opt || {day: "numeric", month: "short",
   hour: "2-digit", minute: "2-digit"});
@@ -400,11 +399,13 @@ function ticks(lo, hi, n) { const raw = (hi - lo) / n || 1, p = 10 ** Math.floor
   const step = [1, 2, 5, 10].map(k => k * p).find(s => s >= raw); const out = [];
   for (let v = Math.ceil(lo / step) * step; v <= hi + 1e-9; v += step) out.push(+v.toFixed(6)); return out; }
 function draw() {
-  const end = pts.length ? pts[pts.length - 1][0] : 0, from = end - speed * hours * 3600 / 1e9;
-  plot("", pts); plot("z", pts.filter(p => p[0] >= from));
+  if (!hours) { plot("", pts, false); return; }
+  const first = recent.length ? recent[0][0] : Infinity, all = pts.filter(p => p[0] < first).concat(recent);
+  const end = all.length ? all[all.length - 1][0] : 0, from = end - speed * hours * 3600 / 1e9;
+  plot("", all.filter(p => p[0] >= from), true);
 }
-function plot(id, data) {
-  const zoom = !!id, svg = $(id + "svg"), W = svg.clientWidth, H = svg.clientHeight, L = 44, R = 12, T = 10, B = 26;
+function plot(id, data, zoom) {
+  const svg = $(id + "svg"), W = svg.clientWidth, H = svg.clientHeight, L = 44, R = 12, T = 10, B = 26;
   svg.setAttribute("viewBox", `0 0 ${W} ${H}`); svg.replaceChildren(); geos[id] = null;
   const css = getComputedStyle(document.documentElement), ink = css.getPropertyValue("--ink2"),
     line = css.getPropertyValue("--line"), ser = css.getPropertyValue("--series");
@@ -417,10 +418,10 @@ function plot(id, data) {
   const X = v => L + (v - x0) / (x1 - x0 || 1) * (W - L - R), Y = v => T + (y1 - v) / (y1 - y0 || 1) * (H - T - B);
   for (const v of ticks(y0, y1, 5)) { svg.append(el("line", {x1: L, x2: W - R, y1: Y(v), y2: Y(v), stroke: line}));
     svg.append(el("text", {x: L - 6, y: Y(v) + 4, "text-anchor": "end", fill: ink, "font-size": 12}, v)); }
-  for (const v of ticks(x0, x1, zoom ? 3 : 6)) svg.append(el("text", {x: X(v), y: H - 8, "text-anchor": "middle", fill: ink, "font-size": 12}, v + " G"));
+  for (const v of ticks(x0, x1, 6)) svg.append(el("text", {x: X(v), y: H - 8, "text-anchor": "middle", fill: ink, "font-size": 12}, v + " G"));
   resumes.filter(r => r.tokens >= x0 && r.tokens <= x1).forEach((r, i) => { const x = X(r.tokens), left = x > W / 2, clock = {hour: "2-digit", minute: "2-digit"};
     svg.append(el("line", {x1: x, x2: x, y1: T, y2: H - B, stroke: ink, "stroke-dasharray": "4 4"}));
-    if (!zoom) svg.append(el("text", {x: x + (left ? -6 : 6), y: T + 12 + i % 2 * 16, "text-anchor": left ? "end" : "start", fill: ink, "font-size": 12},
+    svg.append(el("text", {x: x + (left ? -6 : 6), y: T + 12 + i % 2 * 16, "text-anchor": left ? "end" : "start", fill: ink, "font-size": 12},
       r.stopped ? `stopped ${when(r.stopped)}, resumed ${when(r.resumed, clock)}` : `resumed ${when(r.resumed)}`)); });
   svg.append(el("path", {d: data.map((p, i) => (i ? "L" : "M") + X(p[0]).toFixed(1) + " " + Y(p[1]).toFixed(1)).join(""),
     fill: "none", stroke: ser, "stroke-width": 2, "stroke-linejoin": "round"}));
@@ -442,9 +443,9 @@ function hover(id) {
   box.addEventListener("mouseleave", () => { tip.style.display = "none"; const geo = geos[id];
     if (geo) { geo.cross.setAttribute("visibility", "hidden"); geo.dot.setAttribute("visibility", "hidden"); } });
 }
-hover(""); hover("z");
+hover("");
 $("range").addEventListener("click", e => { const b = e.target.closest("button"); if (!b) return;
-  hours = +b.dataset.h; $("zlabel").textContent = b.textContent;
+  hours = +b.dataset.h || 0;
   [...$("range").children].forEach(x => x.classList.toggle("on", x === b)); draw(); });
 function follow(pre, text) { const end = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 8;
   pre.textContent = text; if (end) pre.scrollTop = pre.scrollHeight; }
@@ -504,7 +505,7 @@ function show(s, label) {
     steps(s);
     follow($("pane"), s.pane || "(no tmux session)"); follow($("log"), s.log.join("\n"));
     if (s.points.length !== pts.length || s.resumes.length !== resumes.length ||
-        (s.points.length && s.points.at(-1)[0] !== pts.at(-1)[0])) { pts = s.points; resumes = s.resumes; draw(); }
+        s.recent.at(-1)?.[0] !== recent.at(-1)?.[0]) { pts = s.points; recent = s.recent; resumes = s.resumes; draw(); }
 }
 async function tick() {
   try { show(await (await fetch(BASE + "/state")).json(), "live, updated"); }
