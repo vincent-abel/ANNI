@@ -692,6 +692,19 @@ static void train_ema_ce(double *ema, double ce, int weight)
 #define TRAIN_MID_VAL_DEFAULT_WINS	32
 
 /* Advance *next_pct (5,10,...,95) after a probe; return 1 if due now. */
+/*
+** Length of the one-sequence NLL probes (start NLL, epoch ctx NLL): the
+** training window. That forward keeps T x T attention rows per head and per
+** block, about 6 GB at LM_MAX_CTX on the 555M sizes: with less than ~10.4 GB
+** of VRAM free at launch it failed and the run went on 12 times slower.
+*/
+static int ctx_probe_len(const text_dataset *ds)
+{
+	if (ds->window > 0 && ds->window < LM_MAX_CTX)
+		return ds->window;
+	return LM_MAX_CTX;
+}
+
 static int train_mid_val_due(int done, int total, int *next_pct)
 {
 	int pct;
@@ -1090,7 +1103,7 @@ double lm_train_corpus_val(lm *model, text_dataset *ds, lm_adam *opt,
 		dbg_stamp("computing start NLL");
 	{
 		int head[LM_MAX_CTX];
-		int nh = (int)text_dataset_head(ds, head, LM_MAX_CTX);
+		int nh = (int)text_dataset_head(ds, head, ctx_probe_len(ds));
 
 		last = lm_nll(model, head, nh);
 	}
@@ -1415,7 +1428,7 @@ double lm_train_corpus_val(lm *model, text_dataset *ds, lm_adam *opt,
 			{
 				int head[LM_MAX_CTX];
 				int nh = (int)text_dataset_head(ds, head,
-				    LM_MAX_CTX);
+				    ctx_probe_len(ds));
 				double ctx_nll = lm_nll(model, head, nh);
 
 				if (debug && !g_progress_fn && ctx_nll >= 0.0) {

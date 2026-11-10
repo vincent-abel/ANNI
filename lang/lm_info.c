@@ -76,6 +76,8 @@ int lm_info_peek(const char *path, lm_info *out)
 		out->magic_kind = LM_INFO_MAGIC_LMCF;
 	else if (magic == (int)LM_MAGIC_BPE)
 		out->magic_kind = LM_INFO_MAGIC_LMCV;
+	else if (magic == (int)LM_MAGIC_TIED)
+		out->magic_kind = LM_INFO_MAGIC_LMCT;
 	else {
 		out->magic_kind = LM_INFO_MAGIC_OTHER;
 		fclose(fp);
@@ -99,13 +101,13 @@ int lm_info_peek(const char *path, lm_info *out)
 	out->n_blocks = n_blocks;
 	out->vocab_size = vsize;
 	merges = 0;
-	if (magic == (int)LM_MAGIC_BPE) {
+	if (magic == (int)LM_MAGIC_BPE || magic == (int)LM_MAGIC_TIED) {
 		if (read_i32_fp(fp, &merges) != 0) {
 			fclose(fp);
 			return -1;
 		}
 		out->is_bpe = 1;
-		out->n_merges = merges;
+		out->n_merges = merges & ~BPE_FP_WS_RUNS;
 	}
 	fclose(fp);
 	return 0;
@@ -155,7 +157,8 @@ int lm_info_from_model(lm_info *out, const char *path, const lm *model,
 	L = model->tr ? model->tr->n_blocks : LM_N_BLOCKS;
 	block = 4 * d * d + d * ff + ff + ff * d + d + 4 * d;
 	if (out->params <= 0)
-		out->params = V * d + L * block + d * V + V;
+		out->params = (model->embed->tied ? 0 : V * d) + L * block
+		    + d * V + V;
 	out->weight_bytes = (size_t)out->params * sizeof(ann_real);
 	if (opt) {
 		out->has_checkpoint = 1;
@@ -180,6 +183,8 @@ static const char *magic_name(int kind)
 		return "LMCF (float)";
 	case LM_INFO_MAGIC_LMCV:
 		return "LMCV (float+bpe)";
+	case LM_INFO_MAGIC_LMCT:
+		return "LMCT (float+bpe, tied head)";
 	case LM_INFO_MAGIC_LMCK:
 		return "LMCK (legacy double)";
 	case LM_INFO_MAGIC_OTHER:

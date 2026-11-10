@@ -24,6 +24,8 @@ static unsigned int key_hash(unsigned long long k)
 /* ------------------------------------------------------------------ */
 /* Pre-tokenization: split text into "words" that merges never cross.  */
 /* A word is an optional leading space plus a run of one byte class.   */
+/* With ws_runs, spaces before a space are one word (code indentation); */
+/* the last space of the run still leads the word after it.             */
 /* ------------------------------------------------------------------ */
 
 static int byte_class(unsigned char c)
@@ -34,12 +36,19 @@ static int byte_class(unsigned char c)
 	return 1;
 }
 
-static size_t word_len(const unsigned char *s, size_t n)
+static size_t word_len(const unsigned char *s, size_t n, int ws_runs)
 {
 	size_t i;
 	int cls;
 
 	i = 0;
+	if (ws_runs) {
+		while (i + 1 < n && i < BPE_MAX_WORD && s[i] == ' '
+		    && s[i + 1] == ' ')
+			i++;
+		if (i > 0)
+			return i;
+	}
 	if (s[0] == ' ')
 		i = 1;
 	if (i < n && s[i] != ' ') {
@@ -172,14 +181,19 @@ bpe *bpe_create(const int *left, const int *right, int n_merges)
 
 bpe *bpe_clone(const bpe *b)
 {
+	bpe *c;
+
 	if (!b)
 		return NULL;
-	return bpe_create(b->left, b->right, b->n_merges);
+	c = bpe_create(b->left, b->right, b->n_merges);
+	if (c)
+		c->ws_runs = b->ws_runs;
+	return c;
 }
 
 int bpe_equal(const bpe *a, const bpe *b)
 {
-	if (!a || !b || a->n_merges != b->n_merges)
+	if (!a || !b || a->n_merges != b->n_merges || a->ws_runs != b->ws_runs)
 		return 0;
 	return a->n_merges == 0
 	    || (memcmp(a->left, b->left, (size_t)a->n_merges * sizeof(int)) == 0
@@ -249,7 +263,7 @@ int bpe_encode_n(const bpe *b, const char *text, size_t len, int *ids,
 	n = 0;
 	pos = 0;
 	while (pos < len && n < max_ids) {
-		wl = word_len(p + pos, len - pos);
+		wl = word_len(p + pos, len - pos, b->ws_runs);
 		k = encode_word(b, p + pos, wl, tmp);
 		if (k > max_ids - n)
 			k = max_ids - n;
@@ -312,7 +326,7 @@ int bpe_save(const bpe *b, const char *path)
 	fp = fopen(path, "w");
 	if (!fp)
 		return -1;
-	fprintf(fp, "BPEV 1 %d\n", b->n_merges);
+	fprintf(fp, "BPEV %d %d\n", b->ws_runs ? 2 : 1, b->n_merges);
 	for (i = 0; i < b->n_merges; i++)
 		fprintf(fp, "%d %d\n", b->left[i], b->right[i]);
 	if (fclose(fp) != 0)
@@ -337,7 +351,7 @@ bpe *bpe_load(const char *path)
 	if (!fp)
 		return NULL;
 	if (fscanf(fp, "%7s %d %d", tag, &ver, &n) != 3 || strcmp(tag, "BPEV") != 0
-	    || ver != 1 || n < 0 || n > BPE_MAX_MERGES) {
+	    || (ver != 1 && ver != 2) || n < 0 || n > BPE_MAX_MERGES) {
 		fclose(fp);
 		return NULL;
 	}
@@ -361,17 +375,21 @@ bpe *bpe_load(const char *path)
 	b = bpe_create(l, r, n);
 	free(l);
 	free(r);
+	if (b)
+		b->ws_runs = ver == 2;
 	return b;
 }
 
 int bpe_write_fp(FILE *fp, const bpe *b)
 {
 	int i;
+	int n;
 	int pair[2];
 
 	if (!fp || !b)
 		return -1;
-	if (fwrite(&b->n_merges, sizeof(int), 1, fp) != 1)
+	n = b->n_merges | (b->ws_runs ? BPE_FP_WS_RUNS : 0);
+	if (fwrite(&n, sizeof(int), 1, fp) != 1)
 		return -1;
 	for (i = 0; i < b->n_merges; i++) {
 		pair[0] = b->left[i];
@@ -386,13 +404,17 @@ bpe *bpe_read_fp(FILE *fp)
 {
 	int n;
 	int i;
+	int ws_runs;
 	int pair[2];
 	int *l;
 	int *r;
 	bpe *b;
 
-	if (!fp || fread(&n, sizeof(int), 1, fp) != 1 || n < 0
-	    || n > BPE_MAX_MERGES)
+	if (!fp || fread(&n, sizeof(int), 1, fp) != 1 || n < 0)
+		return NULL;
+	ws_runs = (n & BPE_FP_WS_RUNS) != 0;
+	n &= ~BPE_FP_WS_RUNS;
+	if (n > BPE_MAX_MERGES)
 		return NULL;
 	l = malloc((size_t)(n ? n : 1) * sizeof(int));
 	r = malloc((size_t)(n ? n : 1) * sizeof(int));
@@ -413,6 +435,8 @@ bpe *bpe_read_fp(FILE *fp)
 	b = bpe_create(l, r, n);
 	free(l);
 	free(r);
+	if (b)
+		b->ws_runs = ws_runs;
 	return b;
 }
 
@@ -610,7 +634,7 @@ int bpe_trainer_add(bpe_trainer *t, const char *text, size_t len)
 	p = (const unsigned char *)text;
 	pos = 0;
 	while (pos < len) {
-		wl = word_len(p + pos, len - pos);
+		wl = word_len(p + pos, len - pos, 1);
 		if (trainer_add_word(t, p + pos, wl) != 0)
 			return -1;
 		pos += wl;
@@ -976,6 +1000,8 @@ bpe *bpe_trainer_finish(bpe_trainer *t, int vocab_size)
 			goto done;
 	}
 	out = bpe_create(left, right, m);
+	if (out)
+		out->ws_runs = 1;
 done:
 	for (i = 0; i < t->nw; i++)
 		free(sym[i]);

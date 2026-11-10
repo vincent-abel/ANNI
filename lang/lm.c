@@ -66,7 +66,7 @@ static void softmax_inplace(ann_real *x, int n, ann_real *tmp)
 	}
 }
 
-static lm *lm_create_with(vocab *v, bpe *tok)
+static lm *lm_create_with(vocab *v, bpe *tok, int tied)
 {
 	lm *model;
 	int i;
@@ -82,12 +82,15 @@ static lm *lm_create_with(vocab *v, bpe *tok)
 	model->vocab = v;
 	model->bpe = tok;
 	model->vocab_size = vocab_size(model->vocab);
-	model->embed = embed_create(model->vocab_size);
+	if (!tied)
+		model->embed = embed_create(model->vocab_size);
 	model->tr = transformer_create();
 	model->w_head = mat_create(LM_D_MODEL, model->vocab_size);
 	model->b_head = vec_create(model->vocab_size);
 	model->dw_head = mat_create(LM_D_MODEL, model->vocab_size);
 	model->db_head = vec_create(model->vocab_size);
+	if (tied)
+		model->embed = embed_create_tied(model->w_head, model->dw_head);
 	if (!model->embed || !model->tr || !model->w_head || !model->b_head
 	    || !model->dw_head || !model->db_head) {
 		model->bpe = NULL;	/* caller keeps ownership on failure */
@@ -107,12 +110,12 @@ static lm *lm_create_with(vocab *v, bpe *tok)
 
 lm *lm_create(void)
 {
-	return lm_create_with(vocab_byte_create(), NULL);
+	return lm_create_with(vocab_byte_create(), NULL, 0);
 }
 
 lm *lm_create_vocab(int vocab_size)
 {
-	return lm_create_with(vocab_sized_create(vocab_size), NULL);
+	return lm_create_with(vocab_sized_create(vocab_size), NULL, 0);
 }
 
 lm *lm_create_bpe(bpe *tok)
@@ -121,10 +124,17 @@ lm *lm_create_bpe(bpe *tok)
 
 	if (!tok)
 		return NULL;
-	model = lm_create_with(bpe_vocab_create(tok), tok);
+	model = lm_create_with(bpe_vocab_create(tok), tok, 0);
 	if (!model)
 		return NULL;
 	return model;
+}
+
+lm *lm_create_bpe_tied(bpe *tok)
+{
+	if (!tok)
+		return NULL;
+	return lm_create_with(bpe_vocab_create(tok), tok, 1);
 }
 
 int lm_attach_bpe(lm *model, bpe *tok)
@@ -1052,15 +1062,14 @@ int lm_batch_auto(int T, int vocab_size, size_t free_bytes, double frac,
 ** per-window lm_nll built a cache, ran a GEMV and a host FP64 softmax per
 ** row). logits are never softmaxed in place: gpu_ce_nll_rows writes the FP32
 ** log-sum-exp - target logit of each row; the host sums them in FP64.
-** win_nll[b] = mean CE over the T-1 predicting rows of window b. -1 = not
+** row_nll[b * (T - 1) + t] = CE of token t + 1 of window b. -1 = not
 ** applicable (host head, no GPU, B == 1): use lm_nll.
 */
-int lm_nll_packed(lm *model, lm_cache *c, const int *ids, int B, int T,
-	double *win_nll)
+int lm_nll_rows_packed(lm *model, lm_cache *c, const int *ids, int B, int T,
+	float *row_nll)
 {
 	mat *hc;
 	mat *lg;
-	float *per;
 	int *tgt;
 	ann_real *dp;
 	int rows;
@@ -1069,17 +1078,16 @@ int lm_nll_packed(lm *model, lm_cache *c, const int *ids, int B, int T,
 	int t;
 	int rc;
 
-	if (!model || !c || !ids || !win_nll || B <= 1 || T < 2 || c->B != B
+	if (!model || !c || !ids || !row_nll || B <= 1 || T < 2 || c->B != B
 	    || c->T != T || !gpu_available())
 		return -1;
 	V = model->vocab_size;
 	rows = B * (T - 1);
 	hc = mat_create_dev(rows, LM_D_MODEL);
 	lg = mat_create_dev(rows, V);
-	per = malloc((size_t)rows * sizeof(float));
 	tgt = malloc((size_t)rows * sizeof(int));
 	rc = -1;
-	if (!hc || !lg || !per || !tgt)
+	if (!hc || !lg || !tgt)
 		goto out;
 	if (lm_forward_cache_packed(model, ids, B, T, c) != 0)
 		goto out;
@@ -1099,21 +1107,39 @@ int lm_nll_packed(lm *model, lm_cache *c, const int *ids, int B, int T,
 	    || gpu_bias_row_add(dp, model->b_head->data, rows, V) != 0)
 		goto out;
 	mat_mark_written(lg, dp);
-	if (gpu_ce_nll_rows(dp, tgt, rows, V, per) != 0)
+	if (gpu_ce_nll_rows(dp, tgt, rows, V, row_nll) != 0)
 		goto out;
-	for (b = 0; b < B; b++) {
+	rc = 0;
+out:
+	mat_free(&hc);
+	mat_free(&lg);
+	free(tgt);
+	return rc;
+}
+
+/* win_nll[b] = mean CE over the T-1 predicting rows of window b. */
+int lm_nll_packed(lm *model, lm_cache *c, const int *ids, int B, int T,
+	double *win_nll)
+{
+	float *per;
+	int b;
+	int t;
+	int rc;
+
+	if (!win_nll || B <= 1 || T < 2)
+		return -1;
+	per = malloc((size_t)B * (size_t)(T - 1) * sizeof(float));
+	if (!per)
+		return -1;
+	rc = lm_nll_rows_packed(model, c, ids, B, T, per);
+	for (b = 0; rc == 0 && b < B; b++) {
 		double s = 0.0;
 
 		for (t = 0; t < T - 1; t++)
 			s += (double)per[b * (T - 1) + t];
 		win_nll[b] = s / (double)(T - 1);
 	}
-	rc = 0;
-out:
-	mat_free(&hc);
-	mat_free(&lg);
 	free(per);
-	free(tgt);
 	return rc;
 }
 

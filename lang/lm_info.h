@@ -13,6 +13,7 @@
 #define LM_INFO_MAGIC_LMCV	2
 #define LM_INFO_MAGIC_LMCK	3
 #define LM_INFO_MAGIC_OTHER	4
+#define LM_INFO_MAGIC_LMCT	5
 
 typedef struct	lm_info {
 	char		path[512];

@@ -684,21 +684,27 @@ int gpu_mat_axpy(mat *y, double a, const mat *x)
 	return -1;
 }
 
-int gpu_embed_lookup(mat *out, const mat *table, const int *ids, int n)
+int gpu_embed_lookup(mat *out, const mat *table, const int *ids, int n,
+	int tied, ann_real scale)
 {
 	(void)out;
 	(void)table;
 	(void)ids;
 	(void)n;
+	(void)tied;
+	(void)scale;
 	return -1;
 }
 
-int gpu_embed_scatter(mat *dtable, const mat *dout, const int *ids, int n)
+int gpu_embed_scatter(mat *dtable, const mat *dout, const int *ids, int n,
+	int tied, ann_real scale)
 {
 	(void)dtable;
 	(void)dout;
 	(void)ids;
 	(void)n;
+	(void)tied;
+	(void)scale;
 	return -1;
 }
 
@@ -798,8 +804,11 @@ int gpu_dec_set_layer(gpu_dec *g, int i, const gpu_dec_layer_w *w)
 }
 
 int gpu_dec_set_io(gpu_dec *g, const ann_real *embed_dev,
-	const ann_real *w_head_dev, const ann_real *b_head_host)
+	const ann_real *w_head_dev, const ann_real *b_head_host,
+	int tied, ann_real scale)
 {
+	(void)tied;
+	(void)scale;
 	(void)g;
 	(void)embed_dev;
 	(void)w_head_dev;

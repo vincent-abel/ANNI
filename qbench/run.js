@@ -77,7 +77,9 @@ function runCode(lang, code, tests) {
   const r = spawnSync(cmd[0], cmd[1], { cwd: dir, encoding: "utf8", timeout: 10000,
     stdio: ["ignore", "pipe", "pipe"] });
   fs.rmSync(dir, { recursive: true, force: true });
-  const err = (r.stderr || "").trim().split("\n").filter((l) => l).pop() || "";
+  // The error line itself, not node's trailing version banner.
+  const lines = (r.stderr || "").trim().split("\n").filter((l) => l);
+  const err = lines.filter((l) => /Error/.test(l)).pop() || lines.pop() || "";
   // A syntax error means the code never ran; an assertion or other error means it ran.
   const ran = r.status === 0 || !/SyntaxError|IndentationError/.test(r.stderr || "");
   return { pass: r.status === 0, ran, error: r.status === 0 ? "" : (r.error ? "timeout" : err) };

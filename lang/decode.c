@@ -55,7 +55,8 @@ lm_decoder *lm_decoder_create(lm *model)
 			goto fail;
 	}
 	if (gpu_dec_set_io(d->dec, dev_weight(model->embed->table),
-	    dev_weight(model->w_head), model->b_head->data) != 0)
+	    dev_weight(model->w_head), model->b_head->data,
+	    model->embed->tied, model->embed->scale) != 0)
 		goto fail;
 	return d;
 fail:

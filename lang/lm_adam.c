@@ -65,7 +65,8 @@ int lm_param_count(const lm *model)
 	    || !model->embed->table || !model->tr)
 		return 0;
 	n = model->w_head->rows * model->w_head->cols + model->b_head->n;
-	n += model->embed->table->rows * model->embed->table->cols;
+	if (!model->embed->tied)
+		n += model->embed->table->rows * model->embed->table->cols;
 	for (i = 0; i < model->tr->n_blocks; i++) {
 		n += 4 * LM_D_MODEL * LM_D_MODEL;
 		n += LM_D_MODEL * LM_D_FF + LM_D_FF + LM_D_FF * LM_D_MODEL
@@ -116,7 +117,8 @@ lm_adam *lm_adam_create(lm *model)
 	add_mat(opt, &i, model->w_head, model->dw_head);
 	add_vec(opt, &i, model->b_head, model->db_head);
 	/* The embedding table is updated like every other matrix. */
-	add_mat(opt, &i, model->embed->table, model->embed->dtable); /* R2 */
+	if (!model->embed->tied)
+		add_mat(opt, &i, model->embed->table, model->embed->dtable); /* R2 */
 	for (n = 0; n < model->tr->n_blocks; n++) {
 		b = &model->tr->blocks[n];
 		add_mat(opt, &i, b->attn->wq, b->attn->dwq);
@@ -544,6 +546,15 @@ void lm_adam_step_scaled(lm_adam *opt, double lr, double grad_scale)
 		*/
 		gpu_half_wt_invalidate(NULL);
 		return;
+	}
+	/* Say it once: on a GPU run this path is many times slower. */
+	if (gpu_available()) {
+		static int warned;
+
+		if (!warned++)
+			fprintf(stderr, "[adam] step %d: GPU step failed, "
+			    "host fallback from now on (much slower)\n",
+			    opt->t);
 	}
 	/* Host fallback: bring resident m/v, weights and grads back first. */
 	lm_adam_sync_host(opt);

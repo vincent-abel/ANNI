@@ -61,6 +61,11 @@ data/wiki_*
 # talk-170m mix fetched by scripts/fetch_mix.py (licensed sources, never vendored)
 data/raw/
 data/mix*
+data/code2*
+data/web2*
+data/code1*
+data/web1*
+data/fr2*
 data/chat*
 
 # local run logs
@@ -71,3 +76,15 @@ data/prof_ids.bin
 tests/bench_attn
 tests/bench_ln
 bench/
+build/
+*.local.*
+
+# latent space viewer
+objects-latent/
+anni-probe
+anni-latent
+latent/third_party/
+models/latent/
+
+# fetched by scripts/hellaswag_data.py
+data/hellaswag_val.tsv

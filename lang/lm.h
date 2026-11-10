@@ -41,6 +41,8 @@ lm	*lm_create(void);
 lm	*lm_create_vocab(int vocab_size);
 /* Subword model: vocab_size = tok->vocab_size. Takes ownership of tok on success. */
 lm	*lm_create_bpe(bpe *tok);
+/* Same, with one table for the token embedding and the head (see embed.h). */
+lm	*lm_create_bpe_tied(bpe *tok);
 /* Attach/replace the tokenizer of an existing model (sizes must match). */
 int	lm_attach_bpe(lm *model, bpe *tok);
 /* Tokenize with the model's tokenizer (byte or BPE). Same contract as tokenize_*. */
@@ -81,6 +83,10 @@ double	lm_nll(const lm *model, const int *ids, int n);
 ** -1 when not applicable (caller falls back to lm_nll per window). */
 int	lm_nll_packed(lm *model, lm_cache *c, const int *ids, int B, int T,
 		double *win_nll);
+/* Same forward, per token: row_nll[B * (T - 1)], row b * (T - 1) + t being
+** the loss of token t + 1 of window b. */
+int	lm_nll_rows_packed(lm *model, lm_cache *c, const int *ids, int B, int T,
+		float *row_nll);
 double	lm_perplexity(const lm *model, const int *ids, int n);
 double	lm_train_steps(lm *model, const char *text, int steps, double lr);
 

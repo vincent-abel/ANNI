@@ -16,10 +16,12 @@
 #define BPE_DEFAULT_VOCAB	16384
 #define BPE_MAX_WORD		64	/* longest pre-token (bytes) */
 #define BPE_BASE		(VOCAB_SPECIALS + LM_BYTE_VOCAB)
+#define BPE_FP_WS_RUNS		0x40000000	/* in a checkpoint's merge count */
 
 typedef struct	bpe {
 	int			n_merges;
 	int			vocab_size;
+	int			ws_runs;	/* runs of spaces are one word */
 	int			*left;		/* n_merges */
 	int			*right;
 	unsigned char		**bytes;	/* vocab_size expansions */
@@ -57,7 +59,10 @@ int	bpe_encode_n(const bpe *b, const char *text, size_t len, int *ids,
 int	bpe_decode(const bpe *b, const int *ids, int n_ids, char *out,
 		int out_cap);
 
-/* Text vocab file: "BPEV 1 <n_merges>\n" then one "<left> <right>" per line. */
+/*
+** Text vocab file: "BPEV 1 <n_merges>\n" then one "<left> <right>" per line.
+** Version 2 is the same with ws_runs set.
+*/
 int	bpe_save(const bpe *b, const char *path);
 bpe	*bpe_load(const char *path);
 /* Binary form embedded in LM checkpoints: i32 n_merges, then (i32,i32) pairs. */
