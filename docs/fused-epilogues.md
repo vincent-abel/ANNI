@@ -8,7 +8,7 @@ Combine common post-GEMM elementwise steps into one kernel launch to cut launch 
 
 - `gpu_bias_relu_forward` in [`num/gpu_cuda.cu`](../num/gpu_cuda.cu): bias add + ReLU in one launch
 - [`lang/ffn.c`](../lang/ffn.c) `ffn_forward_cache` prefers the fused path; keeps a separate pre-ReLU `pre_act` for the backward mask
-- Residual add stays on `gpu_mat_add` (already device-resident); LN stays on the fused LN path from E7
+- Residual add: since folded into the output GEMM, see [Residual add fused into the GEMM](residual-fused-gemm.md); LN stays on the fused LN path from E7
 
 ## Pitfalls
 

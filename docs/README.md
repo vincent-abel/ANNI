@@ -133,6 +133,22 @@
 - [BF16 outputs straight from the GEMMs (97 TF)](bf16-direct-outputs.md)
 - [Code audit: dead paths and remaining compute](code-audit-dead-paths-and-compute.md)
 - [Plan: proper 8-bit and 4-bit training](low-precision-plan.md)
+- [GPU residency, step by step (G1–G3, K1–K3)](gpu-residency-steps.md)
+- [Packed batches (P1–P3, M1)](packed-batch-attention.md)
+- [Transposed GEMMs (H2)](transposed-gemm.md)
+- [cuBLASLt algorithm choice](cublaslt-algo-choice.md)
+- [Residual add fused into the GEMM](residual-fused-gemm.md)
+- [BF16 twins](bf16-twins.md)
+- [BF16 Adam](bf16-adam.md)
+- [One-pass LayerNorm](layernorm-one-pass.md)
+- [Fused head and cross-entropy](fused-head-ce.md)
+- [Merged QKV backward](qkv-backward-merged.md)
+- [Deterministic gradients](deterministic-gradients.md)
+- [VRAM diet](vram-diet.md)
+- [FP8 training path](fp8-train-path.md)
+- [Op profiler](op-profiler.md)
+- [Batched validation probe](batched-validation-probe.md)
+- [GPU prefill](gpu-prefill.md)
 
 ### From toy LM → small LLM
 
@@ -171,6 +187,12 @@ Full code checklists live in the root [`../README.md`](../README.md): **Capable 
 - [Talking model pretraining run](talk-170m-pretrain.md)
 - [Talking model chat fine-tune](talk-170m-chat.md)
 - [Weight-space edits](weight-space-edits.md)
+- [Weight tying](weight-tying.md)
+- [100k BPE trainer](bpe-trainer-100k.md)
+- [Context 2048](context-2048.md)
+- [LR schedule on continue](lr-schedule-continue.md)
+- [Mid-epoch checkpoints](mid-epoch-checkpoints.md)
+- [Merging checkpoints](lm-merge.md)
 
 # How this neural network works
 
@@ -411,6 +433,54 @@ GPU_SYNC_BATCH skips per-GEMM D2H when outputs are pinned. The train loop syncs 
 ### [nvidia-smi / train util proof](gpu-train-util-proof.md)
 lm train --bench-gpu and lm bench --train time full train steps and print the GPU backend. Use nvidia-smi dmon alongside make cuda builds to confirm util. They time an unpacked B=1 step; for the packed train path use [lm bench step](bench-harness.md).
 
+### [GPU residency, step by step (G1–G3, K1–K3)](gpu-residency-steps.md)
+Each matrix has a host pointer, a device pointer and a state saying which side holds the truth. Weights are pinned once, activations live on the device, and the host waits once per microbatch.
+
+### [Packed batches (P1–P3, M1)](packed-batch-attention.md)
+`B` windows in one `(B*T) x D` matrix: embedding, LayerNorm, FFN and head run as fat GEMMs over all rows, attention stays causal per window in one fused launch. `--grad-accum` grows the batch without growing memory.
+
+### [Transposed GEMMs (H2)](transposed-gemm.md)
+`A B^T` and `A^T B` on row-major data through column-major cuBLAS, with no transposed copy. The three recipes and the backward products that use them.
+
+### [cuBLASLt algorithm choice](cublaslt-algo-choice.md)
+Each GEMM shape is timed once over the library's candidates and the fastest is cached, keyed by shape, epilogue and pointer alignment. Why alignment is in the key, and the switches to fall back to the heuristic.
+
+### [Residual add fused into the GEMM](residual-fused-gemm.md)
+The block's `x + f(x)` rides on the output projection with `beta = 1`, so the separate add pass over the activations is gone.
+
+### [BF16 twins](bf16-twins.md)
+FP32 stays the master; weights, activations and gradients each get a BF16 copy that the GEMMs read. Who writes each twin, when it goes stale, and the check that catches a stale one.
+
+### [BF16 Adam](bf16-adam.md)
+One kernel updates the FP32 weight and its moments and writes the BF16 twin in the same pass. The clip norm is a block-ordered sum instead of atomics.
+
+### [One-pass LayerNorm](layernorm-one-pass.md)
+One warp per row computes mean, variance and the BF16 output in a single read. The backward recomputes `x_hat` instead of storing it, which frees 384 MB at the 555M sizes.
+
+### [Fused head and cross-entropy](fused-head-ce.md)
+Bias, softmax, loss, bias gradient and the BF16 logit gradient in one kernel, written in place over the logits. The widest buffer of the model is read once.
+
+### [Merged QKV backward](qkv-backward-merged.md)
+The three input gradients of attention become one GEMM with `K = 3D`, and the three weight gradients one strided batch.
+
+### [Deterministic gradients](deterministic-gradients.md)
+Float sums done in a fixed order: column sums, the embedding scatter and the clip norm. Two runs with the same seed give the same weights, for a small cost in the LayerNorm backward.
+
+### [VRAM diet](vram-diet.md)
+Which activation buffers were dropped or aliased, and the peak going from 13.5 GB to 9.0 GB at the same batch.
+
+### [FP8 training path](fp8-train-path.md)
+E4M3 weights and activations, E5M2 gradients, per-tensor scales with delayed scaling. What it costs today against BF16 and why it is not the default.
+
+### [Op profiler](op-profiler.md)
+`ANN_OP_PROF=1` times each kernel category with CUDA events and prints a table per optimizer step; `ANN_STEP_PROF=1` gives forward / loss / backward wall time.
+
+### [Batched validation probe](batched-validation-probe.md)
+The held-out probe reuses the training's packed cache: 16 windows per forward and a read-only loss kernel. About 2 s instead of 40 s.
+
+### [GPU prefill](gpu-prefill.md)
+Filling the KV cache from the prompt: one full forward for short prompts, the device decode step token by token past 256. Attention never falls back to the CPU.
+
 # From toy LM → small LLM docs
 
 Short guides for the planned path from the byte-level toy model toward a small subword LLM. Some pieces describe behavior that is planned rather than shipped; each note says where it lands in the repo.
@@ -470,3 +540,21 @@ Two epochs on 24M tokens of User:/Assistant: conversations from the pretrained c
 
 ### [Weight-space edits](weight-space-edits.md)
 Edits to the FFN output weights, with no training: one direction projected out of one block, after the Weight-Space Programming blog article. Edits against held-out code/web NLL all made it worse. Removing the chat model's "talk reply" direction from block 9 made the coding bench's File: format 0.12 nats per token more likely, with no cost on code or web text.
+
+### [Weight tying](weight-tying.md)
+`--tied`: the embedding reads columns of the head, one table instead of two. Saves about 154M parameters at a 100k vocabulary and `D = 1536`.
+
+### [100k BPE trainer](bpe-trainer-100k.md)
+The trainer behind the 555M run's vocabulary: the sample is read in chunks, only distinct words are kept with their counts, and each merge comes from a heap. Runs of spaces are their own words.
+
+### [Context 2048](context-2048.md)
+Windows of up to 2048 tokens instead of 256. Nothing in the weights depends on the length; talk-170m was stretched by training a little more on long windows, and the 555M run uses 2048 from the start.
+
+### [LR schedule on continue](lr-schedule-continue.md)
+`--lr-sched-from STEP` makes warmup and decay count from a given Adam step, so a finished model can train some more with a fresh warmup and cosine.
+
+### [Mid-epoch checkpoints](mid-epoch-checkpoints.md)
+`--ckpt-minutes` saves in the middle of an epoch with the window reached; `--resume` rebuilds the same shuffle and continues there.
+
+### [Merging checkpoints](lm-merge.md)
+`anni lm merge` writes the mean of 2 to 32 models of the same shape and tokenizer. The output has no Adam state.

@@ -187,7 +187,7 @@ CUDA can run forward GEMM, backward GEMMs, Adam, KV decode, and optional cuBLAS;
 
 Parallel tracks: **G** (runtime residency) ∥ **K** (elementwise kernels) → then **A** (Adam in-place) ∥ **H** (batched head/CE).
 
-- [x] **G1** Persistent device twins for all weights/grads (`mat_try_pin` at create; no per-GEMM `cudaMalloc` of W)
+- [x] **G1** Persistent device twins for all weights/grads (`mat_try_pin` at create; no per-GEMM `cudaMalloc` of W); see [docs/gpu-residency-steps.md](docs/gpu-residency-steps.md)
 - [x] **G2** `ensure_dev` / BATCH: H2D when host is authoritative; `mat_ensure_host` before host reads; drop stale `d_data` reuse bugs
 - [x] **G3** One `cudaDeviceSynchronize` (or event) per microbatch — not after every GEMM/outer/LN/Adam launch
 - [x] **K1** Softmax forward (+ bwd if still host) on GPU for attention rows
@@ -195,19 +195,19 @@ Parallel tracks: **G** (runtime residency) ∥ **K** (elementwise kernels) → t
 - [x] **K3** FFN bias / ReLU (and mask) on GPU
 - [x] **A1** Adam updates device-resident params/grads in place — no pack/H2D/D2H/unpack every step (D2H only on checkpoint)
 - [x] **H1** Batched LM head + fused softmax-CE over all `T` tokens (replace per-token host loop in `lm_loss_backward`)
-- [x] **H2** cuBLAS `OP_T` for `mat_mul_at` / bwd layouts (drop host weight transpose copies where possible)
+- [x] **H2** cuBLAS `OP_T` for `mat_mul_at` / bwd layouts (drop host weight transpose copies where possible); see [docs/transposed-gemm.md](docs/transposed-gemm.md)
 - [x] Bench: `make cuda` train progress ~**3.0 ms/tok** at D=256 / window 64 (was ~6.8 ms/tok); `--bench-gpu` uses wall time (~3.2 ms/tok @ 64 tokens)
 
 ### Token-parallel train / fill the GPU
 
 `--batch N` packs **N parallel windows** into one microbatch so linear layers see `(B·T)×D` GEMMs and VRAM holds a large activation working set (not just grad-accumulation of tiny sequential forwards). Use `--batch auto` to size `B` from free VRAM.
 
-- [x] **P1** Pack `B` windows into one microbatch: ids layout `B·T`; embed / LN / FFN / LM-head GEMMs over all `B·T` tokens in one launch
+- [x] **P1** Pack `B` windows into one microbatch: ids layout `B·T`; embed / LN / FFN / LM-head GEMMs over all `B·T` tokens in one launch; see [docs/packed-batch-attention.md](docs/packed-batch-attention.md)
 - [x] **P2** Attention stays causal **per sequence** (loop `b` over length-`T` slices, or block-diagonal mask) while QKV/FFN stay fat GEMMs
 - [x] **P3** CLI: `--batch` = parallel sequences in one step; `--grad-accum K` for extra Adam accumulation without growing activations
 - [x] **V1** Report peak activation estimate + `cudaMemGetInfo` free/total at train start (`-d`)
 - [x] **V2** `--batch auto` (or `--vram-frac 0.85`): grow `B` until estimated/working alloc approaches budget; fall back on OOM
-- [x] **M1** Optional fused batched attention (no per-`b` host loop) once P1–P2 land
+- [x] **M1** Optional fused batched attention (no per-`b` host loop) once P1–P2 land; see [docs/packed-batch-attention.md](docs/packed-batch-attention.md)
 - [x] Bench (RTX 5070 Ti, `--window 64`, 1 epoch of 1 KB toy text, byte vocab): `--batch 1` **1.23 ms/tok** (sequential-equivalent) → `--batch 16` **0.12 ms/tok** (~10×); GPU util ~34% (was ~2% idle). Remaining time is host↔device staging of LN/FFN/residual activations (scales with tokens), not GEMM — next step is keeping those device-resident.
 
 ### Fill the GPU further / expand matrices
@@ -382,10 +382,10 @@ Stage 1 local turn loop on a pretrained checkpoint — not Stage 3 SFT/HTTP.
 The first model that answers back. 185M params on the **T2** config, one 16 GB GPU. Plan: [docs/talk-170m-plan.md](docs/talk-170m-plan.md).
 
 - [x] **TALK1** Data: 3.81B tokens (3.21B FineWeb-Edu + 0.60B permissive code), 16k BPE retrained on the mix, held-out split, chat conversations; see [docs/talk-170m-data.md](docs/talk-170m-data.md)
-- [x] **TALK2** Mid-epoch checkpoints (`--ckpt-minutes`), resume at the same window, and a tmux driver that survives reboots (`scripts/talk170m_run.sh`)
+- [x] **TALK2** Mid-epoch checkpoints (`--ckpt-minutes`), resume at the same window, and a tmux driver that survives reboots (`scripts/talk170m_run.sh`); see [docs/mid-epoch-checkpoints.md](docs/mid-epoch-checkpoints.md)
 - [x] **TALK3** Pretrain: one epoch, batch 16 × 256 tokens × 32 accum, BF16 + tiled flash attention, ~34k tok/s, 11.7 GB, ~33 h; see [docs/talk-170m-pretrain.md](docs/talk-170m-pretrain.md)
 - [x] **TALK4** Chat fine-tune: two epochs on 24M tokens, loss on the assistant's turns only; see [docs/talk-170m-chat.md](docs/talk-170m-chat.md)
-- [x] **TALK5** Context 256 → 2048: 0.4B more tokens at window 2048, then the chat fine-tune again (`scripts/ctx2048_run.sh`)
+- [x] **TALK5** Context 256 → 2048: 0.4B more tokens at window 2048, then the chat fine-tune again (`scripts/ctx2048_run.sh`); see [docs/context-2048.md](docs/context-2048.md)
 - [x] **TALK6** Benches: [`qbench/`](qbench/README.md) (40 questions) and [`taskbench/`](taskbench/README.md) (20 coding tasks)
 - [x] **TALK7** Weight-space edits: change a behaviour by editing FFN weights, no training; see [docs/weight-space-edits.md](docs/weight-space-edits.md)
 
@@ -393,7 +393,7 @@ The first model that answers back. 185M params on the **T2** config, one 16 GB G
 
 Same code, three times the parameters, four times the data.
 
-- [x] **BIG1** Weight tying (`--tied`): one table for input and output, ~154M params saved at a 100k vocabulary
+- [x] **BIG1** Weight tying (`--tied`): one table for input and output, ~154M params saved at a 100k vocabulary; see [docs/weight-tying.md](docs/weight-tying.md)
 - [x] **BIG2** Data: 15.6B tokens of web text, code and French, 100k BPE (`scripts/fetch_code.py`, `scripts/build_code.sh`)
 - [x] **BIG3** Driver `scripts/run555m.sh`: builds its own 555M binary in `build/555m`; `--check` measures peak VRAM before the real run
 - [x] **BIG4** Live dashboard (`scripts/dashboard.py`): progress, loss curve, GPU, log tail
