@@ -22,7 +22,7 @@ The first attempt used cuBLASLt's `RELU_AUX_BIAS` epilogue on the W1 forward GEM
 
 | Build | Bench tok/s | Meter TF | fwd / bwd ms per microbatch | Peak VRAM |
 |---|---|---|---|---|
-| native (2775c4f) | 50.0k | 75.4 | 23.0 / 48.8 | 13408 MiB |
+| native (7cfef31) | 50.0k | 75.4 | 23.0 / 48.8 | 13408 MiB |
 | fused ReLU backward | 52.8k | 79.8 | 22.9 / 46.3 | 13263 MiB |
 
 Loss trajectory over the 12 gate steps identical to the reference; `make test-gpu` BF16 losses identical to the native build's at every step.

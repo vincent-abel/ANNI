@@ -59,7 +59,7 @@ F_{recompute}(T) = 2\,L\,(4D^2 + 2\,D\,D_{ff}) + 2\,L\,T\,D
 
 - **Wall clock bracketed by device syncs, not CUDA events.** One step is one stream-ordered unit ending in a full sync anyway; events would add a `gpu.h` API for no extra accuracy at the 10–1000 ms scale.
 - **Fresh model per sweep point.** Each point builds its own model and Adam state, so a precision or graph change cannot inherit the previous point's caches. Cost: model init (~1–2 s at D=1024) per point.
-- **Attention path is "auto".** `--flash-attn` is set: the TC score path runs when `B·H·T·T` floats fit in 256 MiB, otherwise tiled flash. The once-per-process `[attn]` log line says which one ran. Each layer keeps its own logsumexp for the tiled backward (the shared-buffer bug was fixed in `6c786ec`).
+- **Attention path is "auto".** `--flash-attn` is set: the TC score path runs when `B·H·T·T` floats fit in 256 MiB, otherwise tiled flash. The once-per-process `[attn]` log line says which one ran. Each layer keeps its own logsumexp for the tiled backward (the shared-buffer bug was fixed in `e5f31b7`).
 - **`--prec fp8`** sets BF16 compute plus `lm_train_set_fp8(1)` (E4M3 forward, E5M2 dgrad, BF16 wgrad), matching what `lm train --fp8 --bf16` does.
 - **The train meter is not changed here.** `lm train` still prints the old TF estimate; switching it to `lm_bench_flops_per_token` changes every logged number and the TF gate scripts, so it lands with the CLI trim.
 - **GPU only.** Every mode refuses to run on the CPU stub: CPU timings say nothing about the CUDA path. `make test` still checks `lm_train_bench_packed` for correctness (timings recorded, phases filled, CE falls) and the FLOP formula, on the small test model (D=64, 2 blocks), without reporting speed.

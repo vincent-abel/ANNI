@@ -1,6 +1,6 @@
 # Code audit: dead paths and remaining compute (talk-170m, candidate 16)
 
-Read-only audit of the tree at df483bb ("candidate 16"), 2026-10-26 night, done by two reviewers over `num/gpu_cuda.cu` (9.7k lines), `num/attn_fa2.cuh`, `lang/*.c` and the tests, against a fresh nsys profile of candidate 16 on the idle RTX 5070 Ti (129 microbatches, `logs/prof/nsys___bf16___flash_attn.sqlite`). Nothing was changed. The production configuration assumed throughout: `./anni lm train --bf16 --flash-attn`, B=16, T=256, D=1024, 16 heads of 64, FF=4096, vocab 16384, batch sync mode in training, eager mode for the probes, every `ANN_*` switch at its default, no `--cuda-graphs`, `--fp8`, `--fp16` or `--act-checkpoint`. Everything proposed below keeps the model, the checkpoint format and the Adam state usable as they are.
+Read-only audit of the tree at 7f7cd6a ("candidate 16"), 2026-10-26 night, done by two reviewers over `num/gpu_cuda.cu` (9.7k lines), `num/attn_fa2.cuh`, `lang/*.c` and the tests, against a fresh nsys profile of candidate 16 on the idle RTX 5070 Ti (129 microbatches, `logs/prof/nsys___bf16___flash_attn.sqlite`). Nothing was changed. The production configuration assumed throughout: `./anni lm train --bf16 --flash-attn`, B=16, T=256, D=1024, 16 heads of 64, FF=4096, vocab 16384, batch sync mode in training, eager mode for the probes, every `ANN_*` switch at its default, no `--cuda-graphs`, `--fp8`, `--fp16` or `--act-checkpoint`. Everything proposed below keeps the model, the checkpoint format and the Adam state usable as they are.
 
 ## Summary
 
