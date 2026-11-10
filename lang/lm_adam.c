@@ -547,6 +547,15 @@ void lm_adam_step_scaled(lm_adam *opt, double lr, double grad_scale)
 		gpu_half_wt_invalidate(NULL);
 		return;
 	}
+	/* Say it once: on a GPU run this path is many times slower. */
+	if (gpu_available()) {
+		static int warned;
+
+		if (!warned++)
+			fprintf(stderr, "[adam] step %d: GPU step failed, "
+			    "host fallback from now on (much slower)\n",
+			    opt->t);
+	}
 	/* Host fallback: bring resident m/v, weights and grads back first. */
 	lm_adam_sync_host(opt);
 	for (i = 0; i < opt->n_segs; i++) {
