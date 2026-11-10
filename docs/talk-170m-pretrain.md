@@ -49,7 +49,7 @@ tail -f logs/talk170m_pretrain.log
 tmux attach -t talk170m          # Ctrl-b d to detach, Ctrl-c to stop
 ```
 
-The driver stops `llama-server` with `systemctl --user stop` first, waits until the GPU holds under 2 GB and RAM has over 30 GB free, skips finished steps by marker file, and runs:
+The driver stops the systemd user unit named by `LLAMA_UNIT` (set in `talk170m.local.conf`, a copy of `talk170m.conf`) with `systemctl --user stop` first, waits until the GPU holds under 2 GB and RAM has over 30 GB free, skips finished steps by marker file, and runs:
 
 ```bash
 ./anni lm train --resume models/talk170m.bin --out models/talk170m.bin \

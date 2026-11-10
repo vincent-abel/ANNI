@@ -13,7 +13,9 @@
 # Every step is idempotent: it is skipped when its marker exists, and
 # pretraining resumes from models/talk170m.bin (a mid-epoch checkpoint keeps
 # the window it reached; --ckpt-minutes sets how often it is written).
-# Before any GPU or heavy step, llama-server is stopped with systemctl.
+# Before any GPU or heavy step, the systemd user unit that holds the GPU is
+# stopped. Its name is LLAMA_UNIT: read from talk170m.local.conf, else from
+# the mockup talk170m.conf; LLAMA_UNIT in the environment overrides both.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -46,11 +48,20 @@ CHAT=models/talk170m-chat.bin
 
 log() { echo "[$(date '+%F %T')] talk170m: $*"; }
 
+CONF=talk170m.local.conf
+if [ ! -f "$CONF" ]; then
+	CONF=talk170m.conf
+	log "no talk170m.local.conf: using the mockup values of $CONF"
+fi
+UNIT_ENV=${LLAMA_UNIT:-}
+. "./$CONF"
+LLAMA_UNIT=${UNIT_ENV:-$LLAMA_UNIT}
+
 stop_llama() {
 	export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
-	if systemctl --user is-active --quiet llama-server 2>/dev/null; then
-		log "stopping llama-server (restart: systemctl --user start llama-server)"
-		systemctl --user stop llama-server
+	if systemctl --user is-active --quiet "$LLAMA_UNIT" 2>/dev/null; then
+		log "stopping $LLAMA_UNIT (restart: systemctl --user start $LLAMA_UNIT)"
+		systemctl --user stop "$LLAMA_UNIT"
 	fi
 }
 
@@ -152,5 +163,5 @@ step chat_ids data/.chat_ids chat_ids
 stop_llama
 wait_free
 step finetune models/.talk170m_chat finetune
-log "all steps done; restarting llama-server"
-systemctl --user start llama-server || log "llama-server start failed"
+log "all steps done; restarting $LLAMA_UNIT"
+systemctl --user start "$LLAMA_UNIT" || log "$LLAMA_UNIT start failed"
