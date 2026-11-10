@@ -1,10 +1,10 @@
 # AnnI
 
-**AnnI** (`./anni`) is a neural network implemented from scratch in **C**, with the long-term goal of building a small **Transformer-based language model** without machine-learning frameworks. (`./ann` is a compat symlink to `./anni`.)
+**AnnI** (`./anni`) is a neural network written from scratch in **C**. It started as a single neuron and grew into a **Transformer language model** you can chat with, without any machine-learning framework.
 
 ## Status
 
-🚧 **Early development**
+🟢 **It talks.** Stage 1 is done and Stage 2 is cooking: a 185M model chats today, and a 555M one is training right now.
 
 Current implementation:
 
@@ -57,26 +57,36 @@ Current implementation:
 - LM weight serialization
 - Per-epoch checkpoints, `--lr` / `--window` / `--seed`, `lm merge`
 - FP32 (`ann_real`), generate sampling, `--out` resume confirm, BPE + streaming data path
-- Target-shaped config (~36M @ 16k BPE); quality run Q1–Q5 still open — see **Target quality run**
+- CUDA training with weights that stay on the GPU
+- BF16 GEMMs, tiled flash attention
+- Mid-epoch checkpoints, crash-safe resume
+- Chat fine-tune (loss on the assistant's turns only)
+- 2048-token context
+- Weight tying, 100k BPE vocabulary
+- HellaSwag, question bench, coding-task bench
+- Live run dashboard, latent space viewer
+- Weight-space edits
 
-Trainable decoder-only LM in `lang/`: FP32 mats, byte or BPE tokenizer, CUDA optional, checkpoint/resume, eval knobs, streaming splits, `lm merge`. Config is 40TF-shaped (`D=1024`, 12 blocks, ctx=256 → ~**185M** params at 16k BPE; older D=512 ckpts need retrain); readable generate / chat gated on **Q1–Q5**.
+Trainable decoder-only LM in `lang/`: byte or BPE tokenizer, CUDA optional, BF16 GEMMs, checkpoint/resume, eval knobs, streaming splits, `lm merge`. Default config: `D=1024`, 16 heads, `FF=4096`, 12 blocks, ctx=2048 → ~**185M** params at 16k BPE. Sizes are compile-time (`lang/lm_config.h`), so a checkpoint needs a binary built with its sizes.
 
-### Done vs open (Target)
+### Done vs open
 
-**Done (plumbing + speed stack):** FP32 / `LMCF`, GPU residency (R1–R4, R2, R8–R12, R10 TF32), packed `--batch` / `--batch auto`, BPE + `LMCV`, wiki stream, Efficiency E1–E16, Autotrain AT1–AT9. Config today: `D=1024`, `heads=16`, `FF=4096`, `ctx=256`, `blocks=12` (~185M @ 16k BPE; 40TF T2 — retrain older D=512 ckpts).
+**Done (Stage 1):** the plumbing, the speed stack, and a model that answers. **talk-170m** is 185M params, one epoch over 3.81B tokens of web text and code (~33 h on an RTX 5070 Ti, ~34k tok/s, 11.7 GB), then a chat fine-tune, then stretched from 256 to 2048 tokens of context. Try it: `./anni chat --model models/talk170m-chat.bin`.
 
-**Open for Target quality:** Q1–Q5 (rebuild → autotrain wiki → honest val metrics → gate → flip Hit Target). Config + Autotrain path land; quality not yet claimed.
+**How good is it?** Fluent, often wrong: 5–7 of 20 general questions, 6–7 of 20 small coding questions (17 of 20 at least run), 0 of 20 multi-file coding tasks. See [`qbench/`](qbench/README.md) and [`taskbench/`](taskbench/README.md).
 
-**Beyond Target:** ChatGPT-class needs more than a bigger decoder — see **Toward ChatGPT-class (code)** (modern block, scale, data shards, multi-GPU, SFT/DPO, eval, serve). Local `./anni chat` (CHAT1/CHAT3) is Stage 1 after Q4; do not skip Target for Stage 3 serve/SFT.
+**Cooking (Stage 2):** **run555m**, 555M params (`D=1536`, 24 heads, `FF=6272`, 14 blocks, tied 100k BPE), one epoch over 15.6B tokens of web text, code and French. Started 2026-11-05; on 2026-11-10 it is 5.8B tokens in, train NLL 2.86, ~17k tok/s at 13 GB. HellaSwag so far: 29.7% → 31.4% → 33.9% (chance is 25%).
+
+**Open:** runtime model config (**C1**), the modern block (**C6–C10**: RMSNorm, RoPE, SwiGLU, GQA), then Stage 3: chat template, data shards, multi-GPU, DPO, serve. See **Toward ChatGPT-class (code)**.
 
 ### Milestone map (code)
 
-| Stage | What “done” means in this repo | Where in README |
-| --- | --- | --- |
-| **0 Teaching** | Neurons → Transformer train/generate in C | Neural Network … Performance (mostly [x]) |
-| **1 Target small LLM** | ~10–50M, BPE, ≥100 MB, readable generate | Fill GPU R\* · Efficiency E\* · Autotrain · From toy → small LLM |
-| **2 Capable local** | ~100M–1B-class code path on 1–few GPUs | Capable local LLM (code) |
-| **3 ChatGPT-class stack** | Modern arch + web-scale data path + distributed train + chat SFT/DPO + serve | Toward ChatGPT-class (code) |
+| Stage | What “done” means in this repo | Where in README | Status |
+| --- | --- | --- | --- |
+| **0 Teaching** | Neurons → Transformer train/generate in C | Neural Network … Performance | ✅ done |
+| **1 Target small LLM** | ~10–50M, BPE, ≥100 MB, readable generate | Fill GPU R\* · Efficiency E\* · Autotrain · From toy → small LLM | ✅ done, passed by talk-170m |
+| **2 Capable local** | ~100M–1B-class code path on 1–few GPUs | Talking model · 555M run · Capable local LLM (code) | 🚧 size is there (185M, 555M training); modern block open |
+| **3 ChatGPT-class stack** | Modern arch + web-scale data path + distributed train + chat SFT/DPO + serve | Toward ChatGPT-class (code) | ⏳ first pieces: chat fine-tune, HellaSwag, 100k BPE |
 
 ## Roadmap
 
@@ -140,8 +150,8 @@ Trainable decoder-only LM in `lang/`: FP32 mats, byte or BPE tokenizer, CUDA opt
 - [x] Generation from trained checkpoints
 - [x] Train / generate / load CLI
 - [x] Per-epoch checkpoint saves; `--lr` / `--window` / `--seed`; `lm merge` weight average
-- [x] Subword BPE + stream/splits + packed batch (Target-shaped config landed; quality = Q1–Q5)
-- [ ] Hit Target size/quality — see **Target quality run (Q\*)** (flip after Q4)
+- [x] Subword BPE + stream/splits + packed batch
+- [x] Hit Target size/quality — talk-170m, see **Target quality run (Q\*)**
 - [x] Interactive chat CLI — see **CHAT1** / **CHAT2** / **CHAT3**
 - [ ] ChatGPT-class code path — see **Toward ChatGPT-class (code)**
 
@@ -247,6 +257,12 @@ Stretch goal on RTX 5070 Ti (~88 TF BF16 peak / ~40 TF realistic). Meter is \(6P
 - [x] **T2** Scale config `D=1024`, heads=16, `FF=4096`, blocks=12; see [docs/scale-d1024-40tf.md](docs/scale-d1024-40tf.md)
 - [x] **T3** Fused QKV + CE hot path / graphs-safe pack; see [docs/fused-qkv-ce-40tf.md](docs/fused-qkv-ce-40tf.md)
 - [ ] **T4** Bench milestones 5 / 15 / 40 TF with `anni lm bench step|sweep` (packed path, measured GEMM ceiling, MFU); see [docs/bench-harness.md](docs/bench-harness.md). Note: the `lm train` TF meter overcounts by ~1.5× until it switches to the bench FLOP model
+- [x] **T5** GPU training audit: stale caches fixed, BF16 numerics checked; see [docs/gpu-training-audit.md](docs/gpu-training-audit.md)
+- [x] **T6** FFN ReLU backward in one pass; see [docs/ffn-relu-backward-fusion.md](docs/ffn-relu-backward-fusion.md)
+- [x] **T7** Fused attention on `mma.sync`; see [docs/attention-fa2-mma.md](docs/attention-fa2-mma.md)
+- [x] **T8** BF16 outputs straight from the GEMMs; see [docs/bf16-direct-outputs.md](docs/bf16-direct-outputs.md)
+- [x] **T9** Code audit: dead paths and what compute is left; see [docs/code-audit-dead-paths-and-compute.md](docs/code-audit-dead-paths-and-compute.md)
+- [ ] **T10** FP8 / 4-bit training that beats BF16 (today `--fp8` works but is slower); plan in [docs/low-precision-plan.md](docs/low-precision-plan.md)
 
 **Other fill / scale**
 
@@ -311,7 +327,7 @@ See [docs/autotrain.md](docs/autotrain.md).
 
 ### From toy LM → small LLM (not-toy)
 
-What we have at `f3a44b3` was a **byte-level** educational model (`LM_BYTE_VOCAB` 256, short train windows, `double` mats, toy corpora). Low **window NLL** on `data/toy_*.txt` does **not** mean fluent generation: each token is one byte, so meaning is spread over long sequences and needs far more data (and usually subwords) than a wordpiece LM.
+What we had at `c7a9a88` was a **byte-level** educational model (`LM_BYTE_VOCAB` 256, short train windows, `double` mats, toy corpora). Low **window NLL** on `data/toy_*.txt` does **not** mean fluent generation: each token is one byte, so meaning is spread over long sequences and needs far more data (and usually subwords) than a wordpiece LM.
 
 **Near-term steps (unblock speed and honest metrics)**
 
@@ -338,28 +354,53 @@ What we have at `f3a44b3` was a **byte-level** educational model (`LM_BYTE_VOCAB
 - [x] Activation checkpointing when packed activations blow RAM — see **R9**
 - [x] FP16/BF16 or TF32 GEMMs — see **R10**
 - [x] Stronger generate: `--temperature` / `--top-k` / `--top-p` (length/EOS control still open)
-- [ ] Eval suite: window NLL, long-context NLL, held-out PPL, and a few fixed prompts for qualitative checks
+- [ ] Eval suite: window NLL, long-context NLL, held-out PPL, and a few fixed prompts for qualitative checks (have: held-out NLL, HellaSwag, `qbench/`, `taskbench/`; long-context NLL still open)
 - [ ] Multi-run: already have `--seed`, shuffle, `lm merge`—document as the cheap ensemble recipe; repro flags: **E11**
 - [x] One-command Target path — see **Autotrain** (`./autotrain`, AT1–AT9)
-- [ ] After Target: Stage 2 (**C1–C14**) then Stage 3 (**ARCH/TOK/DAT/DIST/ALN/EV/SRV/OPS**)
+- [ ] After Target: Stage 2 (**C1–C14**) then Stage 3 (**ARCH/TOK/DAT/DIST/ALN/EV/SRV/OPS**) — Stage 2 under way, see **555M run**
 
 **Target quality run (Q\*)**
 
 - [x] **Q1** Rebuild: `make clean && make cuda && make cuda-autotrain` after R5–R7 dims; old d=256 ckpts will not load
 - [x] **Q2** Smoke train on `data/wiki_sample.txt` (~1 MB): BPE 16k + stream + val-frac → `wiki_bpe.bin` (use `--batch 64` if `--batch auto` OOMs near ~12 GB; not full `wiki_simple.txt`)
 - [x] **Q3** Honest metrics resume: `ann lm train` with `--tokenizer bpe --vocab wiki_bpe.bin.vocab --data data/wiki_sample.txt --val-frac 0.05 --split doc --window 128 --batch 64 --resume wiki_bpe.bin`
-- [ ] **Q4** Gate: `lm info` shows ~tens of M params + BPE V≈16384; val window NLL ≪ ln(V)≈9.7; in-domain `lm generate` readable English (smoke: 35.7M / V=16384 / val≈8.6 — generate still not readable; needs more data/steps)
-- [ ] **Q5** Mark “Hit Target size/quality” [x] only after Q4 **and** a real ≥100 MB run (`data/wiki_simple.txt`) — smoke on `wiki_sample` does not flip this
+- [x] **Q4** Gate: `lm info` shows ~tens of M params + BPE V≈16384; val window NLL ≪ ln(V)≈9.7; in-domain `lm generate` readable English (the 35.7M wiki smoke stayed at val≈8.6 and unreadable; talk-170m passed it: 185M, val≈3.35)
+- [x] **Q5** Mark “Hit Target size/quality” [x] only after Q4 **and** a real ≥100 MB run — done on 15 GB of text (talk-170m), not on `data/wiki_simple.txt`
 
 **Interactive chat (after Target quality)**
 
 Stage 1 local turn loop on a pretrained checkpoint — not Stage 3 SFT/HTTP.
 
-- [x] **CHAT1** `./anni chat --model wiki_bpe.bin`: User/Assistant history, `lm_generate`, context ≤ `LM_MAX_CTX` (stdin when no TTY)
+- [x] **CHAT1** `./anni chat --model models/talk170m-chat.bin`: User/Assistant history, `lm_generate`, context ≤ `LM_MAX_CTX` (stdin when no TTY)
 - [x] **CHAT2** Docs + README example; exit on empty line / Ctrl-D (stdin) or a lone Esc (ncurses)
 - [x] **CHAT3** Ncurses messenger UI on TTY (`libncurses-dev`); same flags as CHAT1; `./anni lm chat` is an alias
 
-**Done when:** subword vocab, ≥100 MB train data, ~10M+ params, train window ≈ generate horizon, FP32 (or faster) on GPU, and generate produces readable multi-word text on held-out-style prompts—not just low NLL on `toy_tiny`. Then `./anni chat` for multi-turn local chat.
+**Done when:** subword vocab, ≥100 MB train data, ~10M+ params, train window ≈ generate horizon, FP32 (or faster) on GPU, and generate produces readable multi-word text on held-out-style prompts—not just low NLL on `toy_tiny`. Then `./anni chat` for multi-turn local chat. ✅ Reached with talk-170m.
+
+### Talking model (talk-170m)
+
+The first model that answers back. 185M params on the **T2** config, one 16 GB GPU. Plan: [docs/talk-170m-plan.md](docs/talk-170m-plan.md).
+
+- [x] **TALK1** Data: 3.81B tokens (3.21B FineWeb-Edu + 0.60B permissive code), 16k BPE retrained on the mix, held-out split, chat conversations; see [docs/talk-170m-data.md](docs/talk-170m-data.md)
+- [x] **TALK2** Mid-epoch checkpoints (`--ckpt-minutes`), resume at the same window, and a tmux driver that survives reboots (`scripts/talk170m_run.sh`)
+- [x] **TALK3** Pretrain: one epoch, batch 16 × 256 tokens × 32 accum, BF16 + tiled flash attention, ~34k tok/s, 11.7 GB, ~33 h; see [docs/talk-170m-pretrain.md](docs/talk-170m-pretrain.md)
+- [x] **TALK4** Chat fine-tune: two epochs on 24M tokens, loss on the assistant's turns only; see [docs/talk-170m-chat.md](docs/talk-170m-chat.md)
+- [x] **TALK5** Context 256 → 2048: 0.4B more tokens at window 2048, then the chat fine-tune again (`scripts/ctx2048_run.sh`)
+- [x] **TALK6** Benches: [`qbench/`](qbench/README.md) (40 questions) and [`taskbench/`](taskbench/README.md) (20 coding tasks)
+- [x] **TALK7** Weight-space edits: change a behaviour by editing FFN weights, no training; see [docs/weight-space-edits.md](docs/weight-space-edits.md)
+
+### 555M run (run555m)
+
+Same code, three times the parameters, four times the data.
+
+- [x] **BIG1** Weight tying (`--tied`): one table for input and output, ~154M params saved at a 100k vocabulary
+- [x] **BIG2** Data: 15.6B tokens of web text, code and French, 100k BPE (`scripts/fetch_code.py`, `scripts/build_code.sh`)
+- [x] **BIG3** Driver `scripts/run555m.sh`: builds its own 555M binary in `build/555m`; `--check` measures peak VRAM before the real run
+- [x] **BIG4** Live dashboard (`scripts/dashboard.py`): progress, loss curve, GPU, log tail
+- [x] **BIG5** HellaSwag during the run (`anni lm hellaswag`); see [docs/hellaswag.md](docs/hellaswag.md)
+- [x] **BIG6** Latent space viewer (`anni-probe`, `anni-latent`); see [docs/latent-space-viewer.md](docs/latent-space-viewer.md)
+- [ ] **BIG7** Finish the epoch (5.8B of 15.6B tokens on 2026-11-10)
+- [ ] **BIG8** Chat fine-tune, then `qbench/` and `taskbench/` against talk-170m
 
 ### Capable local LLM (code) — Stage 2
 
@@ -368,8 +409,8 @@ Single-node / few-GPU path between Target and ChatGPT-class. Still from-scratch 
 **Config & memory**
 
 - [ ] **C1** Runtime model config (not only `lm_config.h` macros): load `D`, heads, blocks, ctx, vocab from checkpoint header / JSON
-- [ ] **C2** Grow to ~**100M–1B** params via C1 + R5–R7 (example: D=768–2048, blocks=12–24, ctx=2048+)
-- [ ] **C3** Weight tying option (embed ↔ LM head) + optional bias-free linear layers
+- [x] **C2** Grow to ~**100M–1B** params (example: D=768–2048, blocks=12–24, ctx=2048+) — 185M at ctx 2048, 555M training; still macros, so **C1** stays open
+- [x] **C3** Weight tying option (embed ↔ LM head): `--tied` (**BIG1**); bias-free linear layers not done
 - [x] **C4** Gradient checkpointing wired for packed train (`--act-checkpoint`, **S11**/R9)
 - [ ] **C5** Sharded checkpoint I/O (multi-file or mmap) so save/load fits host RAM
 
@@ -383,7 +424,7 @@ Single-node / few-GPU path between Target and ChatGPT-class. Still from-scratch 
 
 **Train loop hardening**
 
-- [ ] **C11** Grad clip + weight decay + warmup/cosine — land **E1–E2** for real
+- [x] **C11** Grad clip + weight decay + warmup/cosine — **E1–E2**, used by every real run
 - [ ] **C12** Token-budget steps (`--tokens-per-step`) — **E9**; epoch = token budget not file passes
 - [x] **C13** BF16/FP16 train path with FP32 master weights — **R10** / **S5a/S5b**
 - [ ] **C14** Data: multi-file shard reader + shuffle across shards (**E14** + beyond wiki dump)
@@ -403,7 +444,7 @@ What ChatGPT-class systems need **in code**, ordered so each section can ship as
 
 #### Tokenizer & specials
 
-- [ ] **TOK1** Production BPE/Unigram: 32k–100k+ vocab, Unicode-safe, explicit UNK/byte-fallback
+- [x] **TOK1** Production BPE/Unigram: 32k–100k+ vocab, Unicode-safe, explicit UNK/byte-fallback — 100k byte-level BPE in run555m
 - [ ] **TOK2** Special tokens: `BOS`/`EOS`/`PAD`/`SEP`, plus chat roles (`system` / `user` / `assistant`)
 - [ ] **TOK3** Chat template encode/decode (string → token ids with roles); shared by train SFT and serve
 - [ ] **TOK4** Stop sequences / EOS-forced generate; max-new-tokens separate from context length
@@ -428,17 +469,17 @@ What ChatGPT-class systems need **in code**, ordered so each section can ship as
 
 #### Instruction / chat alignment
 
-- [ ] **ALN1** SFT dataset reader (JSONL: messages[] → TOK3 ids); pack multi-turn with loss mask on assistant tokens only
-- [ ] **ALN2** `lm sft` (or `./autotrain --sft`) continue-train from pretrain checkpoint
+- [ ] **ALN1** SFT dataset reader (JSONL: messages[] → TOK3 ids); pack multi-turn with loss mask on assistant tokens only (the mask exists, on plain `User:` / `Assistant:` text — **TALK4**)
+- [x] **ALN2** Continue-train from a pretrain checkpoint on chat data: `lm train --resume` on masked ids (**TALK4**)
 - [ ] **ALN3** Preference pairs JSONL (chosen / rejected); **DPO** loss + train loop in C
 - [ ] **ALN4** Optional reward-model head + simple PPO/REINFORCE loop (only after DPO works)
 - [ ] **ALN5** System-prompt + safety refusal samples in SFT mix (data + mask, not a separate product)
 
 #### Eval & regression (code harness)
 
-- [ ] **EV1** Fixed prompt suite checked into `data/eval/` (completion + chat); score exact / fuzzy / judge-stub
+- [x] **EV1** Fixed prompt suite: `qbench/`, 40 chat questions scored by exact match or by running the code
 - [ ] **EV2** Window NLL + bits-per-byte + long-ctx NLL CLI (`lm eval`)
-- [ ] **EV3** Multiple-choice harness (MMLU-style JSON → logprob pick) — small public slices first
+- [x] **EV3** Multiple-choice harness (logprob pick): `anni lm hellaswag`, 10,042 questions; see [docs/hellaswag.md](docs/hellaswag.md)
 - [ ] **EV4** Chat rubrics: format compliance (role tags, EOS), repetition / blank detectors
 - [ ] **EV5** CI smoke: tiny model + tiny SFT step + EV1 must not regress
 
@@ -455,7 +496,7 @@ What ChatGPT-class systems need **in code**, ordered so each section can ship as
 #### Tooling & ops (still code in-repo)
 
 - [ ] **OPS1** Training job manifest (JSON): model, data mix, LR, budget tokens, seed — written beside ckpt (**E11**)
-- [ ] **OPS2** Crash-safe resume: step counter + dataloader offset in checkpoint footer
+- [x] **OPS2** Crash-safe resume: epoch + window index in the checkpoint (`--ckpt-minutes`, **TALK2**)
 - [ ] **OPS3** Profiling hooks: NVTX ranges around fwd/bwd/Adam/data for nsys
 - [ ] **OPS4** Model card generator from manifest + EV2/EV3 numbers
 
@@ -463,21 +504,23 @@ What ChatGPT-class systems need **in code**, ordered so each section can ship as
 
 ## Target
 
-**Stage 1** — the “small LLM, not toy” bar (finish this before Stage 2–3):
+**Stage 1** — the “small LLM, not toy” bar (✅ passed, with a bigger model than planned):
 
 - Decoder-only Transformer
 - ~10–50M parameters
 - 10k–30k **subword** vocabulary (not byte-256)
 - 256–512 token context
 - 4–6 Transformer layers
-- 4–16 attention heads (today `LM_N_HEADS=8` at D=256; scale with **R5b**)
+- 4–16 attention heads (today 16 at D=1024)
 - Training data from **100 MB** upward (then 1 GB+)
+
+**Stage 2** is where we are: 100M–1B params on one GPU. 185M is done, 555M is training.
 
 The goal is to implement and understand the complete stack from **neurons to text generation**, then grow that stack until generation is useful—not only until toy window NLL falls. ChatGPT-class is **Stage 3**, not a rename of Target.
 
 ## Training
 
-Next-token prediction (today: next **byte**; Target: next **subword**).
+Next-token prediction (next **subword** with BPE; next **byte** is still there as the teaching path).
 
     Input:  "The cat is"
     Target: "on"
@@ -491,13 +534,17 @@ Training loop:
 5. Update parameters
 6. Repeat
 
-Practical CLI knobs already: `--data`, `--epochs`, `--batch N|auto`, `--grad-accum K`, `--vram-frac F`, `--lr`, `--window`, `--seed`, `--resume`, `--out`, `-d`; generate via `./anni lm generate --model … --prompt … --tokens …`; chat via `./anni chat --model wiki_bpe.bin` (see [docs/lm-chat.md](docs/lm-chat.md)). Ncurses tower (needs `libncurses-dev`): `./anni lm tower train`, `./anni lm tower inspect`; plain intel: `./anni lm info --model …` (see [docs/training-control-tower.md](docs/training-control-tower.md)).
+Practical CLI knobs: `--data`, `--epochs`, `--batch N|auto`, `--grad-accum K`, `--vram-frac F`, `--lr`, `--window`, `--seed`, `--resume`, `--out`, `--bf16`, `--flash-attn`, `--tied`, `--ckpt-minutes M`, `-d`; generate via `./anni lm generate --model … --prompt … --tokens …`; chat via `./anni chat --model models/talk170m-chat.bin` (see [docs/lm-chat.md](docs/lm-chat.md)). Ncurses tower (needs `libncurses-dev`): `./anni lm tower train`, `./anni lm tower inspect`; plain intel: `./anni lm info --model …` (see [docs/training-control-tower.md](docs/training-control-tower.md)).
+
+A full run is one script: `scripts/talk170m_run.sh`, `scripts/ctx2048_run.sh`, `scripts/run555m.sh`. Each one skips the steps already done and resumes after a crash.
 
 ## Data
 
 Progression toward non-toy:
 
-    toy KB → 10 MB → 100 MB → 1 GB → 10 GB+
+    toy KB → 10 MB → 100 MB → 1 GB → 10 GB+   ← we are here
+
+talk-170m read 15 GB of text (3.81B tokens); run555m is reading 15.6B tokens: FineWeb-Edu, permissively licensed GitHub code, and French from FineWeb-2. The fetch scripts download it all.
 
 Byte LMs need **more raw text** than subword LMs for similar fluency. Prefer document-level held-out splits. Wikipedia and other freely licensed text are fine for experiments.
 
@@ -521,10 +568,14 @@ Byte LMs need **more raw text** than subword LMs for similar fluency. Prefer doc
 
 The project is written in C and aims to remain dependency-light.
 
-    make          # CPU stub ./anni (+ ./ann symlink)
-    make test     # unit tests on a small D=64 / 2-block build (objects/test/)
-    make cuda     # CUDA ./anni (+ ./ann symlink; when nvcc available)
-    make autotrain   # CUDA ./autotrain (requires nvcc); autotrain-cpu for stub
+    make            # CPU ./anni
+    make test       # unit tests on a small D=64 / 2-block build
+    make cuda       # CUDA ./anni (needs nvcc)
+    make test-gpu   # GPU checks on the same small build
+    make autotrain  # CUDA ./autotrain; autotrain-cpu for the CPU one
+    make latent     # anni-probe + anni-latent (needs libglfw3-dev)
+
+Want another model size? Override the macros: `make OPT="-O2 -DLM_D_MODEL=64 -DLM_N_HEADS=4 -DLM_D_FF=256 -DLM_N_BLOCKS=2"`.
 
 ## Philosophy
 
@@ -539,6 +590,6 @@ The project is written in C and aims to remain dependency-light.
 
 Build a functional **text-generating Transformer in C from scratch**, then grow the *same* codebase through the milestone map:
 
-**Stage 0** Teaching stack → **Stage 1** Target small LLM → **Stage 2** Capable local (modern block, 100M–1B path) → **Stage 3** ChatGPT-class code (distributed pretrain, SFT/DPO, eval, serve)
+**Stage 0** Teaching stack ✅ → **Stage 1** Target small LLM ✅ → **Stage 2** Capable local (modern block, 100M–1B path) 🚧 → **Stage 3** ChatGPT-class code (distributed pretrain, SFT/DPO, eval, serve)
 
 Still: train and infer without ML frameworks; measure; keep the code readable.
