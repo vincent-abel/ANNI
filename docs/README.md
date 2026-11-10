@@ -63,6 +63,8 @@
 - [Train / generate / load CLI](lm-cli.md)
 - [Interactive chat (AnnI)](lm-chat.md)
 - [Training control tower](training-control-tower.md)
+- [HellaSwag bench](hellaswag.md)
+- [Latent space viewer](latent-space-viewer.md)
 
 ### Performance
 
@@ -344,6 +346,12 @@ The CLI exposes lm train, lm generate, and lm load over model.bin checkpoints. F
 
 ### [Training control tower](training-control-tower.md)
 Ncurses TUI for live train metrics, loss sparkline, pause/lr/save/quit, and generate samples; plus `lm tower inspect` / `lm info` for checkpoint architecture and parameter counts.
+
+### [HellaSwag bench](hellaswag.md)
+`anni lm hellaswag` scores a checkpoint on the 10,042 HellaSwag validation questions: four endings per context, the one with the lowest loss per byte wins, chance is 25%. The 555M run scores itself at each test step.
+
+### [Latent space viewer](latent-space-viewer.md)
+`anni-probe` writes a checkpoint's token table and the hidden states of real text at every layer. `anni-latent` shows them as a 3D cloud with a layer slider, search, nearest neighbours, and the comparison of two checkpoints.
 
 # Performance docs
 
